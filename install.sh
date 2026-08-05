@@ -70,7 +70,16 @@ ask_yn() {
     [ "$ans" = "y" ] || [ "$ans" = "yes" ]
 }
 
-cleanup() { [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ] && rm -rf "$WORKDIR"; }
+# Must end on a success. Bash lets a non-zero status from the last command in an
+# EXIT trap override the script's real exit status, so the bare `[ -n "$WORKDIR" ]
+# && ...` form made every run that never downloaded a tarball - any install from
+# a local checkout, and every --uninstall - exit 1 despite succeeding.
+cleanup() {
+    if [ -n "$WORKDIR" ] && [ -d "$WORKDIR" ]; then
+        rm -rf "$WORKDIR"
+    fi
+    return 0
+}
 trap cleanup EXIT
 
 # ---------------------------------------------------------------------------

@@ -15,9 +15,9 @@ jobs:
         python-version: ["3.9", "3.12"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -68,7 +68,7 @@ jobs:
   shell:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Syntax-check the installer
         run: bash -n install.sh
@@ -78,5 +78,60 @@ jobs:
           sudo apt-get update && sudo apt-get install -y shellcheck
           shellcheck --severity=warning install.sh
 
-      - name: Installer honours --help without root
-        run: bash install.sh --help
+      # Exit codes are asserted explicitly. A bash EXIT trap whose last command
+      # fails silently overrides the script's real status, which is exactly how
+      # a successful install came to report failure once.
+      - name: Installer honours --help without root, and exits 0
+        run: |
+          bash install.sh --help
+          bash install.sh --help > /dev/null; rc=$?
+          test "$rc" = "0" || { echo "--help exited $rc, expected 0"; exit 1; }
+
+      - name: Unknown option is rejected with a non-zero status
+        run: |
+          if bash install.sh --nonsense > /dev/null 2>&1; then
+            echo "an unknown option should not have succeeded"; exit 1
+          fi
+
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Full install from a local checkout - the path that skips the tarball
+      # download, and the one whose exit status regressed.
+      - name: Install unattended
+        run: |
+          sudo bash install.sh --unattended; rc=$?
+          test "$rc" = "0" || { echo "install exited $rc, expected 0"; exit 1; }
+
+      - name: Verify what landed
+        run: |
+          set -x
+          test -x /opt/timelapse/timelapse_capture.py
+          test -x /opt/timelapse/timelapse_setup.py
+          test -x /usr/local/bin/timelapse
+          test -f /etc/systemd/system/timelapse-capture.service
+          test -f /etc/systemd/system/timelapse-encode.timer
+          id timelapse
+          sudo test -r /etc/timelapse/config.json
+          sudo python3 -m json.tool /etc/timelapse/config.json > /dev/null
+          # ReadWritePaths must have been rewritten from the generated config.
+          grep -q '^ReadWritePaths=/var/lib/timelapse/' \
+               /etc/systemd/system/timelapse-capture.service
+          systemd-analyze verify /etc/systemd/system/timelapse-capture.service
+          systemd-analyze verify /etc/systemd/system/timelapse-encode.timer
+
+      - name: Re-running is safe
+        run: |
+          sudo bash install.sh --unattended --no-wizard; rc=$?
+          test "$rc" = "0" || { echo "re-install exited $rc, expected 0"; exit 1; }
+
+      - name: Uninstall exits 0 and leaves nothing behind
+        run: |
+          sudo bash install.sh --unattended --uninstall; rc=$?
+          test "$rc" = "0" || { echo "uninstall exited $rc, expected 0"; exit 1; }
+          test ! -e /opt/timelapse
+          test ! -e /usr/local/bin/timelapse
+          test ! -e /etc/systemd/system/timelapse-capture.service
+          test ! -e /etc/systemd/system/timelapse-encode.timer

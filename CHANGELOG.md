@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [Unreleased]
+
+### Fixed
+- `install.sh` exited `1` on success whenever it had not downloaded a tarball —
+  that is, every install from a local git checkout, every `--uninstall`, and
+  `--help`. The `EXIT` trap ended on a failing test (`[ -n "$WORKDIR" ] && …`
+  with `WORKDIR` empty), and bash lets a non-zero status from the last command
+  in an `EXIT` trap override the script's real exit status. The installation
+  itself was correct; only the reported status was wrong, but it would break
+  any automation wrapping the installer.
+
+### Changed
+- CI asserts installer exit codes explicitly instead of relying on `&&`, and now
+  runs a full install → verify → re-install → uninstall cycle on a runner.
+- Bumped `actions/checkout` to v5 and `actions/setup-python` to v6, clearing the
+  Node 20 deprecation warnings.
+
 ## [0.0.1] - 2026-08-05
 
 First public release. Previously a single-host private deployment, developed and
