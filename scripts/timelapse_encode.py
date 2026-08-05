@@ -20,6 +20,7 @@ import argparse
 import json
 import logging
 import logging.handlers
+import os
 import platform
 import re
 import shutil
@@ -261,6 +262,44 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
 # Transfer
 # ----------------------------------------------------------------------------
 
+def nearest_mountpoint(path):
+    """The deepest ancestor of path (or path itself) that is a mount point."""
+    p = Path(path).resolve()
+    while p != p.parent and not os.path.ismount(p):
+        p = p.parent
+    return p
+
+
+def mount_problem(t, dest):
+    """Why dest must not be written to, or None if it is fine.
+
+    An unmounted CIFS/NFS destination is an ordinary empty local directory, so
+    rsync would cheerfully fill the local disk instead of the NAS - and with
+    --remove-source-files, delete the originals afterwards. Setting
+    transfer.require_mountpoint refuses to transfer in that case.
+
+    true    - the destination must sit on something mounted below /
+    "/path" - that exact path must be a mount point (precise; prefer it when
+              an intermediate directory like /mnt is its own filesystem)
+    """
+    req = t.get("require_mountpoint")
+    if not req or not dest.startswith("/"):
+        return None
+    if isinstance(req, str):
+        if os.path.ismount(req):
+            return None
+        return f"{req} is not a mounted filesystem"
+    mp = nearest_mountpoint(dest)
+    if mp == mp.parent:
+        # Walked all the way to the filesystem root without finding a mount,
+        # so nothing is mounted under the destination. Comparing against the
+        # root this way rather than to os.sep keeps it correct wherever the
+        # root is not literally "/".
+        return (f"{dest} is not on a mounted filesystem - the share is "
+                f"probably not mounted")
+    return None
+
+
 def transfer(cfg, dry_run):
     """rsync the video folder to the destination. Works for both a local mount
     path and a remote user@host:/path spec."""
@@ -273,6 +312,15 @@ def transfer(cfg, dry_run):
         return {"ok": True, "moved": 0, "detail": "nothing to transfer"}
 
     dest = t["destination"]
+
+    problem = mount_problem(t, dest)
+    if problem:
+        # Deliberately not an exception: the encode succeeded, the videos are
+        # safe in video_output, and the next run ships them once the mount is
+        # back. Filling the frames disk instead would be the real disaster.
+        log.error("Refusing to transfer - %s", problem)
+        return {"ok": False, "moved": 0, "detail": problem}
+
     args = list(t.get("rsync_args", ["-a", "--partial", "--remove-source-files"]))
     cmd = ["rsync"] + args + [str(f) for f in files] + [dest]
 

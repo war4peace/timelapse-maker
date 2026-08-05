@@ -200,7 +200,16 @@ Pipeline, in `main()`:
 - Failure is contained per camera-day. An exception is caught, recorded in the
   result dict, the partial output file is unlinked, and the loop continues.
 
-**`transfer()`** shells out to `rsync` with `--remove-source-files`. One code path
+**`transfer()`** shells out to `rsync` with `--remove-source-files`.
+
+`mount_problem()` runs first when `transfer.require_mountpoint` is set. An
+unmounted CIFS/NFS destination is an ordinary empty local directory, so rsync
+would fill the local disk and then delete the originals — strictly worse than
+not transferring. Refusing returns a transfer failure, which by the rule below
+does not spoil the encode; the videos stay in `video_output` and ship next run.
+`true` walks up from the destination and fails if it reaches the filesystem
+root; a string checks that exact path with `os.path.ismount`, which is more
+precise when an intermediate directory is its own filesystem. One code path
 serves both a local mount (`/mnt/nas/timelapse/`) and a remote spec
 (`user@nas:/mnt/user/timelapse/`) — rsync doesn't care. A missing `rsync` binary
 or a non-zero exit returns a failure dict rather than raising: **a transfer
@@ -328,9 +337,11 @@ take an optional path as their first positional argument. See
 | `max_backlog_days` | 7 | Bounds a catch-up run after long downtime. |
 
 ### `transfer`
-`destination` is either a local directory or an rsync remote spec. `rsync_args`
-defaults include `--remove-source-files`; if you remove that, set
-`delete_local_after_transfer` accordingly or files accumulate.
+| Key | Notes |
+|---|---|
+| `destination` | A local directory or an rsync remote spec; one code path serves both. |
+| `rsync_args` | Defaults include `--remove-source-files`; if you drop that, set `delete_local_after_transfer` accordingly or files accumulate. On a CIFS mount `-a` may exit 23 because owner/group cannot be set — `tools/setup-cifs-transfer.sh` measures which flags work on your share. |
+| `require_mountpoint` | `false` (default), `true`, or an explicit mount path. Refuses to transfer when the destination is not on a mounted filesystem. Only meaningful for a local destination; ignored for a remote spec. |
 
 ### `cameras[]`
 | Key | Notes |
@@ -355,6 +366,7 @@ defaults include `--remove-source-files`; if you remove that, set
 | One camera's encode fails | Recorded `FAIL`, partial output deleted, **frames retained**, loop continues, Discord lists it. |
 | No encoder available | Critical abort + Discord alert. Frames retained. |
 | `rsync` missing or failing | Reported as a transfer failure in the summary; encode still counts as success; videos stay in `video_output` and ship next run. |
+| NAS share not mounted | With `require_mountpoint`, the transfer is refused before rsync runs, so nothing is written to the local disk and no originals are deleted. Without it, rsync silently fills the local filesystem. |
 | Discord unreachable | Logged, swallowed. |
 | Encode never succeeds for a camera | Frames accumulate. `max_backlog_days` bounds the work; DiskGuard bounds the damage; nightly Discord shows repeated failures. |
 
@@ -487,6 +499,7 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 
 ```
 install.sh                       bootstrap installer, 467 lines
+tools/setup-cifs-transfer.sh     CIFS mount setup and verification
 scripts/timelapse_capture.py     daemon, 340 lines
 scripts/timelapse_encode.py      batch job, 491 lines
 scripts/timelapse_test.py        pre-flight checks, 320 lines

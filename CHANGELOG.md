@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [Unreleased]
+
+### Added
+- `transfer.require_mountpoint` — refuses to transfer when the destination is
+  not on a mounted filesystem. An unmounted CIFS/NFS mountpoint is an ordinary
+  empty local directory, so rsync would fill the local disk and
+  `--remove-source-files` would then delete the originals. Accepts `true`
+  (walk up from the destination) or an explicit mount path (checked with
+  `os.path.ismount`, more precise). Off by default.
+- `tools/setup-cifs-transfer.sh` — mounts an SMB/CIFS share, determines which
+  rsync flags the share actually accepts, performs a real round trip with a
+  throwaway file (verifying md5 and that `--remove-source-files` worked),
+  writes the `/etc/fstab` entry with `nofail,x-systemd.automount`, and prints
+  the exact config.json block and `ReadWritePaths` change needed.
+- `timelapse_test.py` now warns when the transfer destination is not on a
+  mount, and when `rsync_args` uses `-a` against a CIFS/NFS destination.
+
+### Notes
+- Whether `rsync -a` works on CIFS depends on the server and mount options —
+  `-a` implies `--owner --group`, which many shares reject with exit 23, but
+  `forceuid`/`forcegid` can make it succeed. The tool measures it rather than
+  assuming either way.
+
 ## [0.0.2] - 2026-08-05
 
 ### Added

@@ -35,10 +35,13 @@
 
   "transfer": {
     "_comment": "Set enabled false to keep videos local. destination is a local mount path OR a remote rsync spec such as user@nas:/mnt/user/timelapse/",
+    "_comment_cifs": "On a CIFS/SMB mount, '-a' implies -o -g and rsync exits 23 because the share cannot set owner/group. Use ['-rt','--partial','--remove-source-files'] there. tools/setup-cifs-transfer.sh works out which flags your share accepts.",
+    "_comment_mount": "require_mountpoint refuses to transfer when the destination is not on a mounted filesystem - otherwise a dropped NAS mount turns into rsync filling your local disk. true checks the destination; a string checks that exact mount point, which is more precise.",
     "enabled": false,
     "destination": "/mnt/nas/timelapse/",
     "rsync_args": ["-a", "--partial", "--remove-source-files"],
-    "delete_local_after_transfer": true
+    "delete_local_after_transfer": true,
+    "require_mountpoint": false
   },
 
   "discord": {

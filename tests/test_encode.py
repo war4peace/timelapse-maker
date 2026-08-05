@@ -3,6 +3,8 @@
 The end-to-end encode is covered separately by tests/smoke_test.py.
 """
 
+import logging
+import os
 import shutil
 import tempfile
 import unittest
@@ -244,6 +246,103 @@ class TestEncoderCandidates(unittest.TestCase):
         args = enc.build_candidates({})[0]["args"]
         self.assertIn("p6", args)
         self.assertIn("26", args)
+
+
+class TestMountGuard(unittest.TestCase):
+    """transfer.require_mountpoint - the CIFS/NFS dropped-mount protection.
+
+    Without it, an unmounted share is an ordinary empty directory and rsync
+    fills the local disk, then --remove-source-files deletes the originals.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        # transfer() logs the refusal at ERROR; keep it out of test output.
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self):
+        logging.disable(logging.NOTSET)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_disabled_by_default(self):
+        self.assertIsNone(enc.mount_problem({}, "/mnt/nas/tl/"))
+
+    def test_explicitly_disabled(self):
+        self.assertIsNone(
+            enc.mount_problem({"require_mountpoint": False}, "/mnt/nas/tl/"))
+
+    def test_never_applies_to_a_remote_destination(self):
+        # rsync over SSH writes nothing locally, so there is no mount to check.
+        self.assertIsNone(enc.mount_problem({"require_mountpoint": True},
+                                            "user@nas:/mnt/user/tl/"))
+
+    def test_string_form_rejects_a_path_that_is_not_a_mount(self):
+        # POSIX-style strings throughout: the guard only engages for
+        # destinations starting with "/", which is how a local path is told
+        # apart from an rsync remote spec.
+        problem = enc.mount_problem(
+            {"require_mountpoint": "/mnt/unraid-cctv"},
+            "/mnt/unraid-cctv/TL/")
+        self.assertIsNotNone(problem)
+        self.assertIn("not a mounted filesystem", problem)
+
+    def test_string_form_accepts_a_real_mount(self):
+        # "/" is a mount point on every POSIX system, and on Windows
+        # ismount() accepts a drive root, so this works either way.
+        root = os.path.abspath(os.sep)
+        self.assertIsNone(
+            enc.mount_problem({"require_mountpoint": root}, "/mnt/nas/tl/"))
+
+    def test_boolean_form_rejects_an_unmounted_destination(self):
+        # Nothing is mounted under the temp dir, so the nearest mount point
+        # walking up is the filesystem root - meaning the share is absent.
+        problem = enc.mount_problem({"require_mountpoint": True},
+                                    "/definitely/not/mounted/tl/")
+        self.assertIsNotNone(problem)
+        self.assertIn("not mounted", problem)
+
+    def test_nearest_mountpoint_terminates_at_the_root(self):
+        mp = enc.nearest_mountpoint("/no/such/path/anywhere")
+        self.assertEqual(str(mp), os.path.abspath(os.sep))
+
+    def test_transfer_refuses_and_reports_a_failure(self):
+        videos = self.tmp / "videos"
+        videos.mkdir()
+        (videos / "Cam.20260804.mkv").write_bytes(b"x" * 2048)
+        cfg = {"paths": {"video_output": str(videos)},
+               "transfer": {"enabled": True,
+                            "destination": "/definitely/not/mounted/tl/",
+                            "require_mountpoint": True}}
+        result = enc.transfer(cfg, dry_run=False)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["moved"], 0)
+
+    def test_refusing_leaves_the_videos_alone(self):
+        # The encode succeeded; the videos must survive to ship next run.
+        videos = self.tmp / "videos"
+        videos.mkdir()
+        keep = videos / "Cam.20260804.mkv"
+        keep.write_bytes(b"x" * 2048)
+        cfg = {"paths": {"video_output": str(videos)},
+               "transfer": {"enabled": True,
+                            "destination": "/definitely/not/mounted/tl/",
+                            "require_mountpoint": True}}
+        enc.transfer(cfg, dry_run=False)
+        self.assertTrue(keep.exists(), "videos must not be deleted or moved")
+
+    def test_nothing_to_transfer_short_circuits_before_the_guard(self):
+        videos = self.tmp / "videos"
+        videos.mkdir()
+        cfg = {"paths": {"video_output": str(videos)},
+               "transfer": {"enabled": True,
+                            "destination": "/definitely/not/mounted/tl/",
+                            "require_mountpoint": True}}
+        self.assertTrue(enc.transfer(cfg, dry_run=False)["ok"])
+
+    def test_disabled_transfer_returns_none(self):
+        cfg = {"paths": {"video_output": str(self.tmp)},
+               "transfer": {"enabled": False}}
+        self.assertIsNone(enc.transfer(cfg, dry_run=False))
 
 
 class TestBuildSummary(unittest.TestCase):

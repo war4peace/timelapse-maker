@@ -237,14 +237,57 @@ def test_transfer(cfg):
 
     p = Path(dest)
     if not p.is_dir():
-        bad(f"{dest} is not a mounted directory")
+        bad(f"{dest} is not a directory (is the share mounted?)")
         return
     try:
         with tempfile.NamedTemporaryFile(dir=p, prefix=".tl-write-test-"):
             pass
-        ok(f"{dest} is mounted and writable")
+        ok(f"{dest} exists and is writable")
     except Exception as exc:
         bad(f"{dest} is not writable: {exc}")
+        return
+
+    # A destination that is a plain local directory rather than a mount is the
+    # dangerous case: rsync succeeds, fills the local disk, and
+    # --remove-source-files then deletes the originals.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import nearest_mountpoint
+    mp = nearest_mountpoint(dest)
+    if str(mp) == "/":
+        if t.get("require_mountpoint"):
+            bad(f"{dest} is not on a mounted filesystem, and "
+                f"require_mountpoint is set - transfers will be refused")
+        else:
+            warn(f"{dest} is on the root filesystem, not a mount.")
+            info("If this should be a NAS share, it is not mounted right now,")
+            info("and a transfer would fill the local disk instead. Consider")
+            info('setting "require_mountpoint": true in the transfer block.')
+    else:
+        ok(f"backed by a mount at {mp}")
+
+    # rsync -a implies -o -g, which CIFS cannot honour; it exits 23 and the
+    # nightly run reports a transfer failure even though the files arrived.
+    args = t.get("rsync_args", [])
+    fstype = _fstype(mp)
+    if fstype in ("cifs", "smb3", "nfs", "nfs4") and any(
+            a == "-a" or (a.startswith("-") and not a.startswith("--")
+                          and "a" in a) for a in args):
+        warn(f"destination is {fstype} and rsync_args uses -a")
+        info("-a implies --owner --group, which this filesystem cannot set;")
+        info("rsync will exit 23 every night. Use -rt instead, or add")
+        info("--no-owner --no-group --no-perms.")
+
+
+def _fstype(mountpoint):
+    """Filesystem type of a mount point, or '' if it cannot be determined."""
+    try:
+        for line in Path("/proc/mounts").read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[1] == str(mountpoint):
+                return parts[2]
+    except OSError:
+        pass
+    return ""
 
 
 def test_discord(cfg):

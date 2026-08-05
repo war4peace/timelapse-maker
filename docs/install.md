@@ -217,9 +217,31 @@ sudo -u timelapse ssh-copy-id user@nas
 # destination: "user@nas:/mnt/user/timelapse/"
 ```
 
-**CIFS/NFS mount:** add it to `/etc/fstab`, set `destination` to the local
-mountpoint, and add that mountpoint to `ReadWritePaths=` in
-`timelapse-encode.service`.
+**CIFS/SMB mount:** there is a script for this. It mounts the share, works out
+which rsync flags the share actually accepts, does a real round trip with a
+throwaway file, writes the `/etc/fstab` entry, and prints the exact config:
+
+```bash
+sudo bash tools/setup-cifs-transfer.sh --server 192.168.1.50 --share cctv
+```
+
+Two things it exists to catch, both of which are silent by hand:
+
+- **`rsync -a` may or may not work.** `-a` implies `--owner --group`, which a
+  CIFS mount often cannot honour — rsync then exits `23` every night even
+  though the files arrived. Whether it happens depends on the server and the
+  mount options (`forceuid`/`forcegid` can make it a non-issue), so the script
+  tries `-a`, `-rt` and `-a --no-perms --no-owner --no-group` and tells you
+  which succeeded rather than guessing.
+- **A dropped mount is worse than a failed transfer.** An unmounted mountpoint
+  is an ordinary empty local directory, so rsync writes your videos to the
+  local disk and `--remove-source-files` then deletes the originals. Set
+  `"require_mountpoint": true` and the encoder refuses instead, leaving the
+  videos in `video_output` to ship on the next run.
+
+Whichever way you mount it, add the mountpoint to `ReadWritePaths=` in
+`timelapse-encode.service` — `ProtectSystem=strict` will otherwise fail the
+write read-only.
 
 Set `transfer.enabled` to `false` to keep videos on the local disk. Note that
 nothing then prunes `video_output` — add your own retention if you do this.
