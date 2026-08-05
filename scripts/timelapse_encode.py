@@ -32,7 +32,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -110,25 +110,97 @@ def build_candidates(enc):
     ]
 
 
-def probe_encoder(ffmpeg, candidate):
-    """Encode one synthetic frame. 256x256 satisfies av1_nvenc's minimum size;
-    smaller dimensions fail InitializeEncoder even when the encoder exists."""
+# NVENC rejects small frames: hevc_nvenc fails 128x128 outright with
+# "InitializeEncoder failed: invalid param (8): Frame dimensions". 512 is
+# comfortably clear of every documented minimum and costs nothing to encode.
+PROBE_SIZE = "512x512"
+
+
+def list_encoders(ffmpeg):
+    """Encoder names this ffmpeg binary was built with, or None if unknown.
+
+    Distinguishes "the build has no av1_nvenc" from "the build has it but the
+    GPU or driver cannot use it" - which need completely different fixes.
+    """
+    try:
+        out = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                             capture_output=True, text=True, timeout=30)
+    except Exception:
+        return None
+    if out.returncode != 0:
+        return None
+    names = set()
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0][:1] in "VAS":
+            names.add(parts[1])
+    return names or None
+
+
+def probe_encoder_detail(ffmpeg, candidate):
+    """(available, message). On failure, message is ffmpeg's own error.
+
+    Never swallow this. The two failure modes look identical from the exit
+    code but need opposite responses: "No capable devices found" is the GPU or
+    driver, "Unknown encoder" is the ffmpeg build.
+    """
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
-           "-f", "lavfi", "-i", "testsrc=size=256x256:rate=1",
+           "-f", "lavfi", "-i", f"testsrc=size={PROBE_SIZE}:rate=1",
            "-frames:v", "1"] + candidate["args"] + ["-f", "null", "-"]
     try:
-        return subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=60).returncode == 0
-    except Exception:
-        return False
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except FileNotFoundError:
+        return False, f"{ffmpeg} not found"
+    except subprocess.TimeoutExpired:
+        return False, "probe timed out"
+    except Exception as exc:
+        return False, str(exc)[:200]
+    if p.returncode == 0:
+        return True, ""
+    return False, " ".join((p.stderr or "").split())[:300] or f"exit {p.returncode}"
+
+
+def probe_encoder(ffmpeg, candidate):
+    return probe_encoder_detail(ffmpeg, candidate)[0]
+
+
+def encoder_hint(codec, message, built_in=None):
+    """Plain-language cause for a failed probe, or '' if there is nothing useful.
+
+    Deliberately derived from ffmpeg's message rather than guessed from the
+    codec name - claiming "your GPU is too old" when the real problem is the
+    ffmpeg build sends people down entirely the wrong path.
+    """
+    m = (message or "").lower()
+    if built_in is False or "unknown encoder" in m:
+        return (f"this ffmpeg build does not include {codec}; "
+                f"try jellyfin-ffmpeg or a BtbN static build")
+    if "no capable devices" in m or "no capable" in m:
+        return (f"the GPU or driver cannot do {codec} "
+                f"(AV1 encoding needs an RTX 40-series or newer, and a recent driver)")
+    if "invalid param" in m and "dimension" in m:
+        return "the probe frame was rejected as too small - please report this"
+    if "cannot load" in m or "libnvidia-encode" in m:
+        return "the NVIDIA encode library is missing; install the driver's NVENC support"
+    if "out of memory" in m or "sessions" in m:
+        return "no free NVENC session - another process may be using the encoder"
+    return ""
 
 
 def select_encoder(ffmpeg, enc):
+    built = list_encoders(ffmpeg)
     for cand in build_candidates(enc):
-        ok = probe_encoder(ffmpeg, cand)
-        log.info("  probe %-22s %s", cand["name"], "available" if ok else "not available")
+        ok, message = probe_encoder_detail(ffmpeg, cand)
+        log.info("  probe %-22s %s", cand["name"],
+                 "available" if ok else "not available")
         if ok:
             return cand
+        in_build = None if built is None else (cand["codec"] in built)
+        hint = encoder_hint(cand["codec"], message, in_build)
+        if hint:
+            log.info("      %s", hint)
+        if message:
+            log.debug("      ffmpeg: %s", message)
     return None
 
 
@@ -355,6 +427,22 @@ def transfer(cfg, dry_run):
 
 ICON = {"OK": "\u2705", "SKIP": "\u23ed\ufe0f", "FAIL": "\u274c", "DRY": "\U0001f9ea"}
 
+# Discord sits behind Cloudflare, which rejects urllib's default
+# "Python-urllib/3.x" User-Agent with HTTP 403 before the request ever reaches
+# the webhook. This is the format Discord documents for API clients.
+USER_AGENT = ("DiscordBot (https://github.com/war4peace/timelapse-maker, "
+              f"{__version__})")
+
+
+def post_webhook(url, payload, timeout=20):
+    """POST a JSON payload to a webhook. Raises on transport or HTTP error."""
+    req = urlrequest.Request(
+        url, data=json.dumps(payload).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json",
+                 "User-Agent": USER_AGENT})
+    with urlrequest.urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read()
+
 
 def send_discord(cfg, title, description, color, fields):
     d = cfg.get("discord", {})
@@ -372,12 +460,8 @@ def send_discord(cfg, title, description, color, fields):
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }],
     }
-    req = urlrequest.Request(
-        d["webhook_url"], data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"}, method="POST")
     try:
-        with urlrequest.urlopen(req, timeout=20) as resp:
-            resp.read()
+        post_webhook(d["webhook_url"], payload)
     except Exception as exc:
         # Deliberately broad: a socket timeout is not a URLError, and a failed
         # notification must never take down the run that it is reporting on.

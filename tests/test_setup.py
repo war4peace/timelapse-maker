@@ -302,16 +302,79 @@ class TestWritablePaths(unittest.TestCase):
 
 
 class TestCredentialQuoting(unittest.TestCase):
-    """A password in a query string must survive intact."""
+    """A password in a query string must survive intact.
 
-    def test_reserved_characters_are_escaped(self):
-        self.assertEqual(setup.quote("p@ss&w=rd#1"), "p%40ss%26w%3Drd%231")
+    Encoding is deliberately minimal: some camera firmware does not
+    percent-decode query values, so anything encoded unnecessarily becomes an
+    authentication failure that looks like a bad URL.
+    """
 
-    def test_slash_is_escaped_too(self):
-        self.assertEqual(setup.quote("a/b"), "a%2Fb")
+    def test_query_breaking_characters_are_escaped(self):
+        self.assertEqual(setup.quote("p@ss&w=rd#1"), "p@ss%26w%3Drd%231")
 
-    def test_plain_password_is_unchanged(self):
-        self.assertEqual(setup.quote("simple123"), "simple123")
+    def test_percent_and_plus_are_escaped(self):
+        self.assertEqual(setup.quote("50%+more"), "50%25%2Bmore")
+
+    def test_space_is_escaped(self):
+        self.assertEqual(setup.quote("two words"), "two%20words")
+
+    def test_characters_that_need_no_escaping_are_left_alone(self):
+        for raw in ("simple123", "a/b", "p@ssword", "a:b", "wh?at", "a!b*c",
+                    "under_score-dot.til~de"):
+            with self.subTest(raw=raw):
+                self.assertEqual(setup.quote(raw), raw)
+
+    def test_non_ascii_becomes_utf8_percent_bytes(self):
+        self.assertEqual(setup.quote("é"), "%C3%A9")
+
+    def test_every_escaped_form_still_round_trips(self):
+        for secret in ("p@ss&w=rd#1", "50%+more", "two words", "simple123",
+                       "a/b", "é", "!$'()*,;:@"):
+            with self.subTest(secret=secret):
+                url = f"http://h/x?user=admin&password={setup.quote(secret)}&cmd=Snap"
+                q = parse_qs(urlparse(url).query)
+                self.assertEqual(q["password"], [secret])
+                self.assertEqual(q["cmd"], ["Snap"])
+
+
+class TestExplainPayload(unittest.TestCase):
+    """Cameras answer 200 OK with an error body; surface what they said."""
+
+    def test_reolink_error_shape(self):
+        body = (b'[{"cmd":"Snap","code":1,'
+                b'"error":{"detail":"login failed","rspCode":-7}}]')
+        _, reason = setup.explain_payload(body)
+        self.assertEqual(reason, "login failed")
+
+    def test_reolink_please_login_first(self):
+        body = (b'[{"cmd":"Snap","code":1,'
+                b'"error":{"detail":"please login first","rspCode":-6}}]')
+        self.assertEqual(setup.explain_payload(body)[1], "please login first")
+
+    def test_object_rather_than_list(self):
+        self.assertEqual(
+            setup.explain_payload(b'{"error":{"detail":"no permission"}}')[1],
+            "no permission")
+
+    def test_string_error_field(self):
+        self.assertEqual(
+            setup.explain_payload(b'{"error":"unauthorized"}')[1],
+            "unauthorized")
+
+    def test_html_login_page_has_no_structured_reason(self):
+        head, reason = setup.explain_payload(b"<html><body>Login</body></html>")
+        self.assertIsNone(reason)
+        self.assertIn("html", head)
+
+    def test_binary_junk_does_not_raise(self):
+        head, reason = setup.explain_payload(bytes(range(256)))
+        self.assertIsNone(reason)
+        self.assertIsInstance(head, str)
+
+    def test_head_is_bounded_and_single_line(self):
+        head, _ = setup.explain_payload(b"x\n" * 500)
+        self.assertLessEqual(len(head), 160)
+        self.assertNotIn("\n", head)
 
     def test_round_trips_through_a_reolink_style_url(self):
         secret = "p@ss&w=rd#1"

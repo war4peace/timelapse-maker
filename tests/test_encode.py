@@ -3,6 +3,7 @@
 The end-to-end encode is covered separately by tests/smoke_test.py.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -246,6 +247,123 @@ class TestEncoderCandidates(unittest.TestCase):
         args = enc.build_candidates({})[0]["args"]
         self.assertIn("p6", args)
         self.assertIn("26", args)
+
+
+class TestEncoderDiagnostics(unittest.TestCase):
+    """A failed probe must explain itself.
+
+    The exit code alone cannot distinguish "this ffmpeg has no av1_nvenc" from
+    "this GPU cannot do AV1", and the two need opposite fixes. Guessing from
+    the codec name produced a wizard that told an RTX 4060 owner their GPU was
+    too old.
+    """
+
+    def test_probe_frame_is_large_enough_for_nvenc(self):
+        # hevc_nvenc rejects 128x128 with "invalid param (8): Frame dimensions".
+        w, h = (int(v) for v in enc.PROBE_SIZE.split("x"))
+        self.assertGreaterEqual(min(w, h), 256)
+
+    def test_missing_encoder_in_build_blames_the_build(self):
+        hint = enc.encoder_hint("av1_nvenc", "Unknown encoder 'av1_nvenc'")
+        self.assertIn("build", hint)
+        self.assertNotIn("GPU", hint)
+
+    def test_encoder_list_absence_blames_the_build(self):
+        hint = enc.encoder_hint("av1_nvenc", "some other error", built_in=False)
+        self.assertIn("build", hint)
+
+    def test_no_capable_devices_blames_the_hardware(self):
+        hint = enc.encoder_hint("av1_nvenc", "No capable devices found",
+                                built_in=True)
+        self.assertIn("GPU", hint)
+        self.assertNotIn("build", hint)
+
+    def test_dimension_error_is_flagged_as_our_bug(self):
+        hint = enc.encoder_hint(
+            "hevc_nvenc",
+            "InitializeEncoder failed: invalid param (8): Frame dimensions",
+            built_in=True)
+        self.assertIn("report", hint)
+
+    def test_session_exhaustion_is_recognised(self):
+        hint = enc.encoder_hint("hevc_nvenc", "OpenEncodeSessionEx failed: out of memory",
+                                built_in=True)
+        self.assertIn("session", hint.lower())
+
+    def test_unrecognised_error_yields_no_invented_cause(self):
+        self.assertEqual(enc.encoder_hint("av1_nvenc", "something odd",
+                                          built_in=True), "")
+
+    def test_probe_detail_reports_a_missing_binary(self):
+        ok, msg = enc.probe_encoder_detail(
+            "/nonexistent/ffmpeg", {"codec": "x", "args": []})
+        self.assertFalse(ok)
+        self.assertIn("not found", msg)
+
+    def test_probe_bool_wrapper_agrees_with_detail(self):
+        cand = {"codec": "x", "args": []}
+        self.assertEqual(enc.probe_encoder("/nonexistent/ffmpeg", cand),
+                         enc.probe_encoder_detail("/nonexistent/ffmpeg", cand)[0])
+
+    def test_list_encoders_handles_a_missing_binary(self):
+        self.assertIsNone(enc.list_encoders("/nonexistent/ffmpeg"))
+
+
+class TestWebhookRequest(unittest.TestCase):
+    """Discord sits behind Cloudflare, which 403s urllib's default UA."""
+
+    def _capture(self, payload=None):
+        captured = {}
+
+        class FakeResponse:
+            status = 204
+
+            def read(self):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            captured["req"] = req
+            return FakeResponse()
+
+        original = enc.urlrequest.urlopen
+        enc.urlrequest.urlopen = fake_urlopen
+        try:
+            enc.post_webhook("https://discord.com/api/webhooks/x/y",
+                             payload or {"content": "hi"})
+        finally:
+            enc.urlrequest.urlopen = original
+        return captured["req"]
+
+    def test_sends_an_explicit_user_agent(self):
+        ua = self._capture().get_header("User-agent")
+        self.assertTrue(ua)
+        self.assertNotIn("Python-urllib", ua)
+
+    def test_user_agent_matches_discords_documented_format(self):
+        # "DiscordBot ($url, $version)" - the form Discord asks API clients for.
+        ua = self._capture().get_header("User-agent")
+        self.assertTrue(ua.startswith("DiscordBot ("), ua)
+        self.assertIn("github.com", ua)
+
+    def test_user_agent_carries_the_version(self):
+        self.assertIn(enc.__version__, self._capture().get_header("User-agent"))
+
+    def test_posts_json_with_the_right_content_type(self):
+        req = self._capture({"content": "hello"})
+        self.assertEqual(req.get_header("Content-type"), "application/json")
+        self.assertEqual(req.get_method(), "POST")
+        self.assertEqual(json.loads(req.data.decode()), {"content": "hello"})
+
+    def test_unicode_payload_is_utf8_encoded(self):
+        req = self._capture({"content": "café ✅"})
+        self.assertEqual(json.loads(req.data.decode("utf-8"))["content"],
+                         "café ✅")
 
 
 class TestMountGuard(unittest.TestCase):

@@ -34,7 +34,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 OUT = Path(os.environ.get("TIMELAPSE_TEST_DIR") or
            Path(tempfile.gettempdir()) / "timelapse-test")
@@ -177,22 +177,32 @@ def probe_profiles(cam, cfg):
 
 def test_encoders(cfg):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from timelapse_encode import build_candidates, probe_encoder
+    from timelapse_encode import (build_candidates, encoder_hint,
+                                  list_encoders, probe_encoder_detail)
     ffmpeg = cfg["paths"]["ffmpeg"]
     if not shutil.which(ffmpeg) and not Path(ffmpeg).exists():
         bad(f"ffmpeg not found at {ffmpeg}")
         return
+    built = list_encoders(ffmpeg)
     found = False
     for cand in build_candidates(cfg["encode"]):
-        if probe_encoder(ffmpeg, cand):
+        available, message = probe_encoder_detail(ffmpeg, cand)
+        if available:
             (ok if not found else info)(f"{cand['name']} available"
                                         + ("  <- will be used" if not found else ""))
             found = True
-        else:
-            info(f"{cand['name']} not available")
+            continue
+        info(f"{cand['name']} not available")
+        # Say *why*. "Unknown encoder" (rebuild ffmpeg) and "No capable
+        # devices" (GPU/driver) share an exit code but need opposite fixes.
+        in_build = None if built is None else (cand["codec"] in built)
+        hint = encoder_hint(cand["codec"], message, in_build)
+        if hint:
+            info(f"      {hint}")
+        if message:
+            info(f"      ffmpeg: {message[:140]}")
     if not found:
-        bad("No usable encoder. Ubuntu's stock ffmpeg may lack NVENC support - "
-            "try a BtbN static build or jellyfin-ffmpeg.")
+        bad("No usable encoder at all - see the reasons above.")
 
 
 def test_disk(cfg, avg_bytes, n_cameras):
@@ -299,14 +309,18 @@ def test_discord(cfg):
                "embeds": [{"title": "Timelapse pre-flight test",
                            "description": "If you can read this, the webhook works.",
                            "color": 0x3498DB}]}
-    req = urlrequest.Request(d["webhook_url"], data=json.dumps(payload).encode(),
-                             headers={"Content-Type": "application/json"},
-                             method="POST")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import post_webhook
     try:
-        urlrequest.urlopen(req, timeout=20).read()
+        post_webhook(d["webhook_url"], payload)
         ok("Discord webhook accepted the test message")
     except Exception as exc:
         bad(f"Discord webhook failed: {exc}")
+        if "403" in str(exc):
+            info("403 usually means the webhook URL was deleted or regenerated;")
+            info("check it in Discord under Channel Settings -> Integrations.")
+        elif "404" in str(exc):
+            info("404 means the webhook no longer exists at that URL.")
 
 
 def main():

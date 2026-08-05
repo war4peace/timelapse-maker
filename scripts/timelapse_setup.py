@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.0.2"
+__version__ = "0.0.3"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -373,37 +373,53 @@ def choose_tools(cfg):
     cfg["paths"]["ffmpeg"] = ask("Path to ffmpeg", ffmpeg)
     cfg["paths"]["ffprobe"] = ask("Path to ffprobe", ffprobe)
 
-    enc = detect_encoders(cfg["paths"]["ffmpeg"])
-    if enc is None:
-        fail("ffmpeg is not usable. Install it, or point at a static build.")
-    elif enc == "av1_nvenc":
+    chosen, failures = detect_encoders(cfg["paths"]["ffmpeg"])
+
+    if chosen is None:
+        fail("No usable encoder at all - ffmpeg cannot encode here.")
+    elif chosen == "av1_nvenc":
         good("av1_nvenc available - AV1 hardware encoding will be used.")
-    elif enc == "hevc_nvenc":
+    elif chosen == "hevc_nvenc":
         good("hevc_nvenc available - HEVC hardware encoding will be used.")
-        note("No AV1 NVENC on this GPU (needs RTX 40-series or newer).")
     else:
         warn("No NVENC encoder found; falling back to libx264 on the CPU.")
-        note("A nightly run will be slower. For hardware encoding, install a")
-        note("build with NVENC support (jellyfin-ffmpeg or a BtbN static build)")
-        note("and re-run this wizard to point at it.")
+        note("A nightly run will be slower but the output is fine.")
+
+    # Report why each better encoder was skipped, using ffmpeg's own words
+    # rather than a guess. Claiming "your GPU is too old" when the real cause
+    # is the ffmpeg build sends people down entirely the wrong path.
+    for codec, message, hint in failures:
+        print()
+        warn(f"{codec} unavailable")
+        if hint:
+            note(hint)
+        if message:
+            note(f"ffmpeg said: {message[:150]}")
 
 
 def detect_encoders(ffmpeg):
-    for codec, args in (
-        ("av1_nvenc", ["-c:v", "av1_nvenc"]),
-        ("hevc_nvenc", ["-c:v", "hevc_nvenc"]),
-        ("libx264", ["-c:v", "libx264"]),
-    ):
-        cmd = ([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
-                "-f", "lavfi", "-i", "testsrc=size=256x256:rate=1",
-                "-frames:v", "1"] + args + ["-f", "null", "-"])
-        try:
-            if subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                              stderr=subprocess.DEVNULL, timeout=90).returncode == 0:
-                return codec
-        except Exception:
-            return None
-    return None
+    """(chosen codec or None, [(codec, ffmpeg message, hint), ...])."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from timelapse_encode import (encoder_hint, list_encoders,
+                                      probe_encoder_detail)
+    except ImportError:
+        return None, []
+
+    built = list_encoders(ffmpeg)
+    if built is None:
+        fail(f"Could not run {ffmpeg} - is the path right?")
+        return None, []
+
+    failures = []
+    for codec in ("av1_nvenc", "hevc_nvenc", "libx264"):
+        ok, message = probe_encoder_detail(
+            ffmpeg, {"codec": codec, "args": ["-c:v", codec]})
+        if ok:
+            return codec, failures
+        failures.append((codec, message,
+                         encoder_hint(codec, message, codec in built)))
+    return None, failures
 
 
 def choose_capture(cfg, disk):
@@ -551,9 +567,47 @@ def add_one_camera(cfg, n):
     return cam
 
 
+def explain_payload(data):
+    """(printable head, camera's own error message or None).
+
+    Recognises the Reolink shape:
+        [{"cmd":"Snap","code":1,"error":{"detail":"login failed",...}}]
+    """
+    text = data[:400].decode("utf-8", errors="replace").strip()
+    head = " ".join(text.split())[:160]
+    try:
+        doc = json.loads(data.decode("utf-8", errors="replace"))
+    except Exception:
+        return head, None
+    if isinstance(doc, list) and doc and isinstance(doc[0], dict):
+        doc = doc[0]
+    if isinstance(doc, dict):
+        err = doc.get("error")
+        if isinstance(err, dict):
+            detail = err.get("detail") or err.get("rspCode")
+            if detail:
+                return head, str(detail)
+        if isinstance(err, str):
+            return head, err
+    return head, None
+
+
+# Only what would genuinely break a query string. Percent-encoding more than
+# necessary is not harmless: some camera firmware (Reolink notably) does not
+# percent-decode query values, so an over-encoded password fails to
+# authenticate while the same password typed literally works.
+_MUST_ENCODE = set("&=#+%")
+
+
 def quote(s):
-    from urllib.parse import quote as q
-    return q(s, safe="")
+    out = []
+    for byte in s.encode("utf-8"):
+        ch = chr(byte)
+        if byte < 0x21 or byte > 0x7E or ch in _MUST_ENCODE:
+            out.append("%%%02X" % byte)
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def test_camera(cam, cfg):
@@ -595,7 +649,18 @@ def test_camera(cam, cfg):
         fail(f"HTTP {r.status_code} from the camera.")
         return False
     if r.content[:2] != b"\xff\xd8":
+        # The body is where the camera says what is actually wrong. Reolink in
+        # particular answers 200 OK with a JSON error when auth fails, so
+        # reporting only "not a JPEG" hides the real cause.
+        head, reason = explain_payload(r.content)
         fail("Responded, but the payload is not a JPEG.")
+        if reason:
+            fail(f"The camera said: {reason}")
+            note("That is an authentication or permission error, not a URL")
+            note("problem. Check the username and password, and that the")
+            note("account is allowed to take snapshots.")
+        else:
+            note(f"First bytes: {head}")
         return False
 
     dims = probe_sample(cfg, r.content)
@@ -676,20 +741,22 @@ def choose_discord(cfg):
 
 
 def send_test_webhook(url, username):
-    import json as _json
-    from urllib import request as urlrequest
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import post_webhook
     payload = {"username": username,
                "embeds": [{"title": "timelapse-maker",
                            "description": "Setup test - the webhook works.",
                            "color": 0x3498DB}]}
-    req = urlrequest.Request(url, data=_json.dumps(payload).encode(),
-                             headers={"Content-Type": "application/json"},
-                             method="POST")
     try:
-        urlrequest.urlopen(req, timeout=20).read()
+        post_webhook(url, payload)
         good("Discord accepted the test message.")
     except Exception as exc:
         fail(f"Webhook failed: {exc}")
+        if "403" in str(exc):
+            note("403 usually means the webhook was deleted or regenerated.")
+            note("Re-copy it from Channel Settings -> Integrations -> Webhooks.")
+        elif "404" in str(exc):
+            note("404 means no webhook exists at that URL any more.")
 
 
 # ----------------------------------------------------------------------------

@@ -167,10 +167,18 @@ Batch job. `systemd` `Type=oneshot` + timer at 00:05, `Persistent=true`.
 Pipeline, in `main()`:
 
 1. `select_encoder()` → probes `av1_nvenc`, `hevc_nvenc`, `libx264` in order by
-   encoding one 256×256 synthetic frame. First success wins. **256×256 is
-   deliberate:** `av1_nvenc` has a minimum dimension and fails
-   `InitializeEncoder` with "invalid param" at 128×128 even when the encoder is
-   present — a false negative.
+   encoding one synthetic frame at `PROBE_SIZE` (512×512). NVENC rejects small
+   frames: measured on an RTX 3090, `hevc_nvenc` fails 128×128 outright with
+   `InitializeEncoder failed: invalid param (8): Frame dimensions`. 512 is
+   clear of every documented minimum and costs nothing.
+   **The probe must never discard ffmpeg's stderr.** Two failure modes are
+   indistinguishable by exit code but need opposite fixes:
+   `Unknown encoder 'av1_nvenc'` means the ffmpeg build lacks it (install
+   jellyfin-ffmpeg or a BtbN build), while `No capable devices found` means the
+   GPU or driver cannot do it. `encoder_hint()` maps the message to a cause and
+   `list_encoders()` confirms whether the codec is compiled in at all. An
+   earlier version guessed from the codec name and told an RTX 4060 owner their
+   GPU was too old for AV1.
 2. `find_pending()` → every date directory across all enabled cameras whose name
    sorts `< today`, oldest first, capped to the newest `max_backlog_days`
    distinct dates.
@@ -226,8 +234,13 @@ failure must not turn a successful encode into a critical abort**, because the
 encode result and the Discord summary are still valid and the videos are still
 on disk. This was a real bug found in testing.
 
-**`send_discord()`** uses `urllib` only — no dependency. Truncates to Discord's
-limits (4096 description, 1024 per field value, 25 fields). Failure is logged and
+**`send_discord()`** uses `urllib` only — no dependency. Posts through
+`post_webhook()`, which sets an explicit `User-Agent`. This is not cosmetic:
+Discord is behind Cloudflare, which rejects urllib's default
+`Python-urllib/3.x` with **HTTP 403, Cloudflare error 1010**, before the
+request reaches Discord at all. With the documented
+`DiscordBot ($url, $version)` form the same request reaches the API. Truncates
+to Discord's limits (4096 description, 1024 per field value, 25 fields). Failure is logged and
 swallowed, catching `Exception` deliberately: a socket timeout is not a
 `URLError`, and notification is never load-bearing — least of all in the
 critical-failure handler, where an exception would mask the original error.

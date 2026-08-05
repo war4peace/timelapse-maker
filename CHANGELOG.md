@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.0.3] - 2026-08-05
+
+Bugs from the first real install on someone else's hardware.
+
+### Fixed
+- **Encoder probes discarded ffmpeg's error, so the wizard guessed the cause —
+  and guessed wrong.** With `hevc_nvenc` working and `av1_nvenc` not, it stated
+  "No AV1 NVENC on this GPU (needs RTX 40-series or newer)" — reported on an
+  RTX 4060, which encodes AV1 natively. Probes now capture stderr,
+  `list_encoders()` checks whether the codec is compiled into the ffmpeg binary
+  at all, and `encoder_hint()` derives the cause from ffmpeg's own message.
+  `Unknown encoder` means rebuild ffmpeg; `No capable devices found` means the
+  GPU or driver. The two are indistinguishable by exit code and need opposite
+  fixes.
+- **Discord webhooks returned HTTP 403.** Discord is behind Cloudflare, which
+  rejects urllib's default `Python-urllib/3.x` User-Agent with error 1010
+  before the request reaches Discord. All three webhook callers now go through
+  `post_webhook()`, which sends the documented `DiscordBot ($url, $version)`
+  form. Verified against Discord's API: the old header gets 403/1010, the new
+  one reaches the API and gets a normal `Unknown Webhook` 404.
+- **A camera answering 200 OK with an error body reported only "not a JPEG".**
+  Reolink returns a JSON error there, e.g. `{"error":{"detail":"login
+  failed"}}`. The wizard now parses and shows it, so an auth failure reads as
+  an auth failure instead of a URL problem.
+- **Credentials in a query string were over-encoded.** `quote()` escaped every
+  reserved character; some camera firmware (Reolink notably) does not
+  percent-decode query values, so an encoded password that works when typed
+  literally would fail. It now escapes only `& = # + %`, space and non-ASCII.
+
+### Changed
+- Encoder probe frame is 512×512, up from 256×256. Measured: `hevc_nvenc`
+  rejects 128×128 with "invalid param (8): Frame dimensions". Larger costs
+  nothing and removes a variable. The architecture note attributing that
+  minimum to `av1_nvenc` was wrong and has been corrected.
+- `timelapse_test.py` reports the reason each encoder was unavailable, and
+  distinguishes a 403 from a 404 on the webhook check.
+
 ## [Unreleased]
 
 ### Added
