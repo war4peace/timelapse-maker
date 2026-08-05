@@ -7,9 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
-## [Unreleased]
+## [0.0.2] - 2026-08-05
+
+### Added
+- A unit test suite (`tests/test_*.py`, stdlib `unittest`, ~115 cases, under a
+  second, no third-party dependencies). Covers frame validation, concat-list
+  escaping, backlog selection, storage-scan filtering and deduplication,
+  partition-name stripping, storage recommendation, `ReadWritePaths` derivation,
+  credential quoting, and the DST collision suffixes in `_dest_path`.
+  CI runs it on Python 3.9 and 3.12.
 
 ### Fixed
+- `scan_filesystems()` normalised paths with `pathlib.Path`, which produced
+  Windows separators when run off-target. It now uses `PurePosixPath` for
+  `writable_paths()` output, which is correct in all cases — the result goes
+  into a systemd unit.
+- `timelapse_setup.py` could not be imported on a non-POSIX host, because
+  `os.statvfs` was evaluated as a default argument. Only affects running the
+  tests off-target, but there is no reason to forbid that.
 - `install.sh` exited `1` on success whenever it had not downloaded a tarball —
   that is, every install from a local git checkout, every `--uninstall`, and
   `--help`. The `EXIT` trap ended on a failing test (`[ -n "$WORKDIR" ] && …`
@@ -23,6 +38,9 @@ While the version is `0.x`, the configuration format may change in any release.
   runs a full install → verify → re-install → uninstall cycle on a runner.
 - Bumped `actions/checkout` to v5 and `actions/setup-python` to v6, clearing the
   Node 20 deprecation warnings.
+- `scan_filesystems()` and `_base_device()` take injectable inputs
+  (`mounts_path`, `statvfs`, `rotational`, `sys_block`) so the filtering rules
+  can be tested against synthetic input on any machine. No behaviour change.
 
 ## [0.0.1] - 2026-08-05
 

@@ -33,19 +33,27 @@ and auth scheme to try.
 
 ## Testing
 
-There is no unit test suite yet. §9 of the architecture doc describes how each
-component was verified manually, including how to generate a synthetic frame set
-for an end-to-end encoder run. Please do the equivalent for whatever you touch,
-and say in the PR what you ran.
-
-At minimum:
-
 ```bash
-python3 -m py_compile scripts/*.py
-python3 -m json.tool config/config.example.json > /dev/null
+python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
+python3 tests/smoke_test.py                                     # needs ffmpeg
+bash -n install.sh && shellcheck --severity=warning install.sh
 ```
 
-A real unit test suite would be a very welcome contribution.
+Tests use stdlib `unittest` — please don't add pytest or any other test
+dependency. §9 of the architecture doc covers what is and isn't tested, and how
+the parts that need a camera, a GPU or systemd were verified by hand.
+
+If you add tests, **check that the rule you mean to test is the one doing the
+work.** The storage scan rejects a mount for any of six reasons, so it is easy
+to write a case that passes for the wrong one — two of the original tests did
+exactly that. The cheap way to confirm: break the rule on purpose and make sure
+your test fails.
+
+Coverage is thin in obvious places. Welcome contributions:
+
+- the RTSP capture path, which has no automated coverage at all
+- `transfer()`, which currently needs a stub `rsync` on `PATH`
+- installer behaviour on a non-apt distro (see below)
 
 ## Scope
 

@@ -3,6 +3,9 @@
 config/config.json
 config/*.local.json
 
+# Local assistant working notes, not shipped to contributors.
+CLAUDE.md
+
 # Python
 __pycache__/
 *.py[cod]

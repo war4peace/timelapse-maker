@@ -31,7 +31,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")

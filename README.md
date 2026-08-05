@@ -3,7 +3,7 @@
 > [!WARNING]
 > ## ⚠️ EXPERIMENTAL — IN DEVELOPMENT
 >
-> **Version 0.0.1.** This is early software that has run on exactly one machine.
+> **Version 0.0.2.** This is early software that has run on exactly one machine.
 > It has not been tested across different distributions, camera makes, GPUs or
 > disk layouts, and it almost certainly has rough edges nobody has hit yet.
 >
@@ -114,7 +114,7 @@ download and the run are separate steps above precisely so you can inspect
 ```bash
 sudo bash install_timelapse.sh --unattended   # no questions, sane defaults
 sudo bash install_timelapse.sh --no-wizard    # install files only
-sudo bash install_timelapse.sh --ref v0.0.1   # pin to a tag
+sudo bash install_timelapse.sh --ref v0.0.2   # pin to a tag
 sudo bash install_timelapse.sh --uninstall    # remove; captured data is kept
 ```
 
@@ -160,9 +160,9 @@ encoders, and projects real disk usage from your actual snapshot sizes.
   same instant across cameras.
 - **A frozen-but-reachable camera** produces a full frame count and a static
   video. The tell is a suspiciously small output file.
-- **Thin test coverage.** There is one end-to-end encode test
-  (`python3 tests/smoke_test.py`) and no unit tests. See §9 of the architecture
-  doc for what else was verified, and how.
+- **Thin test coverage.** ~115 unit tests plus one end-to-end encode test,
+  covering the pure logic; the RTSP path, transfer and installer behaviour on
+  non-apt distros have no automated coverage. See §9 of the architecture doc.
 
 ## License
 

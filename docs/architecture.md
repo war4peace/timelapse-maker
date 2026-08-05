@@ -416,18 +416,39 @@ help.
 
 ## 9. Testing notes
 
-One automated test, no unit suite:
-
 ```bash
-python3 tests/smoke_test.py
+python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
+python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-It builds a synthetic capture day (150 good frames plus two corrupt ones, named
-as real captures), runs `timelapse_encode.py` over it, and asserts the things
-that have actually broken before: bad frames rejected, exact output duration,
-`color_range=tv`, `color_space=bt709`, `pix_fmt=yuv420p`, and frames deleted
-afterwards. It needs ffmpeg but no GPU — it falls back to libx264. CI runs it on
-Python 3.9 and 3.12.
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, ~115 cases, under a
+second) cover the pure logic: frame validation, concat-list escaping,
+`find_pending` backlog selection, `human_*` formatting, the storage scan's
+filtering and deduplication, `_base_device` partition stripping, `recommend`,
+`writable_paths`, credential quoting, and `_dest_path` including the DST
+collision suffixes. Anything needing a camera, a GPU or systemd is out of scope
+here by design.
+
+Three seams exist purely for testability, and should be preserved:
+`scan_filesystems(mounts_path, statvfs, rotational)` and
+`_base_device(source, sys_block)` take injectable inputs, so the awkward cases
+(network mounts, read-only duplicates, a device mounted twice, nvme partition
+naming) can be exercised on any machine rather than only where they happen to
+exist.
+
+**The smoke test** builds a synthetic capture day (150 good frames plus two
+corrupt ones, named as real captures), runs `timelapse_encode.py` over it, and
+asserts what has actually broken before: bad frames rejected, exact output
+duration, `color_range=tv`, `color_space=bt709`, `pix_fmt=yuv420p`, frames
+deleted afterwards. Needs ffmpeg but no GPU — it falls back to libx264.
+
+**The suite was mutation-checked** when written: 18 deliberate breakages
+introduced one at a time, 16 caught. The two misses were tests passing for the
+wrong reason — a network-filesystem case rejected by the source filter before
+the fstype rule ran, and a deduplication case filtered by a skip-prefix before
+deduplication happened. Both are fixed, and both are worth remembering as the
+failure mode to watch for when adding tests here: assert that the rule you
+*mean* to test is the one doing the work.
 
 The rest was verified by hand. The methods, in case you want to re-verify after
 changes:
@@ -465,12 +486,16 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 456 lines
+install.sh                       bootstrap installer, 467 lines
 scripts/timelapse_capture.py     daemon, 340 lines
 scripts/timelapse_encode.py      batch job, 491 lines
 scripts/timelapse_test.py        pre-flight checks, 320 lines
-scripts/timelapse_setup.py       configuration wizard, 818 lines
-tests/smoke_test.py              end-to-end encode check
+scripts/timelapse_setup.py       configuration wizard, 850 lines
+tests/_support.py                path setup and fakes
+tests/test_capture.py            unit tests
+tests/test_encode.py             unit tests
+tests/test_setup.py              unit tests
+tests/smoke_test.py              end-to-end encode check, needs ffmpeg
 config/config.example.json       template; the real config.json is gitignored
 service/timelapse-capture.service
 service/timelapse-encode.service

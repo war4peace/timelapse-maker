@@ -19,9 +19,9 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -196,8 +196,12 @@ SKIP_PREFIXES = (
 )
 
 
-def _base_device(source):
-    """/dev/sda1 -> sda, /dev/nvme0n1p2 -> nvme0n1, /dev/mapper/vg-lv -> dm-N."""
+def _base_device(source, sys_block="/sys/block"):
+    """/dev/sda1 -> sda, /dev/nvme0n1p2 -> nvme0n1, /dev/mapper/vg-lv -> dm-N.
+
+    sys_block is injectable so the partition-stripping rules can be tested
+    against a fake tree rather than whatever disks this machine happens to have.
+    """
     if not source.startswith("/dev/"):
         return None
     name = source[5:]
@@ -206,31 +210,48 @@ def _base_device(source):
             return os.path.basename(os.readlink(source))
         except OSError:
             return None
-    if Path(f"/sys/block/{name}").exists():
+    if Path(f"{sys_block}/{name}").exists():
         return name
     # Strip a partition suffix: sda1 -> sda, nvme0n1p2 -> nvme0n1, mmcblk0p1.
     for cut in (lambda s: s.rstrip("0123456789"),
                 lambda s: s.rsplit("p", 1)[0] if "p" in s else s):
         cand = cut(name)
-        if cand and Path(f"/sys/block/{cand}").exists():
+        if cand and Path(f"{sys_block}/{cand}").exists():
             return cand
     return None
 
 
-def _is_rotational(source):
-    dev = _base_device(source)
+def _is_rotational(source, sys_block="/sys/block"):
+    dev = _base_device(source, sys_block)
     if not dev:
         return None
     try:
-        return Path(f"/sys/block/{dev}/queue/rotational").read_text().strip() == "1"
+        p = Path(f"{sys_block}/{dev}/queue/rotational")
+        return p.read_text().strip() == "1"
     except OSError:
         return None
 
 
-def scan_filesystems():
-    """Real, writable, local filesystems that could hold frames."""
+def scan_filesystems(mounts_path="/proc/mounts", statvfs=None, rotational=None):
+    """Real, writable, local filesystems that could hold frames.
+
+    The three inputs are injectable so the filtering can be tested against a
+    synthetic /proc/mounts without needing the machine to have the interesting
+    cases (network mounts, read-only duplicates, a device mounted twice) on it.
+
+    Resolved here rather than as default arguments: os.statvfs does not exist on
+    Windows, and evaluating it at def time would make the module unimportable
+    there - which matters only for running the tests off-target, but there is no
+    reason to forbid that.
+    """
+    if statvfs is None:
+        statvfs = getattr(os, "statvfs", None)
+        if statvfs is None:
+            return []
+    if rotational is None:
+        rotational = _is_rotational
     try:
-        raw = Path("/proc/mounts").read_text().splitlines()
+        raw = Path(mounts_path).read_text().splitlines()
     except OSError:
         return []
 
@@ -251,7 +272,7 @@ def scan_filesystems():
         if not source.startswith("/dev/"):
             continue
         try:
-            st = os.statvfs(target)
+            st = statvfs(target)
         except OSError:
             continue
         if st.f_blocks == 0:
@@ -263,7 +284,7 @@ def scan_filesystems():
             "fstype": fstype,
             "free": st.f_bavail * st.f_frsize,
             "total": st.f_blocks * st.f_frsize,
-            "rotational": _is_rotational(source),
+            "rotational": rotational(source),
         }
         # One device can be mounted repeatedly (bind mounts, WSL). Keep the
         # shortest mountpoint, which is the primary one.
@@ -705,14 +726,18 @@ def default_config(template_path=None):
 
 
 def writable_paths(cfg):
-    """Minimal set of directories systemd's ReadWritePaths must allow."""
+    """Minimal set of directories systemd's ReadWritePaths must allow.
+
+    PurePosixPath, not Path: the output goes into a systemd unit, so it is a
+    POSIX path whatever platform normalises it.
+    """
     paths = [cfg["paths"][k] for k in ("frames_root", "video_output", "log_dir")
              if cfg["paths"].get(k)]
     t = cfg.get("transfer", {})
     dest = t.get("destination", "")
     if t.get("enabled") and dest.startswith("/"):
         paths.append(dest)
-    resolved = sorted({str(Path(p)) for p in paths})
+    resolved = sorted({str(PurePosixPath(p)) for p in paths})
     # Drop any path already covered by a parent in the set.
     minimal = []
     for p in resolved:
