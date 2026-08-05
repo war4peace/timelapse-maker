@@ -91,7 +91,7 @@ each one SSD or HDD:
 
 ```
    #  Mount                 Type          Free      Total   Notes
-   1  /mnt/sata-ssd         ext4      683.2 GB   916.0 GB   SSD            <- recommended
+   1  /mnt/storage          ext4      683.2 GB   916.0 GB   SSD            <- recommended
    2  /mnt/hdd              xfs         1.7 TB     3.6 TB   HDD
    3  /                     ext4      858.0 GB   932.0 GB   SSD, OS disk
 

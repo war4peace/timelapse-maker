@@ -416,17 +416,35 @@ help.
 
 ## 9. Testing notes
 
-There is no unit test suite. What was verified during development, and the
-method, in case you want to re-verify after changes:
+One automated test, no unit suite:
 
-- **Encoder end-to-end** — 400 synthetic `testsrc` JPEGs named as real captures,
-  two deliberately corrupted (bad header, truncated). Confirmed: 398 frames
-  encoded, 2 rejected, output 60fps at the right duration, `color_range=tv`,
-  `color_space=bt709`, frames deleted, transfer executed, `video_output` emptied.
+```bash
+python3 tests/smoke_test.py
+```
+
+It builds a synthetic capture day (150 good frames plus two corrupt ones, named
+as real captures), runs `timelapse_encode.py` over it, and asserts the things
+that have actually broken before: bad frames rejected, exact output duration,
+`color_range=tv`, `color_space=bt709`, `pix_fmt=yuv420p`, and frames deleted
+afterwards. It needs ffmpeg but no GPU — it falls back to libx264. CI runs it on
+Python 3.9 and 3.12.
+
+The rest was verified by hand. The methods, in case you want to re-verify after
+changes:
+
 - **Capture daemon** — two cameras against a local `http.server`, one valid URL
   and one 404. Confirmed: files land on exact interval boundaries, correct
   directory layout, no leftover `.tmp`, failure throttling works, clean SIGTERM
   shutdown.
+- **Installer and wizard** — Ubuntu 24.04 with real systemd. Confirmed: package
+  detection and dependency install, service account creation, unit templating
+  (`systemd-analyze verify` clean), a live capture run against a local HTTP
+  camera writing frames **at a non-default path under `ProtectSystem=strict`**
+  — which is what actually exercises the `ReadWritePaths` derivation — a nightly
+  encode as the service user, and a clean uninstall. Worth repeating on a distro
+  using a different package manager; only apt has been exercised.
+- **Query-string credential encoding** — a password containing `@ & = #` fed
+  through the wizard and parsed back out of the generated URL unchanged.
 - **Profile probe** — mock ONVIF endpoint serving 2560×1440 / 704×576 / 640×480
   for Profile_1/2/3. Confirmed it identifies the largest and recommends the
   config change.

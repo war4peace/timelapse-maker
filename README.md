@@ -1,5 +1,24 @@
 # timelapse-maker
 
+> [!WARNING]
+> ## ⚠️ EXPERIMENTAL — IN DEVELOPMENT
+>
+> **Version 0.0.1.** This is early software that has run on exactly one machine.
+> It has not been tested across different distributions, camera makes, GPUs or
+> disk layouts, and it almost certainly has rough edges nobody has hit yet.
+>
+> - The **configuration format may change without warning** between versions.
+> - The installer creates a system account, writes to `/opt`, `/etc` and
+>   `/etc/systemd/system`, and enables services. **Read
+>   [`install.sh`](install.sh) before running it as root.**
+> - Capture writes tens of thousands of files a day. Point it at a disk you
+>   are willing to fill, and run `timelapse test` first — it projects real
+>   usage from your actual cameras.
+> - There is no upgrade path between versions yet, and no security review.
+>
+> Use it if you want to experiment or help develop it. Don't put it anywhere
+> that matters yet. **No warranty** — see [LICENSE](LICENSE).
+
 Unattended daily timelapses from IP cameras. Pulls a full-resolution snapshot
 from each camera on a fixed interval, encodes each finished day into one video
 per camera overnight, and optionally ships the results to a NAS and posts a
@@ -9,8 +28,8 @@ It is a replacement for the timelapse features built into NVR software, which
 tend to record from the substream and give you low-resolution video. This talks
 to the cameras directly and takes whatever the main stream offers.
 
-**Status: 0.0.1 — first public release.** Working and in daily use, but the
-configuration format is not yet frozen. See [CHANGELOG.md](CHANGELOG.md).
+Bug reports and camera compatibility reports are genuinely useful at this stage
+— see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
@@ -68,7 +87,7 @@ setup wizard. The wizard scans your disks and proposes where to put the frames:
 
 ```
    #  Mount                 Type          Free      Total   Notes
-   1  /mnt/sata-ssd         ext4      683.2 GB   916.0 GB   SSD            <- recommended
+   1  /mnt/storage          ext4      683.2 GB   916.0 GB   SSD            <- recommended
    2  /mnt/hdd              xfs         1.7 TB     3.6 TB   HDD
    3  /                     ext4      858.0 GB   932.0 GB   SSD, OS disk
 
@@ -141,8 +160,9 @@ encoders, and projects real disk usage from your actual snapshot sizes.
   same instant across cameras.
 - **A frozen-but-reachable camera** produces a full frame count and a static
   video. The tell is a suspiciously small output file.
-- **No unit test suite.** See §10 of the architecture doc for what was verified
-  and how.
+- **Thin test coverage.** There is one end-to-end encode test
+  (`python3 tests/smoke_test.py`) and no unit tests. See §9 of the architecture
+  doc for what else was verified, and how.
 
 ## License
 
