@@ -52,6 +52,31 @@ jobs:
           python scripts/timelapse_encode.py --version
           python scripts/timelapse_test.py --version
           python scripts/timelapse_capture.py --version
+          python scripts/timelapse_setup.py --version
+
+      - name: Wizard runs headless and derives systemd paths
+        run: |
+          python scripts/timelapse_setup.py --defaults \
+                 --output /tmp/wizard.json \
+                 --template config/config.example.json
+          python -m json.tool /tmp/wizard.json > /dev/null
+          echo "ReadWritePaths -> $(python scripts/timelapse_setup.py --print-paths /tmp/wizard.json)"
 
       - name: End-to-end encode smoke test
         run: python tests/smoke_test.py
+
+  shell:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax-check the installer
+        run: bash -n install.sh
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck --severity=warning install.sh
+
+      - name: Installer honours --help without root
+        run: bash install.sh --help

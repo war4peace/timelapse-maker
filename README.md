@@ -21,6 +21,7 @@ configuration format is not yet frozen. See [CHANGELOG.md](CHANGELOG.md).
 | `timelapse_capture.py` | One full-quality JPEG per camera every N seconds | systemd service, always on |
 | `timelapse_encode.py` | Encodes finished days to AV1, notifies, transfers | systemd timer, 00:05 |
 | `timelapse_test.py` | Pre-flight checker — run before enabling anything | manually |
+| `timelapse_setup.py` | Storage-aware configuration wizard | installer, or `timelapse setup` |
 
 The two daemons never talk to each other. They share only a directory layout,
 so either can be stopped, replaced or rewritten without touching the other.
@@ -54,28 +55,72 @@ is 4:48 of video at 60fps. Budget disk accordingly — at ~600 KB per 1440p
 snapshot that is ~10 GB per camera per day, resident for up to two days.
 `timelapse_test.py` computes the real figure from your own cameras.
 
-## Quick start
+## Install
+
+```bash
+curl -sL https://raw.githubusercontent.com/war4peace/timelapse-maker/main/install.sh -o install_timelapse.sh
+sudo bash install_timelapse.sh
+rm install_timelapse.sh
+```
+
+That installs the dependencies, the scripts and the systemd units, then runs a
+setup wizard. The wizard scans your disks and proposes where to put the frames:
+
+```
+   #  Mount                 Type          Free      Total   Notes
+   1  /mnt/sata-ssd         ext4      683.2 GB   916.0 GB   SSD            <- recommended
+   2  /mnt/hdd              xfs         1.7 TB     3.6 TB   HDD
+   3  /                     ext4      858.0 GB   932.0 GB   SSD, OS disk
+
+  Which filesystem should hold the frames? [1]:
+```
+
+Every question has a default in brackets — **press Enter to accept it**. The
+wizard then works out the disk budget for your camera count and interval, walks
+you through adding cameras (testing each one live, and reporting the resolution
+it got back), and writes `/etc/timelapse/config.json`.
+
+It also derives systemd's `ReadWritePaths` from the storage you chose. That is
+the single most common way a hand-install fails: the units run with
+`ProtectSystem=strict`, so a frames directory that isn't listed produces a
+baffling read-only error at 3am.
+
+Prefer to read before running as root? That's the sensible instinct — the
+download and the run are separate steps above precisely so you can inspect
+[install.sh](install.sh) in between.
+
+<details>
+<summary>Other install options</summary>
+
+```bash
+sudo bash install_timelapse.sh --unattended   # no questions, sane defaults
+sudo bash install_timelapse.sh --no-wizard    # install files only
+sudo bash install_timelapse.sh --ref v0.0.1   # pin to a tag
+sudo bash install_timelapse.sh --uninstall    # remove; captured data is kept
+```
+
+From a clone, which uses your checkout instead of downloading:
 
 ```bash
 git clone https://github.com/war4peace/timelapse-maker.git
-cd timelapse-maker
-
-sudo apt install ffmpeg python3-requests rsync
-
-# 1. Configure
-cp config/config.example.json config/config.json
-$EDITOR config/config.json          # camera URLs, credentials, paths
-
-# 2. Verify before enabling anything
-python3 scripts/timelapse_test.py config/config.json --probe-profiles
-python3 scripts/timelapse_test.py config/config.json
+cd timelapse-maker && sudo ./install.sh
 ```
 
-Fix everything the test reports red, then follow
-**[docs/install.md](docs/install.md)** for the full system install.
+For a fully manual install, see [docs/install.md](docs/install.md).
+</details>
 
-> `config/config.json` is gitignored — it holds camera passwords and your
-> webhook URL. Keep it that way, and `chmod 640` the deployed copy.
+After installing, a `timelapse` command wraps the common operations:
+
+```
+timelapse status | logs | test | encode | config | setup
+```
+
+Run `timelapse test` before enabling anything — it fetches one snapshot per
+camera and reports size, resolution, latency and auth result, probes the
+encoders, and projects real disk usage from your actual snapshot sizes.
+
+> `/etc/timelapse/config.json` holds camera passwords and your webhook URL. The
+> installer sets it to mode `640`, and `config/config.json` is gitignored.
 
 ## Documentation
 

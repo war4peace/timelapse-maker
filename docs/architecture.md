@@ -232,6 +232,64 @@ logic cannot drift between the two).
 Samples land in a temp directory (override with `TIMELAPSE_TEST_DIR`) for visual
 inspection. `--probe-profiles` short-circuits everything else.
 
+### 4.4 `timelapse_setup.py`
+
+Configuration wizard. Run by `install.sh`, or standalone as `timelapse setup`.
+Writes `config.json` and nothing else — it never touches systemd, never enables
+anything, and is safe to re-run.
+
+**Storage discovery** parses `/proc/mounts` rather than shelling out to `lsblk`
+or `df`, so it has no dependency beyond the stdlib. Filtering, in order:
+
+| Rejected | Why |
+|---|---|
+| `PSEUDO_FS` fstypes | tmpfs, overlay, squashfs, cgroup… are not real storage |
+| `NETWORK_FS` fstypes | `os.replace()` has no atomicity guarantee across the wire, and 17k small writes/camera/day over a network is painful. Fine as a *transfer* target, not as `frames_root`. |
+| `SKIP_PREFIXES` mountpoints | `/snap`, `/boot`, `/var/lib/docker`, WSL internals |
+| `ro` mounts | cannot hold frames |
+| sources not under `/dev/` | bind mounts and synthetic sources |
+| duplicate devices | one device mounted repeatedly; the shortest mountpoint wins |
+
+Free space comes from `os.statvfs` (`f_bavail`, i.e. space available to a
+non-root user, not `f_bfree`). Rotational status comes from
+`/sys/block/<dev>/queue/rotational`, with `_base_device()` mapping `sda1 → sda`,
+`nvme0n1p2 → nvme0n1` and `/dev/mapper/*` through its symlink. Every one of
+these is best-effort: a `None` rotational just means the SSD/HDD hint is
+omitted.
+
+`recommend()` prefers the roomiest filesystem that is not `/`, provided it has
+at least 20 GB — the OS disk is a poor place to write 17k files a day.
+
+**Two things it exists to get right**, both of which are silent failures by hand:
+
+- Credentials destined for a query string are `urllib.parse.quote`d. A password
+  containing `&`, `#`, `=` or `%` otherwise breaks the URL in a way that looks
+  like an auth failure.
+- `--print-paths` emits the minimal set of directories systemd must allow, which
+  `install.sh` splices into `ReadWritePaths=`. Paths already covered by a parent
+  in the set are dropped.
+
+**Input handling.** `init_tty()` picks a source: stdin if it is a terminal,
+otherwise `/dev/tty`, otherwise defaults-only. It must *never* silently read a
+piped stdin — under `curl … | bash` that pipe is the installer script itself.
+`--stdin` opts in explicitly for scripted runs. Passwords go through
+`getpass` when a real terminal is present, so they stay out of scroll-back.
+
+### 4.5 `install.sh`
+
+Bootstrap. Detects the package manager (apt/dnf/yum/pacman/zypper/apk), installs
+dependencies, creates the `timelapse` system account, places scripts, units and
+a `timelapse` command wrapper, then calls the wizard and offers to enable.
+
+It uses the checkout it is running from when there is one, and otherwise
+downloads a tarball from `codeload.github.com` — so the same script serves both
+`git clone && sudo ./install.sh` and the piped one-liner.
+
+`sync_units()` is the important part: it rewrites `User=`, `Group=`,
+`ExecStart=` and `ReadWritePaths=` in the installed units from the config the
+wizard just wrote. Prompts read from `/dev/tty` for the same reason the wizard's
+do. `--uninstall` removes programs and units but never captured data.
+
 ---
 
 ## 5. Configuration reference
@@ -389,9 +447,12 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-scripts/timelapse_capture.py     daemon, 338 lines
+install.sh                       bootstrap installer, 456 lines
+scripts/timelapse_capture.py     daemon, 340 lines
 scripts/timelapse_encode.py      batch job, 491 lines
 scripts/timelapse_test.py        pre-flight checks, 320 lines
+scripts/timelapse_setup.py       configuration wizard, 818 lines
+tests/smoke_test.py              end-to-end encode check
 config/config.example.json       template; the real config.json is gitignored
 service/timelapse-capture.service
 service/timelapse-encode.service

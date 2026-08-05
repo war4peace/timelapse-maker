@@ -18,6 +18,38 @@ Nothing depends on file mtime.
 
 ## 2. Install
 
+### The short way
+
+```bash
+curl -sL https://raw.githubusercontent.com/war4peace/timelapse-maker/main/install.sh -o install_timelapse.sh
+sudo bash install_timelapse.sh
+rm install_timelapse.sh
+```
+
+`install.sh` installs dependencies (apt, dnf, yum, pacman, zypper or apk),
+creates a `timelapse` system account, puts the scripts in `/opt/timelapse`, the
+units in `/etc/systemd/system`, a `timelapse` wrapper in `/usr/local/bin`, and
+then runs the setup wizard described in §3. Re-running it upgrades the scripts
+and offers to keep your existing config.
+
+| Flag | Effect |
+|---|---|
+| `--unattended` | No questions. Defaults everywhere, services not enabled. |
+| `--no-wizard` | Install files only; configure later with `timelapse setup`. |
+| `--ref REF` | Install a specific branch or tag. |
+| `--prefix DIR` | Install somewhere other than `/opt/timelapse`. |
+| `--uninstall` | Remove programs and units. Captured data is never deleted. |
+
+The download and the execution are deliberately two steps, so you can read the
+script before running it as root.
+
+> **Piping straight to bash** (`curl -sL … | sudo bash`) also works — the
+> installer and wizard read prompts from `/dev/tty` rather than stdin, because
+> under a pipe stdin *is* the script. If no terminal is reachable at all, both
+> fall back to accepting defaults instead of hanging.
+
+### The manual way
+
 ```bash
 sudo apt install ffmpeg python3-requests rsync
 
@@ -44,7 +76,49 @@ put frames anywhere other than `/var/lib/timelapse` — the `paths` block.
 > confusing read-only error. The same applies to a local transfer destination
 > such as a CIFS or NFS mountpoint.
 
-## 3. Test before enabling anything
+## 3. The setup wizard
+
+The installer runs it automatically. Run it again any time with:
+
+```bash
+timelapse setup
+```
+
+It scans `/proc/mounts` for real, writable, local filesystems — skipping pseudo
+filesystems, read-only mounts, snap/docker paths and network shares — reads free
+space with `statvfs`, and checks `/sys/block/<dev>/queue/rotational` to label
+each one SSD or HDD:
+
+```
+   #  Mount                 Type          Free      Total   Notes
+   1  /mnt/sata-ssd         ext4      683.2 GB   916.0 GB   SSD            <- recommended
+   2  /mnt/hdd              xfs         1.7 TB     3.6 TB   HDD
+   3  /                     ext4      858.0 GB   932.0 GB   SSD, OS disk
+
+  Which filesystem should hold the frames? [1]:
+```
+
+It recommends the roomiest filesystem that isn't the OS disk. Every prompt has a
+default in brackets; Enter accepts it.
+
+It then covers ffmpeg paths (probing for NVENC and telling you which encoder you
+will actually get), the capture interval, a disk budget for your camera count,
+the low-space threshold, cameras, transfer and Discord.
+
+Two things it does that are easy to get wrong by hand:
+
+- **URL-encodes credentials** that belong in a query string. A password
+  containing `&`, `#`, `=` or `%` silently breaks a hand-written Reolink URL.
+- **Derives `ReadWritePaths`** for the systemd units from the storage you chose.
+  The units run `ProtectSystem=strict`; an unlisted frames directory fails with
+  a read-only error that looks nothing like a permissions problem.
+
+Network filesystems (NFS, CIFS, 9p, sshfs) are deliberately excluded as frame
+storage — `os.replace()` gives no atomicity guarantee across the wire, and 17k
+small writes per camera per day over a network is painful. They are still fine
+as a *transfer destination*, which is a nightly bulk copy.
+
+## 4. Test before enabling anything
 
 ```bash
 sudo -u timelapse python3 /opt/timelapse/timelapse_test.py /etc/timelapse/config.json
@@ -101,7 +175,7 @@ budget.
   BtbN static build or `jellyfin-ffmpeg` and point `paths.ffmpeg` at it. The
   script falls back to HEVC then x264 rather than failing, but you lose AV1.
 
-## 4. Enable
+## 5. Enable
 
 ```bash
 sudo cp service/timelapse-capture.service \
@@ -130,7 +204,7 @@ python3 /opt/timelapse/timelapse_encode.py /etc/timelapse/config.json \
 `--dry-run --no-transfer` builds the concat list and reports frame counts
 without encoding, transferring or deleting anything. Safe on live data.
 
-## 5. Transfer destination
+## 6. Transfer destination
 
 `transfer.destination` is either a local path or an rsync remote spec — one code
 path serves both.
@@ -150,7 +224,7 @@ mountpoint, and add that mountpoint to `ReadWritePaths=` in
 Set `transfer.enabled` to `false` to keep videos on the local disk. Note that
 nothing then prunes `video_output` — add your own retention if you do this.
 
-## 6. Sizing
+## 7. Sizing
 
 At a 5s interval: **17,280 frames/camera/day** → 4:48 of video at 60fps.
 
@@ -166,7 +240,7 @@ write-once/read-once.
 Write endurance is a non-issue on SSD: even 110 GB/day is ~40 TB/year against a
 typical 600 TBW consumer rating.
 
-## 7. Day to day
+## 8. Day to day
 
 ```bash
 journalctl -u timelapse-capture -f
@@ -188,7 +262,7 @@ Exit codes: `0` all good, `1` partial failure, `2` critical.
 Changing the config requires `systemctl restart timelapse-capture`. The encoder
 re-reads it on every run.
 
-## 8. Adding a camera
+## 9. Adding a camera
 
 Add one entry to `cameras[]`, run `timelapse_test.py --camera <Name>`, then
 restart capture. No code changes. The frames directory is created on first
