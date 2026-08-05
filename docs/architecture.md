@@ -171,6 +171,14 @@ Pipeline, in `main()`:
    frames: measured on an RTX 3090, `hevc_nvenc` fails 128×128 outright with
    `InitializeEncoder failed: invalid param (8): Frame dimensions`. 512 is
    clear of every documented minimum and costs nothing.
+   **The probe pins `-pix_fmt` to `PIX_FMT` (yuv420p), the same constant
+   `encode_day()` builds its filter chain from.** `testsrc` emits rgb24; left
+   to negotiate, ffmpeg picks the closest format the encoder advertises, and
+   `av1_nvenc` advertises `yuv444p`. NVENC on Ada cannot do AV1 in 4:4:4, so
+   the capability check failed and reported "No capable devices found" — which
+   declared an RTX 4060 incapable of AV1 it does perfectly well in 4:2:0. A
+   probe that encodes something the pipeline never produces is worse than no
+   probe. Both now read one constant so they cannot drift.
    **The probe must never discard ffmpeg's stderr.** Two failure modes are
    indistinguishable by exit code but need opposite fixes:
    `Unknown encoder 'av1_nvenc'` means the ffmpeg build lacks it (install

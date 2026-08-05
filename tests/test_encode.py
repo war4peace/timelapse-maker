@@ -263,6 +263,55 @@ class TestEncoderDiagnostics(unittest.TestCase):
         w, h = (int(v) for v in enc.PROBE_SIZE.split("x"))
         self.assertGreaterEqual(min(w, h), 256)
 
+    def test_probe_pins_the_pixel_format(self):
+        """Regression: the probe must not let ffmpeg negotiate a format.
+
+        testsrc emits rgb24; left alone ffmpeg picks the closest format the
+        encoder advertises, which for av1_nvenc is yuv444p. NVENC on Ada
+        cannot do AV1 in 4:4:4, so the probe failed with "No capable devices
+        found" and declared an RTX 4060 incapable of AV1 that it can do
+        perfectly well in 4:2:0.
+        """
+        captured = {}
+
+        class Result:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return Result()
+
+        original = enc.subprocess.run
+        enc.subprocess.run = fake_run
+        try:
+            enc.probe_encoder_detail("ffmpeg", {"codec": "av1_nvenc",
+                                                "args": ["-c:v", "av1_nvenc"]})
+        finally:
+            enc.subprocess.run = original
+
+        cmd = captured["cmd"]
+        self.assertIn("-pix_fmt", cmd)
+        self.assertEqual(cmd[cmd.index("-pix_fmt") + 1], enc.PIX_FMT)
+
+    def test_probe_format_matches_what_the_pipeline_produces(self):
+        """The probe is only meaningful if it encodes what encode_day() will.
+
+        Both now read the same constant; this guards the invariant rather than
+        the spelling.
+        """
+        import inspect
+        source = inspect.getsource(enc.encode_day)
+        self.assertIn("format={PIX_FMT}", source,
+                      "encode_day must build its filter chain from PIX_FMT")
+        self.assertEqual(enc.PIX_FMT, "yuv420p")
+
+    def test_pixel_format_rejection_is_explained(self):
+        hint = enc.encoder_hint("av1_nvenc", "YUV444P not supported",
+                                built_in=True)
+        self.assertIn("pixel format", hint)
+
     def test_missing_encoder_in_build_blames_the_build(self):
         hint = enc.encoder_hint("av1_nvenc", "Unknown encoder 'av1_nvenc'")
         self.assertIn("build", hint)

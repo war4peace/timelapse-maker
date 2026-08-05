@@ -32,7 +32,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -115,6 +115,18 @@ def build_candidates(enc):
 # comfortably clear of every documented minimum and costs nothing to encode.
 PROBE_SIZE = "512x512"
 
+# The probe MUST encode in the same pixel format the real pipeline produces,
+# or it tests something that will never run.
+#
+# testsrc emits rgb24. Left to negotiate, ffmpeg picks the closest format the
+# encoder advertises - which for av1_nvenc is yuv444p. NVENC on Ada does not
+# support AV1 in 4:4:4, so the capability check fails and ffmpeg reports the
+# unhelpful "No capable devices found". That made an RTX 4060 look incapable of
+# AV1 when it is not: encode_day()'s filter chain ends in format=yuv420p, so
+# real encodes would always have succeeded. Forcing it here keeps probe and
+# pipeline honest with each other.
+PIX_FMT = "yuv420p"
+
 
 def list_encoders(ffmpeg):
     """Encoder names this ffmpeg binary was built with, or None if unknown.
@@ -144,9 +156,10 @@ def probe_encoder_detail(ffmpeg, candidate):
     code but need opposite responses: "No capable devices found" is the GPU or
     driver, "Unknown encoder" is the ffmpeg build.
     """
-    cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
-           "-f", "lavfi", "-i", f"testsrc=size={PROBE_SIZE}:rate=1",
-           "-frames:v", "1"] + candidate["args"] + ["-f", "null", "-"]
+    cmd = ([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-nostats",
+            "-f", "lavfi", "-i", f"testsrc=size={PROBE_SIZE}:rate=1",
+            "-frames:v", "1", "-pix_fmt", PIX_FMT]
+           + candidate["args"] + ["-f", "null", "-"])
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
     except FileNotFoundError:
@@ -182,9 +195,10 @@ def probe_encoder_verbose(ffmpeg, candidate, size=None):
     Only worth calling after a failure: it costs a second ffmpeg invocation and
     exists purely to recover the reason that -loglevel error discards.
     """
-    cmd = [ffmpeg, "-v", "verbose", "-y", "-hide_banner", "-nostats",
-           "-f", "lavfi", "-i", f"testsrc=size={size or PROBE_SIZE}:rate=1",
-           "-frames:v", "1"] + candidate["args"] + ["-f", "null", "-"]
+    cmd = ([ffmpeg, "-v", "verbose", "-y", "-hide_banner", "-nostats",
+            "-f", "lavfi", "-i", f"testsrc=size={size or PROBE_SIZE}:rate=1",
+            "-frames:v", "1", "-pix_fmt", PIX_FMT]
+           + candidate["args"] + ["-f", "null", "-"])
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
     except Exception as exc:
@@ -221,6 +235,11 @@ def encoder_hint(codec, message, built_in=None):
                 "transcoder) may be holding them all")
     if "invalid param" in m and "dimension" in m:
         return "the probe frame was rejected as too small - please report this"
+    if "not supported" in m and any(
+            fmt in m for fmt in ("yuv44", "yuv42", "p010", "nv12", "rgb")):
+        return (f"{codec} rejected the pixel format offered to it. The probe "
+                f"forces {PIX_FMT}, so seeing this means the GPU cannot "
+                f"encode {codec} even in 4:2:0")
     if "codec not supported" in m or "no capable devices" in m:
         # Ambiguous on purpose: the driver did not advertise this codec for
         # this GPU, which is either a genuinely incapable GPU or an ffmpeg
@@ -328,7 +347,8 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
         # and tag it, so the result looks correct in any player rather than
         # washed out. Pinning the scaler to the first frame's size also makes the
         # run immune to a stray odd-sized snapshot mid-day.
-        vf = f"scale={w}:{h}:in_range=full:out_range=limited,format=yuv420p"
+        vf = (f"scale={w}:{h}:in_range=full:out_range=limited,"
+              f"format={PIX_FMT}")
 
         write_concat_list(frames, concat_path)
 

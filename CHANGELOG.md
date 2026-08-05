@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.0.5] - 2026-08-06
+
+### Fixed
+- **The encoder probe reported AV1 unavailable on hardware that supports it.**
+  `testsrc` emits rgb24 and the probe let ffmpeg negotiate the output format;
+  ffmpeg picked `yuv444p`, which `av1_nvenc` advertises but NVENC on Ada
+  cannot actually encode. The capability check failed and surfaced as
+  `No capable devices found`, so an RTX 4060 with a current driver and
+  ffmpeg 8.0.1 was silently downgraded to HEVC. Verbose output named it
+  exactly: `YUV444P not supported`.
+
+  Real encodes were never affected — `encode_day()` already ends its filter
+  chain in `format=yuv420p` — so this only ever cost people AV1 they could
+  have had. The probe now pins `-pix_fmt` to the same `PIX_FMT` constant the
+  filter chain uses, so the two cannot drift apart again.
+- `encoder_hint()` recognises a pixel-format rejection and says so, instead of
+  folding it into the generic "no capable devices" advice.
+
 ## [0.0.4] - 2026-08-06
 
 ### Added
