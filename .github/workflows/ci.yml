@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Byte-compile all scripts
+        run: python -m compileall -q scripts tests
+
+      - name: Validate example config
+        run: |
+          python -m json.tool config/config.example.json > /dev/null
+          python - <<'PY'
+          import json
+          cfg = json.load(open("config/config.example.json"))
+          for key in ("paths", "capture", "encode", "cameras"):
+              assert key in cfg, f"example config is missing {key!r}"
+          assert cfg["capture"]["timeout_seconds"] < cfg["capture"]["interval_seconds"], \
+              "timeout_seconds must be below interval_seconds"
+          names = [c["name"] for c in cfg["cameras"]]
+          assert len(names) == len(set(names)), "duplicate camera names"
+          for cam in cfg["cameras"]:
+              assert cam.get("method") in ("http", "rtsp"), cam["name"]
+          print(f"example config OK ({len(names)} cameras)")
+          PY
+
+      - name: Check --version on every entry point
+        run: |
+          python scripts/timelapse_encode.py --version
+          python scripts/timelapse_test.py --version
+          python scripts/timelapse_capture.py --version
+
+      - name: End-to-end encode smoke test
+        run: python tests/smoke_test.py

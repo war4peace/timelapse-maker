@@ -1,0 +1,30 @@
+[Unit]
+Description=Encode yesterday's timelapse frames into daily videos
+Documentation=https://github.com/war4peace/timelapse-maker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Must match the user that owns the frames written by timelapse-capture.
+User=timelapse
+Group=timelapse
+ExecStart=/usr/bin/python3 /opt/timelapse/timelapse_encode.py /etc/timelapse/config.json
+# A full backlog catch-up can legitimately take hours; do not let systemd
+# kill it mid-encode.
+TimeoutStartSec=infinity
+# Encoding is a batch job. Yield to capture, which must not miss frames.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# Hardening. ReadWritePaths must list every path this writes to, including
+# a local transfer destination (e.g. a CIFS/NFS mountpoint) if you use one.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/timelapse
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+# Real configuration — holds camera credentials and webhook URLs.
+# Only config/config.example.json is tracked.
+config/config.json
+config/*.local.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Captured data / generated media, in case anyone runs from the repo root
+frames/
+videos/
+logs/
+*.log
+*.jpg
+*.jpeg
+*.mkv
+*.mp4
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

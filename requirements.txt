@@ -1,0 +1,3 @@
+# The only third-party Python dependency. Everything else is stdlib.
+# On Debian/Ubuntu you can equally use: sudo apt install python3-requests
+requests>=2.25

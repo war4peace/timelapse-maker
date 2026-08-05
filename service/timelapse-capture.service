@@ -1,0 +1,30 @@
+[Unit]
+Description=Camera snapshot capture for timelapse
+Documentation=https://github.com/war4peace/timelapse-maker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change User/Group to the account that owns the frames directory.
+User=timelapse
+Group=timelapse
+ExecStart=/usr/bin/python3 /opt/timelapse/timelapse_capture.py /etc/timelapse/config.json
+Restart=always
+RestartSec=15
+# Cameras are the slow part, not CPU; keep this off the encoder's back.
+Nice=5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+# Hardening. ReadWritePaths must list every path the daemon writes to -
+# if you move paths.frames_root or paths.log_dir in config.json, change it
+# here too or writes fail with a confusing read-only error.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/timelapse
+
+[Install]
+WantedBy=multi-user.target

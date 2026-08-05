@@ -1,0 +1,15 @@
+[Unit]
+Description=Nightly timelapse encode
+Documentation=https://github.com/war4peace/timelapse-maker
+
+[Timer]
+# Just after midnight, so the previous day's frame directory is complete.
+OnCalendar=*-*-* 00:05:00
+# If the machine was off at 00:05, run on the next boot. The encoder picks up
+# every missed day on its own, bounded by encode.max_backlog_days.
+Persistent=true
+# Avoid every install on a network hammering its NAS at the same second.
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

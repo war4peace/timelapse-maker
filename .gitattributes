@@ -1,0 +1,17 @@
+# This project is deployed on Linux. Everything text is stored and checked out
+# with LF, regardless of the platform it was authored on.
+* text=auto eol=lf
+
+*.py    text eol=lf diff=python
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.sh    text eol=lf
+*.service text eol=lf
+*.timer   text eol=lf
+LICENSE   text eol=lf
+
+*.jpg binary
+*.png binary
+*.mkv binary
+*.mp4 binary
