@@ -218,12 +218,18 @@ sudo -u timelapse ssh-copy-id user@nas
 # destination: "user@nas:/mnt/user/timelapse/"
 ```
 
-**CIFS/SMB mount:** there is a script for this. It mounts the share, works out
-which rsync flags the share actually accepts, does a real round trip with a
-throwaway file, writes the `/etc/fstab` entry, and prints the exact config:
+**CIFS/SMB share:** the wizard does this for you. Pick *"A network share
+(SMB/CIFS) - set it up for me"* at the transfer step and it will install
+`cifs-utils`, ask for the server, share, credentials and mount point, mount it
+(negotiating the SMB dialect), create the destination folder, work out which
+rsync flags the share accepts, and add an `/etc/fstab` entry with
+`nofail,x-systemd.automount` so it returns after a reboot without blocking boot
+if the NAS is down.
+
+To set this up after the initial install, or to change it later:
 
 ```bash
-sudo bash tools/setup-cifs-transfer.sh --server 192.168.1.50 --share cctv
+sudo timelapse transfer
 ```
 
 Two things it exists to catch, both of which are silent by hand:

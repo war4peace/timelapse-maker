@@ -370,7 +370,7 @@ take an optional path as their first positional argument. See
 | Key | Notes |
 |---|---|
 | `destination` | A local directory or an rsync remote spec; one code path serves both. |
-| `rsync_args` | Defaults include `--remove-source-files`; if you drop that, set `delete_local_after_transfer` accordingly or files accumulate. On a CIFS mount `-a` may exit 23 because owner/group cannot be set — `tools/setup-cifs-transfer.sh` measures which flags work on your share. |
+| `rsync_args` | Defaults include `--remove-source-files`; if you drop that, set `delete_local_after_transfer` accordingly or files accumulate. On a CIFS mount `-a` may exit 23 because owner/group cannot be set; the wizard measures which flags your share accepts and writes those. |
 | `require_mountpoint` | `false` (default), `true`, or an explicit mount path. Refuses to transfer when the destination is not on a mounted filesystem. Only meaningful for a local destination; ignored for a remote spec. |
 
 ### `cameras[]`
@@ -529,7 +529,6 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 
 ```
 install.sh                       bootstrap installer, 467 lines
-tools/setup-cifs-transfer.sh     CIFS mount setup and verification
 scripts/timelapse_capture.py     daemon, 340 lines
 scripts/timelapse_encode.py      batch job, 491 lines
 scripts/timelapse_test.py        pre-flight checks, 320 lines

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.0.7] - 2026-08-06
+
+### Added
+- **The wizard sets up a network share itself.** The transfer step now offers
+  *"A network share (SMB/CIFS) - set it up for me"*: it installs `cifs-utils`,
+  asks for the server, share, credentials and mount point, mounts it
+  (negotiating the SMB dialect down from 3.1.1), creates the destination
+  folder, measures which rsync flags the share accepts, and writes an
+  `/etc/fstab` entry with `nofail,x-systemd.automount`.
+- `timelapse transfer` (`--transfer-only`) reconfigures just the destination
+  against an existing config, without walking the whole wizard again. It also
+  updates `ReadWritePaths=` in the installed units, so a share added after the
+  initial install does not fail read-only under `ProtectSystem=strict`.
+
+### Removed
+- `tools/setup-cifs-transfer.sh`. The wizard does this now, and `install.sh`
+  never installed the script anyway — so the wizard was pointing at a file
+  that was not on the machine. One implementation instead of two that could
+  drift.
+
+### Fixed
+- `timelapse setup` run outside the installer wrote the config `0640
+  root:root`, leaving the service account unable to read it — a failure that
+  only shows up when a unit refuses to start. `write_config()` now sets the
+  group when it knows the service user.
+- Documentation keys leaked from the example config into generated configs;
+  one shipped a `_comment_cifs` still describing the removed script. Every
+  `_`-prefixed key is now stripped, not the three that existed at the time.
+
 ## [0.0.6] - 2026-08-06
 
 ### Fixed

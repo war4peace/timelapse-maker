@@ -248,11 +248,13 @@ case "\${1:-}" in
     setup)     shift; exec python3 $PREFIX/timelapse_setup.py --output "$CONFIG" \\
                           --template "$CONFDIR/config.example.json" \\
                           --owner "$SVCUSER" "\$@" ;;
+    transfer)  shift; exec python3 $PREFIX/timelapse_setup.py --transfer-only \\
+                          --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     config)    exec \${EDITOR:-nano} "$CONFIG" ;;
     logs)      exec journalctl -u timelapse-capture -f ;;
     status)    exec systemctl status timelapse-capture.service timelapse-encode.timer ;;
     *)
-        echo "usage: timelapse {setup|test|encode|config|logs|status}"
+        echo "usage: timelapse {setup|transfer|test|encode|config|logs|status}"
         exit 1 ;;
 esac
 EOF
@@ -361,7 +363,7 @@ offer_enable() {
     fi
 
     printf '\n'
-    say "${B}timelapse${N} status | logs | test | encode | config | setup"
+    say "${B}timelapse${N} status | logs | test | encode | config | setup | transfer"
 }
 
 as_service_user() {
@@ -446,7 +448,7 @@ main() {
   ╚══════════════════════════════════════════════════════════╝
 BANNER
     printf '%s' "$N"
-    printf '  %sEXPERIMENTAL (v0.0.6)%s - early software, tested on one machine.\n' "$Y$B" "$N"
+    printf '  %sEXPERIMENTAL (v0.0.7)%s - early software, tested on one machine.\n' "$Y$B" "$N"
     note "Config format may change between versions. Not for production use."
 
     if [ "$DO_UNINSTALL" = "1" ]; then

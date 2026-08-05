@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -777,6 +777,10 @@ def probe_rsync_flags(dest, svcuser=None):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
 def choose_transfer(cfg, svcuser=None):
     heading("Transfer (optional)")
     note("After encoding, videos can be moved to a NAS or another host.")
@@ -788,27 +792,259 @@ def choose_transfer(cfg, svcuser=None):
     cfg["transfer"]["enabled"] = True
 
     print()
-    print("    1  A path on this machine")
-    print("       (an SMB/NFS share you have already mounted, or any local disk)")
-    print("    2  Another host over SSH")
+    print("    1  A network share (SMB/CIFS) - set it up for me")
+    print("       (a NAS share; mounts it, tests it and makes it survive reboots)")
+    print("    2  A path already on this machine")
+    print("       (a share you have mounted yourself, or any local disk)")
+    print("    3  Another host over SSH")
     print("       (rsync remote spec - needs working SSH keys for the service account)")
-    kind = ask_int("How is the destination reached?", 1, 1, 2)
+    kind = ask_int("How is the destination reached?", 1, 1, 3)
 
-    if kind == 2:
+    if kind == 3:
         note("SSH key authentication must already work for the account the")
         note("encoder runs as, non-interactively. Test it before enabling.")
         cfg["transfer"]["destination"] = ask("Destination",
                                              "user@nas:/mnt/user/timelapse/")
         cfg["transfer"]["require_mountpoint"] = False
+    elif kind == 1:
+        if not setup_cifs_share(cfg, svcuser):
+            print()
+            warn("Share not configured. Transfer left disabled; re-run")
+            warn("'timelapse transfer' once the share is reachable.")
+            cfg["transfer"]["enabled"] = False
     else:
-        note("If the share is not mounted yet, tools/setup-cifs-transfer.sh")
-        note("will mount it, verify it and write the fstab entry for you.")
         dest = ask("Destination path", "/mnt/nas/timelapse/")
         cfg["transfer"]["destination"] = dest
         configure_local_transfer(cfg, dest, svcuser)
 
-    if not shutil.which("rsync"):
+    if cfg["transfer"]["enabled"] and not shutil.which("rsync"):
         warn("rsync is not installed - transfers will fail until it is.")
+
+
+# ----------------------------------------------------------------------------
+# SMB/CIFS share setup
+# ----------------------------------------------------------------------------
+
+def ensure_cifs_utils():
+    if shutil.which("mount.cifs"):
+        return True
+    note("Installing cifs-utils...")
+    for mgr, args in (
+        ("apt-get", ["install", "-y", "-qq", "cifs-utils"]),
+        ("dnf", ["install", "-y", "-q", "cifs-utils"]),
+        ("pacman", ["-S", "--noconfirm", "--needed", "cifs-utils"]),
+        ("zypper", ["--non-interactive", "install", "cifs-utils"]),
+        ("apk", ["add", "--quiet", "cifs-utils"]),
+    ):
+        if not shutil.which(mgr):
+            continue
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+        try:
+            subprocess.run([mgr] + args, capture_output=True, timeout=300, env=env)
+        except Exception:
+            pass
+        break
+    if shutil.which("mount.cifs"):
+        good("Installed cifs-utils")
+        return True
+    fail("Could not install cifs-utils. Install it and re-run.")
+    return False
+
+
+def try_mount_cifs(unc, mountpoint, opts_base):
+    """Mount, negotiating the SMB dialect down. Returns (ok, vers, error)."""
+    last = ""
+    for vers in ("", "vers=3.1.1", "vers=3.0", "vers=2.1"):
+        opts = opts_base + (f",{vers}" if vers else "")
+        try:
+            r = subprocess.run(["mount", "-t", "cifs", unc, mountpoint,
+                                "-o", opts],
+                               capture_output=True, text=True, timeout=60)
+        except Exception as exc:
+            return False, "", str(exc)[:200]
+        if r.returncode == 0:
+            return True, vers, ""
+        last = " ".join((r.stderr or "").split())[:200]
+    return False, "", last
+
+
+def setup_cifs_share(cfg, svcuser=None):
+    """Prompt for a share, mount it, verify it, and persist it. True on success."""
+    print()
+    if not is_root():
+        fail("Mounting a share needs root privileges.")
+        note("Re-run this as root (the installer does), or choose option 2")
+        note("and give a path you have already mounted yourself.")
+        return False
+    if not ensure_cifs_utils():
+        return False
+
+    server = ask("NAS address (IP or hostname)", "")
+    if not server:
+        fail("No address given.")
+        return False
+    share = ask("Share name (as it appears on the NAS)", "cctv")
+    subdir = ask("Folder inside the share", "timelapse")
+    mountpoint = ask("Mount the share at", f"/mnt/{share}")
+    username = ask("SMB username", "")
+    password = ask_secret("SMB password")
+
+    uid = gid = 0
+    if svcuser:
+        try:
+            import pwd
+            entry = pwd.getpwnam(svcuser)
+            uid, gid = entry.pw_uid, entry.pw_gid
+        except (ImportError, KeyError):
+            warn(f"Unknown user '{svcuser}'; mounting as root.")
+
+    # 0600 and root-owned: it holds the share password in plain text.
+    cred = Path("/etc/timelapse") / f"cifs-{share}.cred"
+    cred.parent.mkdir(parents=True, exist_ok=True)
+    old_umask = os.umask(0o077)
+    try:
+        cred.write_text(f"username={username}\npassword={password}\n",
+                        encoding="utf-8")
+    finally:
+        os.umask(old_umask)
+    os.chmod(cred, 0o600)
+    del password
+    good(f"Credentials written to {cred} (root only)")
+
+    opts = (f"credentials={cred},uid={uid},gid={gid},"
+            f"file_mode=0664,dir_mode=0775,iocharset=utf8")
+    unc = f"//{server}/{share}"
+    Path(mountpoint).mkdir(parents=True, exist_ok=True)
+
+    if os.path.ismount(mountpoint):
+        good(f"{mountpoint} is already mounted")
+        vers = ""
+    else:
+        note(f"Mounting {unc} at {mountpoint}...")
+        ok_mount, vers, err = try_mount_cifs(unc, mountpoint, opts)
+        if not ok_mount:
+            fail(f"Could not mount {unc}")
+            if err:
+                note(err)
+            note("Common causes: wrong username or password, the share name")
+            note("is not what the NAS calls it, or the user has no access.")
+            return False
+        good(f"Mounted{' with ' + vers if vers else ''}")
+
+    dest = str(PurePosixPath(mountpoint) / subdir) if subdir else mountpoint
+    try:
+        Path(dest).mkdir(parents=True, exist_ok=True)
+        if svcuser:
+            try:
+                shutil.chown(dest, user=svcuser)
+            except (OSError, LookupError):
+                pass
+    except OSError as exc:
+        fail(f"Could not create {dest} on the share: {exc}")
+        return False
+    good(f"Destination {dest} ready")
+
+    cfg["transfer"]["destination"] = dest.rstrip("/") + "/"
+    cfg["transfer"]["require_mountpoint"] = True
+
+    print()
+    note("Checking which rsync flags this share accepts...")
+    flags = probe_rsync_flags(dest, svcuser)
+    if flags:
+        cfg["transfer"]["rsync_args"] = flags + ["--remove-source-files"]
+        good(f"rsync {' '.join(flags)} works here")
+        if "-a" not in flags:
+            note("'-a' failed - it implies --owner --group, which this share")
+            note("cannot set. Using the flags above instead.")
+    elif flags == []:
+        fail("No rsync flag combination worked against the share.")
+        note("The mount succeeded but the service account cannot write.")
+        return False
+    else:
+        note("Could not test (rsync missing?); leaving the defaults.")
+
+    persist_cifs_mount(unc, mountpoint, opts, vers)
+    return True
+
+
+def sync_unit_readwritepaths(cfg, unitdir="/etc/systemd/system"):
+    """Update ReadWritePaths= in the installed units from the config.
+
+    install.sh does this after the full wizard, but a later `timelapse
+    transfer` also changes where the encoder writes. Without this the unit
+    still lists only the old paths and ProtectSystem=strict fails the write
+    read-only - which looks nothing like a configuration mistake.
+    """
+    if not is_root():
+        return False
+    paths = " ".join(writable_paths(cfg))
+    if not paths:
+        return False
+    touched = []
+    for name in ("timelapse-capture.service", "timelapse-encode.service"):
+        unit = Path(unitdir) / name
+        if not unit.exists():
+            continue
+        try:
+            lines = unit.read_text(encoding="utf-8").splitlines(keepends=True)
+        except OSError:
+            continue
+        out, changed = [], False
+        for line in lines:
+            if line.startswith("ReadWritePaths="):
+                new = f"ReadWritePaths={paths}\n"
+                changed = changed or new != line
+                out.append(new)
+            else:
+                out.append(line)
+        if changed:
+            try:
+                unit.write_text("".join(out), encoding="utf-8")
+                touched.append(name)
+            except OSError:
+                pass
+    if touched:
+        good(f"Updated ReadWritePaths in {', '.join(touched)}")
+        note(f"  {paths}")
+        try:
+            subprocess.run(["systemctl", "daemon-reload"],
+                           capture_output=True, timeout=30)
+        except Exception:
+            pass
+        note("Restart the encoder timer for it to take effect:")
+        note("  systemctl restart timelapse-encode.timer")
+    return bool(touched)
+
+
+def persist_cifs_mount(unc, mountpoint, opts, vers):
+    """Add an /etc/fstab entry so the share comes back after a reboot."""
+    fstab = Path("/etc/fstab")
+    try:
+        current = fstab.read_text(encoding="utf-8")
+    except OSError:
+        warn("Could not read /etc/fstab; the mount will not survive a reboot.")
+        return
+    if f" {mountpoint} " in current:
+        good("/etc/fstab already has an entry for this mount point")
+        return
+    # nofail + x-systemd.automount: a NAS that is down must not block boot,
+    # and the share mounts on first access instead.
+    full = (f"{opts}{',' + vers if vers else ''},_netdev,nofail,"
+            f"x-systemd.automount,x-systemd.mount-timeout=30")
+    line = f"{unc}  {mountpoint}  cifs  {full}  0  0"
+    try:
+        shutil.copy2(fstab, f"/etc/fstab.bak.{int(__import__('time').time())}")
+        with open(fstab, "a", encoding="utf-8") as fh:
+            fh.write(f"\n# timelapse-maker transfer destination\n{line}\n")
+    except OSError as exc:
+        warn(f"Could not update /etc/fstab: {exc}")
+        return
+    good("Added to /etc/fstab (backup taken) - it will remount at boot")
+    try:
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True,
+                       timeout=30)
+    except Exception:
+        pass
 
 
 NETWORK_MOUNTS = ("cifs", "smb3", "smbfs", "nfs", "nfs4", "fuse.sshfs")
@@ -858,7 +1094,7 @@ def configure_local_transfer(cfg, dest, svcuser):
         note("Could not test (rsync missing or destination unwritable).")
     elif not flags:
         fail("No rsync flag combination worked against this destination.")
-        note("Check permissions, then run tools/setup-cifs-transfer.sh.")
+        note("Check the share permissions for the service account.")
     else:
         cfg["transfer"]["rsync_args"] = flags + ["--remove-source-files"]
         good(f"rsync {' '.join(flags)} works here")
@@ -909,10 +1145,16 @@ def default_config(template_path=None):
     if template_path and Path(template_path).exists():
         with open(template_path, encoding="utf-8") as fh:
             cfg = json.load(fh)
-        cfg.pop("_comment", None)
-        cfg.pop("_cameras_comment", None)
+        # Strip every documentation key, not just the ones that existed when
+        # this was written - a stale "_comment_cifs" once shipped into a live
+        # config still describing a tool that had been removed.
+        for key in [k for k in cfg if k.startswith("_")]:
+            cfg.pop(key)
         for section in ("paths", "capture", "encode", "transfer", "discord"):
-            cfg.get(section, {}).pop("_comment", None)
+            block = cfg.get(section)
+            if isinstance(block, dict):
+                for key in [k for k in block if k.startswith("_")]:
+                    block.pop(key)
         cfg["cameras"] = []
         return cfg
     return {
@@ -971,7 +1213,14 @@ def summarise(cfg, out_path):
     print(f"  {'Config':<12}{out_path}")
 
 
-def write_config(cfg, out_path):
+def write_config(cfg, out_path, owner=None):
+    """Write the config 0640, readable by the service account.
+
+    The group matters: 0640 root:root leaves the daemons unable to read their
+    own configuration, which only shows up when a service fails to start.
+    install.sh used to fix this afterwards, so a standalone `timelapse setup`
+    produced a config the service could not read.
+    """
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     if out.exists():
@@ -987,6 +1236,11 @@ def write_config(cfg, out_path):
         os.chmod(out, 0o640)          # it holds camera credentials
     except OSError:
         pass
+    if owner:
+        try:
+            shutil.chown(out, group=owner)
+        except (OSError, LookupError):
+            pass
 
 
 def create_directories(cfg, owner=None):
@@ -1017,6 +1271,8 @@ def main():
                     help="accept every default without prompting")
     ap.add_argument("--stdin", action="store_true",
                     help="read answers from stdin instead of the terminal")
+    ap.add_argument("--transfer-only", action="store_true",
+                    help="reconfigure just the transfer destination")
     ap.add_argument("--print-paths", metavar="CONFIG",
                     help="print the paths systemd must be allowed to write")
     ap.add_argument("--version", action="version",
@@ -1038,6 +1294,36 @@ def main():
     print()
     note("Press Enter to accept the [default] shown for any question.")
 
+    # Re-run just the transfer section against an existing config, so a share
+    # can be set up after the fact without walking the whole wizard again.
+    if args.transfer_only:
+        try:
+            with open(args.output, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except OSError:
+            fail(f"No existing config at {args.output}; run the full wizard.")
+            return 1
+        cfg.setdefault("transfer", default_config()["transfer"])
+        choose_transfer(cfg, args.owner)
+        heading("Writing configuration")
+        write_config(cfg, args.output, args.owner)
+        good(f"Updated {args.output}")
+        t = cfg["transfer"]
+        if t.get("enabled"):
+            print()
+            note(f"destination      {t['destination']}")
+            note(f"rsync_args       {' '.join(t.get('rsync_args', []))}")
+            note(f"require_mountpoint {t.get('require_mountpoint', False)}")
+            if str(t.get("destination", "")).startswith("/"):
+                print()
+                if not sync_unit_readwritepaths(cfg):
+                    warn("Add the destination to ReadWritePaths= in "
+                         "timelapse-encode.service by hand,")
+                    warn("or ProtectSystem=strict will fail the write "
+                         "read-only. (Run as root to do this automatically.)")
+        print()
+        return 0
+
     cfg = default_config(args.template)
     disk = choose_storage(cfg)
     choose_tools(cfg)
@@ -1048,7 +1334,7 @@ def main():
 
     heading("Writing configuration")
     create_directories(cfg, args.owner)
-    write_config(cfg, args.output)
+    write_config(cfg, args.output, args.owner)
     good(f"Wrote {args.output}")
     summarise(cfg, args.output)
     print()

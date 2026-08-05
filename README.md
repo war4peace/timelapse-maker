@@ -3,7 +3,7 @@
 > [!WARNING]
 > ## ⚠️ EXPERIMENTAL — IN DEVELOPMENT
 >
-> **Version 0.0.6.** This is early software that has run on exactly one machine.
+> **Version 0.0.7.** This is early software that has run on exactly one machine.
 > It has not been tested across different distributions, camera makes, GPUs or
 > disk layouts, and it almost certainly has rough edges nobody has hit yet.
 >
@@ -129,7 +129,7 @@ download and the run are separate steps above precisely so you can inspect
 ```bash
 sudo bash install_timelapse.sh --unattended   # no questions, sane defaults
 sudo bash install_timelapse.sh --no-wizard    # install files only
-sudo bash install_timelapse.sh --ref v0.0.6   # pin to a tag
+sudo bash install_timelapse.sh --ref v0.0.7   # pin to a tag
 sudo bash install_timelapse.sh --uninstall    # remove; captured data is kept
 ```
 
@@ -146,7 +146,7 @@ For a fully manual install, see [docs/install.md](docs/install.md).
 After installing, a `timelapse` command wraps the common operations:
 
 ```
-timelapse status | logs | test | encode | config | setup
+timelapse status | logs | test | encode | config | setup | transfer
 ```
 
 Run `timelapse test` before enabling anything — it fetches one snapshot per

@@ -457,14 +457,32 @@ class TestTransferDestinationKind(unittest.TestCase):
         self.assertFalse(transfer["enabled"])
 
     def test_ssh_option_mentions_keys(self):
-        transfer, out = self.drive("y\n2\nuser@nas:/vol/tl/\n")
+        transfer, out = self.drive("y\n3\nuser@nas:/vol/tl/\n")
         self.assertEqual(transfer["destination"], "user@nas:/vol/tl/")
         self.assertIn("SSH key", out)
 
     def test_ssh_option_never_requires_a_mountpoint(self):
         # There is no local mount involved in an rsync-over-SSH transfer.
-        transfer, _ = self.drive("y\n2\nuser@nas:/vol/tl/\n")
+        transfer, _ = self.drive("y\n3\nuser@nas:/vol/tl/\n")
         self.assertFalse(transfer["require_mountpoint"])
+
+    def test_the_wizard_offers_to_mount_a_share_itself(self):
+        # The point of a wizard: it must not tell you to go mount the share
+        # first and come back.
+        _, out = self.drive("y\n2\n/tmp/nonexistent-dest/\nn\n")
+        menu = out.split("How is the destination reached?", 1)[0]
+        self.assertIn("set it up for me", menu)
+        self.assertIn("SMB/CIFS", menu)
+
+    def test_cifs_option_refuses_politely_without_root(self):
+        # Mounting needs root; without it, say so and offer the alternative
+        # rather than failing obscurely.
+        if setup.is_root():
+            self.skipTest("running as root")
+        transfer, out = self.drive("y\n1\n")
+        self.assertIn("root", out)
+        self.assertFalse(transfer["enabled"],
+                         "an unconfigured share must not leave transfer on")
 
     @staticmethod
     def _after_the_choice(out):
@@ -482,15 +500,12 @@ class TestTransferDestinationKind(unittest.TestCase):
         _, out = self.drive("y\n1\n/tmp/nonexistent-dest/\nn\n")
         self.assertNotIn("SSH key", self._after_the_choice(out))
 
-    def test_the_menu_still_describes_both_transports(self):
-        _, out = self.drive("y\n1\n/tmp/nonexistent-dest/\nn\n")
+    def test_the_menu_describes_every_transport(self):
+        _, out = self.drive("y\n2\n/tmp/nonexistent-dest/\nn\n")
         menu = out.split("How is the destination reached?", 1)[0]
+        self.assertIn("SMB/CIFS", menu)
+        self.assertIn("mounted yourself", menu)
         self.assertIn("SSH", menu)
-        self.assertIn("already mounted", menu)
-
-    def test_local_option_points_at_the_cifs_helper(self):
-        _, out = self.drive("y\n1\n/tmp/nonexistent-dest/\nn\n")
-        self.assertIn("setup-cifs-transfer.sh", out)
 
 
 class TestExplainPayload(unittest.TestCase):
