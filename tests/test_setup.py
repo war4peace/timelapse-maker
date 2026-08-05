@@ -337,6 +337,162 @@ class TestCredentialQuoting(unittest.TestCase):
                 self.assertEqual(q["cmd"], ["Snap"])
 
 
+class FakeTTY(io.StringIO):
+    """A terminal that supplies a fixed script of keystrokes."""
+
+    def __init__(self, text, tty=True):
+        super().__init__(text)
+        self.reads = 0
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+    def readline(self):
+        self.reads += 1
+        return super().readline()
+
+
+class TestEnterAcceptsTheDefault(unittest.TestCase):
+    """The wizard's one promise: Enter accepts what is in brackets.
+
+    Regression: ask() used to return early only for a non-empty default and
+    otherwise loop, so pressing Enter at any yes/no prompt (which passes an
+    empty default) re-prompted forever.
+    """
+
+    def drive(self, keystrokes, fn):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                result = fn()
+        finally:
+            reads = setup._TTY.reads
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return result, reads, buf.getvalue()
+
+    def test_enter_accepts_a_yes_default_with_one_read(self):
+        result, reads, _ = self.drive("\n", lambda: setup.ask_yes("Go?", True))
+        self.assertTrue(result)
+        self.assertEqual(reads, 1, "Enter must not re-prompt")
+
+    def test_enter_accepts_a_no_default_with_one_read(self):
+        result, reads, _ = self.drive("\n", lambda: setup.ask_yes("Go?", False))
+        self.assertFalse(result)
+        self.assertEqual(reads, 1)
+
+    def test_prompt_is_shown_exactly_once(self):
+        _, _, out = self.drive("\n", lambda: setup.ask_yes("Unique?", True))
+        self.assertEqual(out.count("Unique?"), 1)
+
+    def test_enter_accepts_an_empty_string_default(self):
+        result, reads, _ = self.drive("\n", lambda: setup.ask("Webhook URL", ""))
+        self.assertEqual(result, "")
+        self.assertEqual(reads, 1)
+
+    def test_enter_accepts_a_text_default(self):
+        result, reads, _ = self.drive("\n", lambda: setup.ask("Name", "Camera1"))
+        self.assertEqual(result, "Camera1")
+        self.assertEqual(reads, 1)
+
+    def test_enter_accepts_a_numeric_default(self):
+        result, reads, _ = self.drive("\n", lambda: setup.ask_int("How many?", 4))
+        self.assertEqual(result, 4)
+        self.assertEqual(reads, 1)
+
+    def test_typed_input_still_wins(self):
+        self.assertEqual(self.drive("Doorbell\n",
+                                    lambda: setup.ask("Name", "Camera1"))[0],
+                         "Doorbell")
+        self.assertTrue(self.drive("y\n", lambda: setup.ask_yes("Go?", False))[0])
+        self.assertFalse(self.drive("n\n", lambda: setup.ask_yes("Go?", True))[0])
+
+    def test_surrounding_whitespace_is_stripped(self):
+        self.assertEqual(self.drive("  Gate  \n",
+                                    lambda: setup.ask("Name", "x"))[0], "Gate")
+
+    def test_whitespace_only_counts_as_blank(self):
+        self.assertEqual(self.drive("   \n",
+                                    lambda: setup.ask("Name", "Camera1"))[0],
+                         "Camera1")
+
+    def test_eof_falls_back_to_the_default(self):
+        result, _, _ = self.drive("", lambda: setup.ask("Name", "Camera1"))
+        self.assertEqual(result, "Camera1")
+
+    def test_a_bad_number_reprompts_but_enter_then_ends_it(self):
+        # Rejecting non-numeric input is correct; it must still terminate.
+        result, reads, _ = self.drive("abc\n\n", lambda: setup.ask_int("N?", 7))
+        self.assertEqual(result, 7)
+        self.assertEqual(reads, 2)
+
+    def test_an_unrecognised_yes_no_reprompts_then_terminates(self):
+        result, reads, _ = self.drive("maybe\n\n",
+                                      lambda: setup.ask_yes("Go?", True))
+        self.assertTrue(result)
+        self.assertEqual(reads, 2)
+
+
+class TestTransferDestinationKind(unittest.TestCase):
+    """SSH guidance must appear only for the SSH option."""
+
+    def drive(self, keystrokes):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=False)
+        cfg = setup.default_config()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                setup.choose_transfer(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return cfg["transfer"], buf.getvalue()
+
+    def test_declining_leaves_transfer_disabled(self):
+        transfer, _ = self.drive("n\n")
+        self.assertFalse(transfer["enabled"])
+
+    def test_ssh_option_mentions_keys(self):
+        transfer, out = self.drive("y\n2\nuser@nas:/vol/tl/\n")
+        self.assertEqual(transfer["destination"], "user@nas:/vol/tl/")
+        self.assertIn("SSH key", out)
+
+    def test_ssh_option_never_requires_a_mountpoint(self):
+        # There is no local mount involved in an rsync-over-SSH transfer.
+        transfer, _ = self.drive("y\n2\nuser@nas:/vol/tl/\n")
+        self.assertFalse(transfer["require_mountpoint"])
+
+    @staticmethod
+    def _after_the_choice(out):
+        """Text shown once a transport has been picked.
+
+        The menu legitimately describes both options, SSH included. What must
+        not happen is SSH guidance after choosing a local path.
+        """
+        marker = "How is the destination reached?"
+        return out.split(marker, 1)[-1]
+
+    def test_local_option_does_not_mention_ssh_keys(self):
+        # The bug this class exists for: the old prompt talked about SSH keys
+        # whichever transport you picked.
+        _, out = self.drive("y\n1\n/tmp/nonexistent-dest/\nn\n")
+        self.assertNotIn("SSH key", self._after_the_choice(out))
+
+    def test_the_menu_still_describes_both_transports(self):
+        _, out = self.drive("y\n1\n/tmp/nonexistent-dest/\nn\n")
+        menu = out.split("How is the destination reached?", 1)[0]
+        self.assertIn("SSH", menu)
+        self.assertIn("already mounted", menu)
+
+    def test_local_option_points_at_the_cifs_helper(self):
+        _, out = self.drive("y\n1\n/tmp/nonexistent-dest/\nn\n")
+        self.assertIn("setup-cifs-transfer.sh", out)
+
+
 class TestExplainPayload(unittest.TestCase):
     """Cameras answer 200 OK with an error body; surface what they said."""
 

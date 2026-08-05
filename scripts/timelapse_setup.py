@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -87,29 +87,31 @@ def fail(text):  print(f"  {red('FAIL')}  {text}")
 
 
 def ask(question, default=""):
-    """Prompt with an Enter-accepts default."""
+    """Prompt once. A blank line always accepts the default.
+
+    Blank input must return the default even when the default is the empty
+    string. An earlier version only short-circuited on a non-empty default and
+    otherwise looped, so pressing Enter at any yes/no prompt - which passes an
+    empty default - re-prompted forever. That contradicted the one promise the
+    wizard makes, that Enter accepts what is in brackets.
+    """
     suffix = f" [{default}]" if default != "" else ""
     if AUTO or _TTY is None:
         print(f"  {question}{suffix}: {dim('(default)')}")
         return default
-    while True:
-        try:
-            sys.stdout.write(f"  {question}{suffix}: ")
-            sys.stdout.flush()
-            line = _TTY.readline()
-        except KeyboardInterrupt:
-            print("\nAborted.")
-            sys.exit(1)
-        if line == "":                      # EOF
-            print()
-            return default
-        if not _TTY.isatty():
-            print()                         # piped input echoes no newline
-        line = line.strip()
-        if line:
-            return line
-        if default != "":
-            return default
+    try:
+        sys.stdout.write(f"  {question}{suffix}: ")
+        sys.stdout.flush()
+        line = _TTY.readline()
+    except KeyboardInterrupt:
+        print("\nAborted.")
+        sys.exit(1)
+    if line == "":                          # EOF
+        print()
+        return default
+    if not _TTY.isatty():
+        print()                             # piped input echoes no newline
+    return line.strip() or default
 
 
 def ask_secret(question):
@@ -709,7 +711,73 @@ def probe_sample(cfg, data):
         return ""
 
 
-def choose_transfer(cfg):
+def mount_fstype(path):
+    """Filesystem type backing path, and its mount point. ('', None) if none."""
+    try:
+        entries = []
+        for line in Path("/proc/mounts").read_text().splitlines():
+            parts = line.split()
+            if len(parts) >= 3:
+                entries.append((parts[1].replace("\\040", " "), parts[2]))
+    except OSError:
+        return "", None
+    target = str(Path(path))
+    best = ("", None)
+    for mount, fstype in entries:
+        if target == mount or target.startswith(mount.rstrip("/") + "/"):
+            if best[1] is None or len(mount) > len(best[1]):
+                best = (fstype, mount)
+    return best
+
+
+def probe_rsync_flags(dest, svcuser=None):
+    """Which rsync flags this destination actually accepts, or None if untested.
+
+    On a CIFS share, `-a` implies --owner --group, which the share often cannot
+    set; rsync then exits 23 and every nightly run reports a transfer failure
+    even though the files arrived. Whether it happens depends on the server and
+    mount options, so measure instead of guessing.
+    """
+    if not shutil.which("rsync"):
+        return None
+    import tempfile
+    candidates = (["-a", "--partial"],
+                  ["-rt", "--partial"],
+                  ["-a", "--no-perms", "--no-owner", "--no-group", "--partial"])
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="tl-xfer-")
+        os.chmod(tmpdir, 0o755)
+        probe = Path(tmpdir) / ".tl-transfer-probe"
+        probe.write_bytes(b"\0" * 4096)
+        if svcuser:
+            try:
+                shutil.chown(tmpdir, user=svcuser)
+                shutil.chown(probe, user=svcuser)
+            except (OSError, LookupError):
+                pass
+    except OSError:
+        return None
+
+    landed = Path(dest) / probe.name
+    try:
+        for args in candidates:
+            cmd = ["rsync"] + args + [str(probe), str(dest).rstrip("/") + "/"]
+            if svcuser and shutil.which("runuser"):
+                cmd = ["runuser", "-u", svcuser, "--"] + cmd
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+            except Exception:
+                return None
+            landed.unlink(missing_ok=True)
+            if r.returncode == 0:
+                return args
+        return []
+    finally:
+        landed.unlink(missing_ok=True)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def choose_transfer(cfg, svcuser=None):
     heading("Transfer (optional)")
     note("After encoding, videos can be moved to a NAS or another host.")
     note("Leave this off to keep them on the local disk.")
@@ -718,11 +786,85 @@ def choose_transfer(cfg):
         cfg["transfer"]["enabled"] = False
         return
     cfg["transfer"]["enabled"] = True
-    note("Either a local mount path (/mnt/nas/timelapse/) or an rsync remote")
-    note("spec (user@nas:/mnt/user/timelapse/). SSH keys must already work.")
-    cfg["transfer"]["destination"] = ask("Destination", "/mnt/nas/timelapse/")
+
+    print()
+    print("    1  A path on this machine")
+    print("       (an SMB/NFS share you have already mounted, or any local disk)")
+    print("    2  Another host over SSH")
+    print("       (rsync remote spec - needs working SSH keys for the service account)")
+    kind = ask_int("How is the destination reached?", 1, 1, 2)
+
+    if kind == 2:
+        note("SSH key authentication must already work for the account the")
+        note("encoder runs as, non-interactively. Test it before enabling.")
+        cfg["transfer"]["destination"] = ask("Destination",
+                                             "user@nas:/mnt/user/timelapse/")
+        cfg["transfer"]["require_mountpoint"] = False
+    else:
+        note("If the share is not mounted yet, tools/setup-cifs-transfer.sh")
+        note("will mount it, verify it and write the fstab entry for you.")
+        dest = ask("Destination path", "/mnt/nas/timelapse/")
+        cfg["transfer"]["destination"] = dest
+        configure_local_transfer(cfg, dest, svcuser)
+
     if not shutil.which("rsync"):
         warn("rsync is not installed - transfers will fail until it is.")
+
+
+NETWORK_MOUNTS = ("cifs", "smb3", "smbfs", "nfs", "nfs4", "fuse.sshfs")
+
+
+def configure_local_transfer(cfg, dest, svcuser):
+    """Check a local destination and set the options it needs."""
+    fstype, mount = mount_fstype(dest)
+    path = Path(dest)
+
+    if not path.is_dir():
+        warn(f"{dest} does not exist yet.")
+        if mount and fstype:
+            note(f"Its filesystem ({fstype} at {mount}) is mounted, so the")
+            note("encoder will create the directory on first transfer.")
+        else:
+            note("Nothing is mounted there. If this is meant to be a NAS share,")
+            note("mount it first or the encoder will write to the local disk.")
+    else:
+        good(f"{dest} exists")
+
+    if fstype in NETWORK_MOUNTS:
+        good(f"backed by a {fstype} mount at {mount}")
+        # A dropped mount turns the mountpoint back into an empty local
+        # directory; rsync would fill the local disk and --remove-source-files
+        # would then delete the originals.
+        print()
+        note("If the share is ever unmounted, this path becomes an ordinary")
+        note("local directory and a transfer would fill the local disk instead.")
+        cfg["transfer"]["require_mountpoint"] = ask_yes(
+            "Refuse to transfer when the share is not mounted?", True)
+    elif mount and mount != "/":
+        note(f"backed by a {fstype} mount at {mount}")
+        cfg["transfer"]["require_mountpoint"] = False
+    else:
+        warn("This path is on the root filesystem, not a separate mount.")
+        note("That is fine for a local destination. If you expected a NAS")
+        note("share here, it is not mounted.")
+        cfg["transfer"]["require_mountpoint"] = False
+
+    if not path.is_dir():
+        return
+    print()
+    note("Checking which rsync flags this destination accepts...")
+    flags = probe_rsync_flags(dest, svcuser)
+    if flags is None:
+        note("Could not test (rsync missing or destination unwritable).")
+    elif not flags:
+        fail("No rsync flag combination worked against this destination.")
+        note("Check permissions, then run tools/setup-cifs-transfer.sh.")
+    else:
+        cfg["transfer"]["rsync_args"] = flags + ["--remove-source-files"]
+        good(f"rsync {' '.join(flags)} works here")
+        if "-a" not in flags:
+            note("'-a' failed - it implies --owner --group, which this share")
+            note("cannot set. Using the flags above instead.")
 
 
 def choose_discord(cfg):
@@ -901,7 +1043,7 @@ def main():
     choose_tools(cfg)
     n_cams = choose_capture(cfg, disk)
     choose_cameras(cfg, n_cams)
-    choose_transfer(cfg)
+    choose_transfer(cfg, args.owner)
     choose_discord(cfg)
 
     heading("Writing configuration")

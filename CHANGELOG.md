@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.0.6] - 2026-08-06
+
+### Fixed
+- **Pressing Enter at a yes/no prompt re-prompted forever.** `ask()` returned
+  early only when the default was non-empty, and `ask_yes()` passes an empty
+  default, so a blank line fell through to the retry loop. The only way past a
+  `(Y/n)` prompt was to type `y` or `n` — which contradicts the wizard's one
+  promise, that Enter accepts what is in brackets. Blank input now always
+  returns the default.
+
+### Changed
+- **The transfer step no longer assumes SSH.** It asks how the destination is
+  reached — a path on this machine, or another host over SSH — and only
+  mentions SSH keys for the SSH option. Reported as confusing when configuring
+  a CIFS share, which needs no SSH at all.
+- For a local destination the wizard now checks the path, reports the
+  filesystem backing it, and **offers `require_mountpoint`** when that is a
+  network mount. This finally connects the guard added in 0.0.4 to the wizard
+  that writes the config; before, only hand-editing or the CIFS script set it.
+- It also **measures which rsync flags the destination accepts** and writes
+  those, rather than shipping `-a` and letting the nightly run discover that
+  the share cannot set owner/group. `-a` works on some shares and not others,
+  so it is tested rather than assumed.
+- An unmounted or unwritable destination is called out during setup instead of
+  at 00:05 the following morning.
+
 ## [0.0.5] - 2026-08-06
 
 ### Fixed
