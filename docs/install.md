@@ -135,8 +135,9 @@ Fix everything red before going further.
 
 If any camera URL contains `Profile_N`, check which profile is actually the main
 stream. On Hikvision, **Profile_1 is normally the main stream, Profile_2 the
-substream, Profile_3 the third stream** — picking the wrong one is the usual
-reason NVR-generated timelapses come out low-resolution.
+substream, Profile_3 the third stream** — but the numbering is not consistent
+across vendors, and nothing in the URL tells you which you got. Guessing wrong
+silently gives you a low-resolution timelapse.
 
 ```bash
 sudo -u timelapse python3 /opt/timelapse/timelapse_test.py \

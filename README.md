@@ -24,9 +24,18 @@ from each camera on a fixed interval, encodes each finished day into one video
 per camera overnight, and optionally ships the results to a NAS and posts a
 summary to Discord.
 
-It is a replacement for the timelapse features built into NVR software, which
-tend to record from the substream and give you low-resolution video. This talks
-to the cameras directly and takes whatever the main stream offers.
+It exists because NVR timelapse features are generally built around *clips*,
+not around one contiguous file per camera per day. Agent DVR, for instance, is
+perfectly capable of pulling full-resolution snapshots and producing good
+timelapses — but a camera reboot, or an ONVIF setting change, interrupts the
+recording and it resumes into a *new* file. A day ends up as several fragments
+rather than one video. There is also no built-in way to ship the results to
+another machine.
+
+This handles those specifically: capture is decoupled from the cameras' state,
+so a camera that drops out simply contributes fewer frames to the same day's
+file instead of splitting it, and finished videos are rsynced wherever you want
+them.
 
 Bug reports and camera compatibility reports are genuinely useful at this stage
 — see [CONTRIBUTING.md](CONTRIBUTING.md).
@@ -45,8 +54,14 @@ Bug reports and camera compatibility reports are genuinely useful at this stage
 The two daemons never talk to each other. They share only a directory layout,
 so either can be stopped, replaced or rewritten without touching the other.
 
+- **One file per camera per day, always.** Capture keeps no session state — each
+  frame is an independent fetch named after its wall-clock time. A camera that
+  reboots, or that you reconfigure over ONVIF mid-afternoon, just contributes
+  fewer frames to the same day. It never splits the output into fragments.
 - **NVENC AV1**, falling back to HEVC then x264 if the GPU or ffmpeg build
   can't do it. No silent failure.
+- **Automated hand-off.** Finished videos rsync to a NAS or another host, with
+  a guard that refuses to transfer if the share isn't actually mounted.
 - **Drift-free capture.** Threads wake on absolute wall-clock boundaries, so
   fetch latency never accumulates.
 - **Atomic frame writes**, so a half-written JPEG never exists on disk.

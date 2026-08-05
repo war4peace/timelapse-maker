@@ -11,11 +11,20 @@ guide.
 
 Produce daily timelapse videos from IP cameras, unattended.
 
-The motivating problem: NVR software (Agent DVR, Blue Iris, Frigate and others)
-usually ships a timelapse feature, and it usually records from whatever stream
-the NVR already has open — typically a substream, so the result is
-low-resolution. This system bypasses the NVR entirely and pulls full-resolution
-snapshots from the cameras over HTTP.
+The motivating problem is **continuity**, not image quality. NVR timelapse
+features are built around recording sessions: Agent DVR and its peers can pull
+full-resolution snapshots and produce perfectly good timelapses, but the
+recording is tied to the camera connection. A camera reboot, or an ONVIF
+setting change, ends the current file and starts a new one. A day then exists
+as several fragments instead of one video, and stitching them back together
+after the fact is exactly the work this avoids. Nor is there a built-in way to
+move finished videos to another machine.
+
+The design consequence is §2's split: capture holds no session state. Each
+frame is an independent HTTP fetch named after its wall-clock time and written
+into the day's directory. A camera that is unreachable for an hour contributes
+no frames for that hour and the day still encodes to one file — shorter, but
+whole. Nothing about a camera restarting is visible to the encoder at all.
 
 **In scope:** pulling snapshots, encoding them into daily videos, reporting
 results, shipping videos elsewhere.
@@ -232,7 +241,7 @@ logic cannot drift between the two).
 | Check | What it catches |
 |---|---|
 | `test_http` / `test_rtsp` | wrong credentials, wrong auth scheme, non-JPEG responses, slow cameras relative to the interval |
-| `probe_profiles` | ONVIF `Profile_N` returning substream resolution — the usual reason NVR timelapses are low-res |
+| `probe_profiles` | ONVIF `Profile_N` pointing at a substream. Profile numbering is not consistent across vendors, so it is easy to configure a low-resolution stream without noticing |
 | `test_encoders` | ffmpeg built without NVENC |
 | `test_disk` | projects daily usage from *measured* snapshot sizes against actual free space |
 | `test_transfer` | unmounted CIFS path, missing SSH key |

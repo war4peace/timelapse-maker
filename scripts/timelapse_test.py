@@ -132,8 +132,8 @@ def probe_profiles(cam, cfg):
     resolution each returns, so you can pick the full-resolution one.
 
     On Hikvision, Profile_1 is normally the main stream, Profile_2 the sub,
-    Profile_3 the third stream - which is why Agent DVR's Profile_3 gave
-    low-resolution images.
+    Profile_3 the third stream, but vendors are not consistent and the URL
+    gives no hint. Fetching each one and comparing is the only reliable way.
     """
     name = cam["name"]
     url = cam["url"]
