@@ -32,7 +32,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -164,26 +164,70 @@ def probe_encoder(ffmpeg, candidate):
     return probe_encoder_detail(ffmpeg, candidate)[0]
 
 
+# Verbose lines worth keeping from an NVENC probe. ffmpeg logs the real reason
+# a device was rejected at AV_LOG_VERBOSE and prints only the useless summary
+# ("No capable devices found") at error level.
+_VERBOSE_KEEP = (
+    "loaded nvenc version", "cuda capable devices", "gpu #",
+    "codec not supported", "does not support nvenc", "no capable devices",
+    "required nvenc features", "minimum required nvidia driver",
+    "opencodesessionex", "openencodesessionex", "cannot load", "sessions",
+    "not supported", "invalid param", "out of memory",
+)
+
+
+def probe_encoder_verbose(ffmpeg, candidate, size=None):
+    """The informative lines from a verbose probe run.
+
+    Only worth calling after a failure: it costs a second ffmpeg invocation and
+    exists purely to recover the reason that -loglevel error discards.
+    """
+    cmd = [ffmpeg, "-v", "verbose", "-y", "-hide_banner", "-nostats",
+           "-f", "lavfi", "-i", f"testsrc=size={size or PROBE_SIZE}:rate=1",
+           "-frames:v", "1"] + candidate["args"] + ["-f", "null", "-"]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    except Exception as exc:
+        return [f"could not run verbose probe: {exc}"]
+    lines, seen = [], set()
+    for raw in (p.stderr or "").splitlines():
+        low = raw.lower()
+        if not any(k in low for k in _VERBOSE_KEEP):
+            continue
+        text = raw.split("] ", 1)[-1].strip()
+        if text and text not in seen:
+            seen.add(text)
+            lines.append(text)
+    return lines
+
+
 def encoder_hint(codec, message, built_in=None):
     """Plain-language cause for a failed probe, or '' if there is nothing useful.
 
-    Deliberately derived from ffmpeg's message rather than guessed from the
-    codec name - claiming "your GPU is too old" when the real problem is the
-    ffmpeg build sends people down entirely the wrong path.
+    Derived from ffmpeg's message, never guessed from the codec name. An
+    earlier version guessed and told an RTX 4060 owner their GPU was too old
+    for AV1, which was both wrong and a dead end.
     """
     m = (message or "").lower()
     if built_in is False or "unknown encoder" in m:
         return (f"this ffmpeg build does not include {codec}; "
                 f"try jellyfin-ffmpeg or a BtbN static build")
-    if "no capable devices" in m or "no capable" in m:
-        return (f"the GPU or driver cannot do {codec} "
-                f"(AV1 encoding needs an RTX 40-series or newer, and a recent driver)")
-    if "invalid param" in m and "dimension" in m:
-        return "the probe frame was rejected as too small - please report this"
+    if "minimum required nvidia driver" in m:
+        return "the NVIDIA driver is older than this ffmpeg build requires"
     if "cannot load" in m or "libnvidia-encode" in m:
         return "the NVIDIA encode library is missing; install the driver's NVENC support"
-    if "out of memory" in m or "sessions" in m:
-        return "no free NVENC session - another process may be using the encoder"
+    if "out of memory" in m or "session" in m:
+        return ("no free NVENC session - another process (an NVR, a "
+                "transcoder) may be holding them all")
+    if "invalid param" in m and "dimension" in m:
+        return "the probe frame was rejected as too small - please report this"
+    if "codec not supported" in m or "no capable devices" in m:
+        # Ambiguous on purpose: the driver did not advertise this codec for
+        # this GPU, which is either a genuinely incapable GPU or an ffmpeg
+        # whose NVENC headers predate the codec. Do not assert which.
+        return (f"the driver did not advertise {codec} support for this GPU. "
+                f"If the GPU does support it, the ffmpeg build is the likely "
+                f"culprit - run 'timelapse test --encoders' for the details")
     return ""
 
 

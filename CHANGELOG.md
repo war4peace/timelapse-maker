@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.0.4] - 2026-08-06
+
+### Added
+- `timelapse test --encoders` — full diagnosis of why a hardware encoder is
+  unavailable: ffmpeg version and NVENC build flags, whether each NVENC codec
+  is compiled in at all, GPU and driver from `nvidia-smi`, and a **verbose**
+  probe per codec.
+- `probe_encoder_verbose()` recovers the lines ffmpeg logs at
+  `AV_LOG_VERBOSE` and discards at error level. This is where the real reason
+  lives: an RTX 3090 reports `Codec not supported` before the useless
+  `No capable devices found`, along with `Loaded Nvenc version 13.1` and the
+  GPU it actually saw.
+
+### Changed
+- The hint for `No capable devices found` / `Codec not supported` no longer
+  asserts a cause. Both an incapable GPU and an ffmpeg too old to ask the
+  driver for the codec produce that same line, and asserting either one was
+  the 0.0.3 bug in a new outfit. It now names both and points at
+  `--encoders`.
+- `nvidia-smi` cannot report NVENC codec capability at all; the diagnosis says
+  so explicitly rather than leaving people to hunt for it.
+
 ## [0.0.3] - 2026-08-05
 
 Bugs from the first real install on someone else's hardware.

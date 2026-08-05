@@ -272,11 +272,119 @@ class TestEncoderDiagnostics(unittest.TestCase):
         hint = enc.encoder_hint("av1_nvenc", "some other error", built_in=False)
         self.assertIn("build", hint)
 
-    def test_no_capable_devices_blames_the_hardware(self):
+    def test_no_capable_devices_does_not_assert_a_single_cause(self):
+        # "Codec not supported" / "No capable devices found" is genuinely
+        # ambiguous: an incapable GPU and an ffmpeg too old to ask for the
+        # codec produce the same line. Asserting either one was the original
+        # bug, so the hint must name both possibilities.
         hint = enc.encoder_hint("av1_nvenc", "No capable devices found",
                                 built_in=True)
         self.assertIn("GPU", hint)
-        self.assertNotIn("build", hint)
+        self.assertIn("build", hint)
+
+    def test_codec_not_supported_is_treated_the_same_way(self):
+        hint = enc.encoder_hint("av1_nvenc", "Codec not supported",
+                                built_in=True)
+        self.assertIn("did not advertise", hint)
+
+    def test_driver_too_old_is_named_precisely(self):
+        hint = enc.encoder_hint(
+            "av1_nvenc",
+            "The minimum required Nvidia driver for nvenc is 520.56.06 or newer",
+            built_in=True)
+        self.assertIn("driver", hint)
+        self.assertNotIn("GPU", hint)
+
+
+class TestVerboseProbeFiltering(unittest.TestCase):
+    """The verbose probe must surface the line that explains the failure."""
+
+    def run_filter(self, stderr_text):
+        captured = {}
+
+        class Result:
+            returncode = 1
+            stderr = stderr_text
+            stdout = ""
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return Result()
+
+        original = enc.subprocess.run
+        enc.subprocess.run = fake_run
+        try:
+            return enc.probe_encoder_verbose(
+                "ffmpeg", {"codec": "av1_nvenc", "args": ["-c:v", "av1_nvenc"]})
+        finally:
+            enc.subprocess.run = original
+
+    REAL_OUTPUT = """[av1_nvenc @ 0x1] Loaded Nvenc version 13.1
+[av1_nvenc @ 0x1] Nvenc initialized successfully
+[av1_nvenc @ 0x1] 1 CUDA capable devices found
+[av1_nvenc @ 0x1] [ GPU #0 - < NVIDIA GeForce RTX 3090 > has Compute SM 8.6 ]
+[av1_nvenc @ 0x1] Codec not supported
+[av1_nvenc @ 0x1] No capable devices found
+[vost#0:0] Starting thread...
+[vost#0:0] Task finished with error code: -22 (Invalid argument)
+"""
+
+    def test_keeps_the_explanatory_line(self):
+        lines = self.run_filter(self.REAL_OUTPUT)
+        self.assertIn("Codec not supported", lines)
+
+    def test_keeps_the_nvenc_version_and_gpu_identity(self):
+        lines = " | ".join(self.run_filter(self.REAL_OUTPUT))
+        self.assertIn("Loaded Nvenc version 13.1", lines)
+        self.assertIn("RTX 3090", lines)
+
+    def test_drops_unrelated_noise(self):
+        lines = " | ".join(self.run_filter(self.REAL_OUTPUT))
+        self.assertNotIn("Starting thread", lines)
+
+    def test_strips_the_ffmpeg_context_prefix(self):
+        # "[av1_nvenc @ 0x1] Codec not supported" -> "Codec not supported".
+        # The GPU line keeps its own brackets, which are part of the message.
+        for line in self.run_filter(self.REAL_OUTPUT):
+            self.assertNotIn("@ 0x", line, line)
+
+    def test_deduplicates_repeated_lines(self):
+        lines = self.run_filter(self.REAL_OUTPUT + self.REAL_OUTPUT)
+        self.assertEqual(len(lines), len(set(lines)))
+
+    def test_uses_the_standard_probe_size(self):
+        captured = {}
+
+        class Result:
+            returncode = 1
+            stderr = ""
+            stdout = ""
+
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            return Result()
+
+        original = enc.subprocess.run
+        enc.subprocess.run = fake_run
+        try:
+            enc.probe_encoder_verbose("ffmpeg", {"codec": "x", "args": []})
+        finally:
+            enc.subprocess.run = original
+        joined = " ".join(captured["cmd"])
+        self.assertIn(enc.PROBE_SIZE, joined)
+        self.assertIn("verbose", joined)
+
+    def test_a_crashing_probe_does_not_raise(self):
+        def boom(cmd, **kw):
+            raise OSError("nope")
+        original = enc.subprocess.run
+        enc.subprocess.run = boom
+        try:
+            lines = enc.probe_encoder_verbose("ffmpeg", {"codec": "x", "args": []})
+        finally:
+            enc.subprocess.run = original
+        self.assertEqual(len(lines), 1)
+        self.assertIn("could not run", lines[0])
 
     def test_dimension_error_is_flagged_as_our_bug(self):
         hint = enc.encoder_hint(

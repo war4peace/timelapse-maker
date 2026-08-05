@@ -34,7 +34,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-__version__ = "0.0.3"
+__version__ = "0.0.4"
 
 OUT = Path(os.environ.get("TIMELAPSE_TEST_DIR") or
            Path(tempfile.gettempdir()) / "timelapse-test")
@@ -205,6 +205,90 @@ def test_encoders(cfg):
         bad("No usable encoder at all - see the reasons above.")
 
 
+def diagnose_encoders(cfg):
+    """Everything needed to work out why a hardware encoder is unavailable.
+
+    Exists because the useful information is spread across ffmpeg's verbose
+    log, its build flags, and nvidia-smi - and the one line ffmpeg prints by
+    default ("No capable devices found") is the least useful of all.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import (PROBE_SIZE, encoder_hint, list_encoders,
+                                  probe_encoder_detail, probe_encoder_verbose)
+    ffmpeg = cfg["paths"].get("ffmpeg", "ffmpeg")
+
+    print("\n=== ffmpeg ===")
+    try:
+        v = subprocess.run([ffmpeg, "-version"], capture_output=True,
+                           text=True, timeout=30)
+    except Exception as exc:
+        bad(f"cannot run {ffmpeg}: {exc}")
+        return
+    banner = (v.stdout or "").splitlines()
+    info(banner[0] if banner else "unknown version")
+    config = " ".join(banner)
+    for flag in ("--enable-nvenc", "--enable-cuda", "--enable-cuvid",
+                 "--enable-ffnvcodec", "--enable-nonfree"):
+        if flag in config:
+            info(f"built with {flag}")
+    if "--enable-nvenc" not in config and "ffnvcodec" not in config:
+        warn("no NVENC flag in the build configuration; this ffmpeg may have "
+             "been built without NVIDIA support")
+
+    print("\n=== NVENC encoders in this build ===")
+    built = list_encoders(ffmpeg) or set()
+    for codec in ("av1_nvenc", "hevc_nvenc", "h264_nvenc"):
+        (ok if codec in built else bad)(
+            f"{codec} {'present' if codec in built else 'NOT COMPILED IN'}")
+    if "av1_nvenc" not in built:
+        info("An ffmpeg built against nv-codec-headers older than 11.1 has no")
+        info("av1_nvenc at all. jellyfin-ffmpeg or a BtbN static build will.")
+
+    print("\n=== GPU ===")
+    try:
+        q = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,driver_version,encoder.stats.sessionCount",
+             "--format=csv,noheader"], capture_output=True, text=True, timeout=30)
+        if q.returncode == 0 and q.stdout.strip():
+            for line in q.stdout.strip().splitlines():
+                info(line.strip())
+            info("nvidia-smi does not report which codecs NVENC supports; "
+                 "only the probe below can tell you that")
+        else:
+            warn("nvidia-smi returned nothing useful")
+    except FileNotFoundError:
+        warn("nvidia-smi not found - no NVIDIA driver installed?")
+    except Exception as exc:
+        warn(f"nvidia-smi failed: {exc}")
+
+    print(f"\n=== Probe ({PROBE_SIZE}) ===")
+    for codec in ("av1_nvenc", "hevc_nvenc", "h264_nvenc", "libx264"):
+        if codec not in built:
+            continue
+        cand = {"codec": codec, "args": ["-c:v", codec]}
+        available, message = probe_encoder_detail(ffmpeg, cand)
+        if available:
+            ok(f"{codec} works")
+            continue
+        bad(f"{codec} failed")
+        hint = encoder_hint(codec, message, True)
+        if hint:
+            info(f"  {hint}")
+        # The reason ffmpeg hides at error level.
+        for line in probe_encoder_verbose(ffmpeg, cand):
+            info(f"  ffmpeg: {line}")
+
+    print("\n=== If a hardware encoder you expect is missing ===")
+    info("1. 'Codec not supported' with a GPU that does support it means the")
+    info("   ffmpeg build is too old to ask the driver for that codec.")
+    info("2. Try a known-good build and point paths.ffmpeg at it:")
+    info("     sudo apt install jellyfin-ffmpeg7    # /usr/lib/jellyfin-ffmpeg/ffmpeg")
+    info("   or a static build from https://github.com/BtbN/FFmpeg-Builds")
+    info("3. Falling back to hevc_nvenc is not a problem - it is fast and the")
+    info("   quality is fine. AV1 mainly buys smaller files.")
+    print()
+
+
 def test_disk(cfg, avg_bytes, n_cameras):
     root = Path(cfg["paths"]["frames_root"])
     probe = root if root.exists() else root.parent
@@ -331,6 +415,8 @@ def main():
     ap.add_argument("--no-discord", action="store_true")
     ap.add_argument("--probe-profiles", action="store_true",
                     help="for ONVIF snapshot URLs, compare Profile_1..4 resolutions")
+    ap.add_argument("--encoders", action="store_true",
+                    help="diagnose why a hardware encoder is unavailable")
     args = ap.parse_args()
 
     with open(args.config, encoding="utf-8") as fh:
@@ -339,6 +425,10 @@ def main():
     cams = [c for c in cfg["cameras"] if c.get("enabled", True)]
     if args.camera:
         cams = [c for c in cams if c["name"].lower() == args.camera.lower()]
+
+    if args.encoders:
+        diagnose_encoders(cfg)
+        return
 
     if args.probe_profiles:
         onvif = [c for c in cams if "Profile_" in c.get("url", "")]
