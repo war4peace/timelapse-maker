@@ -51,6 +51,11 @@ Bug reports and camera compatibility reports are genuinely useful at this stage
 | `timelapse_test.py` | Pre-flight checker — run before enabling anything | manually |
 | `timelapse_setup.py` | Storage-aware configuration wizard | installer, or `timelapse setup` |
 
+Day-to-day, one command covers the rest — `timelapse cameras` to add, edit or
+remove a camera (it restarts capture for you, and warns before an edit would
+strand frames the encoder hasn't reached yet), plus `transfer`, `test`,
+`encode`, `logs`, `status` and `version`. No reinstall, no hand-edited JSON.
+
 The two daemons never talk to each other. They share only a directory layout,
 so either can be stopped, replaced or rewritten without touching the other.
 

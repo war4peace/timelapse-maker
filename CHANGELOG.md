@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [Unreleased]
+
+### Added
+- **`timelapse cameras`** — add, edit, remove, enable/disable and test cameras
+  against an existing config, without reinstalling or re-running the whole
+  wizard. It restarts `timelapse-capture.service` for you, since the daemon
+  reads its camera list only at startup.
+
+  It also refuses to strand frames silently. The nightly encode builds its work
+  list from the cameras *enabled* in the config and looks for
+  `<frames_root>/<name>/`, so removing a camera, **disabling** one, or renaming
+  one without moving its directory all orphan whatever it has already captured,
+  permanently. Each warns first and names the `timelapse encode --date` that
+  would rescue those days; a rename offers to move the directory instead.
+  Disabling being just as destructive as removing is the easy one to miss.
+
+  Passwords carried in a URL query string are masked in the listing —
+  `ask_secret()` keeps them out of scroll-back when typed, so printing the
+  camera table would defeat it.
+
 ## [0.0.8] - 2026-08-06
 
 ### Fixed

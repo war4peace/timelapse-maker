@@ -351,6 +351,40 @@ at least 20 GB — the OS disk is a poor place to write 17k files a day.
   `install.sh` splices into `ReadWritePaths=`. Paths already covered by a parent
   in the set are dropped.
 
+**Focused modes.** The wizard is also the maintenance tool, so a change after
+install never means reinstalling or re-answering everything:
+
+- `--transfer-only` (`timelapse transfer`) — just the destination, including
+  re-deriving `ReadWritePaths=` when a share is added after the fact.
+- `--cameras-only` (`timelapse cameras`) — add/edit/remove/enable/test, looping
+  on a listing. Both load the existing config, change one section, and write it
+  back through `write_config()`, so ownership and the `.bak` copy are handled
+  the same way as a full run.
+
+`--cameras-only` carries two responsibilities that are easy to lose:
+
+1. **It restarts `timelapse-capture.service`.** The daemon reads its camera list
+   once at startup — the same trap `install.sh` had when it replaced scripts
+   under a live service. `restart_capture_if_running()` asks, and says what to
+   run if declined. Cameras never change paths, so the units themselves are
+   untouched.
+2. **It refuses to strand frames silently.** `find_pending()` in the encoder
+   iterates cameras *enabled* in the config and looks for
+   `<frames_root>/<name>/`, so removing a camera, **disabling** one, or renaming
+   one without moving its directory all orphan whatever it has already
+   captured — permanently, since nothing else will ever encode it.
+   `warn_stranded()` counts the un-encoded day directories and names the
+   `timelapse encode --date` that would rescue them; `rename_camera_frames()`
+   offers to move the directory instead. Disabling being just as destructive as
+   removing is the non-obvious half, and is why `x` warns as loudly as `r`.
+
+`redact_url()` masks `password=` in the listing. Not theatre: `ask_secret()`
+exists to keep credentials out of scroll-back, and printing the camera table
+would hand them straight back. The listing elides the *middle* of a long URL
+rather than the tail, because Reolink-style URLs are identical for their first
+40 characters and a plain truncation both makes every camera look the same and
+cuts off the `***`, reading as though nothing were masked.
+
 **Input handling.** `init_tty()` picks a source: stdin if it is a terminal,
 otherwise `/dev/tty`, otherwise defaults-only. It must *never* silently read a
 piped stdin — under `curl … | bash` that pipe is the installer script itself.

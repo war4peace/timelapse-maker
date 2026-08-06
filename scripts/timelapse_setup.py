@@ -16,9 +16,11 @@ Every question has a default in [brackets]; pressing Enter accepts it.
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path, PurePosixPath
 
 __version__ = "0.0.8"
@@ -593,6 +595,257 @@ def add_one_camera(cfg, n):
         if not test_camera(cam, cfg) and not ask_yes("Keep it anyway?", True):
             return None
     return cam
+
+
+# ----------------------------------------------------------------------------
+# Camera management (--cameras-only)
+#
+# The nightly encode builds its work list from the cameras named *and enabled*
+# in the config, and looks for <frames_root>/<name>/. So a camera's identity in
+# the config is what makes its already-captured frames reachable: remove it,
+# disable it, or rename it without moving the directory, and everything it has
+# captured becomes invisible to the encoder and sits on disk forever. Each of
+# those three paths below warns about that rather than silently stranding data.
+# ----------------------------------------------------------------------------
+
+DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CRED_IN_URL_RE = re.compile(r"((?:password|passwd|pwd|pass)=)[^&]*", re.I)
+
+
+def sanitise_name(raw, fallback):
+    """Camera names become directory names, so keep them boring."""
+    return "".join(ch for ch in raw if ch.isalnum() or ch in "-_") or fallback
+
+
+def redact_url(url):
+    """Mask credentials carried in the query string (the Reolink shape).
+
+    ask_secret() exists to keep passwords out of scroll-back; printing the
+    camera list would hand them straight back otherwise.
+    """
+    return CRED_IN_URL_RE.sub(r"\1***", url)
+
+
+def camera_frames_dir(cfg, name):
+    return Path(cfg["paths"]["frames_root"]) / name
+
+
+def pending_days(cfg, name):
+    """Completed day directories this camera has captured but not yet encoded."""
+    d = camera_frames_dir(cfg, name)
+    if not d.is_dir():
+        return []
+    today = date.today().isoformat()
+    try:
+        return sorted(p for p in d.iterdir()
+                      if p.is_dir() and DAY_DIR_RE.match(p.name) and p.name < today)
+    except OSError:
+        return []
+
+
+def warn_stranded(cfg, name, verb):
+    """True if the user still wants to go ahead."""
+    pend = pending_days(cfg, name)
+    if not pend:
+        return ask_yes(f"{verb.capitalize()} '{name}'?", False)
+    warn(f"'{name}' has {len(pend)} un-encoded day(s) in "
+         f"{camera_frames_dir(cfg, name)}")
+    note("The nightly encode only looks at cameras enabled in the config, so")
+    note(f"this would leave those frames on disk with nothing to encode them.")
+    note(f"Encode them first with:  timelapse encode --date {pend[0].name}")
+    return ask_yes(f"{verb.capitalize()} it anyway?", False)
+
+
+def name_taken(cams, name, skip=None):
+    # Case-insensitive: two cameras differing only in case would be two config
+    # entries writing into two directories that differ only in case, which is a
+    # trap on any case-insensitive destination the videos get copied to.
+    low = name.lower()
+    return any(c is not skip and str(c.get("name", "")).lower() == low
+               for c in cams)
+
+
+def list_cameras(cfg):
+    cams = cfg.get("cameras", [])
+    if not cams:
+        note("No cameras configured.")
+        return
+    print()
+    print(f"    {'#':>2}  {'Name':<14} {'On':<4}{'Type':<6}URL")
+    for i, cam in enumerate(cams, 1):
+        # Elide the middle, not the tail. Reolink-style URLs are identical for
+        # their first 40 characters, so a plain truncation makes every camera
+        # look the same - and it would hide the *** that shows the password is
+        # masked, which reads as though nothing were redacted at all.
+        url = redact_url(str(cam.get("url", "")))
+        if len(url) > 44:
+            url = url[:24] + "..." + url[-17:]
+        state = "yes" if cam.get("enabled", True) else dim("no")
+        print(f"    {i:>2}  {str(cam.get('name', '')):<14} {state:<4}"
+              f"{str(cam.get('method', 'http')):<6}{dim(url)}")
+
+
+def pick_camera(cams, verb):
+    if not cams:
+        fail(f"No cameras to {verb}.")
+        return None
+    n = ask_int(f"Which camera to {verb}? (0 cancels)", 0, 0, len(cams))
+    return None if n == 0 else n - 1
+
+
+def rename_camera_frames(cfg, old, new):
+    """Move the frames directory so a rename does not orphan what it captured."""
+    src, dst = camera_frames_dir(cfg, old), camera_frames_dir(cfg, new)
+    if not src.is_dir():
+        return
+    if dst.exists():
+        warn(f"{dst} already exists, so the frames under '{old}' cannot move.")
+        note("Merge the two directories by hand or they will not be encoded.")
+        return
+    if not ask_yes(f"Move already-captured frames '{old}/' -> '{new}/'?", True):
+        warn(f"Frames under '{old}' will no longer be encoded.")
+        return
+    try:
+        src.rename(dst)
+        good(f"Moved {src} -> {dst}")
+    except OSError as exc:
+        fail(f"Could not move the frames: {exc}")
+        warn(f"Frames under '{old}' will no longer be encoded.")
+
+
+def edit_one_camera(cfg, cams, cam):
+    old_name = str(cam.get("name", ""))
+    print()
+    print(f"  {bold('Editing ' + old_name)}")
+    note("Enter keeps the current value.")
+
+    while True:
+        new_name = sanitise_name(ask("Name", old_name), old_name)
+        if new_name != old_name and name_taken(cams, new_name, skip=cam):
+            fail(f"Another camera is already called '{new_name}'.")
+            continue
+        break
+
+    cam["url"] = ask("Snapshot URL", str(cam.get("url", "")))
+    if cam.get("method", "http") == "http":
+        cam["auth"] = ask("Auth (digest/basic/none)",
+                          str(cam.get("auth", "none"))).lower()
+        if cam["auth"] in ("digest", "basic"):
+            cam["username"] = ask("Username", str(cam.get("username", "")))
+            pw = ask_secret("Password (blank keeps the current one)")
+            if pw:
+                cam["password"] = pw
+        else:
+            cam.pop("username", None)
+            cam.pop("password", None)
+
+    if new_name != old_name:
+        rename_camera_frames(cfg, old_name, new_name)
+        cam["name"] = new_name
+    if ask_yes("Test it now?", True):
+        test_camera(cam, cfg)
+    return cam
+
+
+def restart_capture_if_running():
+    """Capture reads its config once, at startup.
+
+    Same trap the installer had when it replaced scripts under a live service:
+    editing the file changes nothing until the daemon restarts.
+    """
+    if not shutil.which("systemctl"):
+        return
+    try:
+        active = subprocess.run(
+            ["systemctl", "is-active", "--quiet", "timelapse-capture.service"],
+            timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if active.returncode != 0:
+        note("Capture is not running; the new list applies when it next starts.")
+        return
+    print()
+    if not ask_yes("Restart capture so the change takes effect now?", True):
+        warn("Capture is still using the previous camera list.")
+        note("Apply it with: systemctl restart timelapse-capture.service")
+        return
+    try:
+        r = subprocess.run(["systemctl", "restart", "timelapse-capture.service"],
+                           timeout=90)
+    except (OSError, subprocess.SubprocessError) as exc:
+        fail(f"Restart failed: {exc}")
+        return
+    if r.returncode == 0:
+        good("Capture restarted on the new camera list.")
+    else:
+        fail("Restart failed (are you root?).")
+        note("See: journalctl -u timelapse-capture -n 40")
+
+
+def manage_cameras(cfg):
+    """Interactive add/edit/remove loop. True if anything changed."""
+    heading("Cameras")
+    if AUTO or _TTY is None:
+        fail("Managing cameras needs a terminal.")
+        return False
+
+    cams = cfg.setdefault("cameras", [])
+    changed = False
+    while True:
+        list_cameras(cfg)
+        print()
+        note("a add   e edit   r remove   x enable/disable   t test   q save & quit")
+        action = ask("Action", "q").strip().lower()[:1]
+
+        if action == "a":
+            cam = add_one_camera(cfg, len(cams) + 1)
+            if cam:
+                if name_taken(cams, cam["name"]):
+                    fail(f"A camera called '{cam['name']}' already exists; "
+                         "two cameras cannot share a frames directory.")
+                else:
+                    cams.append(cam)
+                    changed = True
+                    good(f"Added '{cam['name']}' ({len(cams)} configured)")
+
+        elif action == "e":
+            i = pick_camera(cams, "edit")
+            if i is not None:
+                edit_one_camera(cfg, cams, cams[i])
+                changed = True
+
+        elif action == "r":
+            i = pick_camera(cams, "remove")
+            if i is not None and warn_stranded(cfg, str(cams[i].get("name", "")),
+                                               "remove"):
+                good(f"Removed '{cams.pop(i).get('name', '')}'")
+                changed = True
+
+        elif action == "x":
+            i = pick_camera(cams, "enable or disable")
+            if i is not None:
+                cam = cams[i]
+                name = str(cam.get("name", ""))
+                if cam.get("enabled", True):
+                    if not warn_stranded(cfg, name, "disable"):
+                        continue
+                    cam["enabled"] = False
+                    good(f"'{name}' disabled")
+                else:
+                    cam["enabled"] = True
+                    good(f"'{name}' enabled")
+                changed = True
+
+        elif action == "t":
+            i = pick_camera(cams, "test")
+            if i is not None:
+                test_camera(cams[i], cfg)
+
+        elif action == "q":
+            return changed
+
+        else:
+            fail(f"Unknown action '{action}'.")
 
 
 def explain_payload(data):
@@ -1337,6 +1590,8 @@ def main():
                     help="read answers from stdin instead of the terminal")
     ap.add_argument("--transfer-only", action="store_true",
                     help="reconfigure just the transfer destination")
+    ap.add_argument("--cameras-only", action="store_true",
+                    help="add, edit or remove cameras in an existing config")
     ap.add_argument("--print-paths", metavar="CONFIG",
                     help="print the paths systemd must be allowed to write")
     ap.add_argument("--version", action="version",
@@ -1357,6 +1612,29 @@ def main():
     print(bold("  ╚══════════════════════════════════════════════════════════╝"))
     print()
     note("Press Enter to accept the [default] shown for any question.")
+
+    # Manage cameras against an existing config. Adding a camera after the
+    # initial install must not mean re-running the whole wizard, and must not
+    # mean reinstalling: nothing here touches paths, so the units are unchanged.
+    if args.cameras_only:
+        try:
+            with open(args.output, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except OSError:
+            fail(f"No existing config at {args.output}; run the full wizard.")
+            return 1
+        if not manage_cameras(cfg):
+            print()
+            note("No changes made.")
+            return 0
+        heading("Writing configuration")
+        write_config(cfg, args.output, args.owner)
+        good(f"Updated {args.output}")
+        enabled = [c for c in cfg["cameras"] if c.get("enabled", True)]
+        note(f"{len(cfg['cameras'])} camera(s), {len(enabled)} enabled")
+        restart_capture_if_running()
+        print()
+        return 0
 
     # Re-run just the transfer section against an existing config, so a share
     # can be set up after the fact without walking the whole wizard again.

@@ -357,13 +357,56 @@ Exit codes: `0` all good, `1` partial failure, `2` critical.
 Changing the config requires `systemctl restart timelapse-capture`. The encoder
 re-reads it on every run.
 
-## 9. Adding a camera
+## 9. Adding, editing and removing cameras
 
-Add one entry to `cameras[]`, run `timelapse_test.py --camera <Name>`, then
-restart capture. No code changes. The frames directory is created on first
-capture.
+```bash
+sudo timelapse cameras
+```
 
-Renaming a camera orphans its existing frames — the encoder walks directories
-under configured camera names only, so frames under the old name are stranded.
-Let a rename take effect after a successful encode, or move the directory
-yourself.
+No reinstall, and no walking the whole wizard again. It lists what you have and
+loops on single-key actions:
+
+```
+     #  Name           On  Type  URL
+     1  Doorbell       yes http  http://192.168.2.201/cgi-...&password=***
+     2  Roof           yes http  http://192.168.2.206/onvif-http/snapshot
+     3  Garage         no  http  http://192.168.2.210/ISAPI/Streaming/ch...
+
+  a add   e edit   r remove   x enable/disable   t test   q save & quit
+```
+
+Adding uses the same preset list and live test as the installer. Passwords in
+the query string are masked in the listing — `ask_secret` keeps them out of
+scroll-back when you type them, so printing them back would defeat it.
+
+**It restarts capture for you.** The daemon reads its camera list once, at
+startup, so an edit does nothing until it restarts; you are asked, and told the
+command if you decline. Nothing here touches paths, so the systemd units are
+unaffected.
+
+### It will not let you strand frames silently
+
+The nightly encode builds its work list from the cameras **enabled** in the
+config and looks for `<frames_root>/<name>/`. So three things can orphan
+already-captured frames, and each one warns first:
+
+| Action | What would be lost |
+|---|---|
+| Remove a camera | Every un-encoded day it has captured |
+| **Disable** a camera | The same — `enabled: false` hides it from the encoder too, which is easy to miss |
+| Rename a camera | Everything under the old directory name |
+
+```
+  WARN  'Roof' has 1 un-encoded day(s) in /srv/frames/Roof
+  The nightly encode only looks at cameras enabled in the config, so
+  this would leave those frames on disk with nothing to encode them.
+  Encode them first with:  timelapse encode --date 2020-01-02
+  Remove it anyway? (y/N):
+```
+
+A rename offers to move the directory with it, so that case is normally
+handled for you. Frames are never deleted — a removed camera's directory stays
+on disk, and re-adding it under the same name picks it straight back up.
+
+Editing `config.json` by hand still works (`timelapse config`), but then the
+restart and the stranding checks are yours to remember.

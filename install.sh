@@ -248,6 +248,8 @@ case "\${1:-}" in
     setup)     shift; exec python3 $PREFIX/timelapse_setup.py --output "$CONFIG" \\
                           --template "$CONFDIR/config.example.json" \\
                           --owner "$SVCUSER" "\$@" ;;
+    cameras)   shift; exec python3 $PREFIX/timelapse_setup.py --cameras-only \\
+                          --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     transfer)  shift; exec python3 $PREFIX/timelapse_setup.py --transfer-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     config)    exec \${EDITOR:-nano} "$CONFIG" ;;
@@ -274,7 +276,7 @@ case "\${1:-}" in
         fi
         ;;
     *)
-        echo "usage: timelapse {setup|transfer|test|encode|config|logs|status|version}"
+        echo "usage: timelapse {setup|cameras|transfer|test|encode|config|logs|status|version}"
         exit 1 ;;
 esac
 EOF
@@ -417,7 +419,7 @@ offer_enable() {
     fi
 
     printf '\n'
-    say "${B}timelapse${N} status | logs | test | encode | config | setup | transfer | version"
+    say "${B}timelapse${N} status | logs | test | encode | config | cameras | transfer | version"
 }
 
 as_service_user() {

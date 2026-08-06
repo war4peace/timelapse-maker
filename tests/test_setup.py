@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -490,6 +491,140 @@ class TestCameraCounter(unittest.TestCase):
         # Answering with a bare Enter after meeting the estimate should stop.
         cams, _ = self.drive(self.ONE + "\n", 1)
         self.assertEqual(len(cams), 1)
+
+
+class TestCameraManagement(unittest.TestCase):
+    """`timelapse cameras` — add/edit/remove against a live config.
+
+    The bias in these tests is toward the ways this can silently lose data.
+    The encoder builds its work list from the cameras *enabled* in the config
+    and looks for <frames_root>/<name>/, so removing, disabling or renaming a
+    camera can strand everything it has already captured.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cfg = {"paths": {"frames_root": str(self.tmp)},
+                    "capture": {"timeout_seconds": 4},
+                    "cameras": [
+                        {"name": "Gate", "enabled": True, "method": "http",
+                         "url": "http://192.0.2.1/snap", "auth": "none"},
+                        {"name": "Roof", "enabled": True, "method": "http",
+                         "url": "http://192.0.2.2/snap", "auth": "none"}]}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        setup._TTY, setup.AUTO = None, False
+
+    def drive(self, keystrokes, fn):
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = fn()
+        return result, buf.getvalue()
+
+    def day(self, camera, name):
+        d = self.tmp / camera / name
+        d.mkdir(parents=True)
+        return d
+
+    # -- stranded frames ----------------------------------------------------
+
+    def test_removing_a_camera_with_unencoded_frames_warns(self):
+        self.day("Gate", "2020-01-01")
+        _, out = self.drive("n\n", lambda: setup.warn_stranded(
+            self.cfg, "Gate", "remove"))
+        self.assertIn("1 un-encoded day", out)
+        self.assertIn("timelapse encode --date 2020-01-01", out)
+
+    def test_declining_the_warning_stops_the_removal(self):
+        self.day("Gate", "2020-01-01")
+        keep, _ = self.drive("n\n", lambda: setup.warn_stranded(
+            self.cfg, "Gate", "remove"))
+        self.assertFalse(keep)
+
+    def test_a_camera_with_no_pending_frames_just_confirms(self):
+        ok, out = self.drive("y\n", lambda: setup.warn_stranded(
+            self.cfg, "Gate", "remove"))
+        self.assertTrue(ok)
+        self.assertNotIn("un-encoded", out)
+
+    def test_todays_frames_are_not_counted_as_pending(self):
+        # Today is still being captured; the encoder deliberately skips it, so
+        # warning about it would cry wolf every single time.
+        self.day("Gate", date.today().isoformat())
+        self.assertEqual(setup.pending_days(self.cfg, "Gate"), [])
+
+    def test_non_date_directories_are_ignored(self):
+        self.day("Gate", "notadate")
+        self.assertEqual(setup.pending_days(self.cfg, "Gate"), [])
+
+    def test_disabling_warns_too_because_encode_skips_disabled_cameras(self):
+        self.day("Roof", "2020-01-01")
+        _, out = self.drive("n\n", lambda: setup.warn_stranded(
+            self.cfg, "Roof", "disable"))
+        self.assertIn("un-encoded", out)
+
+    # -- renaming -----------------------------------------------------------
+
+    def test_renaming_moves_the_frames_directory(self):
+        self.day("Gate", "2020-01-01")
+        self.drive("y\n", lambda: setup.rename_camera_frames(
+            self.cfg, "Gate", "FrontGate"))
+        self.assertTrue((self.tmp / "FrontGate" / "2020-01-01").is_dir())
+        self.assertFalse((self.tmp / "Gate").exists())
+
+    def test_declining_the_move_leaves_the_frames_and_says_so(self):
+        self.day("Gate", "2020-01-01")
+        _, out = self.drive("n\n", lambda: setup.rename_camera_frames(
+            self.cfg, "Gate", "FrontGate"))
+        self.assertTrue((self.tmp / "Gate" / "2020-01-01").is_dir())
+        self.assertIn("no longer be encoded", out)
+
+    def test_rename_into_an_existing_directory_refuses_to_merge(self):
+        self.day("Gate", "2020-01-01")
+        self.day("Roof", "2020-01-02")
+        _, out = self.drive("y\n", lambda: setup.rename_camera_frames(
+            self.cfg, "Gate", "Roof"))
+        self.assertTrue((self.tmp / "Gate" / "2020-01-01").is_dir())
+        self.assertTrue((self.tmp / "Roof" / "2020-01-02").is_dir())
+        self.assertIn("already exists", out)
+
+    # -- names --------------------------------------------------------------
+
+    def test_duplicate_names_are_rejected_case_insensitively(self):
+        cams = self.cfg["cameras"]
+        self.assertTrue(setup.name_taken(cams, "gate"))
+        self.assertTrue(setup.name_taken(cams, "GATE"))
+        self.assertFalse(setup.name_taken(cams, "Garage"))
+
+    def test_a_camera_does_not_collide_with_itself_when_edited(self):
+        cams = self.cfg["cameras"]
+        self.assertFalse(setup.name_taken(cams, "Gate", skip=cams[0]))
+
+    def test_names_are_reduced_to_safe_directory_characters(self):
+        self.assertEqual(setup.sanitise_name("Front Gate!", "x"), "FrontGate")
+        self.assertEqual(setup.sanitise_name("../etc", "x"), "etc")
+        self.assertEqual(setup.sanitise_name("!!!", "fallback"), "fallback")
+
+    # -- credentials --------------------------------------------------------
+
+    def test_the_camera_list_does_not_print_passwords(self):
+        # ask_secret() keeps them out of scroll-back; the listing must not
+        # hand them straight back.
+        self.cfg["cameras"][0]["url"] = (
+            "http://192.0.2.1/cgi-bin/api.cgi?cmd=Snap&user=admin"
+            "&password=hunter2&channel=0")
+        _, out = self.drive("", lambda: setup.list_cameras(self.cfg))
+        self.assertNotIn("hunter2", out)
+        self.assertIn("***", out)
+
+    def test_redaction_keeps_the_rest_of_the_url_intact(self):
+        red = setup.redact_url("http://h/a?user=admin&password=p%40ss&channel=0")
+        self.assertIn("user=admin", red)
+        self.assertIn("channel=0", red)
+        self.assertNotIn("p%40ss", red)
 
 
 class TestWebhookVerificationMarker(unittest.TestCase):
