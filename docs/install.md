@@ -335,15 +335,71 @@ write-once/read-once.
 Write endurance is a non-issue on SSD: even 110 GB/day is ~40 TB/year against a
 typical 600 TBW consumer rating.
 
-## 8. Day to day
+## 8. Day to day — the `timelapse` command
+
+The installer puts a single wrapper on `PATH`. Everything below is a subcommand
+of it; nothing needs a reinstall.
+
+| Command | What it does |
+|---|---|
+| `timelapse status` | `systemctl status` for the capture service and the encode timer, in one shot — running or not, how long, recent log lines, and when the next encode fires. |
+| `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
+| `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
+| `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and Discord. Run it after any change. |
+| `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. §9. |
+| `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
+| `timelapse setup` | The full wizard again — storage, capture settings, cameras, transfer, Discord. Overwrites the whole config, so prefer `cameras` or `transfer` for a single change. |
+| `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover. You are then responsible for restarting capture yourself. |
+| `timelapse encode` | Runs the nightly encode immediately instead of waiting for 00:05. Useful to clear a backlog. |
+| `timelapse version` | The installed version of each script, and a warning if the running daemon predates them. |
+
+**Which need root.** `config.json` is `0640 root:timelapse` because it holds
+camera credentials. So `setup`, `cameras`, `transfer` and `config` need `sudo`
+(they write it), and `test`, `usage` and `encode` need either `sudo` or
+membership of the `timelapse` group (they read it). `status`, `logs` and
+`version` work unprivileged.
+
+**A config change only reaches capture when it restarts.** The daemon reads its
+camera list once, at startup. `timelapse cameras` handles that for you; after a
+hand-edit with `timelapse config`, run `sudo systemctl restart
+timelapse-capture`. The encoder re-reads the config on every run, so it never
+needs this.
+
+### Checking disk usage
 
 ```bash
-journalctl -u timelapse-capture -f
-systemctl list-timers timelapse-encode.timer
-find /var/lib/timelapse/frames -name '*.jpg' | wc -l    # ≈720/hour/camera
-du -sh /var/lib/timelapse/frames/*
-sudo systemctl start timelapse-encode.service           # force a run now
+timelapse usage
 ```
+
+```
+=== Frames: /var/lib/timelapse/frames ===
+  Camera          Days     Frames       Size  Range
+  --------------------------------------------------------------------------
+  Doorbell           2     34,560     14.2 GB  2026-08-05..2026-08-06
+  Driveway           -          -          -  -                       not captured yet
+  Garage             3     51,840     21.0 GB  2026-08-01..2026-08-03  ORPHAN
+  Roof               1     17,280      7.1 GB  2026-08-06
+  Workshop           1      9,000      3.7 GB  2026-08-06              disabled
+  --------------------------------------------------------------------------
+  total              7    112,680     46.0 GB
+  ....  average frame 430 KB
+
+  WARN  'Garage' has frames on disk but is not in the config at all.
+  WARN  'Workshop' has frames on disk but is disabled in the config.
+  ....  The nightly encode skips them, so those frames stay forever.
+```
+
+The two flagged rows are the point of the command. The encode job only walks
+cameras **enabled** in the config, so a camera you removed — or merely disabled
+— keeps everything it ever captured, and nothing will ever encode or delete it.
+That is normally what is eating the disk. Re-enable the camera, or encode the
+days out with `timelapse encode --date YYYY-MM-DD`.
+
+`ORPHAN` means no config entry at all; `disabled` means the entry exists with
+`enabled: false`. Frames are never deleted behind your back, so both are safe
+to leave — they just cost space.
+
+It stats every frame file, so on a busy install expect a few seconds.
 
 **Encoder CLI**
 
@@ -352,10 +408,8 @@ timelapse_encode.py [config] [--date YYYY-MM-DD] [--dry-run]
                              [--keep-frames] [--no-transfer]
 ```
 
-Exit codes: `0` all good, `1` partial failure, `2` critical.
-
-Changing the config requires `systemctl restart timelapse-capture`. The encoder
-re-reads it on every run.
+Exit codes: `0` all good, `1` partial failure, `2` critical. Pass these through
+the wrapper too: `timelapse encode --date 2026-08-01 --keep-frames`.
 
 ## 9. Adding, editing and removing cameras
 

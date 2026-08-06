@@ -311,6 +311,25 @@ logic cannot drift between the two).
 | `test_transfer` | unmounted CIFS path, missing SSH key |
 | `test_discord` | bad webhook URL |
 
+It also hosts `--usage` (`timelapse usage`), which is a report rather than a
+check but belongs to the same "inspect this installation" job and reuses
+`test_disk`'s free-space handling. `report_usage()` walks `frames_root` with
+`os.scandir` — a stat per frame, so seconds on a six-figure tree — and prints
+frames, bytes and date range per camera.
+
+Its real purpose is the third column. It compares directories on disk against
+the config and flags two states that `du` cannot show you:
+
+- **`ORPHAN`** — a directory with no config entry at all.
+- **`disabled`** — an entry with `enabled: false`.
+
+`find_pending()` walks only cameras *enabled* in the config, so in both cases
+nothing will ever encode or delete those frames. They are the usual answer to
+"why is the disk full", and disabling being as final as removing is the part
+nobody expects. Leftover `.tmp` files are counted separately: they are captures
+that died between `write()` and `os.replace()`, and folding them into the frame
+total would misreport both count and size.
+
 Samples land in a temp directory (override with `TIMELAPSE_TEST_DIR`) for visual
 inspection. `--probe-profiles` short-circuits everything else.
 
@@ -606,15 +625,16 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 467 lines
-scripts/timelapse_capture.py     daemon, 340 lines
-scripts/timelapse_encode.py      batch job, 491 lines
-scripts/timelapse_test.py        pre-flight checks, 320 lines
-scripts/timelapse_setup.py       configuration wizard, 850 lines
+install.sh                       bootstrap installer, 527 lines
+scripts/timelapse_capture.py     daemon, 401 lines
+scripts/timelapse_encode.py      batch job, 685 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
+scripts/timelapse_setup.py       configuration wizard, 1687 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
 tests/test_setup.py              unit tests
+tests/test_usage.py              unit tests
 tests/smoke_test.py              end-to-end encode check, needs ffmpeg
 config/config.example.json       template; the real config.json is gitignored
 service/timelapse-capture.service

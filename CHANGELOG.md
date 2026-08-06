@@ -10,6 +10,19 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Added
+- **`timelapse usage`** — disk report: frames, bytes and date range per camera,
+  totals, videos and free space. It also names the directories nothing will
+  ever encode: a camera removed from the config (`ORPHAN`) or merely disabled
+  keeps everything it captured, because the nightly encode walks only the
+  cameras *enabled* in the config. That is usually what is filling the disk,
+  and it is invisible to `du`.
+
+### Fixed
+- A missing, malformed or unreadable `config.json` produced a raw Python
+  traceback from every entry point. Each of the three states needs a different
+  action — not configured yet, broken after a hand-edit, or unreadable because
+  the file is `0640 root:timelapse` — and a stack trace conveys none of them.
+  All three now exit with a sentence naming the fix.
 - **`timelapse cameras`** — add, edit, remove, enable/disable and test cameras
   against an existing config, without reinstalling or re-running the whole
   wizard. It restarts `timelapse-capture.service` for you, since the daemon

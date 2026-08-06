@@ -64,8 +64,22 @@ RETRY_MIN_BUDGET = 1.0      # below this a retry would only time out again
 
 
 def load_config(path):
-    with open(path, "r", encoding="utf-8") as fh:
-        return json.load(fh)
+    """Deliberately duplicated rather than imported from timelapse_encode: the
+    daemon must not depend on the batch job, so an encoder change can never
+    stop capture. A clean message here also means journald shows the reason
+    instead of a traceback when the unit refuses to start."""
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        sys.exit(f"No config at {path}. Run: sudo timelapse setup")
+    except PermissionError:
+        sys.exit(f"Cannot read {path} - it is 0640 root:timelapse and this "
+                 f"process is not in that group.")
+    except json.JSONDecodeError as exc:
+        sys.exit(f"{path} is not valid JSON: {exc}")
+    except OSError as exc:
+        sys.exit(f"Cannot read {path}: {exc}")
 
 
 def setup_logging(log_dir):

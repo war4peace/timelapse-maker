@@ -323,6 +323,147 @@ def test_disk(cfg, avg_bytes, n_cameras):
             ok(f"Headroom fine (~{needed/1024**3:.0f} GB needed)")
 
 
+# ----------------------------------------------------------------------------
+# Disk usage report (--usage)
+# ----------------------------------------------------------------------------
+
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def human_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def scan_camera_frames(cam_dir):
+    """Frame counts and bytes for one camera, by day directory.
+
+    os.scandir rather than Path.rglob: this walks six figures of small files on
+    a busy install, and scandir avoids a stat() per entry just to learn it is a
+    file.
+    """
+    days, frames, size, stray = [], 0, 0, 0
+    try:
+        entries = sorted(os.scandir(cam_dir), key=lambda e: e.name)
+    except OSError:
+        return {"days": [], "frames": 0, "size": 0, "stray": 0}
+    for d in entries:
+        if not d.is_dir() or not DAY_RE.match(d.name):
+            continue
+        days.append(d.name)
+        try:
+            with os.scandir(d.path) as it:
+                for f in it:
+                    if not f.is_file():
+                        continue
+                    if f.name.lower().endswith(".jpg"):
+                        frames += 1
+                        try:
+                            size += f.stat().st_size
+                        except OSError:
+                            pass
+                    elif f.name.endswith(".tmp"):
+                        # A capture that died between write and os.replace.
+                        stray += 1
+        except OSError:
+            continue
+    return {"days": days, "frames": frames, "size": size, "stray": stray}
+
+
+def report_usage(cfg):
+    root = Path(cfg["paths"]["frames_root"])
+    videos = Path(cfg["paths"]["video_output"])
+    enabled = {c["name"] for c in cfg["cameras"] if c.get("enabled", True)}
+    known = {c["name"] for c in cfg["cameras"]}
+
+    print(f"\n=== Frames: {root} ===")
+    if not root.is_dir():
+        bad(f"{root} does not exist yet.")
+        return
+    try:
+        on_disk = sorted(e.name for e in os.scandir(root) if e.is_dir())
+    except OSError as exc:
+        bad(f"Cannot read {root}: {exc}")
+        return
+
+    rows, tot_f, tot_b, tot_d, orphans, stray_total = [], 0, 0, 0, [], 0
+    for name in sorted(set(on_disk) | known):
+        st = scan_camera_frames(root / name) if name in on_disk else None
+        if st is None:
+            rows.append((name, "-", "-", "-", "-", "not captured yet"))
+            continue
+        tag = ""
+        if name not in known:
+            tag, _ = "ORPHAN", orphans.append(name)
+        elif name not in enabled:
+            tag, _ = "disabled", orphans.append(name)
+        tot_f += st["frames"]
+        tot_b += st["size"]
+        tot_d += len(st["days"])
+        stray_total += st["stray"]
+        span = (f"{st['days'][0]}..{st['days'][-1]}" if len(st["days"]) > 1
+                else (st["days"][0] if st["days"] else "-"))
+        rows.append((name, len(st["days"]), f"{st['frames']:,}",
+                     human_bytes(st["size"]), span, tag))
+
+    fmt = "  {:<14} {:>5} {:>10} {:>10}  {:<23} {}"
+    line = lambda *a: print(fmt.format(*a).rstrip())
+    line("Camera", "Days", "Frames", "Size", "Range", "")
+    print("  " + "-" * 74)
+    for r in rows:
+        line(*r)
+    print("  " + "-" * 74)
+    line("total", tot_d, f"{tot_f:,}", human_bytes(tot_b), "", "")
+    if tot_f:
+        info(f"average frame {human_bytes(tot_b / tot_f)}")
+
+    if orphans:
+        print()
+        for name in orphans:
+            why = ("is not in the config at all" if name not in known
+                   else "is disabled in the config")
+            warn(f"'{name}' has frames on disk but {why}.")
+        # This is the failure the camera wizard warns about at edit time; say it
+        # here too, because that is where someone counting disk space will look.
+        info("The nightly encode skips them, so those frames stay forever.")
+        info("Re-enable the camera, or encode a day with: "
+             "timelapse encode --date YYYY-MM-DD")
+    if stray_total:
+        print()
+        warn(f"{stray_total} leftover .tmp file(s) from interrupted writes.")
+        info("Harmless, and not counted above; they are overwritten in place.")
+
+    print(f"\n=== Videos: {videos} ===")
+    if not videos.is_dir():
+        info("no video directory yet")
+    else:
+        vids = [p for p in videos.rglob("*") if p.is_file()]
+        vb = sum(p.stat().st_size for p in vids)
+        print(f"  {len(vids)} file(s), {human_bytes(vb)}")
+
+    print("\n=== Disk ===")
+    seen = {}
+    for label, path in (("frames", root), ("videos", videos)):
+        probe = path
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        try:
+            du = shutil.disk_usage(probe)
+        except OSError:
+            continue
+        key = (du.total, du.free)
+        if key in seen:
+            info(f"{label:<7} {probe} (same filesystem as {seen[key]})")
+            continue
+        seen[key] = label
+        pct = 100.0 * (du.total - du.free) / du.total if du.total else 0
+        info(f"{label:<7} {probe}: {human_bytes(du.free)} free of "
+             f"{human_bytes(du.total)} ({pct:.0f}% used)")
+    print()
+
+
 def test_transfer(cfg):
     t = cfg.get("transfer", {})
     if not t.get("enabled"):
@@ -461,14 +602,20 @@ def main():
                     help="for ONVIF snapshot URLs, compare Profile_1..4 resolutions")
     ap.add_argument("--encoders", action="store_true",
                     help="diagnose why a hardware encoder is unavailable")
+    ap.add_argument("--usage", action="store_true",
+                    help="report frames and disk usage per camera")
     args = ap.parse_args()
 
-    with open(args.config, encoding="utf-8") as fh:
-        cfg = json.load(fh)
+    from timelapse_encode import load_config
+    cfg = load_config(args.config)
 
     cams = [c for c in cfg["cameras"] if c.get("enabled", True)]
     if args.camera:
         cams = [c for c in cams if c["name"].lower() == args.camera.lower()]
+
+    if args.usage:
+        report_usage(cfg)
+        return
 
     if args.encoders:
         diagnose_encoders(cfg)

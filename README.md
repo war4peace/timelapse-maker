@@ -51,10 +51,20 @@ Bug reports and camera compatibility reports are genuinely useful at this stage
 | `timelapse_test.py` | Pre-flight checker — run before enabling anything | manually |
 | `timelapse_setup.py` | Storage-aware configuration wizard | installer, or `timelapse setup` |
 
-Day-to-day, one command covers the rest — `timelapse cameras` to add, edit or
-remove a camera (it restarts capture for you, and warns before an edit would
-strand frames the encoder hasn't reached yet), plus `transfer`, `test`,
-`encode`, `logs`, `status` and `version`. No reinstall, no hand-edited JSON.
+Day to day you drive it through one wrapper — no reinstall, no hand-edited JSON:
+
+| | |
+|---|---|
+| `timelapse status` | Are the service and timer healthy, when does the next encode fire |
+| `timelapse logs` | Follow the capture journal live |
+| `timelapse usage` | Frames, bytes and date range per camera — and which folders nothing will ever encode |
+| `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord |
+| `timelapse cameras` | Add, edit, remove or disable a camera, then restart capture |
+| `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed |
+| `timelapse encode` | Run tonight's encode now |
+| `timelapse setup` · `config` · `version` | Full wizard · edit the JSON · what's installed |
+
+Full descriptions in [docs/install.md](docs/install.md#8-day-to-day--the-timelapse-command).
 
 The two daemons never talk to each other. They share only a directory layout,
 so either can be stopped, replaced or rewritten without touching the other.

@@ -547,6 +547,31 @@ def build_summary(results, interval):
 
 # ----------------------------------------------------------------------------
 
+def load_config(path):
+    """Read the config, failing with a sentence instead of a traceback.
+
+    Shared with timelapse_test.py. The three most likely states - not
+    configured yet, invalid JSON after a hand-edit, and unreadable because
+    config.json is 0640 root:timelapse - each need a different action, and a
+    stack trace tells the operator none of them.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        sys.exit(f"No config at {path}. Run: sudo timelapse setup")
+    except PermissionError:
+        sys.exit(f"Cannot read {path} (it is 0640 root:timelapse, since it "
+                 f"holds camera credentials).\nRun with sudo, or add yourself "
+                 f"to the 'timelapse' group.")
+    except json.JSONDecodeError as exc:
+        sys.exit(f"{path} is not valid JSON: {exc}\n"
+                 f"Fix it with 'sudo timelapse config', or restore the backup "
+                 f"at {path}.bak")
+    except OSError as exc:
+        sys.exit(f"Cannot read {path}: {exc}")
+
+
 def find_pending(frames_root, cameras, only_date, max_backlog):
     """Every date dir older than today, oldest first, capped at max_backlog."""
     today = date.today().isoformat()
@@ -579,8 +604,7 @@ def main():
     ap.add_argument("--no-transfer", action="store_true")
     args = ap.parse_args()
 
-    with open(args.config, encoding="utf-8") as fh:
-        cfg = json.load(fh)
+    cfg = load_config(args.config)
     setup_logging(cfg["paths"].get("log_dir"))
 
     run_start = time.time()
