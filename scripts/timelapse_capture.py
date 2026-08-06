@@ -39,7 +39,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 
 # ----------------------------------------------------------------------------
@@ -49,6 +49,18 @@ __version__ = "0.0.7"
 STOP = threading.Event()
 PAUSED = threading.Event()      # set by the disk guard when space runs low
 log = logging.getLogger("capture")
+
+# Intra-tick retry, for snapshot endpoints that refuse instantly (ONVIF answers
+# 500 rather than queueing) and leave the tick's budget unspent.
+#
+# Scope, measured - do not widen this without re-measuring: it recovers ~58% of
+# failures that are *per-request* blips, and 0% of failures that are a busy
+# window longer than one interval. The latter is not a tuning problem. If the
+# camera is out for longer than the interval, the next tick already is the
+# retry, so nothing inside this tick can win.
+RETRY_DELAY = 0.25          # let a camera that just said "busy" breathe
+RETRY_GUARD = 0.5           # a retry must never run into the next tick
+RETRY_MIN_BUDGET = 1.0      # below this a retry would only time out again
 
 
 def load_config(path):
@@ -89,6 +101,7 @@ class HttpCamera(threading.Thread):
         self.timeout = cfg["capture"]["timeout_seconds"]
         self.min_bytes = cfg["capture"]["min_bytes"]
         self.log_every = cfg["capture"].get("log_every_n_failures", 60)
+        self.retry = cfg["capture"].get("retry_within_tick", True)
         self.root = Path(cfg["paths"]["frames_root"]) / self.name_
         self.log = logging.getLogger(self.name_)
 
@@ -104,6 +117,7 @@ class HttpCamera(threading.Thread):
         self.ok = 0
         self.fail = 0
         self.consec_fail = 0
+        self.retried = 0        # ticks a second attempt rescued
 
     # -- helpers ------------------------------------------------------------
 
@@ -125,8 +139,46 @@ class HttpCamera(threading.Thread):
                 n += 1
         return final
 
-    def _grab(self, dt):
-        resp = self.session.get(self.url, timeout=self.timeout)
+    def _retry_timeout(self, deadline, now):
+        """Timeout for a second attempt this tick, or 0.0 to not bother.
+
+        Purely budget-driven, which is what makes it safe: an attempt that
+        *timed out* has already spent the tick, so the arithmetic declines on
+        its own and no special case for slow-vs-fast failures is needed. The
+        worst-case finish is deadline - RETRY_GUARD, so a retry can never cost
+        the next frame as well.
+        """
+        budget = (deadline - RETRY_GUARD) - (now + RETRY_DELAY)
+        if budget < RETRY_MIN_BUDGET:
+            return 0.0
+        return min(self.timeout, budget)
+
+    def _retry_grab(self, dt, deadline, first_exc):
+        """One more attempt inside the same tick. Returns None if it worked,
+        otherwise the exception to report."""
+        if not self.retry:
+            return first_exc
+        # The previous tick failed too, so this is an outage lasting longer than
+        # one interval - and the next tick already *is* a retry. Measured: a
+        # camera busy for a fixed 2.6s window (2 ticks) recovers 0% from a retry
+        # 250ms later, so retrying here is pure extra load on a device that just
+        # said it was busy. Only the first tick of a burst is worth a second try.
+        if self.consec_fail:
+            return first_exc
+        timeout = self._retry_timeout(deadline, time.time())
+        if not timeout:
+            return first_exc
+        if STOP.wait(RETRY_DELAY):      # shutting down; don't start a fetch
+            return first_exc
+        try:
+            self._grab(dt, timeout=timeout)
+        except Exception as exc:
+            return exc
+        self.retried += 1
+        return None
+
+    def _grab(self, dt, timeout=None):
+        resp = self.session.get(self.url, timeout=timeout or self.timeout)
         resp.raise_for_status()
         data = resp.content
 
@@ -164,22 +216,31 @@ class HttpCamera(threading.Thread):
             if PAUSED.is_set():
                 continue
 
+            dt = datetime.fromtimestamp(fire_t)
             try:
-                self._grab(datetime.fromtimestamp(fire_t))
+                self._grab(dt)
+                err = None
+            except Exception as exc:
+                # A rescued tick counts as a plain success: ok/fail stay a count
+                # of frames on disk, which is what the encoder's Cov% reports.
+                err = self._retry_grab(dt, next_t, exc)
+
+            if err is None:
                 if self.consec_fail:
                     self.log.info("recovered after %d consecutive failures",
                                   self.consec_fail)
                 self.ok += 1
                 self.consec_fail = 0
-            except Exception as exc:
+            else:
                 self.fail += 1
                 self.consec_fail += 1
                 # Log the first failure, then throttle to avoid flooding journald
                 # when a camera is offline for hours.
                 if self.consec_fail == 1 or self.consec_fail % self.log_every == 0:
-                    self.log.warning("grab failed (#%d): %s", self.consec_fail, exc)
+                    self.log.warning("grab failed (#%d): %s", self.consec_fail, err)
 
-        self.log.info("capture stopped (ok=%d fail=%d)", self.ok, self.fail)
+        self.log.info("capture stopped (ok=%d fail=%d retried=%d)",
+                      self.ok, self.fail, self.retried)
 
 
 # ----------------------------------------------------------------------------

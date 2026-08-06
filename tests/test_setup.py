@@ -8,6 +8,7 @@ kinds of thing that look like disks but aren't. These drive it with a synthetic
 import contextlib
 import io
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -434,6 +435,183 @@ class TestEnterAcceptsTheDefault(unittest.TestCase):
                                       lambda: setup.ask_yes("Go?", True))
         self.assertTrue(result)
         self.assertEqual(reads, 2)
+
+
+class TestCameraCounter(unittest.TestCase):
+    """The prompt asks about the *next* camera, so it must name that one.
+
+    Regression: after adding the third camera it read "Add another camera?
+    (3 of ~9)", which looks like the count went backwards.
+    """
+
+    def drive(self, keystrokes, expected):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        prev_test = setup.test_camera
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=False)
+        setup.test_camera = lambda cam, cfg: True     # no network in tests
+        cfg = setup.default_config()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                setup.choose_cameras(cfg, expected)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+            setup.test_camera = prev_test
+        return cfg["cameras"], buf.getvalue()
+
+    # configure? / type / name / ip / user / pass / test? / add another?
+    ONE = "y\n1\nGate\n10.0.0.1\nadmin\npw\nn\n"
+    TWO = ONE + "y\n1\nYard\n10.0.0.2\nadmin\npw\nn\n"
+
+    def test_prompt_names_the_next_camera_not_the_count(self):
+        _, out = self.drive(self.ONE + "n\n", 9)
+        self.assertIn("Add camera 2 of ~9?", out)
+        self.assertNotIn("(1 of ~9)", out)
+
+    def test_counter_advances_with_each_camera(self):
+        cams, out = self.drive(self.TWO + "n\n", 9)
+        self.assertEqual([c["name"] for c in cams], ["Gate", "Yard"])
+        self.assertIn("Add camera 2 of ~9?", out)
+        self.assertIn("Add camera 3 of ~9?", out)
+
+    def test_added_message_still_reports_the_running_total(self):
+        _, out = self.drive(self.TWO + "n\n", 9)
+        self.assertIn("(1 configured)", out)
+        self.assertIn("(2 configured)", out)
+
+    def test_no_nonsense_index_once_the_estimate_is_met(self):
+        # With an estimate of 1, the second prompt must not read "2 of ~1".
+        _, out = self.drive(self.ONE + "n\n", 1)
+        self.assertNotIn("of ~1?", out)
+        self.assertIn("(1 configured)", out)
+
+    def test_default_flips_to_no_once_the_estimate_is_met(self):
+        # Answering with a bare Enter after meeting the estimate should stop.
+        cams, _ = self.drive(self.ONE + "\n", 1)
+        self.assertEqual(len(cams), 1)
+
+
+class TestWebhookVerificationMarker(unittest.TestCase):
+    """One test message, not two.
+
+    install.sh runs the wizard and then the pre-flight check, so a webhook the
+    wizard just verified was being tested again seconds later and two identical
+    messages arrived in the channel.
+    """
+
+    URL = "https://discord.com/api/webhooks/123/abc"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cfg_path = self.tmp / "config.json"
+        sys.path.insert(0, str(_support.SCRIPTS))
+        import timelapse_test
+        self.checker = timelapse_test
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_marker_is_written_on_success(self):
+        setup.record_webhook_verified(self.cfg_path, self.URL)
+        self.assertTrue((self.tmp / setup.WEBHOOK_MARKER).exists())
+
+    def test_marker_does_not_contain_the_url(self):
+        # The URL is a posting credential; a digest is enough to match on.
+        setup.record_webhook_verified(self.cfg_path, self.URL)
+        body = (self.tmp / setup.WEBHOOK_MARKER).read_text(encoding="utf-8")
+        self.assertNotIn("abc", body)
+        self.assertNotIn("discord.com", body)
+
+    def test_checker_recognises_a_fresh_marker(self):
+        setup.record_webhook_verified(self.cfg_path, self.URL)
+        age = self.checker.webhook_verified_age(self.cfg_path, self.URL)
+        self.assertGreaterEqual(age, 0)
+        self.assertLess(age, 5)
+
+    def test_a_different_webhook_is_still_tested(self):
+        setup.record_webhook_verified(self.cfg_path, self.URL)
+        other = "https://discord.com/api/webhooks/999/zzz"
+        self.assertEqual(
+            self.checker.webhook_verified_age(self.cfg_path, other), 0)
+
+    def test_a_stale_marker_is_ignored(self):
+        import time
+        marker = self.tmp / setup.WEBHOOK_MARKER
+        old = int(time.time()) - self.checker.WEBHOOK_MARKER_TTL - 60
+        marker.write_text(f"{setup.webhook_fingerprint(self.URL)} {old}\n",
+                          encoding="utf-8")
+        self.assertEqual(
+            self.checker.webhook_verified_age(self.cfg_path, self.URL), 0)
+
+    def test_a_future_timestamp_is_ignored(self):
+        # Clock skew must not suppress the check indefinitely.
+        import time
+        marker = self.tmp / setup.WEBHOOK_MARKER
+        marker.write_text(
+            f"{setup.webhook_fingerprint(self.URL)} {int(time.time()) + 9999}\n",
+            encoding="utf-8")
+        self.assertEqual(
+            self.checker.webhook_verified_age(self.cfg_path, self.URL), 0)
+
+    def test_missing_marker_means_test_it(self):
+        self.assertEqual(
+            self.checker.webhook_verified_age(self.cfg_path, self.URL), 0)
+
+    def test_corrupt_marker_means_test_it(self):
+        (self.tmp / setup.WEBHOOK_MARKER).write_text("garbage\n",
+                                                     encoding="utf-8")
+        self.assertEqual(
+            self.checker.webhook_verified_age(self.cfg_path, self.URL), 0)
+
+    def test_recording_without_a_config_path_is_a_no_op(self):
+        setup.record_webhook_verified(None, self.URL)      # must not raise
+
+    def test_fingerprint_is_stable_and_url_specific(self):
+        self.assertEqual(setup.webhook_fingerprint(self.URL),
+                         setup.webhook_fingerprint(self.URL))
+        self.assertNotEqual(setup.webhook_fingerprint(self.URL),
+                            setup.webhook_fingerprint(self.URL + "x"))
+
+
+class TestNarrowStdout(unittest.TestCase):
+    """Formatting must never abort the wizard."""
+
+    def test_helper_tolerates_a_stream_without_reconfigure(self):
+        # StringIO has no reconfigure(); the helper must not raise.
+        prev = sys.stdout
+        sys.stdout = io.StringIO()
+        try:
+            setup._survive_narrow_stdout()
+        finally:
+            sys.stdout = prev
+
+    def test_headings_survive_an_ascii_only_stream(self):
+        class AsciiOnly(io.TextIOBase):
+            encoding = "ascii"
+
+            def __init__(self):
+                self.text = ""
+
+            def write(self, s):
+                s.encode("ascii")       # raises on box-drawing characters
+                self.text += s
+                return len(s)
+
+        prev = sys.stdout
+        sys.stdout = AsciiOnly()
+        try:
+            setup._survive_narrow_stdout()      # no reconfigure available
+            raised = None
+            try:
+                setup.heading("Cameras")
+            except UnicodeEncodeError as exc:
+                raised = exc
+        finally:
+            sys.stdout = prev
+        # Documents the residual risk: without reconfigure() support the
+        # characters still cannot be written. Real streams have it.
+        self.assertIsNotNone(raised)
 
 
 class TestTransferDestinationKind(unittest.TestCase):

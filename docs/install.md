@@ -48,6 +48,58 @@ script before running it as root.
 > under a pipe stdin *is* the script. If no terminal is reachable at all, both
 > fall back to accepting defaults instead of hanging.
 
+### Upgrading
+
+Re-run the same installer. It is the supported upgrade path, and it is safe on
+a live install:
+
+```bash
+curl -sL https://raw.githubusercontent.com/war4peace/timelapse-maker/main/install.sh -o install_timelapse.sh
+sudo bash install_timelapse.sh
+```
+
+What it does and does not touch:
+
+| | On upgrade |
+|---|---|
+| `config.json` | **Kept.** You are asked "Reconfigure it?" and the default is *no*. |
+| `config.example.json` | Replaced, so you can diff it for new keys. |
+| Scripts and units | Replaced, then `ReadWritePaths` is re-derived from your config. |
+| Captured frames and videos | Never touched. |
+| A running capture daemon | Restarted, after asking — see below. |
+| An encode already in flight | Left alone. It is oneshot, so it finishes on the build it started with and the next nightly trigger uses the new one. |
+
+**Why the restart prompt matters.** A running daemon keeps executing the code it
+read at startup, and `systemctl enable --now` does nothing to an already-active
+unit. Say no and you keep running the old build with the new one sitting unused
+on disk. Apply it later with:
+
+```bash
+sudo systemctl restart timelapse-capture.service
+```
+
+A restart costs only the frames due while it happens — a second or two.
+
+**New config keys** are read with defaults, so an older `config.json` keeps
+working; you get the new behaviour without editing anything. Re-run
+`timelapse setup` only if you actually want to change an answer.
+
+Check what is installed, and whether it is what is *running*:
+
+```bash
+timelapse version
+```
+
+```
+  capture  0.0.8
+  encode   0.0.8
+  test     0.0.8
+  setup    0.0.8
+```
+
+If the daemon predates the installed files it says so explicitly, which is the
+one failure mode a version number by itself cannot show you.
+
 ### The manual way
 
 ```bash
@@ -172,6 +224,20 @@ budget.
   cope badly with sustained polling. Watch the first hour:
   `grep <Camera> <log_dir>/capture.log`. Raising `interval_seconds` usually
   fixes it.
+- **Regular bursts of HTTP 500 from one camera, minutes apart** — check whether
+  your NVR is *also* pulling from it. This is the most likely snag on a shared
+  host, because that is exactly where you would install this: leaving AgentDVR's
+  own timelapse or snapshot schedule enabled points two clients at one camera,
+  and most cameras answer the loser with `500` rather than queueing it.
+
+  The signature is a *fixed number* of consecutive failures per burst (a
+  duration, not a coin flip), recovering on its own each time. Turn off the
+  NVR's timelapse/snapshot schedule for cameras this tool owns — you are
+  replacing that feature, which is the point.
+
+  You do not need to watch the journal for this. The nightly Discord summary
+  prints `Cov%` per camera; one camera sitting a few points below the others is
+  the same story.
 - **`av1_nvenc not available`** — distro ffmpeg builds often lack NVENC. Use a
   BtbN static build or `jellyfin-ffmpeg` and point `paths.ffmpeg` at it. The
   script falls back to HEVC then x264 rather than failing, but you lose AV1.

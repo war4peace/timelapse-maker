@@ -16,7 +16,8 @@
     "timeout_seconds": 4,
     "min_bytes": 4096,
     "min_free_gb": 60,
-    "log_every_n_failures": 60
+    "log_every_n_failures": 60,
+    "retry_within_tick": true
   },
 
   "encode": {

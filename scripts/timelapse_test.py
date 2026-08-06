@@ -34,7 +34,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 OUT = Path(os.environ.get("TIMELAPSE_TEST_DIR") or
            Path(tempfile.gettempdir()) / "timelapse-test")
@@ -394,11 +394,42 @@ def _fstype(mountpoint):
     return ""
 
 
-def test_discord(cfg):
+WEBHOOK_MARKER = ".webhook-verified"
+WEBHOOK_MARKER_TTL = 900          # 15 minutes
+
+
+def webhook_verified_age(config_path, url):
+    """Seconds since the wizard verified this exact webhook, else 0.
+
+    install.sh runs the wizard and then this checker, so without it two
+    identical test messages land in the channel seconds apart. The marker
+    holds a digest rather than the URL - the URL is a posting credential.
+    """
+    import hashlib
+    import time
+    try:
+        marker = Path(config_path).parent / WEBHOOK_MARKER
+        digest, stamp = marker.read_text(encoding="utf-8").split()
+    except (OSError, ValueError):
+        return 0
+    if digest != hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]:
+        return 0                  # a different webhook; test it properly
+    age = time.time() - int(stamp)
+    return age if 0 <= age <= WEBHOOK_MARKER_TTL else 0
+
+
+def test_discord(cfg, config_path=None, force=False):
     d = cfg.get("discord", {})
     if not d.get("enabled") or not d.get("webhook_url"):
         info("Discord disabled or no webhook configured")
         return
+
+    if not force and config_path:
+        age = webhook_verified_age(config_path, d["webhook_url"])
+        if age:
+            ok(f"Discord webhook verified during setup {int(age)}s ago")
+            info("not sending a second test message; --force-discord to re-send")
+            return
     payload = {"username": d.get("username", "Timelapse Bot"),
                "embeds": [{"title": "Timelapse pre-flight test",
                            "description": "If you can read this, the webhook works.",
@@ -422,7 +453,10 @@ def main():
     ap.add_argument("config", nargs="?", default="/etc/timelapse/config.json")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("--camera", help="test only this camera")
-    ap.add_argument("--no-discord", action="store_true")
+    ap.add_argument("--no-discord", action="store_true",
+                    help="skip the webhook check entirely")
+    ap.add_argument("--force-discord", action="store_true",
+                    help="send a test message even if setup just verified it")
     ap.add_argument("--probe-profiles", action="store_true",
                     help="for ONVIF snapshot URLs, compare Profile_1..4 resolutions")
     ap.add_argument("--encoders", action="store_true",
@@ -468,7 +502,7 @@ def main():
 
     if not args.no_discord:
         print("\n=== Discord ===")
-        test_discord(cfg)
+        test_discord(cfg, args.config, args.force_discord)
 
     print(f"\nSample images: {OUT}\n")
 

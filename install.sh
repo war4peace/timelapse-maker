@@ -253,8 +253,28 @@ case "\${1:-}" in
     config)    exec \${EDITOR:-nano} "$CONFIG" ;;
     logs)      exec journalctl -u timelapse-capture -f ;;
     status)    exec systemctl status timelapse-capture.service timelapse-encode.timer ;;
+    version)
+        for f in capture encode test setup; do
+            printf '  %-8s %s\n' "\$f" \\
+                "\$(sed -n 's/^__version__ = "\(.*\)"/\1/p' $PREFIX/timelapse_\$f.py)"
+        done
+        # The daemon runs the code it read at startup. If it predates the files
+        # on disk, an upgrade was installed but never applied - the one failure
+        # mode a version number alone cannot show you.
+        if systemctl is-active --quiet timelapse-capture.service 2>/dev/null; then
+            started=\$(date -d "\$(systemctl show timelapse-capture \\
+                -p ExecMainStartTimestamp --value)" +%s 2>/dev/null || echo 0)
+            mtime=\$(stat -c %Y $PREFIX/timelapse_capture.py 2>/dev/null || echo 0)
+            if [ "\$started" -gt 0 ] && [ "\$mtime" -gt "\$started" ]; then
+                echo
+                echo "  WARNING: capture started before these files were installed,"
+                echo "           so it is still running the previous build."
+                echo "           sudo systemctl restart timelapse-capture.service"
+            fi
+        fi
+        ;;
     *)
-        echo "usage: timelapse {setup|transfer|test|encode|config|logs|status}"
+        echo "usage: timelapse {setup|transfer|test|encode|config|logs|status|version}"
         exit 1 ;;
 esac
 EOF
@@ -317,6 +337,40 @@ run_wizard() {
     sync_units
 }
 
+# A daemon keeps executing the code it read at startup, so replacing the files
+# on disk upgrades nothing until the unit restarts - and `systemctl enable
+# --now` is a no-op on an already-active unit. Without this the installer
+# replaced the scripts, printed "Capture is running", and left the *old* build
+# serving. Verified in WSL: identical MainPID and ExecMainStartTimestamp across
+# an upgrade of a live install.
+restart_upgraded_services() {
+    [ -d /run/systemd/system ] || return 0
+    systemctl is-active --quiet timelapse-capture.service || return 0
+
+    step "Restart"
+    note "Capture is live and still running the previously installed build."
+    if ! ask_yn "Restart it so this version takes effect?" y; then
+        warn "Still running the old build."
+        note "Apply it later with: systemctl restart timelapse-capture.service"
+        return 0
+    fi
+    # Costs only the frames due during the restart - a second or two. The
+    # encoder is left alone on purpose: it is oneshot, so an encode in flight
+    # finishes on the code it started with and the next trigger picks up the new.
+    if systemctl restart timelapse-capture.service; then
+        sleep 2
+        if systemctl is-active --quiet timelapse-capture.service; then
+            ok "Capture restarted on this version."
+        else
+            err "Capture did not come back up."
+            note "See: journalctl -u timelapse-capture -n 40"
+        fi
+    else
+        err "Restart failed. See: journalctl -u timelapse-capture -n 40"
+    fi
+    return 0
+}
+
 offer_enable() {
     step "Next steps"
     if [ ! -f "$CONFIG" ]; then
@@ -363,7 +417,7 @@ offer_enable() {
     fi
 
     printf '\n'
-    say "${B}timelapse${N} status | logs | test | encode | config | setup | transfer"
+    say "${B}timelapse${N} status | logs | test | encode | config | setup | transfer | version"
 }
 
 as_service_user() {
@@ -448,7 +502,7 @@ main() {
   ╚══════════════════════════════════════════════════════════╝
 BANNER
     printf '%s' "$N"
-    printf '  %sEXPERIMENTAL (v0.0.7)%s - early software, tested on one machine.\n' "$Y$B" "$N"
+    printf '  %sEXPERIMENTAL (v0.0.8)%s - early software, tested on one machine.\n' "$Y$B" "$N"
     note "Config format may change between versions. Not for production use."
 
     if [ "$DO_UNINSTALL" = "1" ]; then
@@ -462,6 +516,7 @@ BANNER
     install_files
     install_units
     [ "$RUN_WIZARD" = "1" ] && run_wizard
+    restart_upgraded_services       # after sync_units, before the pre-flight
     offer_enable
     printf '\n'
 }

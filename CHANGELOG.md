@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.0.8] - 2026-08-06
+
+### Fixed
+- **Re-running the installer over a live install did not actually upgrade it.**
+  Replacing the scripts on disk changes nothing for a running daemon — it keeps
+  executing the code it read at startup — and `systemctl enable --now` is a
+  no-op on an already-active unit. So the installer replaced the files, printed
+  *"Capture is running"*, and left the previous build serving until the next
+  reboot. It now restarts a live `timelapse-capture.service` (after asking, and
+  after `ReadWritePaths` has been re-derived), reporting honestly if you decline.
+  An encode in flight is deliberately left alone: it is oneshot, so it finishes
+  on the build it started with and the next trigger picks up the new one.
+- The wizard's camera prompt counted the camera you had just added, offering
+  *"Add another camera? (3 of ~9)"* when the next one would be the 4th.
+- The pre-flight no longer sends a second Discord test message when the wizard
+  already sent one and it succeeded. Setup records a fingerprint of the verified
+  webhook; the check honours it for 15 minutes, so a standalone
+  `timelapse test` next week still verifies properly. `--force-discord`
+  re-sends on demand. The marker holds a truncated digest and a timestamp, never
+  the webhook URL.
+- The wizard could abort half-configured under `PYTHONIOENCODING=ascii`, where
+  printing its own box-drawing headings raises `UnicodeEncodeError`. Characters
+  now degrade to `?` instead.
+
+### Added
+- **One retry inside the capture tick** (`capture.retry_within_tick`, default
+  on). A snapshot endpoint that refuses while busy answers in milliseconds, so
+  the tick was being discarded with almost its whole budget unspent.
+
+  Measured, because the scope is narrower than it looks: it recovers ~58% of
+  *per-request* failures and **0%** of failures that are a busy window longer
+  than one interval. The zero is structural — if the camera is out for longer
+  than `interval_seconds`, the next tick already is the retry. A tick whose
+  predecessor also failed is therefore not retried, which keeps an outage from
+  doubling the request rate against a camera that just said it was busy.
+
+  The retry's timeout comes from the remaining budget, so it provably cannot
+  run into the next tick and cost a second frame. A rescued tick counts as a
+  success, keeping `Cov%` meaning *frames on disk*.
+- `timelapse version` prints the installed version of each script, and warns
+  when the running daemon predates the files on disk — the one failure mode a
+  version number by itself cannot show you.
+
+### Removed
+- A dead `ICON` constant in `timelapse_encode.py`.
+
+### Documentation
+- `install.md` gains an **Upgrading** section stating exactly what is kept,
+  replaced and restarted, and a troubleshooting entry for the most likely snag
+  on a shared host: leaving an NVR's own timelapse or snapshot schedule enabled
+  points two clients at one camera, and most cameras answer the loser with
+  `500`. A *fixed* number of consecutive failures per burst indicates a
+  duration, so it is a second client rather than a flaky one; `Cov%` in the
+  nightly summary is the signal to watch.
+
 ## [0.0.7] - 2026-08-06
 
 ### Added

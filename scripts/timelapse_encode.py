@@ -32,7 +32,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -488,8 +488,6 @@ def transfer(cfg, dry_run):
 # ----------------------------------------------------------------------------
 # Discord
 # ----------------------------------------------------------------------------
-
-ICON = {"OK": "\u2705", "SKIP": "\u23ed\ufe0f", "FAIL": "\u274c", "DRY": "\U0001f9ea"}
 
 # Discord sits behind Cloudflare, which rejects urllib's default
 # "Python-urllib/3.x" User-Agent with HTTP 403 before the request ever reaches

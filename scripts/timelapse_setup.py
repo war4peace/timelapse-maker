@@ -21,7 +21,7 @@ import subprocess
 import sys
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -60,6 +60,26 @@ def init_tty(force_defaults=False, use_stdin=False):
         AUTO = True
         note("No terminal available - accepting all defaults.")
 
+
+def _survive_narrow_stdout():
+    """Never let the wizard die formatting its own output.
+
+    The headings and banner use box-drawing characters. Python gives UTF-8 for
+    effectively every locale (PEP 538 coerces even LC_ALL=C), but an explicit
+    PYTHONIOENCODING=ascii makes printing one raise UnicodeEncodeError and
+    abort the run half-configured. Degrading a character to '?' is a better
+    outcome than that.
+    """
+    enc = (getattr(sys.stdout, "encoding", None) or "").lower()
+    if enc.replace("-", "") == "utf8":
+        return
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except Exception:
+        pass
+
+
+_survive_narrow_stdout()
 
 _COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
 
@@ -518,8 +538,14 @@ def choose_cameras(cfg, expected):
             cams.append(cam)
             good(f"Added '{cam['name']}' ({len(cams)} configured)")
         print()
-        if not ask_yes(f"Add another camera? ({len(cams)} of ~{expected})",
-                       len(cams) < expected):
+        # Name the camera about to be added, not the count already done - the
+        # question is about the next one, so "(3 of ~9)" right after adding the
+        # third reads as though it were going backwards.
+        if len(cams) < expected:
+            question = f"Add camera {len(cams) + 1} of ~{expected}?"
+        else:
+            question = f"Add another camera? ({len(cams)} configured)"
+        if not ask_yes(question, len(cams) < expected):
             break
     cfg["cameras"] = cams
 
@@ -1103,7 +1129,7 @@ def configure_local_transfer(cfg, dest, svcuser):
             note("cannot set. Using the flags above instead.")
 
 
-def choose_discord(cfg):
+def choose_discord(cfg, config_path=None):
     heading("Notifications (optional)")
     note("A nightly Discord summary: what encoded, coverage, size, failures.")
     print()
@@ -1115,10 +1141,11 @@ def choose_discord(cfg):
     cfg["discord"]["enabled"] = bool(url)
     cfg["discord"]["webhook_url"] = url
     if url and ask_yes("Send a test message now?", True):
-        send_test_webhook(url, cfg["discord"].get("username", "Timelapse Bot"))
+        send_test_webhook(url, cfg["discord"].get("username", "Timelapse Bot"),
+                          config_path)
 
 
-def send_test_webhook(url, username):
+def send_test_webhook(url, username, config_path=None):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import post_webhook
     payload = {"username": username,
@@ -1128,6 +1155,7 @@ def send_test_webhook(url, username):
     try:
         post_webhook(url, payload)
         good("Discord accepted the test message.")
+        record_webhook_verified(config_path, url)
     except Exception as exc:
         fail(f"Webhook failed: {exc}")
         if "403" in str(exc):
@@ -1135,6 +1163,42 @@ def send_test_webhook(url, username):
             note("Re-copy it from Channel Settings -> Integrations -> Webhooks.")
         elif "404" in str(exc):
             note("404 means no webhook exists at that URL any more.")
+
+
+WEBHOOK_MARKER = ".webhook-verified"
+
+
+def webhook_fingerprint(url):
+    """Short digest of a webhook URL.
+
+    A hash, not the URL: anyone holding the URL can post to the channel, so
+    there is no reason to write a second copy of it to disk.
+    """
+    import hashlib
+    return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+
+def record_webhook_verified(config_path, url):
+    """Note a successful webhook test so the pre-flight need not repeat it.
+
+    Without this, `install.sh` runs the wizard and then the pre-flight check,
+    and two identical test messages land in the channel seconds apart.
+    """
+    if not config_path:
+        return
+    import time
+    try:
+        marker = Path(config_path).parent / WEBHOOK_MARKER
+        marker.write_text(f"{webhook_fingerprint(url)} {int(time.time())}\n",
+                          encoding="utf-8")
+        # 0644, not 0640: the wizard runs as root but the pre-flight check runs
+        # as the service account, which is not in root's group and could not
+        # otherwise read this. The contents are a digest and a timestamp - no
+        # secret - and /etc/timelapse is itself 0750, so only root and the
+        # service group can reach the file at all.
+        os.chmod(marker, 0o644)
+    except OSError:
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -1162,7 +1226,7 @@ def default_config(template_path=None):
                   "ffmpeg": "/usr/bin/ffmpeg", "ffprobe": "/usr/bin/ffprobe"},
         "capture": {"interval_seconds": 5, "timeout_seconds": 4,
                     "min_bytes": 4096, "min_free_gb": 60,
-                    "log_every_n_failures": 60},
+                    "log_every_n_failures": 60, "retry_within_tick": True},
         "encode": {"framerate": 60, "container": "mkv", "gop": 120,
                    "av1_preset": "p6", "av1_cq": 26, "hevc_cq": 24,
                    "x264_crf": 20, "min_frames": 100,
@@ -1330,7 +1394,7 @@ def main():
     n_cams = choose_capture(cfg, disk)
     choose_cameras(cfg, n_cams)
     choose_transfer(cfg, args.owner)
-    choose_discord(cfg)
+    choose_discord(cfg, args.output)
 
     heading("Writing configuration")
     create_directories(cfg, args.owner)

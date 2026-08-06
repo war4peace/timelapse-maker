@@ -130,8 +130,51 @@ Long-running daemon. `systemd` `Type=simple`, `Restart=always`.
   absolute, the loop cannot accumulate drift from fetch latency. If it falls a
   full interval behind (slow camera, host suspend) it resyncs forward to the
   next boundary instead of replaying a backlog.
-- `_grab(dt)` — one fetch. Validates size ≥ `min_bytes` and JPEG SOI (`FF D8`),
-  writes temp, `os.replace`s into place.
+- `_grab(dt, timeout=None)` — one fetch. Validates size ≥ `min_bytes` and JPEG
+  SOI (`FF D8`), writes temp, `os.replace`s into place. Nothing is written until
+  both checks pass, so a failed attempt leaves no partial file and no
+  `_dest_path` collision for a retry to trip over.
+- `_retry_grab(dt, deadline, first_exc)` / `_retry_timeout(deadline, now)` — one
+  second attempt inside the same tick, controlled by `retry_within_tick`.
+  Rationale: an ONVIF snapshot endpoint on a busy camera answers `500` in
+  milliseconds rather than queueing, so the tick was being discarded with ~98%
+  of its budget unspent.
+
+  The field report that prompted this turned out **not** to be a case it can
+  fix: the camera was being polled by AgentDVR's own timelapse schedule at the
+  same time, which is a busy *window*, the 0% row below. Documented as a snag in
+  `install.md` §4 instead. The retry stands on the blip row alone — know that
+  before extending it.
+
+  **Know what this does and does not fix.** Measured against a local server
+  reproducing both failure shapes, with the failure phase anchored to the tick
+  grid so both arms meet an identical pattern:
+
+  | Failure shape | Recovery |
+  |---|---|
+  | Per-request blip (contention, transient reset) | ~58% |
+  | Busy *window* longer than one interval | **0%** |
+
+  The zero is structural, not a tuning failure: if the camera is refusing for
+  longer than `interval_seconds`, the next tick already *is* a retry, so nothing
+  inside this tick can beat it. Do not try to fix it by lengthening the delay —
+  that only moves the frame's real timestamp away from its filename. Hence the
+  `consec_fail` guard: a tick whose predecessor also failed is part of an outage
+  and is not retried, which cut wasted requests in the window case by half
+  (18 → 9 over a 72s run) while costing only 67% → 58% on blips.
+
+  The delay/timeout decision is **purely budget arithmetic** —
+  `(deadline - RETRY_GUARD) - (now + RETRY_DELAY)`, declined below
+  `RETRY_MIN_BUDGET`. This is deliberately not a fast-failure heuristic: an
+  attempt that *timed out* has already consumed the tick, so the same
+  subtraction rejects it with no special case. Worst-case finish is
+  `deadline - RETRY_GUARD`, which is what guarantees a retry can never also cost
+  the following frame. `deadline` is the loop's `next_t`, so a resync forward
+  legitimately widens the window.
+
+  A rescued tick increments `ok`, not `fail` — those counters mean *frames on
+  disk*, which is what the encoder's `Cov%` divides. `retried` is tracked
+  separately and reported in the `capture stopped` line.
 - `_dest_path(dt)` — builds the destination, creating the day directory only
   when the date changes (cached in `self._last_dir`, so no `mkdir` syscall per
   frame).
@@ -353,6 +396,7 @@ take an optional path as their first positional argument. See
 | `min_bytes` | 4096 | Shared with the encoder's validity check. |
 | `min_free_gb` | 60 | `0` disables DiskGuard. |
 | `log_every_n_failures` | 60 | At 5s intervals, 60 = one log line per 5 minutes of downtime. |
+| `retry_within_tick` | true | One retry per tick when the budget allows. Set false for a camera that degrades under a second request. |
 
 ### `encode`
 | Key | Default | Notes |

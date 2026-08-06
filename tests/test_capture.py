@@ -8,6 +8,7 @@ started - HttpCamera is constructed but never run().
 import math
 import shutil
 import tempfile
+import time
 import unittest
 from datetime import datetime
 from pathlib import Path
@@ -173,6 +174,131 @@ class TestScheduleMath(unittest.TestCase):
         if next_t <= now:
             next_t = self.next_boundary(now, interval)
         self.assertEqual(next_t, 1030)
+
+
+class TestIntraTickRetry(unittest.TestCase):
+    """One retry inside the tick, for cameras that refuse a snapshot instantly.
+
+    The whole design rests on the budget arithmetic being unable to overrun the
+    next tick, so that is tested as a property rather than at one sample point.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cam = cap.HttpCamera(
+            {"name": "Court180", "url": "http://192.0.2.1/snap"},
+            make_config(self.tmp))          # interval 5, timeout 4
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        cap.STOP.clear()
+
+    # -- budget arithmetic --------------------------------------------------
+
+    def test_fast_failure_leaves_room_to_retry(self):
+        # 500 came back 50ms into a 5s tick.
+        self.assertGreater(self.cam._retry_timeout(1005.0, 1000.05), 0)
+
+    def test_a_timed_out_attempt_is_not_retried(self):
+        # The core safety property: a 4s timeout has already spent the tick.
+        # No fast/slow heuristic decides this - the subtraction does.
+        self.assertEqual(self.cam._retry_timeout(1005.0, 1004.0), 0.0)
+
+    def test_retry_can_never_run_into_the_next_tick(self):
+        deadline = 1005.0
+        for ms in range(0, 5000, 25):
+            now = 1000.0 + ms / 1000.0
+            t = self.cam._retry_timeout(deadline, now)
+            if t:
+                finish = now + cap.RETRY_DELAY + t
+                self.assertLessEqual(finish, deadline - cap.RETRY_GUARD + 1e-9,
+                                     f"overruns when failing at +{ms}ms")
+
+    def test_timeout_is_capped_at_the_configured_timeout(self):
+        # A long resync-widened window must not make one fetch hang for it.
+        self.assertEqual(self.cam._retry_timeout(1100.0, 1000.0), self.cam.timeout)
+
+    def test_no_retry_when_the_interval_is_too_short_to_fit_one(self):
+        cfg = make_config(self.tmp, interval=1)
+        cam = cap.HttpCamera({"name": "Fast", "url": "http://192.0.2.1/s"}, cfg)
+        self.assertEqual(cam._retry_timeout(1001.0, 1000.0), 0.0)
+
+    # -- behaviour ----------------------------------------------------------
+
+    def call_retry(self, grab, deadline_in=5.0):
+        self.cam._grab = grab
+        return self.cam._retry_grab(datetime(2026, 8, 6, 9, 4, 45),
+                                    time.time() + deadline_in,
+                                    RuntimeError("500 Server Error"))
+
+    def test_disabled_by_config_reports_the_first_failure(self):
+        self.cam.retry = False
+        called = []
+        err = self.call_retry(lambda dt, timeout=None: called.append(dt))
+        self.assertEqual(called, [])
+        self.assertEqual(str(err), "500 Server Error")
+
+    def test_no_retry_when_the_previous_tick_also_failed(self):
+        # An outage spanning more than one interval cannot be beaten from
+        # inside a tick - the next tick already is the retry. Measured 0%
+        # recovery there, so this guard exists to stop paying for it.
+        self.cam.consec_fail = 1
+        called = []
+        err = self.call_retry(lambda dt, timeout=None: called.append(dt))
+        self.assertEqual(called, [])
+        self.assertEqual(str(err), "500 Server Error")
+
+    def test_the_first_tick_of_a_burst_is_still_retried(self):
+        self.cam.consec_fail = 0
+        self.assertIsNone(self.call_retry(lambda dt, timeout=None: None))
+
+    def test_a_rescued_tick_reports_no_error(self):
+        self.assertIsNone(self.call_retry(lambda dt, timeout=None: None))
+        self.assertEqual(self.cam.retried, 1)
+
+    def test_the_retry_gets_the_budgeted_timeout_not_the_configured_one(self):
+        seen = []
+
+        def grab(dt, timeout=None):
+            seen.append(timeout)
+
+        # Raise the configured timeout rather than shrinking the deadline, so
+        # the budget clears RETRY_MIN_BUDGET by seconds. Squeezing the deadline
+        # instead leaves only ~0.25s of headroom and the test flakes under load.
+        self.cam.timeout = 10
+        self.call_retry(grab, deadline_in=5.0)
+        self.assertTrue(seen, "retry did not fire")
+        self.assertLess(seen[0], self.cam.timeout)
+        self.assertGreater(seen[0], cap.RETRY_MIN_BUDGET)
+
+    def test_a_second_failure_reports_the_second_exception(self):
+        # The retry's error is the current state of the camera; the first one
+        # is stale by then.
+        def grab(dt, timeout=None):
+            raise RuntimeError("connection refused")
+
+        self.assertEqual(str(self.call_retry(grab)), "connection refused")
+
+    def test_shutdown_during_the_delay_skips_the_second_fetch(self):
+        called = []
+        cap.STOP.set()
+        err = self.call_retry(lambda dt, timeout=None: called.append(dt))
+        self.assertEqual(called, [])
+        self.assertEqual(str(err), "500 Server Error")
+
+    def test_a_failed_attempt_leaves_no_file_for_the_retry_to_collide_with(self):
+        # _grab validates before it writes, so the retry must land on the plain
+        # HHMMSS name - not a DST-style "-1" suffix.
+        when = datetime(2026, 8, 6, 9, 4, 45)
+        self.assertEqual(self.cam._dest_path(when).name, "090445.jpg")
+        self.assertEqual(self.cam._dest_path(when).name, "090445.jpg")
+
+    def test_retry_is_on_by_default_and_switchable(self):
+        self.assertTrue(self.cam.retry)
+        cfg = make_config(self.tmp)
+        cfg["capture"]["retry_within_tick"] = False
+        cam = cap.HttpCamera({"name": "C", "url": "http://192.0.2.1/s"}, cfg)
+        self.assertFalse(cam.retry)
 
 
 class TestDiskGuard(unittest.TestCase):
