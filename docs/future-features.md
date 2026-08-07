@@ -196,14 +196,111 @@ And wire it into `timelapse_setup.py` in the same change. CLAUDE.md is blunt
 about this: `require_mountpoint` and the CIFS rsync flags sat in the schema for
 two releases before the wizard offered them.
 
+### The existing library, surveyed 2026-08-07
+
+A read-only survey of the author's own destination (`U:\TL`, an Unraid share
+over SMB) — the only real library this has been measured against. 6,848 files,
+2.78 TiB, 2021-06-26 to 2026-08-06, in 55 `YYYY-MM/` folders plus two named
+event folders and 1,247 loose files at the root.
+
+**The destination is not a timelapse-maker output directory.** It is five years
+of accumulated history from three predecessor systems, and this is the single
+most important fact about the index: a parser written against the native
+filename format handles **64% of it**.
+
+| Pattern | Files | Era |
+|---|---|---|
+| `Camera.YYYYMMDD.mkv` — native | 4,384 | 2024-04 → now |
+| `YYYY-MM-DD_Camera.mp4` | 1,594 | 2022-09 → 2024-02 |
+| `YYYY-MM-DD.mp4` — **no camera name** | 449 | 2021-06 → 2022-09 |
+| `Camera_YYYY-MM-DD.mp4` | 415 | 2021-07 → 2022-09 |
+| `Camera<date>_<timestamp>.mkv` | 3 | 2024-04 |
+| `YYYY-MM-DDTHH-MM-SS[_cam].mp4` | 2 | event folders |
+
+A chain of patterns, tried most-specific first, parses 6,847 of 6,848. The one
+failure is `MakeTLALL_backup.ps1`, the PowerShell predecessor still sitting in
+the root — which is also the proof that "not a directory" is not a sufficient
+test for "is a video".
+
+Constraints this survey establishes, each of which breaks a naive index:
+
+- **Camera identity must fold case.** `Workshop` (723) and `workshop` (446) are
+  one camera. Fold for identity, keep a display name.
+- **449 files have no camera name.** They need a real bucket, not an exception.
+- **`(camera, date)` is not unique** — 6,844 keys for 6,848 files. The primary
+  key is the relative path. Nothing else is safe.
+- **Extension allow-list**, not a directory test. See the `.ps1`.
+- **Container changes with era** — mp4 through 2024, mkv after. Do not infer it.
+- **Human-made folders carry meaning.** `2023-05-10 - Renovări` and
+  `2023-05-12 - Dubios la poartă` are events, not clutter. Keep the folder as a
+  label rather than flattening it away.
+- **Cameras get renamed.** `garaj` → `Garage`, `street4k` → `StreetPTZ`. The UI
+  will show these as separate cameras. Aliasing is a product decision; do not
+  invent it silently.
+- **Some files are broken.** 11 are implausibly small — `Gate.20240727.mkv` at
+  17 KB, `Gate.20251109.mkv` at 86 KB. Worth flagging in the UI; they are
+  almost certainly failed encodes.
+
+Two findings make reconciliation cheap:
+
+- **mtime is exact.** Across all 4,384 native files, mtime is precisely one day
+  after the filename date — min, median, p95 and max all equal 1. That is the
+  00:05 encode timer. `(size, mtime)` is a dependable change key.
+- **The folder never disagrees with the filename.** Zero mismatches in 5,601
+  filed files, so `YYYY-MM/` is redundant and the index can key entirely on
+  filenames.
+
+**On scan duration: there is no baseline, and the design must not need one.** A
+full recursive enumeration measured 1.7 s, but that was from a workstation with
+10G to the server, and the deployment reads over CIFS from Linux on a different
+stack. The work is latency-bound rather than bandwidth-bound — size and mtime
+arrive with the directory entries, so it is round-trips, not megabytes — but
+that only means the number moves for reasons that are hard to predict. Treat
+1.7 s as a floor observed once, never as a budget. The scan runs in the
+background, never blocks a request, and reports progress; if it takes a
+hundred times longer on someone's hardware, nothing about the UI changes.
+
+### Index design
+
+**Storage: sqlite via stdlib `sqlite3`**, at `/var/lib/timelapse/web/index.db`.
+
+This costs the property phase 1a established — `timelapse-web.service` is the
+only unit with no `ReadWritePaths`, so `ProtectSystem=strict` leaves the entire
+filesystem read-only to it, verified under systemd. A database ends that, and
+the honest framing is that the guarantee becomes *scoped* rather than absolute:
+the unit gets exactly one writable path, `/var/lib/timelapse/web/`, and nothing
+else. The library itself, the frames, and the config all stay read-only. That
+is still enforced by systemd rather than by good intentions, which is the part
+worth keeping.
+
+`sync_units()` must derive that path like every other, and the read-only
+comments in the unit and in architecture.md §4.5 need correcting — they
+currently state the unit writes nothing anywhere, which will no longer be true.
+
+**Scan model:**
+
+- **First run scans in the background.** A worker thread, started after the
+  server is listening, so the UI is up immediately and reports "indexing, N
+  files so far" rather than hanging.
+- **Reconcile on access, not on a timer.** Opening a camera or a month
+  re-stats that directory and compares its mtime; serving a file re-stats that
+  file and compares size and mtime. Anything changed is updated, anything gone
+  is evicted. A full rescan stays available as an explicit action.
+- **The path is the primary key.** `(camera, date)` is an index, not an
+  identity.
+- **Store what a directory entry gives**: path, size, mtime, parsed camera,
+  parsed date, parsed pattern, folder label. Anything needing ffprobe —
+  duration, resolution, codec — is a later phase and must not be on the scan
+  path, or the first run stops being metadata-only and becomes 2.78 TiB of I/O.
+
 ### Phasing
 
 | Phase | Work |
 |---|---|
 | 1a | **Done.** `timelapse_web.py`: `ThreadingHTTPServer`, loopback bind, one static page, `/healthz`, library-root resolution. Unit + install wiring + config keys. |
 | 1b | **Done.** Status pane — `systemctl status` and bounded `journalctl` on request, output in a `<pre>`. |
-| 1c | Library index — resolve destination, scan, parse filenames, group by camera and date. Direct URL shown as copyable text. |
-| 1d | `/video/<name>` file serving + `/play/<name>.m3u` handoff. Download link. |
+| 1c | Library index — sqlite store, background first scan, pattern-chain parser, reconcile on access, browse by camera and date. Direct URL shown as copyable text. |
+| 1d | `/video/<id>` file serving + `/play/<id>.m3u` handoff. Download link. |
 | 1e | Range request support, so seeking works. |
 | 1f | Wizard integration and docs. |
 
