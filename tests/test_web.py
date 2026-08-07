@@ -577,6 +577,126 @@ class TestIndexScan(IndexCase):
         self.assertEqual(self.index.totals()["n"], 7)
 
 
+class TestIndexSurvivesAMissingLibrary(IndexCase):
+    """A NAS that is not mounted yet must not cost you the index.
+
+    Measured before this guard existed: restarting the service while the
+    library was away reported "Indexed 0 files" and deleted every row, and it
+    did not come back when the mount returned. On a real share that is a full
+    rescan of thousands of files over CIFS, at every reboot that loses the
+    race with the mount.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Retrying for ten minutes would be a slow unit test.
+        patch = mock.patch.multiple(web, SCAN_RETRY_DELAY=0, SCAN_RETRY_LIMIT=2)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_an_unreadable_root_keeps_the_index(self):
+        self.scan()
+        self.assertEqual(self.index.totals()["n"], 8)
+        shutil.rmtree(self.root)
+        self.scan()
+        self.assertEqual(self.index.totals()["n"], 8, "index was wiped")
+
+    def test_and_says_why(self):
+        self.scan()
+        shutil.rmtree(self.root)
+        self.scan()
+        self.assertIn("kept the existing index", self.index.scan["error"])
+        self.assertFalse(self.index.scan["running"])
+
+    def test_an_empty_but_readable_root_also_keeps_the_index(self):
+        """The real NAS case: an unmounted CIFS mountpoint is a readable,
+        EMPTY directory, so a readability check alone would not catch it."""
+        self.scan()
+        for child in list(self.root.iterdir()):
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        self.assertTrue(self.root.is_dir(), "root must still be readable")
+        self.scan()
+        self.assertEqual(self.index.totals()["n"], 8, "index was wiped")
+        self.assertIn("kept", self.index.scan["error"])
+
+    def test_the_library_returning_repairs_it(self):
+        self.scan()
+        moved = Path(self.tmp) / "away"
+        self.root.rename(moved)
+        self.scan()
+        moved.rename(self.root)
+        self.scan()
+        self.assertEqual(self.index.totals()["n"], 8)
+        self.assertEqual(self.index.scan["error"], "")
+
+    def test_a_first_scan_of_an_empty_library_is_not_an_error(self):
+        # Nothing indexed yet, nothing on disk: that is simply an empty
+        # library, not a mount problem.
+        for child in list(self.root.iterdir()):
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        self.scan()
+        self.assertEqual(self.index.totals()["n"], 0)
+        self.assertEqual(self.index.scan["error"], "")
+
+    def test_a_real_deletion_still_shrinks_the_index(self):
+        # Guard against the fix being too eager: removing SOME files must
+        # still prune them.
+        self.scan()
+        (self.root / "Gate.20260707.mkv").unlink()
+        self.scan()
+        self.assertEqual(self.index.totals()["n"], 7)
+        self.assertIsNone(self.index.get("Gate.20260707.mkv"))
+
+    def test_stale_rows_are_repaired_by_browsing(self):
+        """The cost of keeping the index: if the library really was emptied,
+        the rows linger until something looks. Opening a folder removes them,
+        which is the reconcile-on-access behaviour that already existed.
+
+        Note the guard is narrow: it only holds when a scan finds NOTHING.
+        A partial deletion still prunes normally, which the test above pins.
+        """
+        self.scan()
+        for child in list(self.root.iterdir()):
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+        (self.root / "2024-01").mkdir()
+        self.scan()
+        self.assertIsNotNone(self.index.get("2024-01/2024-01-01_Workshop.mp4"),
+                             "rows should have been kept")
+        self.index.reconcile_dir("2024-01")
+        self.assertIsNone(self.index.get("2024-01/2024-01-01_Workshop.mp4"))
+
+    def test_it_waits_rather_than_giving_up_at_once(self):
+        with mock.patch.object(web.time, "sleep") as slept:
+            shutil.rmtree(self.root)
+            self.scan()
+        self.assertEqual(slept.call_count, web.SCAN_RETRY_LIMIT - 1)
+
+    def test_a_late_mount_is_picked_up_without_a_manual_rescan(self):
+        """The boot race: the library appears while the scan is still waiting."""
+        moved = Path(self.tmp) / "late"
+        self.root.rename(moved)
+        state = {"n": 0}
+
+        def appear(_delay):
+            state["n"] += 1
+            if state["n"] == 1:
+                moved.rename(self.root)
+
+        with mock.patch.object(web.time, "sleep", side_effect=appear):
+            self.scan()
+        self.assertEqual(self.index.totals()["n"], 8)
+        self.assertEqual(self.index.scan["error"], "")
+
+
 class TestIndexReconcile(IndexCase):
 
     def test_unchanged_directory_reports_no_change(self):

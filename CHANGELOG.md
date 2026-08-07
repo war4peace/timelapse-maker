@@ -96,6 +96,14 @@ While the version is `0.x`, the configuration format may change in any release.
   and it is invisible to `du`.
 
 ### Fixed
+- A NAS that was not mounted yet cost you the whole video index. The startup
+  scan read an empty or missing library, concluded every file had been
+  deleted, and emptied the index, which on a real share means re-reading
+  thousands of files over the network. Worse, it did not recover when the
+  mount came back. The scan now waits for the library to appear and picks it
+  up on its own, and a scan that finds nothing at all keeps what it already
+  had rather than throwing it away. Deleting some of your videos still updates
+  the index normally.
 - The video index would serve **any** file sitting inside your video folder,
   not just videos. The extension allow-list was applied when scanning but not
   when serving, and the serving path re-checks files on access, so a request

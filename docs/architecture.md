@@ -492,6 +492,18 @@ dropped NAS mount is a *correct* empty library, not a fault.
   added within the same second as the last scan stayed invisible.
 - **A changed library root wipes the index.** Serving an index built from a
   different directory is worse than having none.
+- **A missing library does NOT wipe the index.** A scan that cannot read the
+  root has not discovered that every file is gone, it has discovered nothing,
+  and a NAS is often not mounted yet when the service starts at boot. Two
+  guards, because one is not enough: `_wait_for_library()` retries for
+  `SCAN_RETRY_LIMIT` intervals before giving up, and a completed scan that
+  found **zero** files while the index holds rows keeps them instead of
+  pruning. The second guard is the one that matters in practice, because an
+  unmounted CIFS mountpoint is a *readable, empty* directory, so a readability
+  check alone would sail straight past it. The cost is stale rows for a
+  library that really was emptied; those 404 on access and are removed by
+  `reconcile_dir()` the moment the folder is opened. A partial deletion still
+  prunes normally.
 - **An unusable state directory degrades rather than crashes.** Status and logs
   still work; the library page explains that the unit needs `ReadWritePaths`.
 
@@ -772,7 +784,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 427 cases, about forty-five
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 436 cases, about forty-five
 seconds; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -828,6 +840,14 @@ changes:
   install → re-install → uninstall cycle including `sync_units()` leaving the
   web unit without a `ReadWritePaths` line and `restart_upgraded_services()`
   picking the live unit up.
+- **Late mount**: same host, all three shapes. A library that vanishes
+  entirely leaves the index intact, says it is waiting, and **picks the
+  library up on its own** when it returns, with no user action. An
+  empty-but-readable root (what an unmounted CIFS mountpoint actually looks
+  like) also keeps the index and says how many rows it kept. A genuine partial
+  deletion still prunes. Before this, a restart while the library was away
+  reported "Indexed 0 files", deleted every row, and did not recover when the
+  mount came back.
 - **Library index**: same host. Confirmed: `ReadWritePaths` really is scoped
   (a process with the unit's properties can write the state directory and
   **cannot** write the library or the frames; this is the claim worth
@@ -906,7 +926,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 1848 lines
-scripts/timelapse_web.py         read-only web UI, 1502 lines
+scripts/timelapse_web.py         read-only web UI, 1581 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

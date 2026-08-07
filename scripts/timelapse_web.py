@@ -231,6 +231,11 @@ SUSPECT_BYTES = 1024 * 1024
 
 SCHEMA_VERSION = "1"
 
+# A library on a NAS is not always there when the service starts at boot. The
+# scan waits for it rather than concluding the library is empty.
+SCAN_RETRY_DELAY = 60
+SCAN_RETRY_LIMIT = 10
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
     path       TEXT PRIMARY KEY,
@@ -331,10 +336,56 @@ class Index:
                          daemon=True).start()
         return True
 
+    def _root_state(self):
+        """(readable, reason). An unreadable root is not evidence of deletion."""
+        if self.root is None:
+            return False, "no library root is configured"
+        try:
+            if not self.root.is_dir():
+                return False, f"{self.root} is not a readable directory"
+            with os.scandir(self.root) as it:
+                next(it, None)
+        except OSError as exc:
+            return False, f"{self.root} cannot be read: {exc}"
+        return True, ""
+
+    def _wait_for_library(self):
+        """Wait for the library to appear, up to a bounded number of tries.
+
+        A NAS mount is not always up when the service starts at boot, and a
+        scan that cannot read the root has not discovered that every file is
+        gone - it has discovered nothing. Waiting is what turns a late mount
+        into a non-event instead of an index wiped at every reboot.
+        """
+        for attempt in range(1, SCAN_RETRY_LIMIT + 1):
+            ok, why = self._root_state()
+            if ok:
+                return True
+            with self._lock:
+                self.scan["error"] = (f"waiting for the library ({attempt}/"
+                                      f"{SCAN_RETRY_LIMIT}): {why}")
+            log.warning("Library not readable (attempt %d/%d): %s",
+                        attempt, SCAN_RETRY_LIMIT, why)
+            if attempt == SCAN_RETRY_LIMIT:
+                return False
+            time.sleep(SCAN_RETRY_DELAY)
+        return False
+
     def _scan_worker(self):
         seen, batch, count = set(), [], 0
         try:
+            if not self._wait_for_library():
+                _, why = self._root_state()
+                with self._lock:
+                    self.scan.update(
+                        running=False, finished=time.time(),
+                        error=f"library unreadable, kept the existing index: {why}")
+                log.error("Giving up on the scan; the existing index is kept.")
+                return
+
             with self._connect() as db:
+                before = db.execute(
+                    "SELECT COUNT(*) c FROM files").fetchone()["c"]
                 for row in self._walk():
                     seen.add(row[0])
                     batch.append(row)
@@ -346,7 +397,27 @@ class Index:
                             self.scan["files"] = count
                 if batch:
                     self._write(db, batch)
-                # Anything not seen this pass is gone from disk.
+
+                # Anything not seen this pass is gone from disk - unless the
+                # pass saw nothing at all while the index holds rows. An
+                # unmounted CIFS mountpoint is a *readable, empty* directory,
+                # so "found nothing" is far more often a mount that is not
+                # there than a library someone deleted. Keeping stale rows
+                # costs a 404 and is repaired by opening the folder; wiping
+                # the index costs a full rescan of the whole share.
+                if count == 0 and before > 0:
+                    db.commit()
+                    with self._lock:
+                        self.scan.update(
+                            running=False, files=0, finished=time.time(),
+                            error=(f"found no videos in {self.root}, so the "
+                                   f"existing index of {before} was kept. If "
+                                   f"the library really is empty it will "
+                                   f"correct itself as you browse."))
+                    log.warning("Scan found nothing but the index holds %d; "
+                                "keeping it.", before)
+                    return
+
                 keep = list(seen)
                 db.execute("CREATE TEMP TABLE seen(path TEXT PRIMARY KEY)")
                 db.executemany("INSERT OR IGNORE INTO seen VALUES (?)",
@@ -356,7 +427,7 @@ class Index:
                 db.commit()
             with self._lock:
                 self.scan.update(running=False, files=count,
-                                 finished=time.time())
+                                 finished=time.time(), error="")
             log.info("Library scan finished: %d files", count)
         except Exception as exc:            # a scan must never kill the server
             log.error("Library scan failed: %s", exc)
@@ -1166,7 +1237,11 @@ class Handler(BaseHTTPRequestHandler):
             return f'<section><p class="note">{escape(index.error)}</p></section>'
         lib = resolve_library(self.server.cfg)
         if not lib["usable"]:
-            return ('<section><h2>Video library</h2>'
+            # The scan banner belongs here too: if a scan is waiting for the
+            # library to appear, saying so is the difference between "this is
+            # broken" and "this will fix itself when the mount comes back".
+            return (self._scan_banner() +
+                    '<section><h2>Video library</h2>'
                     f'<p class="note">{escape(lib["note"] or "No readable library.")}'
                     '</p></section>')
 
@@ -1184,11 +1259,15 @@ class Handler(BaseHTTPRequestHandler):
         s = dict(self.server.index.scan)
         rescan = ('<form class="inline" method="post" action="/rescan">'
                   '<button type="submit">Rescan</button></form>')
+        if s["running"] and s["error"]:
+            # Waiting on the library rather than reading it. Say which.
+            return (f'<p class="note">{escape(s["error"])}</p>'
+                    f'<p class="scan">{rescan}</p>')
         if s["running"]:
             return (f'<p class="scan">Indexing&hellip; {s["files"]} files so far. '
                     f'This page works while it runs; reload for more.</p>')
         if s["error"]:
-            return (f'<p class="note">Last scan failed: {escape(s["error"])}</p>'
+            return (f'<p class="note">{escape(s["error"])}</p>'
                     f'<p class="scan">{rescan}</p>')
         if s["finished"]:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["finished"]))
