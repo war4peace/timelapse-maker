@@ -439,6 +439,34 @@ The function returns a dict with `usable` and a `note` rather than a path,
 because "why is this empty" is the question the page exists to answer, and a
 dropped NAS mount is a *correct* empty library, not a fault.
 
+**Status and logs** (`/status`, `/logs`) shell out, on request only — a page
+load or a click. Nothing polls and nothing is collected in the background.
+
+- **A non-zero exit is not a failure.** `systemctl status` exits 3 for an
+  inactive unit and 4 for one that does not exist, and that output is precisely
+  what the page is for. `run_command()` reports a problem only when the command
+  could not be run at all: missing binary, timeout, `OSError`. Treating exit 3
+  as an error would replace the answer with an error page.
+- **`--lines=0`** suppresses the journal excerpt `systemctl status` normally
+  appends. That excerpt needs journal access, so without the flag the output
+  looks mysteriously truncated for readers who lack it.
+- **Never `-f`.** The `timelapse logs` wrapper is `journalctl -f`, which never
+  returns; a handler running it would hang until the client gave up. The web
+  path is bounded (`-n`, `--no-pager`) with a subprocess timeout on top.
+- **The journal needs a group.** `journalctl -u` returns `-- No entries --`,
+  not a permission error, to a user outside `systemd-journal` — indistinguishable
+  from a quiet service, and it reads as a bug in the UI.
+  `SupplementaryGroups=systemd-journal` in the unit grants it without putting
+  the account in the group system-wide. `sync_units()` **deletes that line when
+  the group does not exist**, because a `SupplementaryGroups` naming a missing
+  group stops the unit from starting at all. When it is absent the page detects
+  the empty result and explains it rather than leaving a blank pane.
+- **No request value reaches a command line.** `unit` and `n` are keys into
+  `LOG_UNITS` and `LOG_LINES`; the *values* are what get executed, and an
+  unknown key falls back to the default rather than 400 — these come from
+  links, and a stale bookmark should show the default log, not an error.
+  `shell=True` appears nowhere.
+
 **Security posture.** Binds `127.0.0.1` by default and warns when it does not;
 `http.server` is not hardened and there is no TLS here. It never serves
 `config.json` and never renders a camera URL — those hold credentials. Routing
@@ -620,7 +648,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 269 cases, under two
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 288 cases, under three
 seconds) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -676,6 +704,14 @@ changes:
   install → re-install → uninstall cycle including `sync_units()` leaving the
   web unit without a `ReadWritePaths` line and `restart_upgraded_services()`
   picking the live unit up.
+- **Status pane** — same host, **both** journal states exercised, which is the
+  point: with `SupplementaryGroups=systemd-journal` the log pane returns real
+  entries; with the line deleted the unit still starts, `systemctl status` still
+  works (it needs no journal), and the log pane explains the empty result
+  instead of showing a blank. The `sync_units()` guard was checked by shadowing
+  `getent` on `PATH` so the group appeared to be missing — the line is removed
+  and the installer says why. Also confirmed `systemctl` reaches PID 1 from
+  inside the sandbox, which is what `RestrictAddressFamilies=…AF_UNIX` is for.
 - **Query-string credential encoding** — a password containing `@ & = #` fed
   through the wizard and parsed back out of the generated URL unchanged.
 - **Profile probe** — mock ONVIF endpoint serving 2560×1440 / 704×576 / 640×480
@@ -698,12 +734,12 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 559 lines
+install.sh                       bootstrap installer, 572 lines
 scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 1691 lines
-scripts/timelapse_web.py         read-only web UI, 341 lines
+scripts/timelapse_web.py         read-only web UI, 498 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

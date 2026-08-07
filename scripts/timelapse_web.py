@@ -28,10 +28,12 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs
 
 __version__ = "0.0.8"
 
@@ -144,10 +146,97 @@ def resolve_library(cfg):
 
 
 # ----------------------------------------------------------------------------
+# Service status and logs
+# ----------------------------------------------------------------------------
+
+# Run only when asked - a page load or a click. Nothing polls, nothing is
+# collected in the background.
+
+COMMAND_TIMEOUT = 10
+
+STATUS_UNITS = ("timelapse-capture.service", "timelapse-encode.timer",
+                "timelapse-encode.service", "timelapse-web.service")
+
+# Request values pick a key; the *value* is what reaches the command line. No
+# string from a request is ever interpolated into an argv, so there is no
+# injection surface even in principle. Keep it that way.
+LOG_UNITS = {
+    "capture": "timelapse-capture",
+    "encode": "timelapse-encode",
+    "web": "timelapse-web",
+}
+LOG_LINES = {"200": "200", "1000": "1000"}
+DEFAULT_LOG_UNIT = "capture"
+DEFAULT_LOG_LINES = "200"
+
+JOURNAL_DENIED = (
+    "No entries. If the unit has been running, this process cannot read the "
+    "journal rather than the journal being empty: journalctl shows nothing to "
+    "a user outside the systemd-journal group, and says so no more loudly "
+    "than this. Add SupplementaryGroups=systemd-journal to "
+    "timelapse-web.service."
+)
+
+
+def run_command(argv):
+    """Run a fixed argv. Returns (output, problem).
+
+    `problem` is set only when the command could not be run at all. A non-zero
+    exit is not a problem: `systemctl status` exits 3 for an inactive unit and
+    4 for one that does not exist, and that output is precisely what the page
+    is for. Treating those as failures would replace the answer with an error.
+
+    Never shell=True, and argv is always built from constants.
+    """
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=COMMAND_TIMEOUT)
+    except FileNotFoundError:
+        return "", (f"{argv[0]} is not installed here. The status pane needs "
+                    f"systemd.")
+    except subprocess.TimeoutExpired:
+        return "", f"{argv[0]} did not answer within {COMMAND_TIMEOUT}s."
+    except OSError as exc:
+        return "", f"Could not run {argv[0]}: {exc}"
+
+    # stderr matters as much as stdout: journalctl explains itself there.
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return out, ""
+
+
+def status_report():
+    """`systemctl status` for every unit this project installs.
+
+    --lines=0 suppresses the journal excerpt systemctl normally appends. That
+    excerpt needs journal access, so without it the output looks mysteriously
+    truncated; the logs page asks for logs explicitly instead.
+    """
+    argv = ["systemctl", "status", "--no-pager", "--lines=0"] + list(STATUS_UNITS)
+    out, problem = run_command(argv)
+    return {"command": " ".join(argv), "output": out, "problem": problem,
+            "hint": ""}
+
+
+def journal_report(unit_key, lines_key):
+    unit = LOG_UNITS.get(unit_key, LOG_UNITS[DEFAULT_LOG_UNIT])
+    lines = LOG_LINES.get(lines_key, LOG_LINES[DEFAULT_LOG_LINES])
+    argv = ["journalctl", "-u", unit, "-n", lines, "--no-pager"]
+    out, problem = run_command(argv)
+
+    # -f would never return and would hang the request until the client gave
+    # up; the `timelapse logs` wrapper follows, and this deliberately does not.
+    hint = ""
+    if not problem and out.strip().lower().strip("- ") in ("no entries", ""):
+        hint = JOURNAL_DENIED
+    return {"command": " ".join(argv), "output": out, "problem": problem,
+            "hint": hint}
+
+
+# ----------------------------------------------------------------------------
 # Page
 # ----------------------------------------------------------------------------
 
-PAGE = """<!doctype html>
+LAYOUT = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>timelapse-maker</title>
@@ -176,13 +265,32 @@ PAGE = """<!doctype html>
     .ok {{ color: #4ac26b; }} .bad {{ color: #ff7b72; }}
   }}
   ul.todo {{ margin: 0; padding-left: 1.1rem; opacity: .65; font-size: .9rem; }}
+  nav {{ display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1.25rem; }}
+  nav a {{ text-decoration: none; border: 1px solid rgba(128,128,128,.35);
+           border-radius: 999px; padding: .25rem .8rem; font-size: .9rem;
+           color: inherit; }}
+  nav a.on {{ background: rgba(128,128,128,.18); font-weight: 600; }}
+  pre {{ overflow-x: auto; background: rgba(128,128,128,.12); border-radius: 6px;
+         padding: .8rem .9rem; font-size: .82rem; line-height: 1.45;
+         margin: 0; }}
+  .cmd {{ font-size: .8rem; opacity: .55; margin: 0 0 .5rem; }}
+  .sub {{ display: flex; gap: .5rem; flex-wrap: wrap; margin: 0 0 .8rem;
+          font-size: .85rem; }}
+  .sub a {{ color: inherit; }}
 </style>
 <header>
   <h1>timelapse-maker</h1>
   <span class="ver">web {version}</span>
 </header>
+<nav>
+  <a href="/" class="{on_home}">Overview</a>
+  <a href="/status" class="{on_status}">Service status</a>
+  <a href="/logs" class="{on_logs}">Recent log</a>
+</nav>
+{content}
+"""
 
-<section>
+OVERVIEW = """<section>
   <h2>Video library</h2>
   <dl>
     <dt>Location</dt><dd><code>{lib_path}</code></dd>
@@ -195,7 +303,6 @@ PAGE = """<!doctype html>
 <section>
   <h2>Not built yet</h2>
   <ul class="todo">
-    <li>Status pane &mdash; <code>systemctl status</code> and recent journal, on request</li>
     <li>Video index &mdash; browse by camera and date</li>
     <li>Playback handoff &mdash; <code>.m3u</code> to VLC, plus a download link</li>
   </ul>
@@ -228,9 +335,16 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(raw)
 
     def do_GET(self):
-        route = self.path.split("?", 1)[0].rstrip("/") or "/"
+        path, _, query = self.path.partition("?")
+        route = path.rstrip("/") or "/"
+        args = parse_qs(query)
+
         if route == "/":
-            self._send(200, self._page())
+            self._send(200, self._render("home", self._overview()))
+        elif route == "/status":
+            self._send(200, self._render("status", self._report(status_report())))
+        elif route == "/logs":
+            self._send(200, self._render("logs", self._logs(args)))
         elif route == "/healthz":
             self._send(200, "ok\n", "text/plain; charset=utf-8")
         else:
@@ -238,20 +352,63 @@ class Handler(BaseHTTPRequestHandler):
 
     do_HEAD = do_GET
 
-    def _page(self):
+    def _render(self, page, content):
+        return LAYOUT.format(
+            version=__version__,
+            on_home="on" if page == "home" else "",
+            on_status="on" if page == "status" else "",
+            on_logs="on" if page == "logs" else "",
+            content=content,
+        )
+
+    def _overview(self):
         # Re-resolved per request rather than cached at startup: a NAS mount
         # comes and goes, and a page that reports a stale answer is worse than
         # no page. It is two stat() calls.
         lib = resolve_library(self.server.cfg)
         note = f'<p class="note">{escape(lib["note"])}</p>' if lib["note"] else ""
-        return PAGE.format(
-            version=__version__,
+        return OVERVIEW.format(
             lib_path=escape(str(lib["path"]) if lib["path"] else "-"),
             lib_source=escape(lib["source"] or "-"),
             lib_class="ok" if lib["usable"] else "bad",
             lib_state="yes" if lib["usable"] else "no",
             lib_note=note,
         )
+
+    def _logs(self, args):
+        unit = (args.get("unit") or [DEFAULT_LOG_UNIT])[0]
+        lines = (args.get("n") or [DEFAULT_LOG_LINES])[0]
+        # Unknown values fall back rather than 400: these come from links, and
+        # a stale bookmark should show the default log, not an error.
+        if unit not in LOG_UNITS:
+            unit = DEFAULT_LOG_UNIT
+        if lines not in LOG_LINES:
+            lines = DEFAULT_LOG_LINES
+
+        picker = ['<p class="sub">']
+        for key in LOG_UNITS:
+            mark = "<strong>%s</strong>" % key if key == unit else key
+            picker.append(f'<a href="/logs?unit={key}&amp;n={lines}">{mark}</a>')
+        picker.append("&nbsp;|&nbsp;")
+        for key in LOG_LINES:
+            mark = "<strong>%s</strong>" % key if key == lines else key
+            picker.append(f'<a href="/logs?unit={unit}&amp;n={key}">{mark}</a>')
+        picker.append("</p>")
+
+        return "".join(picker) + self._report(journal_report(unit, lines))
+
+    @staticmethod
+    def _report(rep):
+        """One command's output in a <pre>, with whatever went wrong instead."""
+        parts = [f'<section><p class="cmd"><code>{escape(rep["command"])}</code></p>']
+        if rep["problem"]:
+            parts.append(f'<p class="note">{escape(rep["problem"])}</p>')
+        else:
+            parts.append(f'<pre>{escape(rep["output"]) or "(no output)"}</pre>')
+        if rep["hint"]:
+            parts.append(f'<p class="note">{escape(rep["hint"])}</p>')
+        parts.append("</section>")
+        return "".join(parts)
 
     def log_message(self, fmt, *args):
         # Default writes to stderr, which journald tags as an error. These are

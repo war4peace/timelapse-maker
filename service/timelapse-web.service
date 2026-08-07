@@ -33,13 +33,19 @@ ProtectSystem=strict
 ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectControlGroups=true
+# AF_UNIX is not optional: systemctl reaches PID 1 over a unix socket.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
-# NOTE for the status pane (next phase): `journalctl -u ...` returns nothing
-# for a user outside the systemd-journal group, which looks like a bug in the
-# UI rather than a missing permission. It needs
-#   SupplementaryGroups=systemd-journal
-# added here - guarded in install.sh, because that group does not exist on
-# every distro and a missing group stops the unit from starting at all.
+
+# The status pane runs `journalctl -u ...`, which returns "-- No entries --"
+# for a user outside this group rather than a permission error - i.e. it looks
+# like a bug in the UI. This grants read access without putting the account in
+# the group system-wide.
+#
+# install.sh sync_units() DELETES this line when the group does not exist,
+# because a SupplementaryGroups naming a missing group stops the unit from
+# starting at all. Every systemd distro has it; the guard is for the ones the
+# installer has never been run on.
+SupplementaryGroups=systemd-journal
 
 [Install]
 WantedBy=multi-user.target

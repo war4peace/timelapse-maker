@@ -11,8 +11,9 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Added
 - **`timelapse web`** — an optional, read-only web UI, disabled by default.
-  This first cut is scaffolding: it serves a status page reporting where your
-  finished videos actually live, plus `/healthz`. Browsing and playback come
+  It shows where your finished videos actually live, and — on request, never
+  by polling — the output of `systemctl status` for every unit and the recent
+  journal for capture, encode or the UI itself. Browsing and playback come
   next. It never changes anything — no encode triggers, no camera control, no
   config edits — and the unit enforces that rather than trusting the code:
   `timelapse-web.service` is the only unit with no `ReadWritePaths`, so the
@@ -27,6 +28,14 @@ While the version is `0.x`, the configuration format may change in any release.
   successful night. A remote `user@nas:/...` destination is not a path this
   host can read at all, and the page says so instead of showing an empty list
   that looks like a fault — as does a NAS that simply is not mounted.
+
+  The log pane has the same habit of explaining itself. `journalctl` tells a
+  process without journal access that there are simply no entries, which is
+  indistinguishable from a quiet service and reads as a broken page. The unit
+  asks for `SupplementaryGroups=systemd-journal` so this does not arise; where
+  that group does not exist the installer removes the line — naming a missing
+  group would stop the service starting at all — and the page then tells you
+  which line to add.
 - **`timelapse usage`** — disk report: frames, bytes and date range per camera,
   totals, videos and free space. It also names the directories nothing will
   ever encode: a camera removed from the config (`ORPHAN`) or merely disabled

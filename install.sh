@@ -323,6 +323,19 @@ sync_units() {
             -e "s|^ExecStart=.*timelapse_web.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_web.py $CONFIG|" \
             "$f"
     done
+
+    # SupplementaryGroups naming a group that does not exist stops the unit
+    # from starting outright, so it is cheaper to drop the line than to have
+    # the web UI fail to boot on a distro we have never tried. The cost of
+    # dropping it is only that the log pane comes back empty - which the page
+    # explains, rather than leaving the reader guessing.
+    if [ -f "$UNITDIR/timelapse-web.service" ] \
+       && ! getent group systemd-journal >/dev/null 2>&1; then
+        sed -i '/^SupplementaryGroups=systemd-journal$/d' \
+            "$UNITDIR/timelapse-web.service"
+        note "No systemd-journal group here; the web log pane will be empty."
+    fi
+
     [ -d /run/systemd/system ] && systemctl daemon-reload || true
     note "ReadWritePaths=$rw"
 }

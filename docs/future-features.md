@@ -201,7 +201,7 @@ two releases before the wizard offered them.
 | Phase | Work |
 |---|---|
 | 1a | **Done.** `timelapse_web.py`: `ThreadingHTTPServer`, loopback bind, one static page, `/healthz`, library-root resolution. Unit + install wiring + config keys. |
-| 1b | Status pane — `systemctl status` and bounded `journalctl` on request, output in a `<pre>`. |
+| 1b | **Done.** Status pane — `systemctl status` and bounded `journalctl` on request, output in a `<pre>`. |
 | 1c | Library index — resolve destination, scan, parse filenames, group by camera and date. Direct URL shown as copyable text. |
 | 1d | `/video/<name>` file serving + `/play/<name>.m3u` handoff. Download link. |
 | 1e | Range request support, so seeking works. |

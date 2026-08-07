@@ -7,9 +7,11 @@ and binding a port in a unit test invites flakiness on a CI runner.
 
 import io
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import _support  # noqa: F401  (puts scripts/ on sys.path)
 
@@ -232,6 +234,165 @@ class TestRouting(unittest.TestCase):
         _, _, body = request("/", config)
         self.assertNotIn("<script>", body)
         self.assertIn("&lt;script&gt;", body)
+
+
+class TestRunCommand(unittest.TestCase):
+    """The status pane shells out. What matters is which outcomes count as
+    failures - getting that wrong replaces the answer with an error page."""
+
+    def test_output_is_captured(self):
+        out, problem = web.run_command(
+            [sys.executable, "-c", "print('hello')"])
+        self.assertEqual(problem, "")
+        self.assertEqual(out, "hello")
+
+    def test_nonzero_exit_is_not_a_problem(self):
+        """`systemctl status` exits 3 for an inactive unit and 4 for a missing
+        one. That output is exactly what the page exists to show."""
+        out, problem = web.run_command(
+            [sys.executable, "-c", "print('inactive (dead)'); raise SystemExit(3)"])
+        self.assertEqual(problem, "")
+        self.assertIn("inactive", out)
+
+    def test_stderr_is_kept(self):
+        # journalctl explains itself on stderr.
+        out, _ = web.run_command(
+            [sys.executable, "-c", "import sys; sys.stderr.write('why')"])
+        self.assertIn("why", out)
+
+    def test_missing_binary_is_a_problem(self):
+        out, problem = web.run_command(["definitely-not-a-real-binary-xyz"])
+        self.assertEqual(out, "")
+        self.assertIn("not installed", problem)
+
+    def test_timeout_is_a_problem_not_a_hang(self):
+        with mock.patch.object(web, "COMMAND_TIMEOUT", 1):
+            out, problem = web.run_command(
+                [sys.executable, "-c", "import time; time.sleep(30)"])
+        self.assertEqual(out, "")
+        self.assertIn("did not answer", problem)
+
+
+class TestReports(unittest.TestCase):
+
+    def test_status_suppresses_the_journal_excerpt(self):
+        # Without --lines=0 systemctl appends log lines that need journal
+        # access, so the output looks truncated for no visible reason.
+        with mock.patch.object(web, "run_command",
+                               return_value=("", "")) as run:
+            web.status_report()
+        self.assertIn("--lines=0", run.call_args[0][0])
+        self.assertIn("--no-pager", run.call_args[0][0])
+
+    def test_journal_never_follows(self):
+        """`timelapse logs` is journalctl -f, which never returns. A request
+        handler running that would hang until the client gave up."""
+        with mock.patch.object(web, "run_command",
+                               return_value=("x", "")) as run:
+            web.journal_report("capture", "200")
+        argv = run.call_args[0][0]
+        self.assertNotIn("-f", argv)
+        self.assertNotIn("--follow", argv)
+        self.assertIn("--no-pager", argv)
+        self.assertEqual(argv[argv.index("-n") + 1], "200")
+
+    def test_request_values_never_reach_the_command_line(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("x", "")) as run:
+            web.journal_report("; rm -rf /", "9999; whoami")
+        argv = run.call_args[0][0]
+        self.assertEqual(argv[argv.index("-u") + 1], "timelapse-capture")
+        self.assertEqual(argv[argv.index("-n") + 1], "200")
+        for token in argv:
+            self.assertNotIn("rm -rf", token)
+            self.assertNotIn("whoami", token)
+
+    def test_every_log_unit_maps_to_a_real_unit_name(self):
+        for key, unit in web.LOG_UNITS.items():
+            self.assertTrue(unit.startswith("timelapse-"), key)
+
+    def test_empty_journal_explains_the_group_problem(self):
+        """An unprivileged reader gets "-- No entries --", not a permission
+        error, which reads as a bug in the UI."""
+        for output in ("-- No entries --", "", "-- no entries --"):
+            with mock.patch.object(web, "run_command",
+                                   return_value=(output, "")):
+                rep = web.journal_report("capture", "200")
+            self.assertIn("systemd-journal", rep["hint"], repr(output))
+
+    def test_real_output_gets_no_hint(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("Aug 07 00:31 started", "")):
+            rep = web.journal_report("capture", "200")
+        self.assertEqual(rep["hint"], "")
+
+    def test_a_failed_command_gets_no_misleading_hint(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("", "journalctl is not installed here.")):
+            rep = web.journal_report("capture", "200")
+        self.assertEqual(rep["hint"], "")
+        self.assertIn("not installed", rep["problem"])
+
+
+class TestStatusRoutes(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        Path(self.tmp, "videos").mkdir()
+        self.config = cfg(self.tmp, transfer={"enabled": False})
+
+    def test_status_page(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("Active: active (running)", "")):
+            status, _, body = request("/status", self.config)
+        self.assertEqual(status, 200)
+        self.assertIn("Active: active (running)", body)
+
+    def test_logs_page_defaults_to_capture(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("a log line", "")) as run:
+            status, _, body = request("/logs", self.config)
+        self.assertEqual(status, 200)
+        self.assertIn("a log line", body)
+        self.assertIn("timelapse-capture", run.call_args[0][0])
+
+    def test_logs_page_honours_the_unit_picker(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("x", "")) as run:
+            request("/logs?unit=encode&n=1000", self.config)
+        argv = run.call_args[0][0]
+        self.assertIn("timelapse-encode", argv)
+        self.assertEqual(argv[argv.index("-n") + 1], "1000")
+
+    def test_a_stale_bookmark_falls_back_rather_than_erroring(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("x", "")) as run:
+            status, _, _ = request("/logs?unit=nonsense&n=7", self.config)
+        self.assertEqual(status, 200)
+        argv = run.call_args[0][0]
+        self.assertIn("timelapse-capture", argv)
+        self.assertEqual(argv[argv.index("-n") + 1], "200")
+
+    def test_command_output_is_escaped(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("<script>alert(1)</script>", "")):
+            _, _, body = request("/status", self.config)
+        self.assertNotIn("<script>", body)
+        self.assertIn("&lt;script&gt;", body)
+
+    def test_a_problem_is_shown_instead_of_an_empty_pre(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("", "systemctl is not installed here.")):
+            _, _, body = request("/status", self.config)
+        self.assertIn("not installed here", body)
+
+    def test_nothing_runs_unless_that_page_is_asked_for(self):
+        # Status is on request only: the overview must not shell out.
+        with mock.patch.object(web, "run_command") as run:
+            request("/", self.config)
+            request("/healthz", self.config)
+        run.assert_not_called()
 
 
 class TestEscape(unittest.TestCase):
