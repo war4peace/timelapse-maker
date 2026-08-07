@@ -68,6 +68,12 @@ While the version is `0.x`, the configuration format may change in any release.
   reached the page on, so a link opened on your phone points at something your
   phone can actually reach.
 
+  There is also **one playlist per day**: open a single file and your player
+  queues that day's videos from every place in turn, rather than you opening
+  seven of them. Recent days are listed on the library page, and any date in a
+  listing links to its own day. It includes whatever was filed under that date,
+  whichever naming convention the file came from.
+
   Seeking does not work yet — the server says so rather than pretending, and
   it is the next thing.
 

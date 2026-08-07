@@ -542,6 +542,19 @@ class Index:
             "SELECT folder, COUNT(*) n, SUM(size) b FROM files "
             "GROUP BY folder ORDER BY folder DESC")
 
+    def by_day(self, day):
+        # lower(camera) for the same reason as cameras(): two spellings of a
+        # place sit together, and neither is folded into the other.
+        return self._query(
+            "SELECT * FROM files WHERE day = ? "
+            "ORDER BY lower(camera), camera, name", (day,))
+
+    def recent_days(self, limit=14):
+        return self._query(
+            "SELECT day, COUNT(*) n, SUM(size) b FROM files "
+            "WHERE day IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT ?",
+            (limit,))
+
     def by_camera(self, camera):
         return self._query(
             "SELECT * FROM files WHERE camera = ? ORDER BY day DESC, name",
@@ -582,6 +595,28 @@ SEND_CHUNK = 256 * 1024
 # A Host header goes straight into the playlist URL, so it is validated rather
 # than trusted. Hostnames, IPv4, bracketed IPv6, optional port - nothing else.
 HOST_RE = re.compile(r"^[A-Za-z0-9._\-]+(:\d{1,5})?$|^\[[0-9A-Fa-f:.]+\](:\d{1,5})?$")
+
+
+DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def valid_day(text):
+    """An ISO date, or None. Guards every day-keyed route."""
+    if not DAY_RE.match(text or ""):
+        return None
+    try:
+        return datetime.date.fromisoformat(text).isoformat()
+    except ValueError:
+        return None
+
+
+def m3u_title(text):
+    """A title that cannot span two lines.
+
+    A filename may legally contain a newline on Linux, and an #EXTINF carrying
+    one would split into a bogus second entry - so all whitespace collapses.
+    """
+    return " ".join(str(text or "").split()) or "timelapse"
 
 
 def media_type(name):
@@ -834,6 +869,9 @@ class Handler(BaseHTTPRequestHandler):
         if route.startswith("/play/"):
             self._serve_m3u(unquote(route[len("/play/"):]))
             return
+        if route.startswith("/day/"):
+            self._serve_day_m3u(unquote(route[len("/day/"):]))
+            return
 
         if route == "/":
             self._send(200, self._render("home", self._overview()))
@@ -979,26 +1017,67 @@ class Handler(BaseHTTPRequestHandler):
             proto = "http"
         return f"{proto}://{host}"
 
-    def _serve_m3u(self, rel):
-        row, path = self._locate(rel)
-        if row is None or path is None:
-            self._send(404, "no such video\n", "text/plain; charset=utf-8")
-            return
-        title = " ".join(x for x in (row["camera"], row["day"]) if x) or row["name"]
-        url = f"{self._base_url()}/video/{quote(rel)}"
-        body = f"#EXTM3U\n#EXTINF:-1,{title}\n{url}\n"
-        raw = body.encode("utf-8")
+    @staticmethod
+    def _entry_title(row):
+        return m3u_title(" ".join(x for x in (row["camera"], row["day"]) if x)
+                         or row["name"])
+
+    def _send_playlist(self, lines, filename):
+        raw = ("\n".join(lines) + "\n").encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", M3U_TYPE)
         self.send_header("Content-Length", str(len(raw)))
         # The filename is what makes the desktop hand this to a player, so the
         # .m3u extension here matters more than anything in the URL.
         self.send_header("Content-Disposition",
-                         f'attachment; filename="{ascii_filename(row["name"], ".m3u")}"')
+                         f'attachment; filename="{filename}"')
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(raw)
+
+    def _serve_m3u(self, rel):
+        row, path = self._locate(rel)
+        if row is None or path is None:
+            self._send(404, "no such video\n", "text/plain; charset=utf-8")
+            return
+        self._send_playlist(
+            ["#EXTM3U",
+             f"#EXTINF:-1,{self._entry_title(row)}",
+             f"{self._base_url()}/video/{quote(rel)}"],
+            ascii_filename(row["name"], ".m3u"))
+
+    def _serve_day_m3u(self, text):
+        """Every video from one day, as a single playlist.
+
+        The point of the feature: to review a day you open one file, and the
+        player queues every place in turn instead of you opening seven.
+        """
+        day = valid_day(text)
+        index = self.server.index
+        if day is None or not index.usable:
+            self._send(404, "no such day\n", "text/plain; charset=utf-8")
+            return
+
+        # Re-stat each entry rather than trusting the index. A playlist is
+        # handed to a player that will not come back and ask again, so a dead
+        # URL in it is worse than a shorter list. A day is a handful of files.
+        live = []
+        for row in index.by_day(day):
+            fresh = index.reconcile_file(row["path"])
+            if fresh is not None:
+                live.append(fresh)
+        if not live:
+            self._send(404, "no videos for that day\n",
+                       "text/plain; charset=utf-8")
+            return
+
+        base = self._base_url()
+        lines = ["#EXTM3U", f"#PLAYLIST:Timelapses {day}"]
+        for row in live:
+            lines.append(f"#EXTINF:-1,{self._entry_title(row)}")
+            lines.append(f"{base}/video/{quote(row['path'])}")
+        self._send_playlist(lines, f"timelapse-{day}.m3u")
 
     # -- library ------------------------------------------------------------
 
@@ -1012,6 +1091,8 @@ class Handler(BaseHTTPRequestHandler):
                     f'<p class="note">{escape(lib["note"] or "No readable library.")}'
                     '</p></section>')
 
+        if "day" in args:
+            return self._scan_banner() + self._day_view(args["day"][0])
         if "folder" in args:
             return self._scan_banner() + self._folder_view(args["folder"][0])
         if "camera" in args:
@@ -1076,6 +1157,24 @@ class Handler(BaseHTTPRequestHandler):
                          'case-insensitively so variants sit together.</p>'
                          "</section>")
 
+        days = index.recent_days()
+        if days:
+            parts.append('<section><h2>Recent days</h2><div class="wrap"><table>'
+                         '<tr><th>Day</th><th>Videos</th><th>Size</th>'
+                         '<th>Open</th></tr>')
+            for d in days:
+                parts.append(
+                    f'<tr><td class="num">'
+                    f'<a href="/library?day={escape(d["day"])}">'
+                    f'{escape(d["day"])}</a></td>'
+                    f'<td class="num">{d["n"]:,}</td>'
+                    f'<td class="num">{human_size(d["b"])}</td>'
+                    f'<td class="acts"><a href="/day/{escape(d["day"])}">'
+                    f'Play the day</a></td></tr>')
+            parts.append('</table></div><p class="scan">One playlist per day, '
+                         'so reviewing a day means opening a single file rather '
+                         'than one per place.</p></section>')
+
         folders = index.folders()
         if folders:
             parts.append('<section><h2>Folders</h2><div class="wrap"><table>'
@@ -1089,6 +1188,23 @@ class Handler(BaseHTTPRequestHandler):
                     f'<td class="num">{human_size(f["b"])}</td></tr>')
             parts.append("</table></div></section>")
         return "".join(parts)
+
+    def _day_view(self, text):
+        day = valid_day(text)
+        if day is None:
+            return ('<section><p class="note">Not a date: '
+                    f'{escape(text)}</p></section>')
+        rows = self.server.index.by_day(day)
+        if not rows:
+            return (f'<section><h2>{escape(day)}</h2>'
+                    '<p class="scan">Nothing indexed for that day.</p></section>')
+        head = (f'<section><h2>{escape(day)}</h2>'
+                f'<p class="sub"><a href="/day/{escape(day)}"><strong>'
+                f'Play the whole day</strong></a> &mdash; one playlist, every '
+                f'place in turn ({len(rows)} videos, '
+                f'{human_size(sum(r["size"] for r in rows))}).</p>')
+        return head + self._file_table(rows, show_folder=True,
+                                       full_path=True) + "</section>"
 
     def _camera_view(self, camera):
         rows = self.server.index.by_camera(camera)
@@ -1152,7 +1268,9 @@ class Handler(BaseHTTPRequestHandler):
         for r in rows:
             enc = quote(r["path"])
             flag = ' class="flag"' if r["suspect"] else ""
-            out.append(f'<tr><td class="num">{escape(r["day"] or "-")}</td>')
+            day = (f'<a href="/library?day={escape(r["day"])}">'
+                   f'{escape(r["day"])}</a>') if r["day"] else "-"
+            out.append(f'<tr><td class="num">{day}</td>')
             out.append(f'<td{flag}>{escape(r["name"])}</td>')
             if show_folder:
                 out.append(f'<td>{escape(r["folder"] or "(root)")}</td>')

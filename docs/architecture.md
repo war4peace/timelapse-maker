@@ -491,6 +491,22 @@ dropped NAS mount is a *correct* empty library, not a fault.
   VLC, mpv and MPC-HC. `/play/<path>` returns a one-line `.m3u` whose
   `Content-Disposition` filename ends in `.m3u`, which is what makes the
   desktop hand it to a player; the URL extension is irrelevant to that.
+- **Two playlists.** `/play/<path>` is one video; `/day/<YYYY-MM-DD>` is every
+  video from one day, so reviewing a day means opening a single file rather
+  than one per place. Entries are ordered `lower(camera)`, which puts two
+  spellings of a place adjacent without folding either into the other — the
+  same rule the index itself follows.
+- **A day playlist re-stats every entry before emitting it.** A playlist is
+  handed to a player that will not come back and ask again, so a dead URL in it
+  is worse than a shorter list; a file removed since the scan is left out, and
+  a day with nothing left is 404 rather than an empty playlist. A day is a
+  handful of files, so this costs nothing.
+- **`valid_day()` guards every day-keyed route** and runs *before* the index is
+  touched: only a real ISO date proceeds, so `2025-02-30` and `../../etc/passwd`
+  are both simply 404.
+- **`m3u_title()` collapses all whitespace.** A filename may legally contain a
+  newline on Linux, and an `#EXTINF` carrying one splits into a bogus second
+  entry.
 - **The playlist URL is built from the request's `Host`**, never from config.
   An `.m3u` containing `127.0.0.1` is useless the moment it is opened on a
   phone, and the address the client just used is the only one known to work.
@@ -729,7 +745,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 359 cases, about thirty
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 378 cases, about forty
 seconds — `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -795,6 +811,13 @@ changes:
   human-named event folder survive; a folder view picks up a file added and a
   file deleted behind the service's back, and says the index had drifted;
   `/rescan` is 404 on GET and 303 on POST.
+- **Day playlists** — same host, seven places across two days plus one
+  legacy-named file. Confirmed: the playlist carries all eight of that day's
+  videos including the legacy name, leaks nothing from the neighbouring day,
+  orders `Workshop` and `workshop` adjacent without merging them, is named
+  `timelapse-<day>.m3u`, and **every URL inside it fetches**; a file deleted
+  after the scan drops out rather than becoming a dead entry; and four
+  malformed dates plus an empty day are all 404.
 - **Serving** — same host. Confirmed: a 5 MB video arrives with a matching
   sha256 and exact length; `Content-Type`, `Content-Length` and
   `Accept-Ranges: none` are right; `?download=1` sets an attachment; a folder
@@ -840,7 +863,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 1710 lines
-scripts/timelapse_web.py         read-only web UI, 1305 lines
+scripts/timelapse_web.py         read-only web UI, 1423 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

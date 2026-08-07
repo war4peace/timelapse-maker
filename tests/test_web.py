@@ -918,6 +918,135 @@ class TestPlaylist(IndexCase):
         self.assertEqual(status, 404)
 
 
+class TestDayHelpers(unittest.TestCase):
+
+    def test_valid_days(self):
+        self.assertEqual(web.valid_day("2026-01-23"), "2026-01-23")
+
+    def test_rejects_nonsense(self):
+        for bad in ("", None, "2026-1-23", "20260123", "yesterday",
+                    "2026-01-23; rm -rf /", "../../etc"):
+            self.assertIsNone(web.valid_day(bad), repr(bad))
+
+    def test_rejects_impossible_dates(self):
+        self.assertIsNone(web.valid_day("2025-02-30"))
+        self.assertIsNone(web.valid_day("2026-13-01"))
+
+    def test_m3u_title_collapses_newlines(self):
+        """A filename may legally contain a newline on Linux, and an #EXTINF
+        carrying one would split into a bogus second playlist entry."""
+        self.assertEqual(web.m3u_title("Gate\n2026-01-23"), "Gate 2026-01-23")
+        self.assertEqual(web.m3u_title("a\r\nb\tc"), "a b c")
+
+    def test_m3u_title_never_empty(self):
+        self.assertEqual(web.m3u_title("   "), "timelapse")
+        self.assertEqual(web.m3u_title(None), "timelapse")
+
+
+class TestDayPlaylist(IndexCase):
+    """One file to review a whole day, instead of one per place."""
+
+    def setUp(self):
+        super().setUp()
+        # A day with three places, deliberately in mixed case so the ordering
+        # rule is visible.
+        for name, size in (("Gate.20260123.mkv", 2_000_000),
+                           ("workshop.20260123.mkv", 2_000_000),
+                           ("Court180.20260123.mkv", 2_000_000),
+                           ("Gate.20260124.mkv", 2_000_000)):
+            (self.root / name).write_bytes(b"\0" * 4096)
+        self.config = cfg(self.tmp, transfer={"enabled": True,
+                                              "destination": str(self.root)})
+        self.scan()
+
+    def get(self, path, **kw):
+        return request(path, self.config, self.index, **kw)
+
+    def test_a_day_lists_every_place_from_that_day(self):
+        status, _, body = self.get("/day/2026-01-23")
+        self.assertEqual(status, 200)
+        for name in ("Gate.20260123.mkv", "workshop.20260123.mkv",
+                     "Court180.20260123.mkv"):
+            self.assertIn(name, body)
+
+    def test_it_does_not_leak_the_neighbouring_day(self):
+        _, _, body = self.get("/day/2026-01-23")
+        self.assertNotIn("Gate.20260124.mkv", body)
+
+    def test_playlist_shape(self):
+        _, head, body = self.get("/day/2026-01-23")
+        self.assertIn("audio/x-mpegurl", head)
+        lines = body.strip().splitlines()
+        self.assertEqual(lines[0], "#EXTM3U")
+        self.assertEqual(lines[1], "#PLAYLIST:Timelapses 2026-01-23")
+        # Then alternating #EXTINF / URL, three of each.
+        self.assertEqual(len(lines), 2 + 6)
+        for i in range(2, len(lines), 2):
+            self.assertTrue(lines[i].startswith("#EXTINF:-1,"), lines[i])
+            self.assertTrue(lines[i + 1].startswith("http://"), lines[i + 1])
+
+    def test_ordered_case_insensitively_by_place(self):
+        _, _, body = self.get("/day/2026-01-23")
+        order = [l.split(",", 1)[1].split(" ")[0]
+                 for l in body.splitlines() if l.startswith("#EXTINF")]
+        self.assertEqual(order, ["Court180", "Gate", "workshop"])
+
+    def test_filename_names_the_day(self):
+        _, head, _ = self.get("/day/2026-01-23")
+        self.assertIn('filename="timelapse-2026-01-23.m3u"', head)
+
+    def test_urls_are_absolute_and_use_the_request_host(self):
+        _, _, body = self.get("/day/2026-01-23")
+        for line in body.splitlines():
+            if line.startswith("http"):
+                self.assertTrue(line.startswith("http://nas.local/video/"), line)
+
+    def test_a_day_with_nothing_is_404(self):
+        status, _, _ = self.get("/day/2019-01-01")
+        self.assertEqual(status, 404)
+
+    def test_a_bad_date_is_404_and_never_reaches_the_index(self):
+        with mock.patch.object(self.index, "by_day") as by_day:
+            for bad in ("2026-13-01", "notadate", "../../etc/passwd"):
+                status, _, _ = self.get(f"/day/{bad}")
+                self.assertEqual(status, 404, bad)
+            by_day.assert_not_called()
+
+    def test_a_file_deleted_since_the_scan_is_left_out(self):
+        """A playlist is handed to a player that will not come back and ask
+        again, so a dead URL in it is worse than a shorter list."""
+        (self.root / "Gate.20260123.mkv").unlink()
+        status, _, body = self.get("/day/2026-01-23")
+        self.assertEqual(status, 200)
+        self.assertNotIn("Gate.20260123.mkv", body)
+        self.assertIn("workshop.20260123.mkv", body)
+
+    def test_a_day_whose_files_have_all_gone_is_404(self):
+        for name in ("Gate.20260123.mkv", "workshop.20260123.mkv",
+                     "Court180.20260123.mkv"):
+            (self.root / name).unlink()
+        status, _, _ = self.get("/day/2026-01-23")
+        self.assertEqual(status, 404)
+
+    def test_day_view_offers_the_whole_day(self):
+        _, _, body = request("/library?day=2026-01-23", self.config, self.index)
+        self.assertIn('href="/day/2026-01-23"', body)
+        self.assertIn("Gate.20260123.mkv", body)
+
+    def test_day_view_rejects_nonsense(self):
+        _, _, body = request("/library?day=notadate", self.config, self.index)
+        self.assertIn("Not a date", body)
+
+    def test_recent_days_are_listed_and_playable(self):
+        _, _, body = request("/library", self.config, self.index)
+        self.assertIn('href="/day/2026-01-23"', body)
+        self.assertIn("Play the day", body)
+
+    def test_day_cells_link_to_the_day(self):
+        _, _, body = request("/library?camera=Gate", self.config, self.index)
+        self.assertIn("/library?day=2026-01-23", body)
+
+
 class TestLibraryLinks(IndexCase):
 
     def setUp(self):
