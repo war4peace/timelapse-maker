@@ -9,6 +9,8 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+## [0.0.9] - 2026-08-07
+
 ### Added
 - **`timelapse web`**: an optional, read-only web UI, disabled by default.
   It shows where your finished videos actually live, an index of the videos
@@ -465,4 +467,5 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.0.9]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.0.9
 [0.0.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.0.1

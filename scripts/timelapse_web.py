@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
 
-__version__ = "0.0.8"
+__version__ = "0.0.9"
 
 log = logging.getLogger("web")
 
