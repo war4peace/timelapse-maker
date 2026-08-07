@@ -165,9 +165,16 @@ class FakeServer:
         self.index = index
 
 
-def request(path, config, index=None, method="GET"):
-    """Drive one request through the real handler and return (status, body)."""
-    raw = (f"{method} {path} HTTP/1.1\r\nHost: nas.local\r\n"
+def request(path, config, index=None, method="GET", headers=""):
+    """Drive one request through the real handler and return (status, body).
+
+    Extra headers go first, and Host is only defaulted when they do not supply
+    one: a duplicate Host would be silently ignored by the header parser, which
+    quietly made an early version of the forged-Host test pass for no reason.
+    """
+    extra = headers or ""
+    host = "" if "host:" in extra.lower() else "Host: nas.local\r\n"
+    raw = (f"{method} {path} HTTP/1.1\r\n{extra}{host}"
            f"Content-Length: 0\r\nConnection: close\r\n\r\n")
     req = FakeRequest(raw.encode())
     handler = web.Handler.__new__(web.Handler)
@@ -634,17 +641,29 @@ class TestIndexSafety(IndexCase):
 
     def test_traversal_is_refused(self):
         for rel in ("../etc/passwd", "../../etc", "2024-01/../../outside"):
-            self.assertIsNone(self.index._abs(rel), rel)
+            self.assertIsNone(self.index.abs_path(rel), rel)
 
     def test_a_sibling_directory_with_a_shared_prefix_is_refused(self):
         # startswith() would accept /library-old for a root of /library.
         sibling = Path(self.tmp) / "library-old"
         sibling.mkdir()
-        self.assertIsNone(self.index._abs("../library-old"))
+        self.assertIsNone(self.index.abs_path("../library-old"))
 
     def test_ordinary_paths_resolve(self):
-        self.assertIsNotNone(self.index._abs("2024-01"))
-        self.assertIsNotNone(self.index._abs("Gate.20260707.mkv"))
+        self.assertIsNotNone(self.index.abs_path("2024-01"))
+        self.assertIsNotNone(self.index.abs_path("Gate.20260707.mkv"))
+
+    def test_reconcile_file_enforces_the_extension_allow_list(self):
+        """/video/<path> resolves through reconcile_file, so the allow-list has
+        to hold here and not only in the scan. Without it a request could name
+        any file the user keeps beside their videos, and this would stat it,
+        index it and serve it back."""
+        self.scan()
+        self.assertIsNone(self.index.reconcile_file("MakeTLALL_backup.ps1"))
+        self.assertIsNone(self.index.reconcile_file("notes.txt"))
+        self.assertIsNone(self.index.get("MakeTLALL_backup.ps1"))
+        # And a real video still works.
+        self.assertIsNotNone(self.index.reconcile_file("Gate.20260707.mkv"))
 
     def test_changing_the_root_wipes_the_index(self):
         """An index built from a different directory is worse than no index."""
@@ -727,6 +746,195 @@ class TestLibraryRoutes(IndexCase):
         self.assertEqual(status, 303)
         self.assertIn("Location: /library", head)
         start.assert_called_once()
+
+
+class TestFilenameHelpers(unittest.TestCase):
+
+    def test_media_types(self):
+        self.assertEqual(web.media_type("Gate.20260707.mkv"),
+                         "video/x-matroska")
+        self.assertEqual(web.media_type("x.mp4"), "video/mp4")
+
+    def test_unknown_extension_is_generic(self):
+        self.assertEqual(web.media_type("x.qqq"), "application/octet-stream")
+
+    def test_ascii_filename_strips_non_ascii(self):
+        # The real library has Romanian folder names; a raw non-ASCII value in
+        # Content-Disposition risks a mangled header.
+        got = web.ascii_filename("Renovări.mkv", ".m3u")
+        self.assertTrue(all(ord(c) < 128 for c in got), got)
+        self.assertTrue(got.endswith(".m3u"))
+
+    def test_ascii_filename_removes_quoting_hazards(self):
+        got = web.ascii_filename('we"ird\\name.mkv', ".m3u")
+        self.assertNotIn('"', got)
+        self.assertNotIn("\\", got)
+
+    def test_ascii_filename_never_returns_only_a_suffix(self):
+        # Everything in the stem is stripped, so there is nothing left to name
+        # the file after.
+        self.assertEqual(web.ascii_filename("___.mkv", ".m3u"), "timelapse.m3u")
+        self.assertEqual(web.ascii_filename("字.mkv", ".m3u"), "timelapse.m3u")
+
+
+class TestServing(IndexCase):
+
+    def setUp(self):
+        super().setUp()
+        self.config = cfg(self.tmp, transfer={"enabled": True,
+                                              "destination": str(self.root)})
+        self.scan()
+
+    def get(self, path, **kw):
+        return request(path, self.config, self.index, **kw)
+
+    def test_video_is_served_with_its_media_type(self):
+        status, head, _ = self.get("/video/Gate.20260707.mkv")
+        self.assertEqual(status, 200)
+        self.assertIn("Content-Type: video/x-matroska", head)
+
+    def test_content_length_matches_the_file(self):
+        size = (self.root / "Gate.20260707.mkv").stat().st_size
+        _, head, body = self.get("/video/Gate.20260707.mkv")
+        self.assertIn(f"Content-Length: {size}", head)
+        self.assertEqual(len(body.encode("utf-8", "surrogateescape")), size)
+
+    def test_accept_ranges_is_honest_before_phase_1e(self):
+        # Claiming range support without implementing it makes a player look
+        # broken rather than limited.
+        _, head, _ = self.get("/video/Gate.20260707.mkv")
+        self.assertIn("Accept-Ranges: none", head)
+
+    def test_head_sends_headers_but_no_body(self):
+        _, head, body = self.get("/video/Gate.20260707.mkv", method="HEAD")
+        self.assertIn("Content-Length:", head)
+        self.assertEqual(body, "")
+
+    def test_download_sets_an_attachment_disposition(self):
+        _, head, _ = self.get("/video/Gate.20260707.mkv?download=1")
+        self.assertIn("Content-Disposition: attachment", head)
+        self.assertIn("Gate.20260707.mkv", head)
+
+    def test_a_nested_path_with_spaces_resolves(self):
+        status, _, _ = self.get(
+            "/video/2023-05-10%20-%20Renovari/2023-05-10_Roof.mp4")
+        self.assertEqual(status, 200)
+
+    def test_missing_file_is_404(self):
+        status, _, _ = self.get("/video/nope.mkv")
+        self.assertEqual(status, 404)
+
+    def test_a_file_deleted_behind_our_back_is_404_and_leaves_the_index(self):
+        (self.root / "Gate.20260707.mkv").unlink()
+        status, _, _ = self.get("/video/Gate.20260707.mkv")
+        self.assertEqual(status, 404)
+        self.assertIsNone(self.index.get("Gate.20260707.mkv"))
+
+    def test_serving_reconciles_a_file_changed_in_place(self):
+        """A file overwritten at the same name does not move its directory's
+        mtime, so serving it is the only thing that notices."""
+        with open(self.root / "Gate.20260707.mkv", "wb") as fh:
+            fh.write(b"\0" * 4096)
+        _, head, _ = self.get("/video/Gate.20260707.mkv")
+        self.assertIn("Content-Length: 4096", head)
+        self.assertEqual(self.index.get("Gate.20260707.mkv")["size"], 4096)
+
+    def test_traversal_is_refused(self):
+        for attack in ("/video/../../etc/passwd",
+                       "/video/%2e%2e%2f%2e%2e%2fetc%2fpasswd",
+                       "/video/2024-01/../../../etc/passwd"):
+            status, _, _ = self.get(attack)
+            self.assertEqual(status, 404, attack)
+
+    def test_a_non_video_in_the_library_is_not_servable(self):
+        # It is not in the index, so there is nothing to serve.
+        status, _, _ = self.get("/video/MakeTLALL_backup.ps1")
+        self.assertEqual(status, 404)
+
+
+class TestPlaylist(IndexCase):
+
+    def setUp(self):
+        super().setUp()
+        self.config = cfg(self.tmp, transfer={"enabled": True,
+                                              "destination": str(self.root)})
+        self.scan()
+
+    def get(self, path, **kw):
+        return request(path, self.config, self.index, **kw)
+
+    def test_playlist_shape(self):
+        status, head, body = self.get("/play/Gate.20260707.mkv")
+        self.assertEqual(status, 200)
+        self.assertIn("audio/x-mpegurl", head)
+        lines = body.strip().splitlines()
+        self.assertEqual(lines[0], "#EXTM3U")
+        self.assertTrue(lines[1].startswith("#EXTINF:-1,"))
+        self.assertTrue(lines[2].startswith("http://"))
+
+    def test_the_url_comes_from_the_request_host(self):
+        """An .m3u containing 127.0.0.1 is useless the moment it opens on a
+        phone. The only address known to work is the one the client used."""
+        _, _, body = self.get("/play/Gate.20260707.mkv")
+        self.assertIn("http://nas.local/video/Gate.20260707.mkv", body)
+
+    def test_a_forged_host_falls_back_to_the_configured_bind(self):
+        config = dict(self.config)
+        config["web"] = {"bind": "127.0.0.1", "port": 8787}
+        _, _, body = request("/play/Gate.20260707.mkv", config, self.index,
+                             headers="Host: bad host\r\n")
+        self.assertIn("http://127.0.0.1:8787/video/", body)
+
+    def test_forwarded_proto_is_honoured_but_only_for_http_or_https(self):
+        _, _, body = self.get("/play/Gate.20260707.mkv",
+                              headers="X-Forwarded-Proto: https\r\n")
+        self.assertIn("https://nas.local/", body)
+        _, _, body = self.get("/play/Gate.20260707.mkv",
+                              headers="X-Forwarded-Proto: gopher\r\n")
+        self.assertIn("http://nas.local/", body)
+
+    def test_disposition_makes_the_desktop_open_a_player(self):
+        # The .m3u filename here is what picks the app, not the URL.
+        _, head, _ = self.get("/play/Gate.20260707.mkv")
+        self.assertIn("Content-Disposition: attachment", head)
+        self.assertIn('filename="Gate.20260707.m3u"', head)
+
+    def test_title_names_the_place_and_the_day(self):
+        _, _, body = self.get("/play/Gate.20260707.mkv")
+        self.assertIn("#EXTINF:-1,Gate 2026-07-07", body)
+
+    def test_a_file_with_no_camera_still_gets_a_title(self):
+        _, _, body = self.get("/play/2021-11/2021-11-01.mp4")
+        self.assertIn("#EXTINF:-1,2021-11-01", body)
+
+    def test_path_is_percent_encoded_in_the_url(self):
+        _, _, body = self.get(
+            "/play/2023-05-10%20-%20Renovari/2023-05-10_Roof.mp4")
+        self.assertIn("2023-05-10%20-%20Renovari/2023-05-10_Roof.mp4", body)
+        self.assertNotIn("Renovari/2023-05-10_Roof.mp4\n", body.split("://")[0])
+
+    def test_missing_file_is_404(self):
+        status, _, _ = self.get("/play/nope.mkv")
+        self.assertEqual(status, 404)
+
+
+class TestLibraryLinks(IndexCase):
+
+    def setUp(self):
+        super().setUp()
+        self.config = cfg(self.tmp, transfer={"enabled": True,
+                                              "destination": str(self.root)})
+        self.scan()
+
+    def test_folder_view_offers_play_and_download(self):
+        _, _, body = request("/library?folder=2024-01", self.config, self.index)
+        self.assertIn("/play/2024-01/2024-01-01_Workshop.mp4", body)
+        self.assertIn("?download=1", body)
+
+    def test_both_reachable_addresses_are_shown(self):
+        _, _, body = request("/library?folder=2024-01", self.config, self.index)
+        self.assertIn(str(self.root), body)          # share path, for a mount
+        self.assertIn("http://nas.local/video/", body)  # URL, for any player
 
 
 class TestEscape(unittest.TestCase):

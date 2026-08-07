@@ -2,25 +2,26 @@
 """
 timelapse_web.py — read-only web UI.
 
-Serves a small status page and, in later phases, an index of finished videos
-from the transfer destination. It is strictly read-only: it never triggers an
-encode, restarts a camera, edits the config, or writes anything at all. That
-is a design constraint, not an accident - it is what lets the unit run with
-ProtectSystem=strict and no ReadWritePaths, so the whole filesystem is
-read-only to this process.
+Serves a status page and an index of the finished videos at the transfer
+destination, browsable by camera and by date.
+
+Read-only towards everything of yours: it never triggers an encode, restarts a
+camera, edits the config or deletes a file. The one thing it writes is its own
+sqlite index, and the unit's ReadWritePaths names that directory and nothing
+else - so under ProtectSystem=strict the library, the frames and the config are
+all read-only to this process. That is enforced by the sandbox, not promised by
+this comment.
 
 Playback is deliberately not done in the browser. The default output is AV1 in
-Matroska, which browsers handle poorly; VLC, mpv and friends handle it
-natively. Later phases serve the bytes over HTTP and hand off via a one-line
-.m3u playlist.
+Matroska, which browsers handle poorly and VLC, mpv and friends handle
+natively. So this serves the bytes over HTTP and hands off with a one-line .m3u
+playlist that the desktop opens in whatever plays .m3u.
 
 Binds to 127.0.0.1 by default. http.server is not a hardened internet-facing
 server and there is no TLS here - anything beyond loopback is an explicit
 opt-in, and anything beyond the LAN belongs behind a reverse proxy.
 
 Run under systemd. Logs to stdout (journald).
-
-Phase 1a: server, config, page, /healthz, library-root resolution.
 """
 
 import argparse
@@ -37,7 +38,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, unquote
 
 __version__ = "0.0.8"
 
@@ -78,9 +79,9 @@ def load_config(path):
 
 
 def setup_logging():
-    """journald only. The other tools also write a rotating file, but this one
-    writes nothing anywhere by design - a log file would be the single reason
-    the unit needed a writable path."""
+    """journald only. The other tools also write a rotating file; this one
+    would need a second writable path for it, and the unit is deliberately
+    scoped to one."""
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
                             "%Y-%m-%d %H:%M:%S")
     handler = logging.StreamHandler(sys.stdout)
@@ -422,7 +423,7 @@ class Index:
         """
         if not self.usable:
             return False
-        path = self._abs(rel)
+        path = self.abs_path(rel)
         if path is None:
             return False
 
@@ -459,10 +460,21 @@ class Index:
         return before != now
 
     def reconcile_file(self, rel):
-        """Re-stat one file. Returns its row, or None when it is gone."""
+        """Re-stat one file. Returns its row, or None when it is gone.
+
+        The extension allow-list is applied HERE too, not only in the scan.
+        This is what /video/<path> resolves through, and without the check a
+        request could name any file inside the library root - a script, a
+        config, whatever the user keeps alongside their videos - and this
+        would stat it, index it and serve it. Path containment stops the
+        request escaping the library; this stops it reading everything within.
+        """
         if not self.usable:
             return None
-        path = self._abs(rel)
+        name = os.path.basename(rel)
+        if os.path.splitext(name)[1].lower() not in VIDEO_EXTS:
+            return None
+        path = self.abs_path(rel)
         if path is None:
             return None
         try:
@@ -472,7 +484,6 @@ class Index:
                 db.execute("DELETE FROM files WHERE path = ?", (rel,))
                 db.commit()
             return None
-        name = os.path.basename(rel)
         folder = os.path.dirname(rel)
         cam, day, pattern = parse_name(name)
         row = (rel, name, folder, st.st_size, int(st.st_mtime), cam, day,
@@ -481,7 +492,7 @@ class Index:
             self._write(db, [row])
         return self.get(rel)
 
-    def _abs(self, rel):
+    def abs_path(self, rel):
         """Resolve a relative index path inside the root, or None.
 
         Nothing from a request should reach the filesystem unchecked, even
@@ -551,6 +562,44 @@ class Index:
     def get(self, rel):
         rows = self._query("SELECT * FROM files WHERE path = ?", (rel,))
         return rows[0] if rows else None
+
+
+# ----------------------------------------------------------------------------
+# Serving video, and handing off to a real player
+# ----------------------------------------------------------------------------
+
+MEDIA_TYPES = {
+    ".mkv": "video/x-matroska", ".mp4": "video/mp4", ".mov": "video/quicktime",
+    ".avi": "video/x-msvideo", ".webm": "video/webm", ".m4v": "video/x-m4v",
+    ".mpg": "video/mpeg", ".mpeg": "video/mpeg",
+}
+
+# audio/x-mpegurl is the type desktops actually have registered for .m3u.
+M3U_TYPE = "audio/x-mpegurl"
+
+SEND_CHUNK = 256 * 1024
+
+# A Host header goes straight into the playlist URL, so it is validated rather
+# than trusted. Hostnames, IPv4, bracketed IPv6, optional port - nothing else.
+HOST_RE = re.compile(r"^[A-Za-z0-9._\-]+(:\d{1,5})?$|^\[[0-9A-Fa-f:.]+\](:\d{1,5})?$")
+
+
+def media_type(name):
+    return MEDIA_TYPES.get(os.path.splitext(name)[1].lower(),
+                           "application/octet-stream")
+
+
+def ascii_filename(name, suffix):
+    """A Content-Disposition filename that cannot break the header.
+
+    The library has Romanian folder names, so non-ASCII is normal here. Rather
+    than risk a mangled header, unrepresentable characters become '_' and the
+    stem falls back to something sane if nothing survives.
+    """
+    stem = os.path.splitext(os.path.basename(name))[0]
+    safe = "".join(c if 32 < ord(c) < 127 and c not in '"\\/:*?<>|' else "_"
+                   for c in stem).strip("_. ")
+    return (safe or "timelapse") + suffix
 
 
 def human_size(n):
@@ -705,6 +754,10 @@ LAYOUT = """<!doctype html>
   .path {{ font-family: ui-monospace, monospace; font-size: .8rem;
            user-select: all; overflow-wrap: anywhere; opacity: .8; }}
   .flag {{ color: #b3261e; font-weight: 600; }}
+  td.acts {{ white-space: nowrap; }}
+  td.acts a {{ color: inherit; margin-right: .5rem; }}
+  tr.sub-row td {{ border-bottom: 1px solid rgba(128,128,128,.14);
+                   padding-top: 0; }}
   .scan {{ font-size: .85rem; opacity: .7; margin: 0 0 1rem; }}
   form.inline {{ display: inline; }}
   button {{ font: inherit; font-size: .85rem; padding: .25rem .8rem;
@@ -773,6 +826,15 @@ class Handler(BaseHTTPRequestHandler):
         route = path.rstrip("/") or "/"
         args = parse_qs(query)
 
+        # Prefix routes first: the rest of the path is a library-relative file
+        # path, which may contain slashes, spaces and non-ASCII.
+        if route.startswith("/video/"):
+            self._serve_file(unquote(route[len("/video/"):]), "download" in args)
+            return
+        if route.startswith("/play/"):
+            self._serve_m3u(unquote(route[len("/play/"):]))
+            return
+
         if route == "/":
             self._send(200, self._render("home", self._overview()))
         elif route == "/library":
@@ -828,6 +890,115 @@ class Handler(BaseHTTPRequestHandler):
             lib_state="yes" if lib["usable"] else "no",
             lib_note=note,
         )
+
+    # -- files and playlists -------------------------------------------------
+
+    def _locate(self, rel):
+        """(row, path) for a request-supplied relative path, or (None, None).
+
+        Every access re-stats the file - this is the "reconcile on access" half
+        that a folder view cannot do, because a file overwritten in place does
+        not change its directory. abs_path() is what keeps a crafted path
+        inside the library.
+        """
+        index = self.server.index
+        if not index.usable:
+            return None, None
+        row = index.reconcile_file(rel)
+        if row is None:
+            return None, None
+        return row, index.abs_path(rel)
+
+    def _serve_file(self, rel, download):
+        row, path = self._locate(rel)
+        if row is None or path is None:
+            self._send(404, "no such video\n", "text/plain; charset=utf-8")
+            return
+        try:
+            fh = open(path, "rb")
+        except OSError as exc:
+            log.warning("Cannot open %s: %s", path, exc)
+            self._send(404, "no such video\n", "text/plain; charset=utf-8")
+            return
+
+        size = row["size"]
+        with fh:
+            self.send_response(200)
+            self.send_header("Content-Type", media_type(row["name"]))
+            self.send_header("Content-Length", str(size))
+            # Honest until phase 1e adds Range: seeking will not work yet, and
+            # claiming otherwise makes a player look broken rather than limited.
+            self.send_header("Accept-Ranges", "none")
+            if download:
+                self.send_header(
+                    "Content-Disposition",
+                    f'attachment; filename="{ascii_filename(row["name"], "")}'
+                    f'{os.path.splitext(row["name"])[1]}"')
+            self.end_headers()
+            if self.command == "HEAD":
+                return
+            self._pump(fh, size)
+
+    def _pump(self, fh, size):
+        """Send exactly `size` bytes, then stop.
+
+        Bounded by the length already promised in the header rather than by
+        EOF: if the file grew since the stat, sending the extra would corrupt
+        the response. If it shrank, the connection is closed instead, because a
+        short body under HTTP/1.1 keep-alive hangs the client rather than
+        failing it.
+        """
+        left = size
+        try:
+            while left > 0:
+                chunk = fh.read(min(SEND_CHUNK, left))
+                if not chunk:
+                    log.warning("File shrank mid-send; closing the connection.")
+                    self.close_connection = True
+                    return
+                self.wfile.write(chunk)
+                left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            # Entirely normal: the viewer closed VLC, or stopped the download.
+            self.close_connection = True
+
+    def _base_url(self):
+        """The origin to put inside a playlist.
+
+        Built from the request rather than from config, because that is the
+        only address known to reach this server: an .m3u containing
+        127.0.0.1 is useless the moment it is opened on a phone.
+        """
+        host = (self.headers.get("Host") or "").strip()
+        if not HOST_RE.match(host):
+            web = self.server.cfg.get("web", {})
+            host = f"{web.get('bind', DEFAULT_BIND)}:{web.get('port', DEFAULT_PORT)}"
+        # Set by a reverse proxy terminating TLS; anything else is ignored.
+        proto = (self.headers.get("X-Forwarded-Proto") or "http").strip().lower()
+        if proto not in ("http", "https"):
+            proto = "http"
+        return f"{proto}://{host}"
+
+    def _serve_m3u(self, rel):
+        row, path = self._locate(rel)
+        if row is None or path is None:
+            self._send(404, "no such video\n", "text/plain; charset=utf-8")
+            return
+        title = " ".join(x for x in (row["camera"], row["day"]) if x) or row["name"]
+        url = f"{self._base_url()}/video/{quote(rel)}"
+        body = f"#EXTM3U\n#EXTINF:-1,{title}\n{url}\n"
+        raw = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", M3U_TYPE)
+        self.send_header("Content-Length", str(len(raw)))
+        # The filename is what makes the desktop hand this to a player, so the
+        # .m3u extension here matters more than anything in the URL.
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{ascii_filename(row["name"], ".m3u")}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(raw)
 
     # -- library ------------------------------------------------------------
 
@@ -925,7 +1096,8 @@ class Handler(BaseHTTPRequestHandler):
         head = (f'<section><h2>{escape(label)}</h2>'
                 f'<p class="scan">{len(rows):,} files, from the index. '
                 f'Open a folder to re-check it against disk.</p>')
-        return head + self._file_table(rows, show_folder=True) + "</section>"
+        return head + self._file_table(rows, show_folder=True,
+                                       full_path=True) + "</section>"
 
     def _folder_view(self, folder):
         index = self.server.index
@@ -936,7 +1108,8 @@ class Handler(BaseHTTPRequestHandler):
                 if changed else "Re-checked against disk; nothing had changed.")
         head = (f'<section><h2>{escape(label)}</h2>'
                 f'<p class="scan">{len(rows):,} files. {note}</p>')
-        return head + self._file_table(rows, show_folder=False) + "</section>"
+        return head + self._file_table(rows, show_folder=False,
+                                       full_path=True) + "</section>"
 
     def _flagged_view(self):
         index = self.server.index
@@ -968,26 +1141,34 @@ class Handler(BaseHTTPRequestHandler):
         if not rows:
             return '<p class="scan">Nothing here.</p>'
         root = self.server.index.root
+        base = self._base_url()
         cols = ["Day", "Name"]
         if show_folder:
             cols.append("Folder")
-        cols += ["Size", "Pattern"]
+        cols += ["Size", "Open"]
         out = ['<div class="wrap"><table><tr>']
         out += [f"<th>{c}</th>" for c in cols]
         out.append("</tr>")
         for r in rows:
+            enc = quote(r["path"])
             flag = ' class="flag"' if r["suspect"] else ""
             out.append(f'<tr><td class="num">{escape(r["day"] or "-")}</td>')
             out.append(f'<td{flag}>{escape(r["name"])}</td>')
             if show_folder:
                 out.append(f'<td>{escape(r["folder"] or "(root)")}</td>')
             out.append(f'<td class="num">{human_size(r["size"])}</td>')
-            out.append(f'<td>{escape(r["pattern"])}</td></tr>')
+            out.append(f'<td class="acts"><a href="/play/{enc}">Play</a> '
+                       f'<a href="/video/{enc}?download=1">Download</a></td></tr>')
             if full_path and root is not None:
-                # Selectable in one click, for pasting into a player or a shell.
+                # Two ways to reach the same file without this UI: the share
+                # path for a machine that has it mounted, and the HTTP URL for
+                # VLC's "Open Network Stream" anywhere else. Selectable in one
+                # click, because that is the whole point of showing them.
                 whole = os.path.join(str(root), r["path"].replace("/", os.sep))
-                out.append(f'<tr><td></td><td colspan="{len(cols) - 1}" '
-                           f'class="path">{escape(whole)}</td></tr>')
+                out.append(f'<tr class="sub-row"><td></td>'
+                           f'<td colspan="{len(cols) - 1}" class="path">'
+                           f'{escape(whole)}<br>{escape(base)}/video/{enc}'
+                           f'</td></tr>')
         out.append("</table></div>")
         return "".join(out)
 

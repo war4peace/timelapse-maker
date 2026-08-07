@@ -14,7 +14,8 @@ While the version is `0.x`, the configuration format may change in any release.
   It shows where your finished videos actually live, an index of the videos
   themselves browsable by camera and by date, and — on request, never by
   polling — the output of `systemctl status` for every unit and the recent
-  journal for capture, encode or the UI itself. Playback comes next.
+  journal for capture, encode or the UI itself, and a Play link that hands
+  each video to VLC.
 
   It never changes anything of yours — no encode triggers, no camera control,
   no config edits, no deleting — and the unit enforces that rather than
@@ -57,6 +58,19 @@ While the version is `0.x`, the configuration format may change in any release.
   reports progress. After that, opening a folder re-reads that one directory
   and opening a file re-stats it, which keeps a browse from walking a NAS.
 
+  Videos play in **your** player, not in the browser. Every listing has a
+  *Play* link that hands VLC (or mpv, or whatever opens `.m3u` on your desktop)
+  a one-line playlist pointing back at this server, plus a *Download* link and
+  the two addresses that need no web UI at all — the share path, for a machine
+  that has the mount, and the stream URL for VLC's *Open Network Stream*. This
+  is deliberate: the videos are AV1 in Matroska, which browsers handle badly
+  and real players handle natively. The playlist is built from the address you
+  reached the page on, so a link opened on your phone points at something your
+  phone can actually reach.
+
+  Seeking does not work yet — the server says so rather than pretending, and
+  it is the next thing.
+
   The index is the one thing the UI writes, and the systemd unit is scoped to
   exactly that directory: the videos, the captured frames and `config.json`
   stay read-only to it.
@@ -68,6 +82,12 @@ While the version is `0.x`, the configuration format may change in any release.
   and it is invisible to `du`.
 
 ### Fixed
+- The video index would serve **any** file sitting inside your video folder,
+  not just videos. The extension allow-list was applied when scanning but not
+  when serving, and the serving path re-checks files on access — so a request
+  naming a `.txt` or a script kept alongside the videos was read, added to the
+  index and returned. Now the same allow-list applies to both. Found by a test
+  written after the code had already been reviewed and thought finished.
 - The wizard stripped documentation keys from the config template by walking a
   hardcoded list of section names, so any section added later kept its
   `_comment` keys and shipped them into live configs. Caught immediately by the

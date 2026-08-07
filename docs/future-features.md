@@ -18,7 +18,7 @@ item depends on explicitly, or the ordering rots.
 
 ## 1. Web UI — read-only status and video index
 
-**Effort:** small. **Prerequisites:** none. **Status:** scoped, not started.
+**Effort:** small. **Prerequisites:** none. **Status:** 1a–1d built; 1e (Range/seeking) and 1f (wizard, docs) remain.
 
 ### Scope
 
@@ -310,7 +310,7 @@ currently state the unit writes nothing anywhere, which will no longer be true.
 | 1a | **Done.** `timelapse_web.py`: `ThreadingHTTPServer`, loopback bind, one static page, `/healthz`, library-root resolution. Unit + install wiring + config keys. |
 | 1b | **Done.** Status pane — `systemctl status` and bounded `journalctl` on request, output in a `<pre>`. |
 | 1c | **Done.** Library index — sqlite store, background first scan, pattern-chain parser, reconcile on access, browse by camera and date, flagged files with full paths. |
-| 1d | `/video/<id>` file serving + `/play/<id>.m3u` handoff. Download link. |
+| 1d | **Done.** `/video/<path>` file serving + `/play/<path>` `.m3u` handoff. Download link, share path and stream URL shown. |
 | 1e | Range request support, so seeking works. |
 | 1f | Wizard integration and docs. |
 

@@ -484,6 +484,39 @@ dropped NAS mount is a *correct* empty library, not a fault.
 - **An unusable state directory degrades rather than crashes.** Status and logs
   still work; the library page explains that the unit needs `ReadWritePaths`.
 
+**Serving and handoff** (`/video/<path>`, `/play/<path>`).
+
+- **Playback is delegated, not embedded.** The default output is AV1 in
+  Matroska — close to the worst case for a browser `<video>`, and native to
+  VLC, mpv and MPC-HC. `/play/<path>` returns a one-line `.m3u` whose
+  `Content-Disposition` filename ends in `.m3u`, which is what makes the
+  desktop hand it to a player; the URL extension is irrelevant to that.
+- **The playlist URL is built from the request's `Host`**, never from config.
+  An `.m3u` containing `127.0.0.1` is useless the moment it is opened on a
+  phone, and the address the client just used is the only one known to work.
+  `Host` is validated against `HOST_RE` before it goes into the file, and
+  `X-Forwarded-Proto` is honoured only for the literal values `http`/`https`,
+  so a reverse proxy terminating TLS produces working links.
+- **The extension allow-list is enforced in `reconcile_file()`, not only in the
+  scan.** `/video/<path>` resolves through it, and without the check a request
+  could name any file the user keeps beside their videos — `abs_path()` stops
+  a request leaving the library, this stops it reading everything inside.
+  Found by a test, having shipped through a full review as `200 OK` on a
+  `.txt`.
+- **`_pump()` sends exactly the promised length.** Bounded by the
+  `Content-Length` already in the header rather than by EOF: a file that grew
+  since the stat would otherwise corrupt the response, and one that shrank
+  would leave a short body, which under keep-alive hangs the client instead of
+  failing it — so that case closes the connection. `BrokenPipeError` and
+  `ConnectionResetError` are caught and ignored, because a viewer quitting VLC
+  is the normal way a video request ends.
+- **`Accept-Ranges: none` is sent deliberately.** Seeking does not work until
+  phase 1e; advertising ranges without serving them makes a player look broken
+  rather than limited.
+- Each listed file also shows two addresses that need no UI at all: the share
+  path, for a machine that has the mount, and the HTTP URL for VLC's *Open
+  Network Stream*.
+
 **Status and logs** (`/status`, `/logs`) shell out, on request only — a page
 load or a click. Nothing polls and nothing is collected in the background.
 
@@ -696,7 +729,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 331 cases, under fifteen
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 359 cases, about thirty
 seconds — `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -762,6 +795,16 @@ changes:
   human-named event folder survive; a folder view picks up a file added and a
   file deleted behind the service's back, and says the index had drifted;
   `/rescan` is 404 on GET and 303 on POST.
+- **Serving** — same host. Confirmed: a 5 MB video arrives with a matching
+  sha256 and exact length; `Content-Type`, `Content-Length` and
+  `Accept-Ranges: none` are right; `?download=1` sets an attachment; a folder
+  name containing spaces round-trips percent-encoded; the `.m3u` carries the
+  request's `Host` and an `X-Forwarded-Proto: https` proxy scheme, and the URL
+  *inside* the playlist fetches the same bytes; `.txt` and `.ps1` beside the
+  videos are 404 and are **not** added to the index by being requested; three
+  traversal shapes are refused; a file changed in place is re-stat'd on access
+  and a deleted one 404s; and aborting a download mid-stream leaves the service
+  running with no traceback in the journal.
 - **Status pane** — same host, **both** journal states exercised, which is the
   point: with `SupplementaryGroups=systemd-journal` the log pane returns real
   entries; with the line deleted the unit still starts, `systemctl status` still
@@ -797,7 +840,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 1710 lines
-scripts/timelapse_web.py         read-only web UI, 1124 lines
+scripts/timelapse_web.py         read-only web UI, 1305 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
