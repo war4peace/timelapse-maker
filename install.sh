@@ -231,7 +231,8 @@ install_files() {
     install -m 0755 "$SRC/scripts/timelapse_capture.py" \
                     "$SRC/scripts/timelapse_encode.py" \
                     "$SRC/scripts/timelapse_test.py" \
-                    "$SRC/scripts/timelapse_setup.py" "$PREFIX/"
+                    "$SRC/scripts/timelapse_setup.py" \
+                    "$SRC/scripts/timelapse_web.py" "$PREFIX/"
     ok "Scripts -> $PREFIX"
 
     install -d -m 0750 "$CONFDIR"
@@ -253,11 +254,12 @@ case "\${1:-}" in
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     transfer)  shift; exec python3 $PREFIX/timelapse_setup.py --transfer-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
+    web)       shift; exec python3 $PREFIX/timelapse_web.py "$CONFIG" "\$@" ;;
     config)    exec \${EDITOR:-nano} "$CONFIG" ;;
     logs)      exec journalctl -u timelapse-capture -f ;;
     status)    exec systemctl status timelapse-capture.service timelapse-encode.timer ;;
     version)
-        for f in capture encode test setup; do
+        for f in capture encode test setup web; do
             printf '  %-8s %s\n' "\$f" \\
                 "\$(sed -n 's/^__version__ = "\(.*\)"/\1/p' $PREFIX/timelapse_\$f.py)"
         done
@@ -277,7 +279,7 @@ case "\${1:-}" in
         fi
         ;;
     *)
-        echo "usage: timelapse {setup|cameras|transfer|test|usage|encode|config|logs|status|version}"
+        echo "usage: timelapse {setup|cameras|transfer|test|usage|encode|web|config|logs|status|version}"
         exit 1 ;;
 esac
 EOF
@@ -287,7 +289,7 @@ EOF
 
 install_units() {
     for unit in timelapse-capture.service timelapse-encode.service \
-                timelapse-encode.timer; do
+                timelapse-encode.timer timelapse-web.service; do
         install -m 0644 "$SRC/service/$unit" "$UNITDIR/$unit"
     done
     sync_units
@@ -304,7 +306,12 @@ sync_units() {
             || rw="/var/lib/timelapse"
         [ -z "$rw" ] && rw="/var/lib/timelapse"
     fi
-    for unit in timelapse-capture.service timelapse-encode.service; do
+    # timelapse-web.service is in this list for User/Group/ExecStart only. It
+    # has no ReadWritePaths line to rewrite, on purpose: the web UI is
+    # read-only and writes nothing, so it keeps the whole filesystem read-only.
+    # sed leaves lines that do not match alone, so no rule is needed to skip it.
+    for unit in timelapse-capture.service timelapse-encode.service \
+                timelapse-web.service; do
         local f="$UNITDIR/$unit"
         [ -f "$f" ] || continue
         sed -i \
@@ -313,6 +320,7 @@ sync_units() {
             -e "s|^ReadWritePaths=.*|ReadWritePaths=$rw|" \
             -e "s|^ExecStart=.*timelapse_capture.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_capture.py $CONFIG|" \
             -e "s|^ExecStart=.*timelapse_encode.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_encode.py $CONFIG|" \
+            -e "s|^ExecStart=.*timelapse_web.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_web.py $CONFIG|" \
             "$f"
     done
     [ -d /run/systemd/system ] && systemctl daemon-reload || true
@@ -346,31 +354,53 @@ run_wizard() {
 # replaced the scripts, printed "Capture is running", and left the *old* build
 # serving. Verified in WSL: identical MainPID and ExecMainStartTimestamp across
 # an upgrade of a live install.
+#
+# Every long-running unit must be listed here. A unit that is missing gets
+# replaced on disk and keeps serving the old build, with the installer
+# reporting success - which is exactly the bug this function exists to fix.
+# The encoder is deliberately absent: it is oneshot, so an encode in flight
+# finishes on the code it started with and the next trigger picks up the new.
+RESTART_UNITS=(timelapse-capture.service timelapse-web.service)
+
 restart_upgraded_services() {
     [ -d /run/systemd/system ] || return 0
-    systemctl is-active --quiet timelapse-capture.service || return 0
 
-    step "Restart"
-    note "Capture is live and still running the previously installed build."
-    if ! ask_yn "Restart it so this version takes effect?" y; then
-        warn "Still running the old build."
-        note "Apply it later with: systemctl restart timelapse-capture.service"
+    # `if`, not `cmd && live+=(...)`: under `set -e` an AND-list whose first
+    # command fails takes the list's exit status with it, so a stopped unit
+    # would abort the installer here.
+    local live=() unit
+    for unit in "${RESTART_UNITS[@]}"; do
+        if systemctl is-active --quiet "$unit"; then
+            live+=("$unit")
+        fi
+    done
+    if [ ${#live[@]} -eq 0 ]; then
         return 0
     fi
-    # Costs only the frames due during the restart - a second or two. The
-    # encoder is left alone on purpose: it is oneshot, so an encode in flight
-    # finishes on the code it started with and the next trigger picks up the new.
-    if systemctl restart timelapse-capture.service; then
-        sleep 2
-        if systemctl is-active --quiet timelapse-capture.service; then
-            ok "Capture restarted on this version."
-        else
-            err "Capture did not come back up."
-            note "See: journalctl -u timelapse-capture -n 40"
-        fi
-    else
-        err "Restart failed. See: journalctl -u timelapse-capture -n 40"
+
+    step "Restart"
+    note "Still running the previously installed build: ${live[*]}"
+    if ! ask_yn "Restart so this version takes effect?" y; then
+        warn "Still running the old build."
+        note "Apply it later with: systemctl restart ${live[*]}"
+        return 0
     fi
+
+    # Restarting capture costs only the frames due during the restart - a
+    # second or two.
+    for unit in "${live[@]}"; do
+        if systemctl restart "$unit"; then
+            sleep 2
+            if systemctl is-active --quiet "$unit"; then
+                ok "$unit restarted on this version."
+            else
+                err "$unit did not come back up."
+                note "See: journalctl -u ${unit%.service} -n 40"
+            fi
+        else
+            err "$unit restart failed. See: journalctl -u ${unit%.service} -n 40"
+        fi
+    done
     return 0
 }
 
@@ -440,10 +470,12 @@ do_uninstall() {
         systemctl disable --now timelapse-capture.service 2>/dev/null || true
         systemctl disable --now timelapse-encode.timer 2>/dev/null || true
         systemctl disable --now timelapse-encode.service 2>/dev/null || true
+        systemctl disable --now timelapse-web.service 2>/dev/null || true
     fi
     rm -f "$UNITDIR"/timelapse-capture.service \
           "$UNITDIR"/timelapse-encode.service \
-          "$UNITDIR"/timelapse-encode.timer
+          "$UNITDIR"/timelapse-encode.timer \
+          "$UNITDIR"/timelapse-web.service
     [ -d /run/systemd/system ] && systemctl daemon-reload || true
     rm -rf "$PREFIX"
     rm -f /usr/local/bin/timelapse

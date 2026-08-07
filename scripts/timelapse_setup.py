@@ -1465,10 +1465,14 @@ def default_config(template_path=None):
         # Strip every documentation key, not just the ones that existed when
         # this was written - a stale "_comment_cifs" once shipped into a live
         # config still describing a tool that had been removed.
+        #
+        # Every dict section, not a named list of them: the list was itself the
+        # drift it was meant to prevent. Adding a "web" section to the template
+        # shipped three _comment keys straight into live configs, because the
+        # new section simply was not in the list.
         for key in [k for k in cfg if k.startswith("_")]:
             cfg.pop(key)
-        for section in ("paths", "capture", "encode", "transfer", "discord"):
-            block = cfg.get(section)
+        for block in cfg.values():
             if isinstance(block, dict):
                 for key in [k for k in block if k.startswith("_")]:
                     block.pop(key)

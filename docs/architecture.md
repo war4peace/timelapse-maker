@@ -410,7 +410,47 @@ piped stdin — under `curl … | bash` that pipe is the installer script itself
 `--stdin` opts in explicitly for scripted runs. Passwords go through
 `getpass` when a real terminal is present, so they stay out of scroll-back.
 
-### 4.5 `install.sh`
+### 4.5 `timelapse_web.py`
+
+Long-running, `Type=simple`, `Restart=on-failure`. Optional: it exits 0 when
+`web.enabled` is false, which is why the unit is `on-failure` rather than
+`always` — that exit is a decision to respect, not a crash to restart through.
+
+**Read-only is a structural property, not a promise.** It never writes anything
+anywhere, which is what lets `timelapse-web.service` run with no
+`ReadWritePaths` at all. That is stronger than a code review: the sandbox, not
+the source, is what stops it writing. It also logs only to journald — a
+rotating log file would be the single reason it needed a writable path.
+
+**`resolve_library()`** is the part with actual thinking in it. Videos are not
+where a naive reading of the config says they are: `transfer()` runs rsync with
+`--remove-source-files` and `transfer.delete_local_after_transfer` defaults to
+true, so after a successful night `paths.video_output` is *empty*. Reading it
+would show an empty library on every correctly-configured install. Resolution
+order is `web.library_root`, then `transfer.destination` when transfer is
+enabled, then `video_output`.
+
+A destination is not necessarily a path. `is_remote_spec()` classifies
+`user@nas:/path` and `rsync://host/mod` as remote — unreadable without SSH, and
+reported as such rather than rendered as an empty list. An absolute path is
+settled before the colon test, so `/mnt/odd:name/videos` stays local.
+
+The function returns a dict with `usable` and a `note` rather than a path,
+because "why is this empty" is the question the page exists to answer, and a
+dropped NAS mount is a *correct* empty library, not a fault.
+
+**Security posture.** Binds `127.0.0.1` by default and warns when it does not;
+`http.server` is not hardened and there is no TLS here. It never serves
+`config.json` and never renders a camera URL — those hold credentials. Routing
+is an explicit allow-list; anything unrecognised is 404 with no filesystem
+lookup. `server_version`/`sys_version` are overridden so the interpreter
+version is not advertised.
+
+`Handler.timeout`, not `Server.timeout`: `ThreadingHTTPServer.timeout` is only
+consulted by `handle_request()`, which `serve_forever()` never calls, so
+setting it there looks like a timeout and is not one.
+
+### 4.6 `install.sh`
 
 Bootstrap. Detects the package manager (apt/dnf/yum/pacman/zypper/apk), installs
 dependencies, creates the `timelapse` system account, places scripts, units and
@@ -422,8 +462,17 @@ downloads a tarball from `codeload.github.com` — so the same script serves bot
 
 `sync_units()` is the important part: it rewrites `User=`, `Group=`,
 `ExecStart=` and `ReadWritePaths=` in the installed units from the config the
-wizard just wrote. Prompts read from `/dev/tty` for the same reason the wizard's
-do. `--uninstall` removes programs and units but never captured data.
+wizard just wrote. `timelapse-web.service` is in that loop for User/Group/
+ExecStart only — it has no `ReadWritePaths` line and must not gain one; `sed`
+leaves non-matching lines alone, so no rule is needed to skip it.
+
+`RESTART_UNITS` lists every long-running unit. **A unit missing from it gets
+replaced on disk and keeps serving the old build while the installer reports
+success** — the bug this function exists to fix. The encoder is deliberately
+absent: it is oneshot, so a run in flight finishes on the code it started with.
+
+Prompts read from `/dev/tty` for the same reason the wizard's do. `--uninstall`
+removes programs and units but never captured data.
 
 ---
 
@@ -469,6 +518,17 @@ take an optional path as their first positional argument. See
 | `destination` | A local directory or an rsync remote spec; one code path serves both. |
 | `rsync_args` | Defaults include `--remove-source-files`; if you drop that, set `delete_local_after_transfer` accordingly or files accumulate. On a CIFS mount `-a` may exit 23 because owner/group cannot be set; the wizard measures which flags your share accepts and writes those. |
 | `require_mountpoint` | `false` (default), `true`, or an explicit mount path. Refuses to transfer when the destination is not on a mounted filesystem. Only meaningful for a local destination; ignored for a remote spec. |
+
+### `web`
+Optional; absent from configs written before the feature existed, so every key
+is read with `.get(key, default)`.
+
+| Key | Notes |
+|---|---|
+| `enabled` | `false` by default. The program exits 0 when false, so the unit may be enabled without the server running. |
+| `bind` | `127.0.0.1` by default. There is no authentication and no TLS — any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup. |
+| `port` | `8787` by default. |
+| `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path — typically a remote rsync destination that is *also* mounted locally. |
 
 ### `cameras[]`
 | Key | Notes |
@@ -560,13 +620,18 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, ~115 cases, under a
-second) cover the pure logic: frame validation, concat-list escaping,
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 269 cases, under two
+seconds) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
-`writable_paths`, credential quoting, and `_dest_path` including the DST
-collision suffixes. Anything needing a camera, a GPU or systemd is out of scope
-here by design.
+`writable_paths`, credential quoting, `_dest_path` including the DST
+collision suffixes, and the web UI's library resolution and routing. Anything
+needing a camera, a GPU or systemd is out of scope here by design.
+
+`test_web.py` drives the real handler through a fake socket rather than binding
+a port — a listening socket in a unit test is a flake waiting for a busy CI
+runner. The fake implements `sendall`, not a writable `makefile`, because
+`StreamRequestHandler` sets `wbufsize = 0` and wraps the socket directly.
 
 Three seams exist purely for testability, and should be preserved:
 `scan_filesystems(mounts_path, statvfs, rotational)` and
@@ -603,6 +668,14 @@ changes:
   — which is what actually exercises the `ReadWritePaths` derivation — a nightly
   encode as the service user, and a clean uninstall. Worth repeating on a distro
   using a different package manager; only apt has been exercised.
+- **Web UI** — Ubuntu 24.04 under real systemd. Confirmed: `web.enabled: false`
+  exits 0 rather than serving; each library-resolution branch reports the right
+  source (fallback, destination, remote spec, missing mount, explicit override);
+  `/healthz`, 404 on unknown routes, no interpreter version in the `Server`
+  header; clean SIGTERM shutdown; `systemd-analyze verify` clean; and the full
+  install → re-install → uninstall cycle including `sync_units()` leaving the
+  web unit without a `ReadWritePaths` line and `restart_upgraded_services()`
+  picking the live unit up.
 - **Query-string credential encoding** — a password containing `@ & = #` fed
   through the wizard and parsed back out of the generated URL unchanged.
 - **Profile probe** — mock ONVIF endpoint serving 2560×1440 / 704×576 / 640×480
@@ -625,28 +698,36 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 527 lines
-scripts/timelapse_capture.py     daemon, 401 lines
-scripts/timelapse_encode.py      batch job, 685 lines
+install.sh                       bootstrap installer, 559 lines
+scripts/timelapse_capture.py     daemon, 415 lines
+scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
-scripts/timelapse_setup.py       configuration wizard, 1687 lines
+scripts/timelapse_setup.py       configuration wizard, 1691 lines
+scripts/timelapse_web.py         read-only web UI, 341 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
 tests/test_setup.py              unit tests
 tests/test_usage.py              unit tests
+tests/test_web.py                unit tests
 tests/smoke_test.py              end-to-end encode check, needs ffmpeg
 config/config.example.json       template; the real config.json is gitignored
 service/timelapse-capture.service
 service/timelapse-encode.service
 service/timelapse-encode.timer
+service/timelapse-web.service
 docs/architecture.md             this file
 docs/install.md                  operator guide
+docs/future-features.md          planned work, in build order
 ```
 
 Dependencies: Python 3.9+ stdlib, `requests`, `ffmpeg`/`ffprobe` (NVENC for
-AV1/HEVC), `rsync`. No virtualenv required, one pip package, no database.
+AV1/HEVC), `rsync`. No virtualenv required, one pip package, no database. The
+web UI adds nothing: it is `http.server` and the stdlib.
 
-Both systemd units use `ProtectSystem=strict` with an explicit `ReadWritePaths`.
-**Any new write path — a different frames root, a CIFS mountpoint for transfer —
-must be added there**, or writes fail with a confusing read-only error.
+All three systemd units use `ProtectSystem=strict`. Capture and encode carry an
+explicit `ReadWritePaths`; **any new write path — a different frames root, a
+CIFS mountpoint for transfer — must be added there**, or writes fail with a
+confusing read-only error. `timelapse-web.service` deliberately has none, so
+the entire filesystem is read-only to it. Giving the web UI anything to write
+means adding the path to the unit *and* to `install.sh sync_units()`.

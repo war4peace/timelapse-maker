@@ -1,0 +1,45 @@
+[Unit]
+Description=Read-only web UI for timelapse-maker
+Documentation=https://github.com/war4peace/timelapse-maker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Must match the user that owns the frames and videos, so it can read them.
+User=timelapse
+Group=timelapse
+ExecStart=/usr/bin/python3 /opt/timelapse/timelapse_web.py /etc/timelapse/config.json
+# on-failure, not always: the program exits 0 when web.enabled is false, and
+# that is a decision to respect rather than a crash to restart through.
+Restart=on-failure
+RestartSec=15
+# Serving a page must never cost the capture daemon a frame.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+# Hardening. This service is read-only by design - it never writes anything,
+# anywhere - so unlike the other two units it deliberately has NO
+# ReadWritePaths and the entire filesystem stays read-only to it. If you ever
+# give it something to write, add the path here AND to install.sh sync_units().
+#
+# Reading still works everywhere ProtectSystem=strict only remounts read-only,
+# including a NAS mount under /mnt.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# NOTE for the status pane (next phase): `journalctl -u ...` returns nothing
+# for a user outside the systemd-journal group, which looks like a bug in the
+# UI rather than a missing permission. It needs
+#   SupplementaryGroups=systemd-journal
+# added here - guarded in install.sh, because that group does not exist on
+# every distro and a missing group stops the unit from starting at all.
+
+[Install]
+WantedBy=multi-user.target

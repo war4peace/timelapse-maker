@@ -912,6 +912,23 @@ class TestDefaultConfig(unittest.TestCase):
         self.assertEqual(cfg["cameras"], [],
                          "example cameras must not leak into a real config")
 
+    def test_no_section_leaks_documentation_keys(self):
+        """Every dict section, not just the ones someone remembered.
+
+        The stripper used to walk a hardcoded list of section names, so adding
+        a "web" section to the template shipped its three _comment keys
+        straight into live configs. Checking one named section - which is what
+        the test above did - could not catch that. This asserts the invariant
+        instead of a sample of it.
+        """
+        example = _support.REPO / "config" / "config.example.json"
+        cfg = setup.default_config(str(example))
+        for name, block in cfg.items():
+            self.assertFalse(name.startswith("_"), f"top-level {name} leaked")
+            if isinstance(block, dict):
+                leaked = [k for k in block if k.startswith("_")]
+                self.assertEqual(leaked, [], f"{name} leaked {leaked}")
+
     def test_missing_template_falls_back_to_the_builtin(self):
         self.assertIn("paths", setup.default_config("/nonexistent.json"))
 

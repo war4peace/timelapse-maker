@@ -10,6 +10,23 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Added
+- **`timelapse web`** — an optional, read-only web UI, disabled by default.
+  This first cut is scaffolding: it serves a status page reporting where your
+  finished videos actually live, plus `/healthz`. Browsing and playback come
+  next. It never changes anything — no encode triggers, no camera control, no
+  config edits — and the unit enforces that rather than trusting the code:
+  `timelapse-web.service` is the only unit with no `ReadWritePaths`, so the
+  whole filesystem is read-only to it.
+
+  It binds `127.0.0.1` by default. There is no login and no HTTPS, so any
+  other bind address exposes the page to your LAN; it warns when you do that.
+
+  The status page leads with where the video library resolved to, because that
+  is the question worth answering first: transfer moves videos to your NAS with
+  `--remove-source-files`, so `paths.video_output` is *empty* after a
+  successful night. A remote `user@nas:/...` destination is not a path this
+  host can read at all, and the page says so instead of showing an empty list
+  that looks like a fault — as does a NAS that simply is not mounted.
 - **`timelapse usage`** — disk report: frames, bytes and date range per camera,
   totals, videos and free space. It also names the directories nothing will
   ever encode: a camera removed from the config (`ORPHAN`) or merely disabled
@@ -18,6 +35,13 @@ While the version is `0.x`, the configuration format may change in any release.
   and it is invisible to `du`.
 
 ### Fixed
+- The wizard stripped documentation keys from the config template by walking a
+  hardcoded list of section names, so any section added later kept its
+  `_comment` keys and shipped them into live configs. Caught immediately by the
+  new `web` section, which put three explanatory paragraphs into every
+  generated `config.json`. It now strips every section, which is what the code
+  claimed to do — its own comment already warned about a stale `_comment_cifs`
+  reaching live configs once before.
 - A missing, malformed or unreadable `config.json` produced a raw Python
   traceback from every entry point. Each of the three states needs a different
   action — not configured yet, broken after a hand-edit, or unreadable because
