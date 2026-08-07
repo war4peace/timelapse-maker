@@ -19,17 +19,24 @@ Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
 
-# Hardening. This service is read-only by design - it never writes anything,
-# anywhere - so unlike the other two units it deliberately has NO
-# ReadWritePaths and the entire filesystem stays read-only to it. If you ever
-# give it something to write, add the path here AND to install.sh sync_units().
+# Hardening. This service writes exactly one thing: the sqlite index below.
+# ReadWritePaths names that directory and NOTHING else, which is the point -
+# the video library, the captured frames and config.json all stay read-only to
+# it, enforced here rather than promised in the code. install.sh sync_units()
+# derives this path from web.state_dir and creates it; the service cannot
+# create it itself, because by then its parent is read-only.
 #
-# Reading still works everywhere ProtectSystem=strict only remounts read-only,
+# Keep this list to one entry. Do not "simplify" it to match the other two
+# units' ReadWritePaths - that would hand the web UI write access to every
+# captured frame in exchange for nothing.
+#
+# Reading still works everywhere: ProtectSystem=strict only remounts read-only,
 # including a NAS mount under /mnt.
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
+ReadWritePaths=/var/lib/timelapse/web
 ProtectHome=read-only
 ProtectKernelTunables=true
 ProtectControlGroups=true

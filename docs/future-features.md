@@ -224,8 +224,10 @@ test for "is a video".
 
 Constraints this survey establishes, each of which breaks a naive index:
 
-- **Camera identity must fold case.** `Workshop` (723) and `workshop` (446) are
-  one camera. Fold for identity, keep a display name.
+- **`Workshop` (723) and `workshop` (446) stay two entries.** They are almost
+  certainly one place typed two ways, but see the rule below: the index does
+  not decide that. Sort case-insensitively so they sit adjacent and the reader
+  can see it for themselves.
 - **449 files have no camera name.** They need a real bucket, not an exception.
 - **`(camera, date)` is not unique** — 6,844 keys for 6,848 files. The primary
   key is the relative path. Nothing else is safe.
@@ -234,12 +236,20 @@ Constraints this survey establishes, each of which breaks a naive index:
 - **Human-made folders carry meaning.** `2023-05-10 - Renovări` and
   `2023-05-12 - Dubios la poartă` are events, not clutter. Keep the folder as a
   label rather than flattening it away.
-- **Cameras get renamed.** `garaj` → `Garage`, `street4k` → `StreetPTZ`. The UI
-  will show these as separate cameras. Aliasing is a product decision; do not
-  invent it silently.
+- **Never merge two names.** `garaj`/`Garage` and `street4k`/`StreetPTZ` look
+  like renames and are not: a camera name is a **place**, cameras get
+  repurposed over the years, and the same device may cover a different area
+  while a new device covers the old one. The name is a location label, not a
+  device identity, and the two drift apart deliberately. Corrected by the user
+  2026-08-07 — do not regress this. More generally: people name things badly
+  over five years, and deciding whether `garaj` and `Garage` are the same place
+  is the *user's* call, not the index's. Show what is on disk. The most the UI
+  should do is sort case-insensitively so variants land next to each other.
 - **Some files are broken.** 11 are implausibly small — `Gate.20240727.mkv` at
-  17 KB, `Gate.20251109.mkv` at 86 KB. Worth flagging in the UI; they are
-  almost certainly failed encodes.
+  17 KB, `Gate.20251109.mkv` at 86 KB, almost certainly failed encodes. List
+  them with their **full path**, so they can be checked and removed by other
+  means. The UI is read-only and does not delete; naming the path is the whole
+  service it can offer.
 
 Two findings make reconciliation cheap:
 
@@ -299,7 +309,7 @@ currently state the unit writes nothing anywhere, which will no longer be true.
 |---|---|
 | 1a | **Done.** `timelapse_web.py`: `ThreadingHTTPServer`, loopback bind, one static page, `/healthz`, library-root resolution. Unit + install wiring + config keys. |
 | 1b | **Done.** Status pane — `systemctl status` and bounded `journalctl` on request, output in a `<pre>`. |
-| 1c | Library index — sqlite store, background first scan, pattern-chain parser, reconcile on access, browse by camera and date. Direct URL shown as copyable text. |
+| 1c | **Done.** Library index — sqlite store, background first scan, pattern-chain parser, reconcile on access, browse by camera and date, flagged files with full paths. |
 | 1d | `/video/<id>` file serving + `/play/<id>.m3u` handoff. Download link. |
 | 1e | Range request support, so seeking works. |
 | 1f | Wizard integration and docs. |

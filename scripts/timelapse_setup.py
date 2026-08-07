@@ -1519,6 +1519,18 @@ def writable_paths(cfg):
     return minimal
 
 
+def web_writable_paths(cfg):
+    """The single directory timelapse-web.service may write to.
+
+    Deliberately separate from writable_paths(): the web UI writes only its
+    sqlite index, and handing it the frames root as well - which is what
+    reusing that function would do - would give a network-facing service write
+    access to every captured frame in exchange for nothing.
+    """
+    state = (cfg.get("web", {}).get("state_dir") or "").strip()
+    return [str(PurePosixPath(state or "/var/lib/timelapse/web"))]
+
+
 def summarise(cfg, out_path):
     heading("Summary")
     print(f"  {'Frames':<12}{cfg['paths']['frames_root']}")
@@ -1598,6 +1610,8 @@ def main():
                     help="add, edit or remove cameras in an existing config")
     ap.add_argument("--print-paths", metavar="CONFIG",
                     help="print the paths systemd must be allowed to write")
+    ap.add_argument("--print-web-paths", metavar="CONFIG",
+                    help="print the one path the web UI must be allowed to write")
     ap.add_argument("--version", action="version",
                     version=f"%(prog)s {__version__}")
     args = ap.parse_args()
@@ -1606,6 +1620,11 @@ def main():
     if args.print_paths:
         with open(args.print_paths, encoding="utf-8") as fh:
             print(" ".join(writable_paths(json.load(fh))))
+        return 0
+
+    if args.print_web_paths:
+        with open(args.print_web_paths, encoding="utf-8") as fh:
+            print(" ".join(web_writable_paths(json.load(fh))))
         return 0
 
     init_tty(force_defaults=args.defaults, use_stdin=args.stdin)

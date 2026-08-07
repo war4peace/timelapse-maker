@@ -11,13 +11,15 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Added
 - **`timelapse web`** — an optional, read-only web UI, disabled by default.
-  It shows where your finished videos actually live, and — on request, never
-  by polling — the output of `systemctl status` for every unit and the recent
-  journal for capture, encode or the UI itself. Browsing and playback come
-  next. It never changes anything — no encode triggers, no camera control, no
-  config edits — and the unit enforces that rather than trusting the code:
-  `timelapse-web.service` is the only unit with no `ReadWritePaths`, so the
-  whole filesystem is read-only to it.
+  It shows where your finished videos actually live, an index of the videos
+  themselves browsable by camera and by date, and — on request, never by
+  polling — the output of `systemctl status` for every unit and the recent
+  journal for capture, encode or the UI itself. Playback comes next.
+
+  It never changes anything of yours — no encode triggers, no camera control,
+  no config edits, no deleting — and the unit enforces that rather than
+  trusting the code: `timelapse-web.service` may write one directory, its own
+  index, and nothing else on the system.
 
   It binds `127.0.0.1` by default. There is no login and no HTTPS, so any
   other bind address exposes the page to your LAN; it warns when you do that.
@@ -36,6 +38,28 @@ While the version is `0.x`, the configuration format may change in any release.
   that group does not exist the installer removes the line — naming a missing
   group would stop the service starting at all — and the page then tells you
   which line to add.
+
+  The library index is built to survive a real destination rather than a tidy
+  one. Surveying five years of accumulated timelapses turned up **six**
+  different filename conventions from successive tools, of which the format
+  this project writes accounts for under two thirds — so the index tries a
+  chain of patterns and files anything it recognises, including videos whose
+  names carry no camera at all. It never decides that two similar names mean
+  the same thing: a name is a *place*, cameras get repurposed over the years,
+  and whether `garaj` and `Garage` are one thing is yours to judge, not the
+  index's. Names are shown as they are on disk, sorted case-insensitively so
+  variants sit next to each other.
+
+  Files too small to be a real day of video are listed with their full path, so
+  you can check and remove them yourself — this UI never deletes anything.
+
+  The first scan runs in the background, so the page is up immediately and
+  reports progress. After that, opening a folder re-reads that one directory
+  and opening a file re-stats it, which keeps a browse from walking a NAS.
+
+  The index is the one thing the UI writes, and the systemd unit is scoped to
+  exactly that directory: the videos, the captured frames and `config.json`
+  stay read-only to it.
 - **`timelapse usage`** — disk report: frames, bytes and date range per camera,
   totals, videos and free space. It also names the directories nothing will
   ever encode: a camera removed from the config (`ORPHAN`) or merely disabled

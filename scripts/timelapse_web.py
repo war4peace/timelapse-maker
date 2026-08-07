@@ -24,16 +24,20 @@ Phase 1a: server, config, page, /healthz, library-root resolution.
 """
 
 import argparse
+import datetime
 import json
 import logging
 import os
+import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 __version__ = "0.0.8"
 
@@ -41,6 +45,10 @@ log = logging.getLogger("web")
 
 DEFAULT_BIND = "127.0.0.1"
 DEFAULT_PORT = 8787
+
+# The only path this service writes to. The unit's ReadWritePaths is scoped to
+# exactly this, so everything else - library, frames, config - stays read-only.
+DEFAULT_STATE_DIR = "/var/lib/timelapse/web"
 
 # A request handler must never outlive the client that abandoned it. This
 # belongs on the handler, not the server: ThreadingHTTPServer.timeout is only
@@ -143,6 +151,414 @@ def resolve_library(cfg):
 
     out["usable"] = True
     return out
+
+
+# ----------------------------------------------------------------------------
+# Filename parsing
+# ----------------------------------------------------------------------------
+
+# Six conventions, measured against a real five-year library (6,848 files;
+# docs/future-features.md records the survey). The native format is 64% of it -
+# a parser that handles only that silently drops a third of the library and all
+# history before 2024-04. Order matters: most specific first.
+#
+# Every camera group is a *place*, not a device. Cameras get repurposed, so two
+# similar names are not evidence of the same thing and are never merged here.
+
+_PATTERNS = (
+    # Camera.20260707
+    ("native", re.compile(
+        r"^(?P<cam>.+)\.(?P<y>\d{4})(?P<mo>\d{2})(?P<d>\d{2})$")),
+    # 2024-01-01_Workshop
+    ("date-first", re.compile(
+        r"^(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})[ _-]+(?P<cam>.+)$")),
+    # Courtyard_4K_2021-11-01
+    ("date-last", re.compile(
+        r"^(?P<cam>.+?)[ _-]+(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})$")),
+    # 2021-11-01  - no camera in the name at all
+    ("date-only", re.compile(
+        r"^(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})$")),
+    # 2023-05-12T22-00-01_roof
+    ("timestamped", re.compile(
+        r"^(?P<y>\d{4})-(?P<mo>\d{2})-(?P<d>\d{2})T[\d.:-]+"
+        r"(?:[ _-]+(?P<cam>.+))?$")),
+    # Court18020240428_20240428233819
+    ("double-stamp", re.compile(
+        r"^(?P<cam>.*?)(?P<y>\d{4})(?P<mo>\d{2})(?P<d>\d{2})_\d{14}$")),
+)
+
+NO_CAMERA = ""      # 449 files in the surveyed library carry no name at all
+
+
+def parse_name(name):
+    """(camera, day, pattern) for a video filename. day is ISO or None.
+
+    A pattern that matches but yields an impossible date falls through to the
+    next rather than winning - `something.99999999.mkv` is not a dated file.
+    """
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    for label, rx in _PATTERNS:
+        m = rx.match(stem)
+        if not m:
+            continue
+        try:
+            day = datetime.date(int(m.group("y")), int(m.group("mo")),
+                                int(m.group("d"))).isoformat()
+        except ValueError:
+            continue
+        cam = ""
+        if "cam" in rx.groupindex:
+            cam = (m.group("cam") or "").strip(" _-.")
+        return cam, day, label
+    return "", None, "unrecognised"
+
+
+# ----------------------------------------------------------------------------
+# Library index
+# ----------------------------------------------------------------------------
+
+# "not a directory" is not a test for "is a video": the surveyed library has a
+# leftover MakeTLALL_backup.ps1 sitting in its root.
+VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm", ".m4v", ".mpg", ".mpeg"}
+
+# A day's timelapse is hundreds of megabytes. Anything this small is a failed
+# encode; 11 such files exist in the surveyed library. They are listed with
+# their full path so they can be dealt with by other means - this UI never
+# deletes anything.
+SUSPECT_BYTES = 1024 * 1024
+
+SCHEMA_VERSION = "1"
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS files (
+    path       TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    folder     TEXT NOT NULL,
+    size       INTEGER NOT NULL,
+    mtime      INTEGER NOT NULL,
+    camera     TEXT NOT NULL,
+    day        TEXT,
+    pattern    TEXT NOT NULL,
+    suspect    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS files_camera ON files(camera, day);
+CREATE INDEX IF NOT EXISTS files_day    ON files(day);
+CREATE INDEX IF NOT EXISTS files_folder ON files(folder, name);
+CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+class Index:
+    """The sqlite-backed file index.
+
+    This is the one thing the web UI writes, and the unit's ReadWritePaths is
+    scoped to exactly its directory - the library, the frames and the config
+    all stay read-only to this process.
+
+    A connection per operation rather than one shared handle: sqlite objects
+    are not safely shared across threads, and the scan worker writes while
+    request threads read. WAL is what makes that concurrency free.
+    """
+
+    def __init__(self, db_path, root):
+        self.db_path = Path(db_path)
+        self.root = Path(root) if root else None
+        self.error = ""
+        self.scan = {"running": False, "files": 0, "started": 0.0,
+                     "finished": 0.0, "error": ""}
+        self._lock = threading.Lock()
+        try:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._connect() as db:
+                db.executescript(SCHEMA)
+                self._check_generation(db)
+        except (OSError, sqlite3.Error) as exc:
+            # Serving status and logs without an index beats refusing to start.
+            self.error = (f"Cannot use the index at {self.db_path}: {exc}. "
+                          f"The unit needs ReadWritePaths for that directory.")
+            log.error("%s", self.error)
+
+    def _connect(self):
+        db = sqlite3.connect(str(self.db_path), timeout=15)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA busy_timeout=15000")
+        db.row_factory = sqlite3.Row
+        return db
+
+    def _check_generation(self, db):
+        """Wipe the index when the schema or the library root changes.
+
+        Rebuilding costs one scan; serving an index built from a different
+        directory costs the user's trust.
+        """
+        want = {"schema": SCHEMA_VERSION, "root": str(self.root or "")}
+        have = {r["key"]: r["value"] for r in db.execute("SELECT * FROM meta")}
+        if any(have.get(k) != v for k, v in want.items()):
+            if have:
+                log.info("Index generation changed (%s -> %s); rebuilding.",
+                         have, want)
+            db.execute("DELETE FROM files")
+            for k, v in want.items():
+                db.execute("INSERT OR REPLACE INTO meta VALUES (?,?)", (k, v))
+            db.commit()
+
+    @property
+    def usable(self):
+        return not self.error and self.root is not None
+
+    # -- scanning ------------------------------------------------------------
+
+    def start_scan(self, reason="first run"):
+        """Kick off a full scan in the background.
+
+        Deliberately not timed against a budget. The only measurement taken -
+        1.7 s for 6,848 files - came from a 10G workstation, while deployments
+        read CIFS over 1G; the work is round-trips rather than megabytes, so it
+        moves for reasons that are hard to predict. Nothing here blocks a
+        request, so the duration does not matter.
+        """
+        if not self.usable:
+            return False
+        with self._lock:
+            if self.scan["running"]:
+                return False
+            self.scan = {"running": True, "files": 0, "started": time.time(),
+                         "finished": 0.0, "error": ""}
+        log.info("Library scan started (%s): %s", reason, self.root)
+        threading.Thread(target=self._scan_worker, name="index-scan",
+                         daemon=True).start()
+        return True
+
+    def _scan_worker(self):
+        seen, batch, count = set(), [], 0
+        try:
+            with self._connect() as db:
+                for row in self._walk():
+                    seen.add(row[0])
+                    batch.append(row)
+                    count += 1
+                    if len(batch) >= 500:
+                        self._write(db, batch)
+                        batch = []
+                        with self._lock:
+                            self.scan["files"] = count
+                if batch:
+                    self._write(db, batch)
+                # Anything not seen this pass is gone from disk.
+                keep = list(seen)
+                db.execute("CREATE TEMP TABLE seen(path TEXT PRIMARY KEY)")
+                db.executemany("INSERT OR IGNORE INTO seen VALUES (?)",
+                               ((p,) for p in keep))
+                db.execute("DELETE FROM files WHERE path NOT IN "
+                           "(SELECT path FROM seen)")
+                db.commit()
+            with self._lock:
+                self.scan.update(running=False, files=count,
+                                 finished=time.time())
+            log.info("Library scan finished: %d files", count)
+        except Exception as exc:            # a scan must never kill the server
+            log.error("Library scan failed: %s", exc)
+            with self._lock:
+                self.scan.update(running=False, finished=time.time(),
+                                 error=str(exc)[:300])
+
+    def _walk(self):
+        """Every video file under the root, as an index row.
+
+        os.scandir, and size/mtime taken from the entry: on a network share the
+        cost is round-trips, and asking the directory once for what it already
+        knows is the whole difference.
+        """
+        stack = [("", str(self.root))]
+        while stack:
+            rel, path = stack.pop()
+            try:
+                entries = list(os.scandir(path))
+            except OSError as exc:
+                log.warning("Cannot read %s: %s", path, exc)
+                continue
+            for entry in entries:
+                child = f"{rel}/{entry.name}" if rel else entry.name
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append((child, entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        row = self._row(child, entry.name, rel, entry)
+                        if row:
+                            yield row
+                except OSError:
+                    continue        # vanished mid-scan; the next pass sorts it
+
+    @staticmethod
+    def _row(rel, name, folder, entry):
+        if os.path.splitext(name)[1].lower() not in VIDEO_EXTS:
+            return None
+        st = entry.stat()
+        cam, day, pattern = parse_name(name)
+        return (rel, name, folder, st.st_size, int(st.st_mtime),
+                cam, day, pattern, 1 if st.st_size < SUSPECT_BYTES else 0)
+
+    @staticmethod
+    def _write(db, batch):
+        db.executemany(
+            "INSERT OR REPLACE INTO files "
+            "(path,name,folder,size,mtime,camera,day,pattern,suspect) "
+            "VALUES (?,?,?,?,?,?,?,?,?)", batch)
+        db.commit()
+
+    # -- reconciliation ------------------------------------------------------
+
+    def reconcile_dir(self, rel):
+        """Re-read one directory and bring its rows into line. Returns whether
+        anything actually differed.
+
+        This always does the scandir. An earlier version gated on the
+        directory's mtime and skipped the read when it matched, which was both
+        a correctness hole and a false economy: mtime is stored at second
+        granularity, so anything added within the same second as the last scan
+        stayed invisible until something else changed. Reading one directory is
+        a single round trip. The expensive thing is walking the whole tree, and
+        that is what this exists to avoid.
+        """
+        if not self.usable:
+            return False
+        path = self._abs(rel)
+        if path is None:
+            return False
+
+        rows, paths = [], set()
+        try:
+            for entry in os.scandir(path):
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                child = f"{rel}/{entry.name}" if rel else entry.name
+                built = self._row(child, entry.name, rel, entry)
+                if built:
+                    rows.append(built)
+                    paths.add(child)
+        except OSError:
+            # The directory is gone: drop everything filed under it.
+            with self._connect() as db:
+                gone = db.execute("SELECT COUNT(*) c FROM files WHERE folder=?",
+                                  (rel,)).fetchone()["c"]
+                db.execute("DELETE FROM files WHERE folder = ?", (rel,))
+                db.commit()
+            return bool(gone)
+
+        with self._connect() as db:
+            before = {r["path"]: (r["size"], r["mtime"]) for r in db.execute(
+                "SELECT path, size, mtime FROM files WHERE folder = ?", (rel,))}
+            now = {r[0]: (r[3], r[4]) for r in rows}
+            if rows:
+                self._write(db, rows)
+            stale = [p for p in before if p not in paths]
+            if stale:
+                db.executemany("DELETE FROM files WHERE path = ?",
+                               ((p,) for p in stale))
+            db.commit()
+        return before != now
+
+    def reconcile_file(self, rel):
+        """Re-stat one file. Returns its row, or None when it is gone."""
+        if not self.usable:
+            return None
+        path = self._abs(rel)
+        if path is None:
+            return None
+        try:
+            st = os.stat(path)
+        except OSError:
+            with self._connect() as db:
+                db.execute("DELETE FROM files WHERE path = ?", (rel,))
+                db.commit()
+            return None
+        name = os.path.basename(rel)
+        folder = os.path.dirname(rel)
+        cam, day, pattern = parse_name(name)
+        row = (rel, name, folder, st.st_size, int(st.st_mtime), cam, day,
+               pattern, 1 if st.st_size < SUSPECT_BYTES else 0)
+        with self._connect() as db:
+            self._write(db, [row])
+        return self.get(rel)
+
+    def _abs(self, rel):
+        """Resolve a relative index path inside the root, or None.
+
+        Nothing from a request should reach the filesystem unchecked, even
+        while this phase only stats. commonpath rather than startswith: the
+        latter accepts /library-old for a root of /library.
+        """
+        if self.root is None:
+            return None
+        candidate = (self.root / rel).resolve() if rel else self.root.resolve()
+        try:
+            root = self.root.resolve()
+            if os.path.commonpath([str(root), str(candidate)]) != str(root):
+                return None
+        except (OSError, ValueError):
+            return None
+        return candidate
+
+    # -- queries -------------------------------------------------------------
+
+    def _query(self, sql, args=()):
+        if not self.usable:
+            return []
+        try:
+            with self._connect() as db:
+                return [dict(r) for r in db.execute(sql, args)]
+        except sqlite3.Error as exc:
+            log.warning("Index query failed: %s", exc)
+            return []
+
+    def totals(self):
+        rows = self._query(
+            "SELECT COUNT(*) n, COALESCE(SUM(size),0) b, MIN(day) a, MAX(day) z,"
+            " SUM(suspect) s FROM files")
+        return rows[0] if rows else {"n": 0, "b": 0, "a": None, "z": None,
+                                     "s": 0}
+
+    def cameras(self):
+        # ORDER BY lower(camera): two spellings of a place sit next to each
+        # other so the reader can judge them. They are never merged - see
+        # future-features.md; a name is a place, and places get recycled.
+        return self._query(
+            "SELECT camera, COUNT(*) n, SUM(size) b, MIN(day) a, MAX(day) z "
+            "FROM files GROUP BY camera ORDER BY lower(camera), camera")
+
+    def folders(self):
+        return self._query(
+            "SELECT folder, COUNT(*) n, SUM(size) b FROM files "
+            "GROUP BY folder ORDER BY folder DESC")
+
+    def by_camera(self, camera):
+        return self._query(
+            "SELECT * FROM files WHERE camera = ? ORDER BY day DESC, name",
+            (camera,))
+
+    def in_folder(self, folder):
+        return self._query(
+            "SELECT * FROM files WHERE folder = ? ORDER BY name", (folder,))
+
+    def suspects(self):
+        return self._query(
+            "SELECT * FROM files WHERE suspect = 1 ORDER BY size, path")
+
+    def unrecognised(self):
+        return self._query(
+            "SELECT * FROM files WHERE day IS NULL ORDER BY path")
+
+    def get(self, rel):
+        rows = self._query("SELECT * FROM files WHERE path = ?", (rel,))
+        return rows[0] if rows else None
+
+
+def human_size(n):
+    n = float(n or 0)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
 
 
 # ----------------------------------------------------------------------------
@@ -277,6 +693,24 @@ LAYOUT = """<!doctype html>
   .sub {{ display: flex; gap: .5rem; flex-wrap: wrap; margin: 0 0 .8rem;
           font-size: .85rem; }}
   .sub a {{ color: inherit; }}
+  table {{ border-collapse: collapse; width: 100%; font-size: .9rem; }}
+  th {{ text-align: left; font-weight: 600; opacity: .6; font-size: .8rem;
+        text-transform: uppercase; letter-spacing: .04em;
+        border-bottom: 1px solid rgba(128,128,128,.3); padding: .3rem .5rem; }}
+  td {{ padding: .3rem .5rem; border-bottom: 1px solid rgba(128,128,128,.14);
+        vertical-align: top; }}
+  td.num {{ text-align: right; font-variant-numeric: tabular-nums;
+            white-space: nowrap; }}
+  .wrap {{ overflow-x: auto; }}
+  .path {{ font-family: ui-monospace, monospace; font-size: .8rem;
+           user-select: all; overflow-wrap: anywhere; opacity: .8; }}
+  .flag {{ color: #b3261e; font-weight: 600; }}
+  .scan {{ font-size: .85rem; opacity: .7; margin: 0 0 1rem; }}
+  form.inline {{ display: inline; }}
+  button {{ font: inherit; font-size: .85rem; padding: .25rem .8rem;
+            border-radius: 999px; border: 1px solid rgba(128,128,128,.35);
+            background: transparent; color: inherit; cursor: pointer; }}
+  @media (prefers-color-scheme: dark) {{ .flag {{ color: #ff7b72; }} }}
 </style>
 <header>
   <h1>timelapse-maker</h1>
@@ -284,6 +718,7 @@ LAYOUT = """<!doctype html>
 </header>
 <nav>
   <a href="/" class="{on_home}">Overview</a>
+  <a href="/library" class="{on_library}">Library</a>
   <a href="/status" class="{on_status}">Service status</a>
   <a href="/logs" class="{on_logs}">Recent log</a>
 </nav>
@@ -303,7 +738,6 @@ OVERVIEW = """<section>
 <section>
   <h2>Not built yet</h2>
   <ul class="todo">
-    <li>Video index &mdash; browse by camera and date</li>
     <li>Playback handoff &mdash; <code>.m3u</code> to VLC, plus a download link</li>
   </ul>
 </section>
@@ -341,6 +775,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if route == "/":
             self._send(200, self._render("home", self._overview()))
+        elif route == "/library":
+            self._send(200, self._render("library", self._library(args)))
         elif route == "/status":
             self._send(200, self._render("status", self._report(status_report())))
         elif route == "/logs":
@@ -352,10 +788,28 @@ class Handler(BaseHTTPRequestHandler):
 
     do_HEAD = do_GET
 
+    def do_POST(self):
+        """The one action a read-only UI has: rescan its own index.
+
+        POST rather than a link so a crawler, a prefetch or a refresh cannot
+        set a full scan going. It still changes nothing outside our own
+        database.
+        """
+        route = self.path.split("?", 1)[0].rstrip("/") or "/"
+        if route == "/rescan":
+            self.server.index.start_scan("requested")
+            self.send_response(303)
+            self.send_header("Location", "/library")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            self._send(404, "not found\n", "text/plain; charset=utf-8")
+
     def _render(self, page, content):
         return LAYOUT.format(
             version=__version__,
             on_home="on" if page == "home" else "",
+            on_library="on" if page == "library" else "",
             on_status="on" if page == "status" else "",
             on_logs="on" if page == "logs" else "",
             content=content,
@@ -374,6 +828,168 @@ class Handler(BaseHTTPRequestHandler):
             lib_state="yes" if lib["usable"] else "no",
             lib_note=note,
         )
+
+    # -- library ------------------------------------------------------------
+
+    def _library(self, args):
+        index = self.server.index
+        if index.error:
+            return f'<section><p class="note">{escape(index.error)}</p></section>'
+        lib = resolve_library(self.server.cfg)
+        if not lib["usable"]:
+            return ('<section><h2>Video library</h2>'
+                    f'<p class="note">{escape(lib["note"] or "No readable library.")}'
+                    '</p></section>')
+
+        if "folder" in args:
+            return self._scan_banner() + self._folder_view(args["folder"][0])
+        if "camera" in args:
+            return self._scan_banner() + self._camera_view(args["camera"][0])
+        if "flagged" in args:
+            return self._scan_banner() + self._flagged_view()
+        return self._scan_banner() + self._library_home()
+
+    def _scan_banner(self):
+        s = dict(self.server.index.scan)
+        rescan = ('<form class="inline" method="post" action="/rescan">'
+                  '<button type="submit">Rescan</button></form>')
+        if s["running"]:
+            return (f'<p class="scan">Indexing&hellip; {s["files"]} files so far. '
+                    f'This page works while it runs; reload for more.</p>')
+        if s["error"]:
+            return (f'<p class="note">Last scan failed: {escape(s["error"])}</p>'
+                    f'<p class="scan">{rescan}</p>')
+        if s["finished"]:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["finished"]))
+            # Only claim a duration when the start was actually recorded;
+            # otherwise the subtraction reports the age of the epoch.
+            took = (f' in {s["finished"] - s["started"]:.1f}s'
+                    if s["started"] else "")
+            return (f'<p class="scan">Indexed {s["files"]} files at {when}'
+                    f'{took}. {rescan}</p>')
+        return f'<p class="scan">Not indexed yet. {rescan}</p>'
+
+    def _library_home(self):
+        index = self.server.index
+        tot = index.totals()
+        parts = [
+            '<section><h2>Library</h2><dl>',
+            f'<dt>Files</dt><dd>{tot["n"]:,}</dd>',
+            f'<dt>Size</dt><dd>{human_size(tot["b"])}</dd>',
+            f'<dt>Span</dt><dd>{escape(tot["a"] or "-")} to '
+            f'{escape(tot["z"] or "-")}</dd>',
+        ]
+        if tot["s"]:
+            parts.append(f'<dt>Flagged</dt><dd><a href="/library?flagged=1" '
+                         f'class="flag">{tot["s"]} suspiciously small</a></dd>')
+        parts.append("</dl></section>")
+
+        cams = index.cameras()
+        if cams:
+            parts.append('<section><h2>Cameras</h2><div class="wrap"><table>'
+                         '<tr><th>Name</th><th>Files</th><th>Size</th>'
+                         '<th>First</th><th>Last</th></tr>')
+            for c in cams:
+                label = c["camera"] or "(no name in filename)"
+                link = f'/library?camera={quote(c["camera"])}'
+                parts.append(
+                    f'<tr><td><a href="{link}">{escape(label)}</a></td>'
+                    f'<td class="num">{c["n"]:,}</td>'
+                    f'<td class="num">{human_size(c["b"])}</td>'
+                    f'<td class="num">{escape(c["a"] or "-")}</td>'
+                    f'<td class="num">{escape(c["z"] or "-")}</td></tr>')
+            parts.append("</table></div>"
+                         '<p class="scan">Names are shown exactly as they are '
+                         'on disk and never merged &mdash; a name is a place, '
+                         'and places get recycled between cameras. Sorted '
+                         'case-insensitively so variants sit together.</p>'
+                         "</section>")
+
+        folders = index.folders()
+        if folders:
+            parts.append('<section><h2>Folders</h2><div class="wrap"><table>'
+                         '<tr><th>Folder</th><th>Files</th><th>Size</th></tr>')
+            for f in folders:
+                label = f["folder"] or "(root)"
+                link = f'/library?folder={quote(f["folder"])}'
+                parts.append(
+                    f'<tr><td><a href="{link}">{escape(label)}</a></td>'
+                    f'<td class="num">{f["n"]:,}</td>'
+                    f'<td class="num">{human_size(f["b"])}</td></tr>')
+            parts.append("</table></div></section>")
+        return "".join(parts)
+
+    def _camera_view(self, camera):
+        rows = self.server.index.by_camera(camera)
+        label = camera or "(no name in filename)"
+        head = (f'<section><h2>{escape(label)}</h2>'
+                f'<p class="scan">{len(rows):,} files, from the index. '
+                f'Open a folder to re-check it against disk.</p>')
+        return head + self._file_table(rows, show_folder=True) + "</section>"
+
+    def _folder_view(self, folder):
+        index = self.server.index
+        changed = index.reconcile_dir(folder)
+        rows = index.in_folder(folder)
+        label = folder or "(root)"
+        note = ("Re-checked against disk; the index was out of date."
+                if changed else "Re-checked against disk; nothing had changed.")
+        head = (f'<section><h2>{escape(label)}</h2>'
+                f'<p class="scan">{len(rows):,} files. {note}</p>')
+        return head + self._file_table(rows, show_folder=False) + "</section>"
+
+    def _flagged_view(self):
+        index = self.server.index
+        rows = index.suspects()
+        unknown = index.unrecognised()
+        parts = [
+            '<section><h2>Flagged files</h2>',
+            '<p class="scan">Smaller than ',
+            human_size(SUSPECT_BYTES),
+            ' &mdash; a day of timelapse is hundreds of megabytes, so these '
+            'are almost certainly failed encodes. Full paths are given so you '
+            'can check and remove them yourself; this UI never deletes '
+            'anything.</p>',
+            self._file_table(rows, show_folder=True, full_path=True),
+            "</section>",
+        ]
+        if unknown:
+            parts += [
+                '<section><h2>No date in the filename</h2>',
+                f'<p class="scan">{len(unknown):,} files whose names match none '
+                'of the known conventions. They are indexed and listed, just '
+                'not filed under a date.</p>',
+                self._file_table(unknown, show_folder=True, full_path=True),
+                "</section>",
+            ]
+        return "".join(parts)
+
+    def _file_table(self, rows, show_folder, full_path=False):
+        if not rows:
+            return '<p class="scan">Nothing here.</p>'
+        root = self.server.index.root
+        cols = ["Day", "Name"]
+        if show_folder:
+            cols.append("Folder")
+        cols += ["Size", "Pattern"]
+        out = ['<div class="wrap"><table><tr>']
+        out += [f"<th>{c}</th>" for c in cols]
+        out.append("</tr>")
+        for r in rows:
+            flag = ' class="flag"' if r["suspect"] else ""
+            out.append(f'<tr><td class="num">{escape(r["day"] or "-")}</td>')
+            out.append(f'<td{flag}>{escape(r["name"])}</td>')
+            if show_folder:
+                out.append(f'<td>{escape(r["folder"] or "(root)")}</td>')
+            out.append(f'<td class="num">{human_size(r["size"])}</td>')
+            out.append(f'<td>{escape(r["pattern"])}</td></tr>')
+            if full_path and root is not None:
+                # Selectable in one click, for pasting into a player or a shell.
+                whole = os.path.join(str(root), r["path"].replace("/", os.sep))
+                out.append(f'<tr><td></td><td colspan="{len(cols) - 1}" '
+                           f'class="path">{escape(whole)}</td></tr>')
+        out.append("</table></div>")
+        return "".join(out)
 
     def _logs(self, args):
         unit = (args.get("unit") or [DEFAULT_LOG_UNIT])[0]
@@ -430,9 +1046,10 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, handler, cfg):
+    def __init__(self, addr, handler, cfg, index):
         super().__init__(addr, handler)
         self.cfg = cfg
+        self.index = index
 
 
 def main():
@@ -471,8 +1088,11 @@ def main():
     if lib["note"]:
         log.warning("%s", lib["note"])
 
+    state_dir = web.get("state_dir", DEFAULT_STATE_DIR)
+    index = Index(Path(state_dir) / "index.db", lib["path"])
+
     try:
-        httpd = Server((bind, port), Handler, cfg)
+        httpd = Server((bind, port), Handler, cfg, index)
     except OSError as exc:
         # Almost always "address already in use" or a bind address that does
         # not exist on this host. Both are config errors, not crashes.
@@ -488,6 +1108,12 @@ def main():
     signal.signal(signal.SIGINT, on_signal)
 
     log.info("Serving on http://%s:%d/ (pid %d)", bind, port, os.getpid())
+
+    # After the socket is listening, never before: the first scan of a large
+    # share on a slow link must not delay the page that reports its progress.
+    if index.usable:
+        index.start_scan()
+
     httpd.serve_forever()
     httpd.server_close()
     log.info("Stopped.")

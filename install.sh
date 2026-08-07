@@ -306,12 +306,18 @@ sync_units() {
             || rw="/var/lib/timelapse"
         [ -z "$rw" ] && rw="/var/lib/timelapse"
     fi
-    # timelapse-web.service is in this list for User/Group/ExecStart only. It
-    # has no ReadWritePaths line to rewrite, on purpose: the web UI is
-    # read-only and writes nothing, so it keeps the whole filesystem read-only.
-    # sed leaves lines that do not match alone, so no rule is needed to skip it.
-    for unit in timelapse-capture.service timelapse-encode.service \
-                timelapse-web.service; do
+    # The web UI gets its OWN ReadWritePaths, not this one. It writes exactly
+    # one thing - its sqlite index - and scoping the unit to that directory is
+    # what keeps the library, the frames and the config read-only to it. Giving
+    # it $rw would hand it write access to every captured frame for no reason.
+    local webrw="/var/lib/timelapse/web"
+    if [ -f "$CONFIG" ]; then
+        webrw="$(python3 "$PREFIX/timelapse_setup.py" --print-web-paths "$CONFIG" 2>/dev/null)" \
+            || webrw="/var/lib/timelapse/web"
+        [ -z "$webrw" ] && webrw="/var/lib/timelapse/web"
+    fi
+
+    for unit in timelapse-capture.service timelapse-encode.service; do
         local f="$UNITDIR/$unit"
         [ -f "$f" ] || continue
         sed -i \
@@ -320,9 +326,22 @@ sync_units() {
             -e "s|^ReadWritePaths=.*|ReadWritePaths=$rw|" \
             -e "s|^ExecStart=.*timelapse_capture.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_capture.py $CONFIG|" \
             -e "s|^ExecStart=.*timelapse_encode.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_encode.py $CONFIG|" \
-            -e "s|^ExecStart=.*timelapse_web.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_web.py $CONFIG|" \
             "$f"
     done
+
+    if [ -f "$UNITDIR/timelapse-web.service" ]; then
+        sed -i \
+            -e "s|^User=.*|User=$user_line|" \
+            -e "s|^Group=.*|Group=$user_line|" \
+            -e "s|^ReadWritePaths=.*|ReadWritePaths=$webrw|" \
+            -e "s|^ExecStart=.*timelapse_web.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_web.py $CONFIG|" \
+            "$UNITDIR/timelapse-web.service"
+        # ReadWritePaths on a directory that does not exist stops the unit
+        # dead, and the service cannot create it: its parent is read-only to
+        # it by then. So it is made here, before anything tries to start.
+        install -d -m 0750 "$webrw" 2>/dev/null || true
+        chown "$SVCUSER:$SVCUSER" "$webrw" 2>/dev/null || true
+    fi
 
     # SupplementaryGroups naming a group that does not exist stops the unit
     # from starting outright, so it is cheaper to drop the line than to have
@@ -338,6 +357,7 @@ sync_units() {
 
     [ -d /run/systemd/system ] && systemctl daemon-reload || true
     note "ReadWritePaths=$rw"
+    note "Web index dir=$webrw"
 }
 
 run_wizard() {

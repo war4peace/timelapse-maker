@@ -416,11 +416,25 @@ Long-running, `Type=simple`, `Restart=on-failure`. Optional: it exits 0 when
 `web.enabled` is false, which is why the unit is `on-failure` rather than
 `always` — that exit is a decision to respect, not a crash to restart through.
 
-**Read-only is a structural property, not a promise.** It never writes anything
-anywhere, which is what lets `timelapse-web.service` run with no
-`ReadWritePaths` at all. That is stronger than a code review: the sandbox, not
-the source, is what stops it writing. It also logs only to journald — a
-rotating log file would be the single reason it needed a writable path.
+**Read-only is a structural property, not a promise.** The service writes
+exactly one thing — its sqlite index — and `ReadWritePaths` names that
+directory and nothing else. The video library, the captured frames and
+`config.json` are all read-only to it, enforced by the sandbox rather than by
+the source. Verified: a process with this unit's properties can write
+`/var/lib/timelapse/web` and cannot write either the library or the frames.
+
+Keep that list to one entry. Reusing the capture/encode `ReadWritePaths` would
+hand a network-facing service write access to every captured frame in exchange
+for nothing, which is why `sync_units()` templates the web unit separately and
+`timelapse_setup.py` has a separate `--print-web-paths`.
+
+It logs only to journald: a rotating log file would be a second writable path
+for no benefit.
+
+**`PrivateTmp=true` hides `/tmp` and `/var/tmp` from the unit.** A library
+placed under either is invisible to the service and the page reports it as
+unreadable — which is correct but baffling. Cost an hour of a test run; worth
+knowing before someone points `library_root` at a scratch directory.
 
 **`resolve_library()`** is the part with actual thinking in it. Videos are not
 where a naive reading of the config says they are: `transfer()` runs rsync with
@@ -438,6 +452,37 @@ settled before the colon test, so `/mnt/odd:name/videos` stays local.
 The function returns a dict with `usable` and a `note` rather than a path,
 because "why is this empty" is the question the page exists to answer, and a
 dropped NAS mount is a *correct* empty library, not a fault.
+
+**The index** (`/library`) is sqlite at `web.state_dir/index.db`.
+
+- **Six filename conventions, not one.** Measured against a real five-year
+  library: the native `Camera.YYYYMMDD.ext` is 64% of it, and a parser handling
+  only that drops a third of the files and everything before 2024-04.
+  `parse_name()` tries patterns most-specific-first and validates the date, so
+  a match yielding 30 February falls through instead of winning. All 6,847
+  video files in the surveyed library parse.
+- **A name is a place, not a camera.** Cameras get repurposed across years, so
+  two similar names are not evidence of one thing. The index **never merges**
+  them — `Workshop` and `workshop` stay two rows — and only sorts
+  case-insensitively so variants sit adjacent for the reader to judge.
+- **The path is the primary key.** `(camera, date)` is not unique in the wild.
+- **An extension allow-list**, because "not a directory" is not a test for "is
+  a video": the surveyed library has a leftover `.ps1` in its root.
+- **The first scan runs in a background thread**, started only after the socket
+  is listening, so the page reporting its progress is never delayed by it. No
+  duration budget is assumed anywhere — the one measurement taken (1.7 s for
+  6,848 files) came from a 10G workstation while deployments read CIFS over 1G,
+  and the work is round-trips rather than megabytes.
+- **Reconciliation is on access.** Opening a folder re-reads that one directory
+  and diffs it; opening a file re-stats it. An earlier version gated the
+  directory read on its mtime and skipped it when unchanged — that was both a
+  false economy (reading one directory is a single round trip) and a
+  correctness hole, since mtime is stored at second granularity and anything
+  added within the same second as the last scan stayed invisible.
+- **A changed library root wipes the index.** Serving an index built from a
+  different directory is worse than having none.
+- **An unusable state directory degrades rather than crashes.** Status and logs
+  still work; the library page explains that the unit needs `ReadWritePaths`.
 
 **Status and logs** (`/status`, `/logs`) shell out, on request only — a page
 load or a click. Nothing polls and nothing is collected in the background.
@@ -490,9 +535,11 @@ downloads a tarball from `codeload.github.com` — so the same script serves bot
 
 `sync_units()` is the important part: it rewrites `User=`, `Group=`,
 `ExecStart=` and `ReadWritePaths=` in the installed units from the config the
-wizard just wrote. `timelapse-web.service` is in that loop for User/Group/
-ExecStart only — it has no `ReadWritePaths` line and must not gain one; `sed`
-leaves non-matching lines alone, so no rule is needed to skip it.
+wizard just wrote. `timelapse-web.service` is templated **separately**, with
+its own narrower `ReadWritePaths` from `--print-web-paths`, and the state
+directory is created there too — `ReadWritePaths` naming a directory that does
+not exist stops the unit dead, and the service cannot create it because by then
+its parent is read-only to it.
 
 `RESTART_UNITS` lists every long-running unit. **A unit missing from it gets
 replaced on disk and keeps serving the old build while the installer reports
@@ -556,7 +603,8 @@ is read with `.get(key, default)`.
 | `enabled` | `false` by default. The program exits 0 when false, so the unit may be enabled without the server running. |
 | `bind` | `127.0.0.1` by default. There is no authentication and no TLS — any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup. |
 | `port` | `8787` by default. |
-| `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path — typically a remote rsync destination that is *also* mounted locally. |
+| `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path — typically a remote rsync destination that is *also* mounted locally. Not `/tmp` or `/var/tmp`: `PrivateTmp=true` hides those from the unit. |
+| `state_dir` | The **only** directory the web UI may write to; holds the sqlite index. The unit's `ReadWritePaths` is scoped to exactly this, so the library, the frames and the config stay read-only to it. `install.sh` creates it — a `ReadWritePaths` naming a missing directory stops the unit dead, and the service cannot create it itself. |
 
 ### `cameras[]`
 | Key | Notes |
@@ -648,8 +696,8 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 288 cases, under three
-seconds) cover the pure logic: frame validation, concat-list escaping,
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 331 cases, under fifteen
+seconds — `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
 `writable_paths`, credential quoting, `_dest_path` including the DST
@@ -704,6 +752,16 @@ changes:
   install → re-install → uninstall cycle including `sync_units()` leaving the
   web unit without a `ReadWritePaths` line and `restart_upgraded_services()`
   picking the live unit up.
+- **Library index** — same host. Confirmed: `ReadWritePaths` really is scoped
+  (a process with the unit's properties can write the state directory and
+  **cannot** write the library or the frames — this is the claim worth
+  testing, not asserting); the state directory is created by the installer and
+  owned by the service user; `--print-web-paths` agrees with the templated
+  unit; a nine-file library indexes to eight with the `.ps1` excluded;
+  `Workshop` and `workshop` both appear, unmerged; the unnamed bucket and the
+  human-named event folder survive; a folder view picks up a file added and a
+  file deleted behind the service's back, and says the index had drifted;
+  `/rescan` is 404 on GET and 303 on POST.
 - **Status pane** — same host, **both** journal states exercised, which is the
   point: with `SupplementaryGroups=systemd-journal` the log pane returns real
   entries; with the line deleted the unit still starts, `systemctl status` still
@@ -734,12 +792,12 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 572 lines
+install.sh                       bootstrap installer, 592 lines
 scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
-scripts/timelapse_setup.py       configuration wizard, 1691 lines
-scripts/timelapse_web.py         read-only web UI, 498 lines
+scripts/timelapse_setup.py       configuration wizard, 1710 lines
+scripts/timelapse_web.py         read-only web UI, 1124 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
@@ -761,9 +819,10 @@ Dependencies: Python 3.9+ stdlib, `requests`, `ffmpeg`/`ffprobe` (NVENC for
 AV1/HEVC), `rsync`. No virtualenv required, one pip package, no database. The
 web UI adds nothing: it is `http.server` and the stdlib.
 
-All three systemd units use `ProtectSystem=strict`. Capture and encode carry an
-explicit `ReadWritePaths`; **any new write path — a different frames root, a
-CIFS mountpoint for transfer — must be added there**, or writes fail with a
-confusing read-only error. `timelapse-web.service` deliberately has none, so
-the entire filesystem is read-only to it. Giving the web UI anything to write
-means adding the path to the unit *and* to `install.sh sync_units()`.
+All three systemd units use `ProtectSystem=strict` with an explicit
+`ReadWritePaths`. **Any new write path — a different frames root, a CIFS
+mountpoint for transfer — must be added there**, or writes fail with a
+confusing read-only error. `timelapse-web.service` is scoped to a single
+directory, its index, and must stay that way: it is the only network-facing
+unit, and widening it to match the others would give it write access to every
+captured frame for nothing.
