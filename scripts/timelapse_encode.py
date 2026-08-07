@@ -630,10 +630,26 @@ def main():
                             cfg["encode"].get("max_backlog_days", 7))
         if not jobs:
             log.info("Nothing to process.")
-            send_discord(cfg, "Timelapse - nothing to do",
-                         "No completed day folders were found.", 0x95A5A6,
-                         [("Encoder", encoder["name"])])
-            return 0
+            # Still ship the backlog. A transfer that failed last night leaves
+            # videos in video_output, and returning here without trying again
+            # stranded them until some later night happened to produce a new
+            # video. That made fixing the share by hand useless: the obvious
+            # move, re-running the encode, was the one path that never
+            # retried. transfer() returns "nothing to transfer" harmlessly
+            # when video_output is empty, which is the usual case here.
+            xfer = None if args.no_transfer else transfer(cfg, args.dry_run)
+            fields = [("Encoder", encoder["name"])]
+            if xfer is not None and (xfer["moved"] or not xfer["ok"]):
+                fields.append(("Transfer",
+                               ("OK - %d file(s) moved" % xfer["moved"])
+                               if xfer["ok"] else "FAILED - " + xfer["detail"]))
+            good = xfer is None or xfer["ok"]
+            send_discord(cfg,
+                         "Timelapse - nothing to do" if good
+                         else "⚠️ Timelapse - transfer failed",
+                         "No completed day folders were found.",
+                         0x95A5A6 if good else 0xF1C40F, fields)
+            return 0 if good else 1
 
         log.info("Found %d job(s) across %d camera(s).", len(jobs), len(cameras))
 

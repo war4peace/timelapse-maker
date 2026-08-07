@@ -96,6 +96,18 @@ While the version is `0.x`, the configuration format may change in any release.
   and it is invisible to `du`.
 
 ### Fixed
+- Fixing a broken transfer and re-running the encode by hand did nothing. A
+  failed transfer correctly leaves your videos in `video_output` to go out
+  next time, but the retry only happened on a run that also had something to
+  encode, and re-running the same night there is nothing new. So the obvious
+  move after remounting a share was the one path that never retried. The
+  backlog now ships even when there is nothing to encode, and a run that
+  fails to ship it exits non-zero so it shows up as a failed service instead
+  of a quiet success.
+- `timelapse status` now shows `timelapse-encode.service` as well as its
+  timer, plus the web UI. The encode service is oneshot, so a run that failed
+  left it in a failed state while the timer beside it still looked perfectly
+  healthy, which is the one place you would have looked.
 - A NAS that was not mounted yet cost you the whole video index. The startup
   scan read an empty or missing library, concluded every file had been
   deleted, and emptied the index, which on a real share means re-reading

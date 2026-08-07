@@ -268,7 +268,14 @@ Pipeline, in `main()`:
 - Failure is contained per camera-day. An exception is caught, recorded in the
   result dict, the partial output file is unlinked, and the loop continues.
 
-**`transfer()`** shells out to `rsync` with `--remove-source-files`.
+**`transfer()`** shells out to `rsync` with `--remove-source-files`. It globs
+the whole of `video_output`, not just this run's output, which is what makes a
+failed night ship itself later with no bookkeeping. It is called even when
+`find_pending()` returned no jobs: the retry used to be reachable only from a
+run that also had something to encode, so the obvious repair after remounting
+a share, re-running the encode, was the one path that never retried. A no-op
+run whose transfer fails exits `1` rather than `0`, so it surfaces as a failed
+unit.
 
 `mount_problem()` runs first when `transfer.require_mountpoint` is set. An
 unmounted CIFS/NFS destination is an ordinary empty local directory, so rsync

@@ -259,7 +259,13 @@ case "\${1:-}" in
     web-serve) shift; exec python3 $PREFIX/timelapse_web.py "$CONFIG" "\$@" ;;
     config)    exec \${EDITOR:-nano} "$CONFIG" ;;
     logs)      exec journalctl -u timelapse-capture -f ;;
-    status)    exec systemctl status timelapse-capture.service timelapse-encode.timer ;;
+    # timelapse-encode.service is listed, not just its timer: it is oneshot,
+    # so a run that failed (a broken transfer, say) leaves the *service* in a
+    # failed state while the timer still looks perfectly healthy.
+    status)    exec systemctl status --lines=5 \\
+                    timelapse-capture.service \\
+                    timelapse-encode.timer timelapse-encode.service \\
+                    timelapse-web.service ;;
     version)
         for f in capture encode test setup web; do
             printf '  %-8s %s\n' "\$f" \\

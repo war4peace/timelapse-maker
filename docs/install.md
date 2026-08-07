@@ -273,6 +273,36 @@ without encoding, transferring or deleting anything. Safe on live data.
 
 ## 6. Transfer destination
 
+### If the destination is unavailable
+
+Nothing is lost. A failed transfer leaves the videos in `paths.video_output`
+and does not spoil the encode; the run exits `1`, so `timelapse status` shows
+`timelapse-encode.service` failed, and the Discord summary says
+`Transfer FAILED`. The next run picks up **everything** waiting in
+`video_output`, not just that night's video, so a backlog ships itself as soon
+as the destination comes back. A run with nothing to encode still ships the
+backlog, so fixing the share and running `timelapse encode` by hand works.
+
+The one case that does **not** self-correct is a share that is not mounted
+while `require_mountpoint` is `false`. An unmounted mountpoint is an ordinary
+empty local directory, so rsync succeeds into it, `--remove-source-files`
+deletes the originals, and the run exits `0`. Nothing failed, so nothing is
+retried, and the videos sit on the local disk underneath the mountpoint where
+they will be hidden the moment the share mounts. Check yours:
+
+```bash
+sudo grep require_mountpoint /etc/timelapse/config.json
+```
+
+If the destination is a NAS share, this should be `true` (or the exact mount
+path, which is more precise). The wizard sets it for you when it recognises a
+CIFS/NFS destination or mounts the share itself, but a hand-written config or
+a path the wizard saw as an ordinary local directory will not have it.
+
+Note also that the backlog is unbounded: `encode.max_backlog_days` limits
+encoding, not transfer, and the disk guard watches `frames_root` rather than
+`video_output`. A destination that is down for weeks will accumulate videos.
+
 `transfer.destination` is either a local path or an rsync remote spec; one code
 path serves both.
 
@@ -342,7 +372,7 @@ of it; nothing needs a reinstall.
 
 | Command | What it does |
 |---|---|
-| `timelapse status` | `systemctl status` for the capture service and the encode timer, in one shot: running or not, how long, recent log lines, and when the next encode fires. |
+| `timelapse status` | `systemctl status` for all four units in one shot: capture, the encode timer **and the encode service**, and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
 | `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and Discord. Run it after any change. |
