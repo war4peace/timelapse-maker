@@ -312,7 +312,7 @@ currently state the unit writes nothing anywhere, which will no longer be true.
 | 1c | **Done.** Library index — sqlite store, background first scan, pattern-chain parser, reconcile on access, browse by camera and date, flagged files with full paths. |
 | 1d | **Done.** `/video/<path>` file serving + `/play/<path>` `.m3u` handoff. Download link, share path and stream URL shown. |
 | 1d+ | **Done.** `/day/<YYYY-MM-DD>` — one playlist for a whole day, every place in turn. |
-| 1e | Range request support, so seeking works. |
+| 1e | **Done.** Range request support, so seeking works. ETag/If-Range for safe resume. |
 | 1f | Wizard integration and docs. |
 
 1a–1d is the bare scaffolding. 1e and 1f are the finish.

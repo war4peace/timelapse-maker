@@ -74,8 +74,10 @@ While the version is `0.x`, the configuration format may change in any release.
   listing links to its own day. It includes whatever was filed under that date,
   whichever naming convention the file came from.
 
-  Seeking does not work yet — the server says so rather than pretending, and
-  it is the next thing.
+  Seeking works: drag the scrubber and the player jumps, instead of
+  re-downloading from the beginning. Interrupted downloads resume, and one
+  that resumes against a video that has since been re-encoded quietly starts
+  over rather than stitching two versions together.
 
   The index is the one thing the UI writes, and the systemd unit is scoped to
   exactly that directory: the videos, the captured frames and `config.json`

@@ -526,9 +526,25 @@ dropped NAS mount is a *correct* empty library, not a fault.
   failing it — so that case closes the connection. `BrokenPipeError` and
   `ConnectionResetError` are caught and ignored, because a viewer quitting VLC
   is the normal way a video request ends.
-- **`Accept-Ranges: none` is sent deliberately.** Seeking does not work until
-  phase 1e; advertising ranges without serving them makes a player look broken
-  rather than limited.
+- **Range requests** (`parse_range()`) are what make scrubbing work. Single
+  ranges only: closed (`bytes=0-499`), open (`bytes=500-`) and suffix
+  (`bytes=-500`, which is how a player reads a Matroska trailer). An end past
+  the file is **clamped, not refused** — required by RFC 7233, and a common
+  place to get a 416 wrong. A start past the file, a backwards range, or
+  `bytes=-0` is 416, which still carries `Content-Range: bytes */<size>` so the
+  client can correct itself.
+- **A header the server does not care for is ignored, not rejected.** RFC 7233
+  permits that, so a multi-range request (which would need
+  `multipart/byteranges`) and an unparseable one both fall back to a plain 200.
+  Nothing seeking a video asks for more than one range.
+- **The digit runs are bounded** (`\d{0,19}`): an unbounded `\d*` invites a
+  megabyte of digits, and arbitrary-precision arithmetic on that is real work
+  for a request that was never going to be satisfiable.
+- **`ETag` and `Last-Modified` come from the fresh stat**, so they change
+  whenever the file does — that is what makes `If-Range` meaningful. A client
+  resuming against a version we no longer have gets the whole current file
+  instead of a slice, because splicing two encodes together produces a file
+  that is corrupt in a way nothing would report.
 - Each listed file also shows two addresses that need no UI at all: the share
   path, for a machine that has the mount, and the HTTP URL for VLC's *Open
   Network Stream*.
@@ -745,7 +761,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 378 cases, about forty
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 406 cases, about forty-five
 seconds — `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -811,6 +827,15 @@ changes:
   human-named event folder survive; a folder view picks up a file added and a
   file deleted behind the service's back, and says the index had drifted;
   `/rescan` is 404 on GET and 303 on POST.
+- **Range** — same host, and verified with a real player rather than only with
+  curl. Byte-exact slices for closed, open-ended and suffix ranges; clamping;
+  416 carrying the true size; multi-range and junk falling back to 200;
+  `If-Range` honoured when it matches and ignored when it does not. Then the
+  part that actually matters: **ffprobe read the container over HTTP and ffmpeg
+  seeked to 5s, 30s and 55s of a 60s video and decoded a frame at each** —
+  with the frames compared against each other, because three identical images
+  would mean every seek had silently landed at byte zero. Repeated against a
+  URL taken straight out of a day playlist.
 - **Day playlists** — same host, seven places across two days plus one
   legacy-named file. Confirmed: the playlist carries all eight of that day's
   videos including the legacy name, leaks nothing from the neighbouring day,
@@ -863,7 +888,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 1710 lines
-scripts/timelapse_web.py         read-only web UI, 1423 lines
+scripts/timelapse_web.py         read-only web UI, 1502 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

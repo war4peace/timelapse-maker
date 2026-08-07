@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
@@ -597,6 +598,50 @@ SEND_CHUNK = 256 * 1024
 HOST_RE = re.compile(r"^[A-Za-z0-9._\-]+(:\d{1,5})?$|^\[[0-9A-Fa-f:.]+\](:\d{1,5})?$")
 
 
+# Digits are bounded: an unbounded \d* invites a megabyte of them, and int()
+# on that is real work for a request that was never going to be satisfiable.
+RANGE_RE = re.compile(r"^bytes=(\d{0,19})-(\d{0,19})$")
+
+UNSATISFIABLE = object()
+
+
+def parse_range(header, size):
+    """(start, end) inclusive, UNSATISFIABLE, or None to send the whole file.
+
+    RFC 7233 allows a server to ignore a Range header it does not care for, and
+    that is what None means here: an unparseable header, or a multi-range
+    request, is answered with a normal 200 rather than an error. Multi-range
+    would need multipart/byteranges, and nothing seeking a video asks for it.
+    """
+    if not header:
+        return None
+    header = header.strip()
+    if "," in header:
+        return None
+    m = RANGE_RE.match(header)
+    if not m:
+        return None
+    first, last = m.group(1), m.group(2)
+    if not first and not last:
+        return None
+
+    if not first:
+        # bytes=-N - the final N bytes. Players use this to read a trailer.
+        want = int(last)
+        if want == 0:
+            return UNSATISFIABLE
+        start, end = max(0, size - want), size - 1
+    else:
+        start = int(first)
+        end = int(last) if last else size - 1
+        if end >= size:
+            end = size - 1          # clamping is required, not an error
+
+    if size == 0 or start >= size or start > end:
+        return UNSATISFIABLE
+    return start, end
+
+
 DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -960,13 +1005,45 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         size = row["size"]
+        # Both derived from the fresh stat, so they change whenever the file
+        # does. That is what makes If-Range below meaningful.
+        etag = f'"{size:x}-{row["mtime"]:x}"'
+        last_mod = formatdate(row["mtime"], usegmt=True)
+
+        rng = parse_range(self.headers.get("Range"), size)
+        if_range = (self.headers.get("If-Range") or "").strip()
+        if rng is not None and if_range and if_range not in (etag, last_mod):
+            # The client is resuming against a version we no longer have. Its
+            # offsets mean nothing now, so send the whole current file rather
+            # than a slice that would splice two encodes together.
+            rng = None
+
         with fh:
-            self.send_response(200)
+            if rng is UNSATISFIABLE:
+                # 416 must still say how big the file actually is, or the
+                # client has no way to correct itself.
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.send_header("Accept-Ranges", "bytes")
+                self.end_headers()
+                return
+
+            if rng is None:
+                start, length, status = 0, size, 200
+            else:
+                start, end = rng
+                length, status = end - start + 1, 206
+
+            self.send_response(status)
             self.send_header("Content-Type", media_type(row["name"]))
-            self.send_header("Content-Length", str(size))
-            # Honest until phase 1e adds Range: seeking will not work yet, and
-            # claiming otherwise makes a player look broken rather than limited.
-            self.send_header("Accept-Ranges", "none")
+            self.send_header("Content-Length", str(length))
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("ETag", etag)
+            self.send_header("Last-Modified", last_mod)
+            if status == 206:
+                self.send_header("Content-Range",
+                                 f"bytes {start}-{start + length - 1}/{size}")
             if download:
                 self.send_header(
                     "Content-Disposition",
@@ -975,10 +1052,12 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             if self.command == "HEAD":
                 return
-            self._pump(fh, size)
+            if start:
+                fh.seek(start)
+            self._pump(fh, length)
 
     def _pump(self, fh, size):
-        """Send exactly `size` bytes, then stop.
+        """Send exactly `size` bytes from wherever the handle is, then stop.
 
         Bounded by the length already promised in the header rather than by
         EOF: if the file grew since the stat, sending the extra would corrupt

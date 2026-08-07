@@ -165,8 +165,8 @@ class FakeServer:
         self.index = index
 
 
-def request(path, config, index=None, method="GET", headers=""):
-    """Drive one request through the real handler and return (status, body).
+def request_bytes(path, config, index=None, method="GET", headers=""):
+    """Drive one request through the real handler; body stays bytes.
 
     Extra headers go first, and Host is only defaulted when they do not supply
     one: a duplicate Host would be silently ignored by the header parser, which
@@ -183,10 +183,16 @@ def request(path, config, index=None, method="GET", headers=""):
     # BaseHTTPRequestHandler does all its work from __init__.
     web.Handler.__init__(handler, req, ("127.0.0.1", 5555),
                          FakeServer(config, index))
-    out = bytes(req.sent).decode("utf-8", "replace")
-    head, _, body = out.partition("\r\n\r\n")
-    status = int(head.split()[1])
-    return status, head, body
+    out = bytes(req.sent)
+    head, _, body = out.partition(b"\r\n\r\n")
+    head = head.decode("latin-1")
+    return int(head.split()[1]), head, body
+
+
+def request(path, config, index=None, method="GET", headers=""):
+    """As request_bytes, with the body decoded for HTML assertions."""
+    status, head, body = request_bytes(path, config, index, method, headers)
+    return status, head, body.decode("utf-8", "replace")
 
 
 class TestRouting(unittest.TestCase):
@@ -799,11 +805,9 @@ class TestServing(IndexCase):
         self.assertIn(f"Content-Length: {size}", head)
         self.assertEqual(len(body.encode("utf-8", "surrogateescape")), size)
 
-    def test_accept_ranges_is_honest_before_phase_1e(self):
-        # Claiming range support without implementing it makes a player look
-        # broken rather than limited.
+    def test_range_support_is_advertised(self):
         _, head, _ = self.get("/video/Gate.20260707.mkv")
-        self.assertIn("Accept-Ranges: none", head)
+        self.assertIn("Accept-Ranges: bytes", head)
 
     def test_head_sends_headers_but_no_body(self):
         _, head, body = self.get("/video/Gate.20260707.mkv", method="HEAD")
@@ -850,6 +854,181 @@ class TestServing(IndexCase):
         # It is not in the index, so there is nothing to serve.
         status, _, _ = self.get("/video/MakeTLALL_backup.ps1")
         self.assertEqual(status, 404)
+
+
+class TestParseRange(unittest.TestCase):
+    """RFC 7233 in the small. Getting the edges wrong makes a scrubber jump to
+    the wrong place, which looks like a corrupt file rather than a bad header."""
+
+    def test_no_header_means_whole_file(self):
+        self.assertIsNone(web.parse_range(None, 1000))
+        self.assertIsNone(web.parse_range("", 1000))
+
+    def test_closed_range(self):
+        self.assertEqual(web.parse_range("bytes=0-499", 1000), (0, 499))
+        self.assertEqual(web.parse_range("bytes=500-999", 1000), (500, 999))
+
+    def test_open_ended_range(self):
+        self.assertEqual(web.parse_range("bytes=500-", 1000), (500, 999))
+
+    def test_suffix_range(self):
+        # Players read a trailer this way; Matroska keeps its cues at the end.
+        self.assertEqual(web.parse_range("bytes=-500", 1000), (500, 999))
+
+    def test_suffix_longer_than_the_file_is_the_whole_file(self):
+        self.assertEqual(web.parse_range("bytes=-5000", 1000), (0, 999))
+
+    def test_end_past_the_file_is_clamped_not_rejected(self):
+        self.assertEqual(web.parse_range("bytes=900-99999", 1000), (900, 999))
+
+    def test_start_past_the_file_is_unsatisfiable(self):
+        self.assertIs(web.parse_range("bytes=1000-", 1000), web.UNSATISFIABLE)
+        self.assertIs(web.parse_range("bytes=5000-6000", 1000),
+                      web.UNSATISFIABLE)
+
+    def test_zero_length_suffix_is_unsatisfiable(self):
+        self.assertIs(web.parse_range("bytes=-0", 1000), web.UNSATISFIABLE)
+
+    def test_backwards_range_is_unsatisfiable(self):
+        self.assertIs(web.parse_range("bytes=500-100", 1000), web.UNSATISFIABLE)
+
+    def test_an_empty_file_satisfies_nothing(self):
+        self.assertIs(web.parse_range("bytes=0-0", 0), web.UNSATISFIABLE)
+
+    def test_multi_range_is_ignored_rather_than_refused(self):
+        # Would need multipart/byteranges. RFC 7233 permits ignoring Range, and
+        # nothing seeking a video asks for more than one.
+        self.assertIsNone(web.parse_range("bytes=0-99,200-299", 1000))
+
+    def test_junk_is_ignored_rather_than_refused(self):
+        for junk in ("bytes=abc", "items=0-1", "bytes=", "bytes=-", "0-99"):
+            self.assertIsNone(web.parse_range(junk, 1000), junk)
+
+    def test_absurdly_long_digits_do_not_reach_int(self):
+        # \d{0,19} rather than \d*: a megabyte of digits is not a request worth
+        # doing arbitrary-precision arithmetic for.
+        self.assertIsNone(web.parse_range("bytes=" + "9" * 5000 + "-", 1000))
+
+
+class TestRangeRequests(IndexCase):
+
+    def setUp(self):
+        super().setUp()
+        # Distinctive content: the shared fixture is sparse zeros, so every
+        # slice of it would compare equal and prove nothing.
+        self.data = bytes(range(256)) * 400        # 102,400 bytes
+        (self.root / "Range.20260101.mkv").write_bytes(self.data)
+        self.config = cfg(self.tmp, transfer={"enabled": True,
+                                              "destination": str(self.root)})
+        self.scan()
+
+    def get(self, rng=None, **kw):
+        headers = f"Range: {rng}\r\n" if rng else ""
+        return request_bytes("/video/Range.20260101.mkv", self.config,
+                             self.index, headers=headers, **kw)
+
+    def test_a_range_returns_206_with_the_right_bytes(self):
+        status, head, body = self.get("bytes=1000-1999")
+        self.assertEqual(status, 206)
+        self.assertIn("Content-Range: bytes 1000-1999/102400", head)
+        self.assertIn("Content-Length: 1000", head)
+        self.assertEqual(body, self.data[1000:2000])
+
+    def test_open_ended_range_runs_to_the_end(self):
+        status, head, body = self.get("bytes=102000-")
+        self.assertEqual(status, 206)
+        self.assertIn("Content-Range: bytes 102000-102399/102400", head)
+        self.assertEqual(body, self.data[102000:])
+
+    def test_suffix_range_returns_the_tail(self):
+        status, head, body = self.get("bytes=-256")
+        self.assertEqual(status, 206)
+        self.assertIn("Content-Range: bytes 102144-102399/102400", head)
+        self.assertEqual(body, self.data[-256:])
+
+    def test_a_clamped_range_reports_what_it_actually_sent(self):
+        status, head, body = self.get("bytes=102300-999999")
+        self.assertEqual(status, 206)
+        self.assertIn("Content-Range: bytes 102300-102399/102400", head)
+        self.assertEqual(len(body), 100)
+
+    def test_first_byte_range(self):
+        status, _, body = self.get("bytes=0-0")
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.data[:1])
+
+    def test_no_range_still_serves_the_whole_file(self):
+        status, head, body = self.get()
+        self.assertEqual(status, 200)
+        self.assertIn("Content-Length: 102400", head)
+        self.assertEqual(body, self.data)
+
+    def test_unsatisfiable_is_416_and_says_how_big_the_file_is(self):
+        status, head, body = self.get("bytes=999999-")
+        self.assertEqual(status, 416)
+        self.assertIn("Content-Range: bytes */102400", head)
+        self.assertEqual(body, b"")
+
+    def test_multi_range_falls_back_to_the_whole_file(self):
+        status, _, body = self.get("bytes=0-99,200-299")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.data)
+
+    def test_junk_range_falls_back_to_the_whole_file(self):
+        status, _, body = self.get("bytes=nonsense")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.data)
+
+    def test_head_with_a_range_has_headers_and_no_body(self):
+        status, head, body = self.get("bytes=10-19", method="HEAD")
+        self.assertEqual(status, 206)
+        self.assertIn("Content-Range: bytes 10-19/102400", head)
+        self.assertEqual(body, b"")
+
+    def test_etag_and_last_modified_are_sent(self):
+        _, head, _ = self.get()
+        self.assertIn("ETag:", head)
+        self.assertIn("Last-Modified:", head)
+
+    def test_etag_changes_when_the_file_does(self):
+        _, head1, _ = self.get()
+        etag1 = [l for l in head1.splitlines() if l.startswith("ETag:")][0]
+        (self.root / "Range.20260101.mkv").write_bytes(b"x" * 50)
+        _, head2, _ = self.get()
+        etag2 = [l for l in head2.splitlines() if l.startswith("ETag:")][0]
+        self.assertNotEqual(etag1, etag2)
+
+    def _etag(self):
+        _, head, _ = self.get()
+        return [l.split(": ", 1)[1] for l in head.splitlines()
+                if l.startswith("ETag:")][0]
+
+    def test_if_range_matching_honours_the_range(self):
+        etag = self._etag()
+        status, _, body = request_bytes(
+            "/video/Range.20260101.mkv", self.config, self.index,
+            headers=f"Range: bytes=0-99\r\nIf-Range: {etag}\r\n")
+        self.assertEqual(status, 206)
+        self.assertEqual(body, self.data[:100])
+
+    def test_if_range_mismatch_sends_the_whole_current_file(self):
+        """The client is resuming against a version we no longer have, so its
+        offsets are meaningless - splicing two encodes together would hand back
+        a file that is corrupt in a way nothing would report."""
+        status, head, body = request_bytes(
+            "/video/Range.20260101.mkv", self.config, self.index,
+            headers='Range: bytes=0-99\r\nIf-Range: "stale-etag"\r\n')
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.data)
+        self.assertNotIn("Content-Range:", head)
+
+    def test_a_range_after_the_file_shrank_is_recomputed_not_stale(self):
+        # reconcile_file runs first, so the size in Content-Range is current.
+        (self.root / "Range.20260101.mkv").write_bytes(b"y" * 500)
+        status, head, body = self.get("bytes=100-399")
+        self.assertEqual(status, 206)
+        self.assertIn("/500", head)
+        self.assertEqual(body, b"y" * 300)
 
 
 class TestPlaylist(IndexCase):
