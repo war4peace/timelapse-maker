@@ -254,7 +254,9 @@ case "\${1:-}" in
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     transfer)  shift; exec python3 $PREFIX/timelapse_setup.py --transfer-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
-    web)       shift; exec python3 $PREFIX/timelapse_web.py "$CONFIG" "\$@" ;;
+    web)       shift; exec python3 $PREFIX/timelapse_setup.py --web-only \\
+                          --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
+    web-serve) shift; exec python3 $PREFIX/timelapse_web.py "$CONFIG" "\$@" ;;
     config)    exec \${EDITOR:-nano} "$CONFIG" ;;
     logs)      exec journalctl -u timelapse-capture -f ;;
     status)    exec systemctl status timelapse-capture.service timelapse-encode.timer ;;
@@ -279,7 +281,9 @@ case "\${1:-}" in
         fi
         ;;
     *)
-        echo "usage: timelapse {setup|cameras|transfer|test|usage|encode|web|config|logs|status|version}"
+        echo "usage: timelapse {setup|cameras|transfer|web|test|usage|encode|config|logs|status|version}"
+        echo "  web        configure the read-only web UI"
+        echo "  web-serve  run it in the foreground (the service normally does)"
         exit 1 ;;
 esac
 EOF
@@ -482,8 +486,27 @@ offer_enable() {
         say "  systemctl enable --now timelapse-encode.timer"
     fi
 
+    # Separate from the pair above: the web UI is optional, off by default, and
+    # only worth offering when the config actually asks for it.
+    local web_on web_url
+    web_on="$(python3 -c "import json;c=json.load(open('$CONFIG')).get('web',{});print('1' if c.get('enabled') else '0')" 2>/dev/null || echo 0)"
+    if [ "$web_on" = "1" ]; then
+        web_url="$(python3 -c "import json;c=json.load(open('$CONFIG')).get('web',{});print('http://%s:%s/' % (c.get('bind','127.0.0.1'), c.get('port',8787)))" 2>/dev/null)"
+        if ask_yn "Enable the web UI now ($web_url)?" y; then
+            systemctl enable --now timelapse-web.service
+            sleep 2
+            if systemctl is-active --quiet timelapse-web.service; then
+                ok "Web UI is running at $web_url"
+            else
+                err "Web UI failed to start. See: journalctl -u timelapse-web -n 40"
+            fi
+        else
+            say "Enable later with: systemctl enable --now timelapse-web.service"
+        fi
+    fi
+
     printf '\n'
-    say "${B}timelapse${N} status | logs | test | usage | encode | config | cameras | transfer"
+    say "${B}timelapse${N} status | logs | test | usage | encode | config | cameras | transfer | web"
 }
 
 as_service_user() {

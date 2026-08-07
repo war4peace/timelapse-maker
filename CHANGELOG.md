@@ -82,6 +82,12 @@ While the version is `0.x`, the configuration format may change in any release.
   The index is the one thing the UI writes, and the systemd unit is scoped to
   exactly that directory: the videos, the captured frames and `config.json`
   stay read-only to it.
+
+  The setup wizard asks about all of this, and **`timelapse web`** reconfigures
+  just this part later without walking the whole wizard. It shows you which
+  path it will read videos from and why — the answer surprises people — and it
+  states plainly that there is no login and no HTTPS before asking what address
+  to listen on. Operator guide: [docs/install.md §10](docs/install.md#10-the-web-ui).
 - **`timelapse usage`** — disk report: frames, bytes and date range per camera,
   totals, videos and free space. It also names the directories nothing will
   ever encode: a camera removed from the config (`ORPHAN`) or merely disabled

@@ -404,6 +404,17 @@ rather than the tail, because Reolink-style URLs are identical for their first
 40 characters and a plain truncation both makes every camera look the same and
 cuts off the `***`, reading as though nothing were masked.
 
+**`choose_web()`** is the wizard step for the web UI, and `--web-only` re-runs
+just it — same reasoning as `--transfer-only`: turning the UI on later must not
+mean walking the whole wizard, and a feature the wizard never offers is one
+nobody finds. It previews *where videos will be read from* and why, because
+that is the surprising part (see `resolve_library()` in §4.5), states the lack
+of authentication before asking for the bind address, and warns when the answer
+is not loopback. `create_web_state_dir()` makes the index directory here rather
+than in the service, which could not create it: `ReadWritePaths` naming a
+missing directory stops the unit dead, and inside the sandbox its parent is
+read-only.
+
 **Input handling.** `init_tty()` picks a source: stdin if it is a terminal,
 otherwise `/dev/tty`, otherwise defaults-only. It must *never* silently read a
 piped stdin — under `curl … | bash` that pipe is the installer script itself.
@@ -761,7 +772,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 406 cases, about forty-five
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 427 cases, about forty-five
 seconds — `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -827,6 +838,13 @@ changes:
   human-named event folder survive; a folder view picks up a file added and a
   file deleted behind the service's back, and says the index had drifted;
   `/rescan` is 404 on GET and 303 on POST.
+- **Wizard and wiring** — same host. Confirmed: an unattended install leaves
+  the UI **off**; `timelapse web` runs the wizard (not the server) and writes
+  the answers; the state directory is created and owned correctly; a re-install
+  templates `ReadWritePaths` to that one directory; enabling the unit serves
+  the configured `library_root` on the configured port; the wizard turns it
+  back off again; `timelapse web-serve` still runs it in the foreground; and a
+  non-loopback bind produces the reverse-proxy warning.
 - **Range** — same host, and verified with a real player rather than only with
   curl. Byte-exact slices for closed, open-ended and suffix ranges; clamping;
   416 carrying the true size; multi-range and junk falling back to 200;
@@ -883,11 +901,11 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 592 lines
+install.sh                       bootstrap installer, 615 lines
 scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
-scripts/timelapse_setup.py       configuration wizard, 1710 lines
+scripts/timelapse_setup.py       configuration wizard, 1848 lines
 scripts/timelapse_web.py         read-only web UI, 1502 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests

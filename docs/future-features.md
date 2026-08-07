@@ -18,7 +18,7 @@ item depends on explicitly, or the ordering rots.
 
 ## 1. Web UI — read-only status and video index
 
-**Effort:** small. **Prerequisites:** none. **Status:** 1a–1d built; 1e (Range/seeking) and 1f (wizard, docs) remain.
+**Effort:** small. **Prerequisites:** none. **Status:** **complete** (1a–1f, plus the day playlist).
 
 ### Scope
 
@@ -313,7 +313,7 @@ currently state the unit writes nothing anywhere, which will no longer be true.
 | 1d | **Done.** `/video/<path>` file serving + `/play/<path>` `.m3u` handoff. Download link, share path and stream URL shown. |
 | 1d+ | **Done.** `/day/<YYYY-MM-DD>` — one playlist for a whole day, every place in turn. |
 | 1e | **Done.** Range request support, so seeking works. ETag/If-Range for safe resume. |
-| 1f | Wizard integration and docs. |
+| 1f | **Done.** Wizard integration (`choose_web`, `--web-only`), installer offer, operator docs. |
 
 1a–1d is the bare scaffolding. 1e and 1f are the finish.
 

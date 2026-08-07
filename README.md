@@ -50,6 +50,7 @@ Bug reports and camera compatibility reports are genuinely useful at this stage
 | `timelapse_encode.py` | Encodes finished days to AV1, notifies, transfers | systemd timer, 00:05 |
 | `timelapse_test.py` | Pre-flight checker — run before enabling anything | manually |
 | `timelapse_setup.py` | Storage-aware configuration wizard | installer, or `timelapse setup` |
+| `timelapse_web.py` | Optional read-only web UI — status, video index, hands playback to VLC | systemd service, off by default |
 
 Day to day you drive it through one wrapper — no reinstall, no hand-edited JSON:
 
@@ -61,6 +62,7 @@ Day to day you drive it through one wrapper — no reinstall, no hand-edited JSO
 | `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord |
 | `timelapse cameras` | Add, edit, remove or disable a camera, then restart capture |
 | `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed |
+| `timelapse web` | Turn the read-only web UI on or off, set its address and library path |
 | `timelapse encode` | Run tonight's encode now |
 | `timelapse setup` · `config` · `version` | Full wizard · edit the JSON · what's installed |
 
@@ -89,6 +91,14 @@ so either can be stopped, replaced or rewritten without touching the other.
 - **Correct colour.** JPEGs are full-range; the pipeline converts to
   limited-range BT.709 and tags it, so output isn't washed out or crushed
   depending on the player.
+- **Optional read-only web UI.** Service status, an index of your finished
+  videos by camera and by day, and a *Play* link that hands each one to VLC —
+  including one playlist per day, so reviewing a day means opening a single
+  file instead of one per camera. It reads the destination you already keep
+  your timelapses in, recognising the naming conventions of whatever tool came
+  before. Off by default, binds to localhost, and allowed to write exactly one
+  directory — its own index. See
+  [docs/install.md §10](docs/install.md#10-the-web-ui).
 
 ## Requirements
 

@@ -890,6 +890,174 @@ class TestHumanReadable(unittest.TestCase):
         self.assertEqual(setup.human(1024 ** 6), "1024.0 PB")
 
 
+class TestWebLibraryPreview(unittest.TestCase):
+    """The wizard shows where videos will be read from, because that is the
+    surprising part: transfer moves them away with --remove-source-files, so
+    the answer is usually the destination and not video_output."""
+
+    def cfg(self, **kw):
+        c = setup.default_config()
+        c["paths"]["video_output"] = "/var/lib/timelapse/videos"
+        c.setdefault("web", {})
+        c["transfer"].update(kw.pop("transfer", {}))
+        c["web"].update(kw.pop("web", {}))
+        return c
+
+    def test_transfer_disabled_shows_video_output(self):
+        where, why = setup.web_library_preview(
+            self.cfg(transfer={"enabled": False}))
+        self.assertEqual(where, "/var/lib/timelapse/videos")
+        self.assertIn("video_output", why)
+
+    def test_enabled_transfer_shows_the_destination(self):
+        where, why = setup.web_library_preview(self.cfg(
+            transfer={"enabled": True, "destination": "/mnt/nas/tl/"}))
+        self.assertEqual(where, "/mnt/nas/tl/")
+        self.assertIn("destination", why)
+
+    def test_remote_destination_is_called_out(self):
+        _, why = setup.web_library_preview(self.cfg(
+            transfer={"enabled": True, "destination": "user@nas:/vol/tl/"}))
+        self.assertIn("REMOTE", why)
+
+    def test_rsync_url_is_remote_too(self):
+        _, why = setup.web_library_preview(self.cfg(
+            transfer={"enabled": True, "destination": "rsync://nas/tl"}))
+        self.assertIn("REMOTE", why)
+
+    def test_a_path_with_a_colon_is_not_remote(self):
+        _, why = setup.web_library_preview(self.cfg(
+            transfer={"enabled": True, "destination": "/mnt/odd:name/tl/"}))
+        self.assertNotIn("REMOTE", why)
+
+    def test_override_wins(self):
+        where, why = setup.web_library_preview(self.cfg(
+            transfer={"enabled": True, "destination": "user@nas:/vol/tl/"},
+            web={"library_root": "/mnt/nas/tl/"}))
+        self.assertEqual(where, "/mnt/nas/tl/")
+        self.assertIn("library_root", why)
+
+
+class TestChooseWeb(unittest.TestCase):
+
+    def drive(self, keystrokes, cfg=None):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=False)
+        cfg = cfg or setup.default_config()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                setup.choose_web(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return cfg.get("web", {}), buf.getvalue()
+
+    def test_declining_leaves_it_disabled(self):
+        web, _ = self.drive("n\n")
+        self.assertFalse(web["enabled"])
+
+    def test_it_is_off_by_default(self):
+        # A network-facing service must be opt-in, so Enter means no.
+        web, _ = self.drive("\n")
+        self.assertFalse(web["enabled"])
+
+    def test_accepting_defaults_binds_to_loopback(self):
+        web, _ = self.drive("y\n\n\n\n\n")
+        self.assertTrue(web["enabled"])
+        self.assertEqual(web["bind"], "127.0.0.1")
+        self.assertEqual(web["port"], 8787)
+        self.assertEqual(web["state_dir"], "/var/lib/timelapse/web")
+
+    def test_the_lack_of_auth_is_stated_before_the_bind_prompt(self):
+        _, out = self.drive("y\n\n\n\n\n")
+        before = out.split("Listen on", 1)[0]
+        self.assertIn("no login", before)
+
+    def test_a_non_loopback_bind_is_warned_about(self):
+        web, out = self.drive("y\n0.0.0.0\n\n\n\n")
+        self.assertEqual(web["bind"], "0.0.0.0")
+        self.assertIn("reverse proxy", out)
+
+    def test_loopback_gets_no_scare_warning(self):
+        _, out = self.drive("y\n\n\n\n\n")
+        self.assertNotIn("reverse proxy", out)
+
+    def test_it_says_where_videos_will_come_from(self):
+        cfg = setup.default_config()
+        cfg["transfer"].update({"enabled": True, "destination": "/mnt/nas/tl/"})
+        _, out = self.drive("y\n\n\n\n\n", cfg)
+        self.assertIn("/mnt/nas/tl/", out)
+
+    def test_a_remote_destination_is_flagged_during_setup(self):
+        cfg = setup.default_config()
+        cfg["transfer"].update({"enabled": True,
+                                "destination": "user@nas:/vol/tl/"})
+        _, out = self.drive("y\n\n\n\n\n", cfg)
+        self.assertIn("not a path this host can read", out)
+
+    def test_blank_library_root_means_work_it_out(self):
+        web, _ = self.drive("y\n\n\n\n\n")
+        self.assertEqual(web["library_root"], "")
+
+    def test_reconfiguring_offers_the_existing_values_as_defaults(self):
+        cfg = setup.default_config()
+        cfg["web"] = {"enabled": True, "bind": "10.0.0.5", "port": 9000,
+                      "library_root": "/srv/tl", "state_dir": "/srv/idx"}
+        web, _ = self.drive("y\n\n\n\n\n", cfg)
+        self.assertEqual(web["bind"], "10.0.0.5")
+        self.assertEqual(web["port"], 9000)
+        self.assertEqual(web["library_root"], "/srv/tl")
+        self.assertEqual(web["state_dir"], "/srv/idx")
+
+
+class TestWebStateDir(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_created_when_enabled(self):
+        target = Path(self.tmp) / "idx"
+        cfg = setup.default_config()
+        cfg["web"] = {"enabled": True, "state_dir": str(target)}
+        setup.create_web_state_dir(cfg)
+        self.assertTrue(target.is_dir())
+
+    def test_created_even_when_disabled(self):
+        """Deliberate. Someone who flips web.enabled by hand and starts the
+        unit would otherwise meet a mount-namespace error naming neither this
+        directory nor the setting that wants it."""
+        target = Path(self.tmp) / "idx"
+        cfg = setup.default_config()
+        cfg["web"] = {"enabled": False, "state_dir": str(target)}
+        setup.create_web_state_dir(cfg)
+        self.assertTrue(target.is_dir())
+
+    def test_the_installer_makes_it_because_the_service_cannot(self):
+        """ReadWritePaths naming a missing directory stops the unit dead, and
+        inside the sandbox the parent is read-only, so the service could not
+        create it even if it started."""
+        target = Path(self.tmp) / "a" / "b" / "idx"
+        cfg = setup.default_config()
+        cfg["web"] = {"enabled": True, "state_dir": str(target)}
+        setup.create_web_state_dir(cfg)
+        self.assertTrue(target.is_dir())
+
+    def test_web_writable_paths_is_only_the_state_dir(self):
+        """Never the frames root. Reusing writable_paths() here would hand the
+        one network-facing unit write access to every captured frame."""
+        cfg = setup.default_config()
+        cfg["paths"]["frames_root"] = "/mnt/big/frames"
+        cfg["web"] = {"enabled": True, "state_dir": "/var/lib/timelapse/web"}
+        self.assertEqual(setup.web_writable_paths(cfg),
+                         ["/var/lib/timelapse/web"])
+
+    def test_web_writable_paths_falls_back_when_unset(self):
+        self.assertEqual(setup.web_writable_paths({}),
+                         ["/var/lib/timelapse/web"])
+
+
 class TestDefaultConfig(unittest.TestCase):
 
     def test_builtin_default_has_every_section(self):

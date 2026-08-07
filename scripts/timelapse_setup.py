@@ -1382,6 +1382,73 @@ def configure_local_transfer(cfg, dest, svcuser):
             note("cannot set. Using the flags above instead.")
 
 
+def web_library_preview(cfg):
+    """Where the web UI would look for videos, and whether it can read it.
+
+    Shown during setup because it is the one thing about this feature that
+    surprises people: transfer moves videos away with --remove-source-files,
+    so the answer is usually the destination and not video_output.
+    """
+    web = cfg.get("web", {})
+    trans = cfg.get("transfer", {})
+    override = (web.get("library_root") or "").strip()
+    dest = (trans.get("destination") or "").strip()
+    if override:
+        return override, "web.library_root"
+    if trans.get("enabled") and dest:
+        if dest.startswith("rsync://") or (not dest.startswith("/")
+                                           and ":" in dest.split("/", 1)[0]):
+            return dest, "transfer.destination - REMOTE, not readable here"
+        return dest, "transfer.destination"
+    return cfg["paths"].get("video_output", ""), "paths.video_output"
+
+
+def choose_web(cfg):
+    heading("Web UI (optional)")
+    note("A small read-only page: service status, and an index of your")
+    note("finished videos that hands each one to VLC to play.")
+    note("It changes nothing - no encoding, no camera control, no deleting.")
+    print()
+
+    cfg.setdefault("web", {})
+    web = cfg["web"]
+    if not ask_yes("Enable the web UI?", web.get("enabled", False)):
+        web["enabled"] = False
+        return
+    web["enabled"] = True
+
+    print()
+    note("There is no login and no HTTPS. 127.0.0.1 means only this machine")
+    note("can reach it; any other address exposes it to your whole network.")
+    web["bind"] = ask("Listen on", web.get("bind", "127.0.0.1"))
+    web["port"] = ask_int("Port", int(web.get("port", 8787)), 1, 65535)
+    if web["bind"] not in ("127.0.0.1", "::1", "localhost"):
+        print()
+        warn("Anyone who can reach this address can watch your videos.")
+        warn("Keep it to a trusted LAN, or put a reverse proxy in front.")
+
+    print()
+    where, why = web_library_preview(cfg)
+    note(f"Videos will be read from: {where or '(not set)'}")
+    note(f"  because: {why}")
+    if "REMOTE" in why:
+        warn("That is an rsync remote spec, not a path this host can read.")
+        warn("If the same files are also mounted here, give that path below.")
+    elif where and not Path(where).is_dir():
+        warn(f"{where} does not exist yet - if it is a NAS mount, it may")
+        warn("simply not be mounted. The page will say so rather than")
+        warn("showing an empty library.")
+    print()
+    note("Leave blank to use the path above.")
+    web["library_root"] = ask("Read videos from", web.get("library_root", ""))
+
+    print()
+    note("The web UI writes one thing: an index of your library. The service")
+    note("is allowed to write this directory and nothing else on the system.")
+    web["state_dir"] = ask("Index directory",
+                           web.get("state_dir", "/var/lib/timelapse/web"))
+
+
 def choose_discord(cfg, config_path=None):
     heading("Notifications (optional)")
     note("A nightly Discord summary: what encoded, coverage, size, failures.")
@@ -1543,6 +1610,13 @@ def summarise(cfg, out_path):
     t = cfg["transfer"]
     print(f"  {'Transfer':<12}{t['destination'] if t.get('enabled') else 'disabled'}")
     print(f"  {'Discord':<12}{'enabled' if cfg['discord'].get('enabled') else 'disabled'}")
+    w = cfg.get("web", {})
+    # Built outside the f-string: nesting an expression like this inside one
+    # needs PEP 701, which is Python 3.12. This project supports 3.9.
+    web_line = "disabled"
+    if w.get("enabled"):
+        web_line = "http://{}:{}/".format(w.get("bind"), w.get("port"))
+    print(f"  {'Web UI':<12}{web_line}")
     print(f"  {'Config':<12}{out_path}")
 
 
@@ -1589,6 +1663,48 @@ def create_directories(cfg, owner=None):
                 shutil.chown(p, user=owner, group=owner)
             except (OSError, LookupError):
                 pass
+    create_web_state_dir(cfg, owner)
+
+
+def create_web_state_dir(cfg, owner=None):
+    """The web UI's index directory, made here rather than by the service.
+
+    It cannot make its own: ReadWritePaths names this directory, and a
+    ReadWritePaths pointing at something that does not exist stops the unit
+    from starting at all - while inside the sandbox the parent is read-only,
+    so the service could not create it even if it started.
+
+    Made even when the UI is disabled, deliberately. Someone who turns
+    web.enabled on by hand and starts the unit would otherwise meet a mount
+    namespace error that names neither this directory nor the setting that
+    wants it. One empty directory is a cheap price for never seeing that.
+    """
+    web = cfg.get("web", {})
+    p = Path(web.get("state_dir") or "/var/lib/timelapse/web")
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        fail(f"Could not create {p}: {exc}")
+        return
+    if owner:
+        try:
+            shutil.chown(p, user=owner, group=owner)
+        except (OSError, LookupError):
+            pass
+
+
+def summarise_web(cfg):
+    web = cfg.get("web", {})
+    if not web.get("enabled"):
+        note("Web UI disabled.")
+        return
+    where, why = web_library_preview(cfg)
+    print()
+    note(f"listen        http://{web.get('bind')}:{web.get('port')}/")
+    note(f"library       {where or '(not set)'}  ({why})")
+    note(f"index         {web.get('state_dir')}")
+    print()
+    note("Start it with: systemctl enable --now timelapse-web.service")
 
 
 # ----------------------------------------------------------------------------
@@ -1608,6 +1724,8 @@ def main():
                     help="reconfigure just the transfer destination")
     ap.add_argument("--cameras-only", action="store_true",
                     help="add, edit or remove cameras in an existing config")
+    ap.add_argument("--web-only", action="store_true",
+                    help="reconfigure just the web UI")
     ap.add_argument("--print-paths", metavar="CONFIG",
                     help="print the paths systemd must be allowed to write")
     ap.add_argument("--print-web-paths", metavar="CONFIG",
@@ -1689,6 +1807,25 @@ def main():
         print()
         return 0
 
+    # Re-run just the web section. Same reason as --transfer-only: turning the
+    # UI on later must not mean walking the whole wizard, and a feature the
+    # wizard never offers is one nobody finds.
+    if args.web_only:
+        try:
+            with open(args.output, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except OSError:
+            fail(f"No existing config at {args.output}; run the full wizard.")
+            return 1
+        choose_web(cfg)
+        heading("Writing configuration")
+        create_web_state_dir(cfg, args.owner)
+        write_config(cfg, args.output, args.owner)
+        good(f"Updated {args.output}")
+        summarise_web(cfg)
+        print()
+        return 0
+
     cfg = default_config(args.template)
     disk = choose_storage(cfg)
     choose_tools(cfg)
@@ -1696,6 +1833,7 @@ def main():
     choose_cameras(cfg, n_cams)
     choose_transfer(cfg, args.owner)
     choose_discord(cfg, args.output)
+    choose_web(cfg)
 
     heading("Writing configuration")
     create_directories(cfg, args.owner)

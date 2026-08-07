@@ -155,7 +155,7 @@ default in brackets; Enter accepts it.
 
 It then covers ffmpeg paths (probing for NVENC and telling you which encoder you
 will actually get), the capture interval, a disk budget for your camera count,
-the low-space threshold, cameras, transfer and Discord.
+the low-space threshold, cameras, transfer, Discord and the optional web UI.
 
 Two things it does that are easy to get wrong by hand:
 
@@ -348,14 +348,16 @@ of it; nothing needs a reinstall.
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and Discord. Run it after any change. |
 | `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. §9. |
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
+| `timelapse web` | Turn the read-only web UI on or off and set its address, port and library path. §10. |
+| `timelapse web-serve` | Run the web UI in the foreground for a look at its log. The service normally does this. |
 | `timelapse setup` | The full wizard again — storage, capture settings, cameras, transfer, Discord. Overwrites the whole config, so prefer `cameras` or `transfer` for a single change. |
 | `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover. You are then responsible for restarting capture yourself. |
 | `timelapse encode` | Runs the nightly encode immediately instead of waiting for 00:05. Useful to clear a backlog. |
 | `timelapse version` | The installed version of each script, and a warning if the running daemon predates them. |
 
 **Which need root.** `config.json` is `0640 root:timelapse` because it holds
-camera credentials. So `setup`, `cameras`, `transfer` and `config` need `sudo`
-(they write it), and `test`, `usage` and `encode` need either `sudo` or
+camera credentials. So `setup`, `cameras`, `transfer`, `web` and `config` need
+`sudo` (they write it), and `test`, `usage` and `encode` need either `sudo` or
 membership of the `timelapse` group (they read it). `status`, `logs` and
 `version` work unprivileged.
 
@@ -464,3 +466,96 @@ on disk, and re-adding it under the same name picks it straight back up.
 
 Editing `config.json` by hand still works (`timelapse config`), but then the
 restart and the stranding checks are yours to remember.
+
+---
+
+## 10. The web UI
+
+Optional, off by default, and read-only: it never triggers an encode, controls
+a camera, edits the config or deletes anything. Turn it on with:
+
+```bash
+sudo timelapse web
+sudo systemctl enable --now timelapse-web.service
+```
+
+Then open `http://127.0.0.1:8787/`.
+
+It gives you four things:
+
+- **Where your videos actually are** — see the warning below, this is the
+  question people get wrong.
+- **Service status and recent log**, on request. Same output as `timelapse
+  status` and `journalctl`, without an SSH session.
+- **An index of finished videos**, browsable by camera, by day and by folder.
+- **Playback in your own player.** Each video has a *Play* link that hands VLC
+  (or mpv, or whatever opens `.m3u`) a playlist pointing back at the server,
+  plus a *Download* link. There is also **one playlist per day**: open it and
+  your player queues that day's videos from every camera in turn.
+
+### Your videos are probably not in `video_output`
+
+The nightly transfer runs `rsync --remove-source-files`, so once it has run,
+`paths.video_output` is **empty** — the videos are at `transfer.destination`.
+The UI works this out for you and says which path it chose. Two cases worth
+knowing:
+
+- **A remote destination** (`user@nas:/mnt/user/timelapse/`) is not a path this
+  host can read at all. The page says so rather than showing an empty list. If
+  the same files are also mounted locally, give that path as `library_root`.
+- **A NAS that is not mounted** looks identical to an empty library, so the
+  page reports the directory as unreadable instead of pretending it is empty.
+
+Do not put the library under `/tmp` or `/var/tmp`. The unit sets
+`PrivateTmp=true`, so the service gets a private empty one and reports your
+library as unreadable — correct, and thoroughly confusing.
+
+### It is not secured — bind it accordingly
+
+There is **no login and no HTTPS**. The default bind is `127.0.0.1`, which
+means only this machine can reach it; the wizard warns you if you change that.
+
+To watch from a phone you must bind to the LAN — and then anyone on that
+network can watch your cameras' footage. Put a reverse proxy with TLS and
+authentication in front of it for anything beyond a trusted home network, and
+do not port-forward it.
+
+### What it is allowed to write
+
+One directory: `web.state_dir`, default `/var/lib/timelapse/web`, which holds
+an index of your library. `timelapse-web.service` lists exactly that path in
+`ReadWritePaths=`, so the videos, the captured frames and `config.json` are
+read-only to it — enforced by systemd, not merely intended.
+
+The installer creates that directory. The service cannot: a `ReadWritePaths=`
+naming a directory that does not exist stops the unit from starting, and inside
+the sandbox its parent is read-only anyway.
+
+### The index
+
+The first scan runs in the background, so the page is usable immediately and
+reports progress. After that, opening a folder re-reads that one directory and
+opening a video re-checks that one file, so browsing does not walk your whole
+NAS. *Rescan* forces a full pass.
+
+It reads whatever is in the destination, not only what this tool wrote. Six
+different filename conventions from predecessor tools are recognised, including
+files with no camera name in them at all. **Names are never merged**: if you
+have both `Workshop` and `workshop`, or `garaj` and `Garage`, you get both,
+sorted next to each other. A camera name is a *place*, places get recycled
+between cameras over the years, and deciding whether two labels mean the same
+thing is your call, not the index's.
+
+Videos too small to be a real day — a few kilobytes where a day is hundreds of
+megabytes — are listed under **Flagged** with their full path, so you can check
+and delete them by whatever means you prefer. The UI will not do it for you.
+
+### Snags
+
+| Symptom | Cause |
+|---|---|
+| Log pane says "no entries" and names `systemd-journal` | The service account cannot read the journal. The unit asks for `SupplementaryGroups=systemd-journal`; the installer drops that line on a distro without the group. Add it back and `systemctl daemon-reload`. |
+| Library page says the directory is unreadable | The NAS is not mounted, or the library is under `/tmp`/`/var/tmp` (see above). |
+| Library is empty but the directory is right | The scan may still be running — the page says so. Otherwise nothing there matched a video extension. |
+| Clicking *Play* downloads a file instead of opening VLC | Your browser has no handler for `.m3u`. Tell it to always open that type, or copy the stream URL shown under each entry into VLC's *Open Network Stream*. |
+| Seeking does nothing in a player | Check you are on 0.0.9 or later; earlier builds sent `Accept-Ranges: none`. |
