@@ -1,6 +1,6 @@
 """Unit tests for the `timelapse usage` disk report.
 
-The report's real job is not arithmetic — it is telling you when frames on disk
+The report's real job is not arithmetic; it is telling you when frames on disk
 have nothing that will ever encode them. A camera removed from the config, or
 merely *disabled*, keeps its directory forever and the nightly encode skips it.
 Someone runs this precisely because disk is filling up, so those two cases have

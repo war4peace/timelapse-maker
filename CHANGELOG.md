@@ -10,15 +10,15 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Added
-- **`timelapse web`** — an optional, read-only web UI, disabled by default.
+- **`timelapse web`**: an optional, read-only web UI, disabled by default.
   It shows where your finished videos actually live, an index of the videos
-  themselves browsable by camera and by date, and — on request, never by
-  polling — the output of `systemctl status` for every unit and the recent
+  themselves browsable by camera and by date, and, on request, never by
+  polling, the output of `systemctl status` for every unit and the recent
   journal for capture, encode or the UI itself, and a Play link that hands
   each video to VLC.
 
-  It never changes anything of yours — no encode triggers, no camera control,
-  no config edits, no deleting — and the unit enforces that rather than
+  It never changes anything of yours: no encode triggers, no camera control,
+  no config edits, no deleting. The unit enforces that rather than
   trusting the code: `timelapse-web.service` may write one directory, its own
   index, and nothing else on the system.
 
@@ -30,20 +30,20 @@ While the version is `0.x`, the configuration format may change in any release.
   `--remove-source-files`, so `paths.video_output` is *empty* after a
   successful night. A remote `user@nas:/...` destination is not a path this
   host can read at all, and the page says so instead of showing an empty list
-  that looks like a fault — as does a NAS that simply is not mounted.
+  that looks like a fault, as does a NAS that simply is not mounted.
 
   The log pane has the same habit of explaining itself. `journalctl` tells a
   process without journal access that there are simply no entries, which is
   indistinguishable from a quiet service and reads as a broken page. The unit
   asks for `SupplementaryGroups=systemd-journal` so this does not arise; where
-  that group does not exist the installer removes the line — naming a missing
-  group would stop the service starting at all — and the page then tells you
+  that group does not exist the installer removes the line (naming a missing
+  group would stop the service starting at all) and the page then tells you
   which line to add.
 
   The library index is built to survive a real destination rather than a tidy
   one. Surveying five years of accumulated timelapses turned up **six**
   different filename conventions from successive tools, of which the format
-  this project writes accounts for under two thirds — so the index tries a
+  this project writes accounts for under two thirds, so the index tries a
   chain of patterns and files anything it recognises, including videos whose
   names carry no camera at all. It never decides that two similar names mean
   the same thing: a name is a *place*, cameras get repurposed over the years,
@@ -52,7 +52,7 @@ While the version is `0.x`, the configuration format may change in any release.
   variants sit next to each other.
 
   Files too small to be a real day of video are listed with their full path, so
-  you can check and remove them yourself — this UI never deletes anything.
+  you can check and remove them yourself; this UI never deletes anything.
 
   The first scan runs in the background, so the page is up immediately and
   reports progress. After that, opening a folder re-reads that one directory
@@ -61,7 +61,7 @@ While the version is `0.x`, the configuration format may change in any release.
   Videos play in **your** player, not in the browser. Every listing has a
   *Play* link that hands VLC (or mpv, or whatever opens `.m3u` on your desktop)
   a one-line playlist pointing back at this server, plus a *Download* link and
-  the two addresses that need no web UI at all — the share path, for a machine
+  the two addresses that need no web UI at all: the share path, for a machine
   that has the mount, and the stream URL for VLC's *Open Network Stream*. This
   is deliberate: the videos are AV1 in Matroska, which browsers handle badly
   and real players handle natively. The playlist is built from the address you
@@ -85,10 +85,10 @@ While the version is `0.x`, the configuration format may change in any release.
 
   The setup wizard asks about all of this, and **`timelapse web`** reconfigures
   just this part later without walking the whole wizard. It shows you which
-  path it will read videos from and why — the answer surprises people — and it
+  path it will read videos from and why (the answer surprises people), and it
   states plainly that there is no login and no HTTPS before asking what address
   to listen on. Operator guide: [docs/install.md §10](docs/install.md#10-the-web-ui).
-- **`timelapse usage`** — disk report: frames, bytes and date range per camera,
+- **`timelapse usage`**, a disk report: frames, bytes and date range per camera,
   totals, videos and free space. It also names the directories nothing will
   ever encode: a camera removed from the config (`ORPHAN`) or merely disabled
   keeps everything it captured, because the nightly encode walks only the
@@ -98,7 +98,7 @@ While the version is `0.x`, the configuration format may change in any release.
 ### Fixed
 - The video index would serve **any** file sitting inside your video folder,
   not just videos. The extension allow-list was applied when scanning but not
-  when serving, and the serving path re-checks files on access — so a request
+  when serving, and the serving path re-checks files on access, so a request
   naming a `.txt` or a script kept alongside the videos was read, added to the
   index and returned. Now the same allow-list applies to both. Found by a test
   written after the code had already been reviewed and thought finished.
@@ -107,14 +107,14 @@ While the version is `0.x`, the configuration format may change in any release.
   `_comment` keys and shipped them into live configs. Caught immediately by the
   new `web` section, which put three explanatory paragraphs into every
   generated `config.json`. It now strips every section, which is what the code
-  claimed to do — its own comment already warned about a stale `_comment_cifs`
+  claimed to do; its own comment already warned about a stale `_comment_cifs`
   reaching live configs once before.
 - A missing, malformed or unreadable `config.json` produced a raw Python
   traceback from every entry point. Each of the three states needs a different
-  action — not configured yet, broken after a hand-edit, or unreadable because
-  the file is `0640 root:timelapse` — and a stack trace conveys none of them.
+  action (not configured yet, broken after a hand-edit, or unreadable because
+  the file is `0640 root:timelapse`), and a stack trace conveys none of them.
   All three now exit with a sentence naming the fix.
-- **`timelapse cameras`** — add, edit, remove, enable/disable and test cameras
+- **`timelapse cameras`**: add, edit, remove, enable/disable and test cameras
   against an existing config, without reinstalling or re-running the whole
   wizard. It restarts `timelapse-capture.service` for you, since the daemon
   reads its camera list only at startup.
@@ -127,7 +127,7 @@ While the version is `0.x`, the configuration format may change in any release.
   would rescue those days; a rename offers to move the directory instead.
   Disabling being just as destructive as removing is the easy one to miss.
 
-  Passwords carried in a URL query string are masked in the listing —
+  Passwords carried in a URL query string are masked in the listing;
   `ask_secret()` keeps them out of scroll-back when typed, so printing the
   camera table would defeat it.
 
@@ -135,8 +135,8 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 - **Re-running the installer over a live install did not actually upgrade it.**
-  Replacing the scripts on disk changes nothing for a running daemon — it keeps
-  executing the code it read at startup — and `systemctl enable --now` is a
+  Replacing the scripts on disk changes nothing for a running daemon: it keeps
+  executing the code it read at startup, and `systemctl enable --now` is a
   no-op on an already-active unit. So the installer replaced the files, printed
   *"Capture is running"*, and left the previous build serving until the next
   reboot. It now restarts a live `timelapse-capture.service` (after asking, and
@@ -162,7 +162,7 @@ While the version is `0.x`, the configuration format may change in any release.
 
   Measured, because the scope is narrower than it looks: it recovers ~58% of
   *per-request* failures and **0%** of failures that are a busy window longer
-  than one interval. The zero is structural — if the camera is out for longer
+  than one interval. The zero is structural: if the camera is out for longer
   than `interval_seconds`, the next tick already is the retry. A tick whose
   predecessor also failed is therefore not retried, which keeps an outage from
   doubling the request rate against a camera that just said it was busy.
@@ -171,7 +171,7 @@ While the version is `0.x`, the configuration format may change in any release.
   run into the next tick and cost a second frame. A rescued tick counts as a
   success, keeping `Cov%` meaning *frames on disk*.
 - `timelapse version` prints the installed version of each script, and warns
-  when the running daemon predates the files on disk — the one failure mode a
+  when the running daemon predates the files on disk, the one failure mode a
   version number by itself cannot show you.
 
 ### Removed
@@ -202,13 +202,13 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Removed
 - `tools/setup-cifs-transfer.sh`. The wizard does this now, and `install.sh`
-  never installed the script anyway — so the wizard was pointing at a file
+  never installed the script anyway, so the wizard was pointing at a file
   that was not on the machine. One implementation instead of two that could
   drift.
 
 ### Fixed
 - `timelapse setup` run outside the installer wrote the config `0640
-  root:root`, leaving the service account unable to read it — a failure that
+  root:root`, leaving the service account unable to read it, a failure that
   only shows up when a unit refuses to start. `write_config()` now sets the
   group when it knows the service user.
 - Documentation keys leaked from the example config into generated configs;
@@ -221,13 +221,13 @@ While the version is `0.x`, the configuration format may change in any release.
 - **Pressing Enter at a yes/no prompt re-prompted forever.** `ask()` returned
   early only when the default was non-empty, and `ask_yes()` passes an empty
   default, so a blank line fell through to the retry loop. The only way past a
-  `(Y/n)` prompt was to type `y` or `n` — which contradicts the wizard's one
+  `(Y/n)` prompt was to type `y` or `n`, which contradicts the wizard's one
   promise, that Enter accepts what is in brackets. Blank input now always
   returns the default.
 
 ### Changed
 - **The transfer step no longer assumes SSH.** It asks how the destination is
-  reached — a path on this machine, or another host over SSH — and only
+  reached (a path on this machine, or another host over SSH), and only
   mentions SSH keys for the SSH option. Reported as confusing when configuring
   a CIFS share, which needs no SSH at all.
 - For a local destination the wizard now checks the path, reports the
@@ -252,8 +252,8 @@ While the version is `0.x`, the configuration format may change in any release.
   ffmpeg 8.0.1 was silently downgraded to HEVC. Verbose output named it
   exactly: `YUV444P not supported`.
 
-  Real encodes were never affected — `encode_day()` already ends its filter
-  chain in `format=yuv420p` — so this only ever cost people AV1 they could
+  Real encodes were never affected (`encode_day()` already ends its filter
+  chain in `format=yuv420p`), so this only ever cost people AV1 they could
   have had. The probe now pins `-pix_fmt` to the same `PIX_FMT` constant the
   filter chain uses, so the two cannot drift apart again.
 - `encoder_hint()` recognises a pixel-format rejection and says so, instead of
@@ -262,7 +262,7 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [0.0.4] - 2026-08-06
 
 ### Added
-- `timelapse test --encoders` — full diagnosis of why a hardware encoder is
+- `timelapse test --encoders`: full diagnosis of why a hardware encoder is
   unavailable: ffmpeg version and NVENC build flags, whether each NVENC codec
   is compiled in at all, GPU and driver from `nvidia-smi`, and a **verbose**
   probe per codec.
@@ -286,9 +286,9 @@ While the version is `0.x`, the configuration format may change in any release.
 Bugs from the first real install on someone else's hardware.
 
 ### Fixed
-- **Encoder probes discarded ffmpeg's error, so the wizard guessed the cause —
+- **Encoder probes discarded ffmpeg's error, so the wizard guessed the cause,
   and guessed wrong.** With `hevc_nvenc` working and `av1_nvenc` not, it stated
-  "No AV1 NVENC on this GPU (needs RTX 40-series or newer)" — reported on an
+  "No AV1 NVENC on this GPU (needs RTX 40-series or newer)", reported on an
   RTX 4060, which encodes AV1 natively. Probes now capture stderr,
   `list_encoders()` checks whether the codec is compiled into the ffmpeg binary
   at all, and `encoder_hint()` derives the cause from ffmpeg's own message.
@@ -321,13 +321,13 @@ Bugs from the first real install on someone else's hardware.
 ## [Unreleased]
 
 ### Added
-- `transfer.require_mountpoint` — refuses to transfer when the destination is
+- `transfer.require_mountpoint`: refuses to transfer when the destination is
   not on a mounted filesystem. An unmounted CIFS/NFS mountpoint is an ordinary
   empty local directory, so rsync would fill the local disk and
   `--remove-source-files` would then delete the originals. Accepts `true`
   (walk up from the destination) or an explicit mount path (checked with
   `os.path.ismount`, more precise). Off by default.
-- `tools/setup-cifs-transfer.sh` — mounts an SMB/CIFS share, determines which
+- `tools/setup-cifs-transfer.sh`: mounts an SMB/CIFS share, determines which
   rsync flags the share actually accepts, performs a real round trip with a
   throwaway file (verifying md5 and that `--remove-source-files` worked),
   writes the `/etc/fstab` entry with `nofail,x-systemd.automount`, and prints
@@ -336,7 +336,7 @@ Bugs from the first real install on someone else's hardware.
   mount, and when `rsync_args` uses `-a` against a CIFS/NFS destination.
 
 ### Notes
-- Whether `rsync -a` works on CIFS depends on the server and mount options —
+- Whether `rsync -a` works on CIFS depends on the server and mount options,
   `-a` implies `--owner --group`, which many shares reject with exit 23, but
   `forceuid`/`forcegid` can make it succeed. The tool measures it rather than
   assuming either way.
@@ -354,12 +354,12 @@ Bugs from the first real install on someone else's hardware.
 ### Fixed
 - `scan_filesystems()` normalised paths with `pathlib.Path`, which produced
   Windows separators when run off-target. It now uses `PurePosixPath` for
-  `writable_paths()` output, which is correct in all cases — the result goes
+  `writable_paths()` output, which is correct in all cases; the result goes
   into a systemd unit.
 - `timelapse_setup.py` could not be imported on a non-POSIX host, because
   `os.statvfs` was evaluated as a default argument. Only affects running the
   tests off-target, but there is no reason to forbid that.
-- `install.sh` exited `1` on success whenever it had not downloaded a tarball —
+- `install.sh` exited `1` on success whenever it had not downloaded a tarball,
   that is, every install from a local git checkout, every `--uninstall`, and
   `--help`. The `EXIT` trap ended on a failing test (`[ -n "$WORKDIR" ] && …`
   with `WORKDIR` empty), and bash lets a non-zero status from the last command
@@ -379,30 +379,30 @@ Bugs from the first real install on someone else's hardware.
 ## [0.0.1] - 2026-08-05
 
 First public release. Previously a single-host private deployment, developed and
-run on exactly one machine — see the warning at the top of the README.
+run on exactly one machine; see the warning at the top of the README.
 
 ### Core programs
-- `timelapse_capture.py` — threaded snapshot daemon with drift-free wall-clock
+- `timelapse_capture.py`: threaded snapshot daemon with drift-free wall-clock
   scheduling, atomic frame writes, throttled failure logging, a free-space guard
   with hysteresis, and an RTSP fallback path for cameras with no HTTP snapshot
   endpoint.
-- `timelapse_encode.py` — nightly encoder with NVENC AV1 → HEVC → x264 fallback,
+- `timelapse_encode.py`: nightly encoder with NVENC AV1 → HEVC → x264 fallback,
   automatic backlog recovery, per-camera failure isolation, correct full→limited
   range colour conversion, rsync transfer, and a Discord summary.
-- `timelapse_test.py` — pre-flight checker for cameras, auth, encoders, disk
+- `timelapse_test.py`: pre-flight checker for cameras, auth, encoders, disk
   headroom, transfer destination and webhook, plus `--probe-profiles` to find
   which ONVIF profile is actually the main stream.
 - systemd units for the capture service, the encode service, and the nightly
   encode timer.
 
 ### Installation
-- `install.sh` — one-command install. Detects the package manager
+- `install.sh`: one-command install. Detects the package manager
   (apt/dnf/yum/pacman/zypper/apk), installs dependencies, creates a `timelapse`
   system account, places the scripts, systemd units and a `timelapse` command
   wrapper, then runs the setup wizard and offers to enable the services.
   Supports `--unattended`, `--no-wizard`, `--ref`, `--prefix` and `--uninstall`.
   Works both from a git checkout and from a downloaded tarball.
-- `timelapse_setup.py` — configuration wizard. Scans `/proc/mounts` for real,
+- `timelapse_setup.py`: configuration wizard. Scans `/proc/mounts` for real,
   writable, local filesystems, reports free space and SSD/HDD status for each,
   and recommends the roomiest one that is not the OS disk. Every prompt takes
   Enter to accept its default. Also covers ffmpeg paths (reporting which encoder
@@ -440,7 +440,7 @@ Found while reviewing the private codebase for publication:
   instead of failing that one camera-day. `probe_dimensions()` now runs inside
   the per-camera error boundary.
 - A Discord webhook timeout raised out of `send_discord()` instead of being
-  swallowed — `socket.timeout` is not a `URLError`. In the critical-failure
+  swallowed: `socket.timeout` is not a `URLError`. In the critical-failure
   handler this masked the original exception.
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.

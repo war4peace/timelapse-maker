@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-timelapse_setup.py — interactive configuration wizard.
+timelapse_setup.py: interactive configuration wizard.
 
 Scans the machine's filesystems, proposes where frames and videos should live,
 then walks through capture settings, cameras, transfer and notifications, and

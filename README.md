@@ -1,7 +1,7 @@
 # timelapse-maker
 
 > [!WARNING]
-> ## ⚠️ EXPERIMENTAL — IN DEVELOPMENT
+> ## ⚠️ EXPERIMENTAL: IN DEVELOPMENT
 >
 > **Version 0.0.8.** This is early software that has run on exactly one machine.
 > It has not been tested across different distributions, camera makes, GPUs or
@@ -12,12 +12,12 @@
 >   `/etc/systemd/system`, and enables services. **Read
 >   [`install.sh`](install.sh) before running it as root.**
 > - Capture writes tens of thousands of files a day. Point it at a disk you
->   are willing to fill, and run `timelapse test` first — it projects real
+>   are willing to fill, and run `timelapse test` first; it projects real
 >   usage from your actual cameras.
 > - There is no upgrade path between versions yet, and no security review.
 >
 > Use it if you want to experiment or help develop it. Don't put it anywhere
-> that matters yet. **No warranty** — see [LICENSE](LICENSE).
+> that matters yet. **No warranty**; see [LICENSE](LICENSE).
 
 Unattended daily timelapses from IP cameras. Pulls a full-resolution snapshot
 from each camera on a fixed interval, encodes each finished day into one video
@@ -27,7 +27,7 @@ summary to Discord.
 It exists because NVR timelapse features are generally built around *clips*,
 not around one contiguous file per camera per day. Agent DVR, for instance, is
 perfectly capable of pulling full-resolution snapshots and producing good
-timelapses — but a camera reboot, or an ONVIF setting change, interrupts the
+timelapses, but a camera reboot, or an ONVIF setting change, interrupts the
 recording and it resumes into a *new* file. A day ends up as several fragments
 rather than one video. There is also no built-in way to ship the results to
 another machine.
@@ -37,8 +37,8 @@ so a camera that drops out simply contributes fewer frames to the same day's
 file instead of splitting it, and finished videos are rsynced wherever you want
 them.
 
-Bug reports and camera compatibility reports are genuinely useful at this stage
-— see [CONTRIBUTING.md](CONTRIBUTING.md).
+Bug reports and camera compatibility reports are genuinely useful at this stage;
+see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 
@@ -48,17 +48,17 @@ Bug reports and camera compatibility reports are genuinely useful at this stage
 |---|---|---|
 | `timelapse_capture.py` | One full-quality JPEG per camera every N seconds | systemd service, always on |
 | `timelapse_encode.py` | Encodes finished days to AV1, notifies, transfers | systemd timer, 00:05 |
-| `timelapse_test.py` | Pre-flight checker — run before enabling anything | manually |
+| `timelapse_test.py` | Pre-flight checker, run before enabling anything | manually |
 | `timelapse_setup.py` | Storage-aware configuration wizard | installer, or `timelapse setup` |
-| `timelapse_web.py` | Optional read-only web UI — status, video index, hands playback to VLC | systemd service, off by default |
+| `timelapse_web.py` | Optional read-only web UI: status, video index, hands playback to VLC | systemd service, off by default |
 
-Day to day you drive it through one wrapper — no reinstall, no hand-edited JSON:
+Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 
 | | |
 |---|---|
 | `timelapse status` | Are the service and timer healthy, when does the next encode fire |
 | `timelapse logs` | Follow the capture journal live |
-| `timelapse usage` | Frames, bytes and date range per camera — and which folders nothing will ever encode |
+| `timelapse usage` | Frames, bytes and date range per camera, and which folders nothing will ever encode |
 | `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord |
 | `timelapse cameras` | Add, edit, remove or disable a camera, then restart capture |
 | `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed |
@@ -66,12 +66,12 @@ Day to day you drive it through one wrapper — no reinstall, no hand-edited JSO
 | `timelapse encode` | Run tonight's encode now |
 | `timelapse setup` · `config` · `version` | Full wizard · edit the JSON · what's installed |
 
-Full descriptions in [docs/install.md](docs/install.md#8-day-to-day--the-timelapse-command).
+Full descriptions in [docs/install.md](docs/install.md#8-day-to-day-the-timelapse-command).
 
 The two daemons never talk to each other. They share only a directory layout,
 so either can be stopped, replaced or rewritten without touching the other.
 
-- **One file per camera per day, always.** Capture keeps no session state — each
+- **One file per camera per day, always.** Capture keeps no session state: each
   frame is an independent fetch named after its wall-clock time. A camera that
   reboots, or that you reconfigure over ONVIF mid-afternoon, just contributes
   fewer frames to the same day. It never splits the output into fragments.
@@ -92,25 +92,25 @@ so either can be stopped, replaced or rewritten without touching the other.
   limited-range BT.709 and tags it, so output isn't washed out or crushed
   depending on the player.
 - **Optional read-only web UI.** Service status, an index of your finished
-  videos by camera and by day, and a *Play* link that hands each one to VLC —
+  videos by camera and by day, and a *Play* link that hands each one to VLC,
   including one playlist per day, so reviewing a day means opening a single
   file instead of one per camera. It reads the destination you already keep
   your timelapses in, recognising the naming conventions of whatever tool came
   before. Off by default, binds to localhost, and allowed to write exactly one
-  directory — its own index. See
+  directory: its own index. See
   [docs/install.md §10](docs/install.md#10-the-web-ui).
 
 ## Requirements
 
 - Linux with systemd (developed on Ubuntu Server; nothing is distro-specific)
 - Python 3.9+ and `requests`
-- `ffmpeg` / `ffprobe` — with NVENC if you want AV1 or HEVC hardware encoding
+- `ffmpeg` / `ffprobe`, with NVENC if you want AV1 or HEVC hardware encoding
 - `rsync`, only if you enable transfer
 - Cameras exposing an HTTP snapshot URL (Dahua, Hikvision/ONVIF, Reolink and
   similar) or, failing that, RTSP
 
 Roughly **17,280 frames per camera per day** at the default 5s interval, which
-is 4:48 of video at 60fps. Budget disk accordingly — at ~600 KB per 1440p
+is 4:48 of video at 60fps. Budget disk accordingly: at ~600 KB per 1440p
 snapshot that is ~10 GB per camera per day, resident for up to two days.
 `timelapse_test.py` computes the real figure from your own cameras.
 
@@ -134,7 +134,7 @@ setup wizard. The wizard scans your disks and proposes where to put the frames:
   Which filesystem should hold the frames? [1]:
 ```
 
-Every question has a default in brackets — **press Enter to accept it**. The
+Every question has a default in brackets; **press Enter to accept it**. The
 wizard then works out the disk budget for your camera count and interval, walks
 you through adding cameras (testing each one live, and reporting the resolution
 it got back), and writes `/etc/timelapse/config.json`.
@@ -144,7 +144,7 @@ the single most common way a hand-install fails: the units run with
 `ProtectSystem=strict`, so a frames directory that isn't listed produces a
 baffling read-only error at 3am.
 
-Prefer to read before running as root? That's the sensible instinct — the
+Prefer to read before running as root? That's the sensible instinct; the
 download and the run are separate steps above precisely so you can inspect
 [install.sh](install.sh) in between.
 
@@ -174,7 +174,7 @@ After installing, a `timelapse` command wraps the common operations:
 timelapse status | logs | test | encode | config | setup | transfer
 ```
 
-Run `timelapse test` before enabling anything — it fetches one snapshot per
+Run `timelapse test` before enabling anything; it fetches one snapshot per
 camera and reports size, resolution, latency and auth result, probes the
 encoders, and projects real disk usage from your actual snapshot sizes.
 
@@ -186,13 +186,13 @@ encoders, and projects real disk usage from your actual snapshot sizes.
 | Document | For |
 |---|---|
 | [docs/install.md](docs/install.md) | Installing, configuring, operating, troubleshooting |
-| [docs/architecture.md](docs/architecture.md) | How it is built and why — read before modifying |
+| [docs/architecture.md](docs/architecture.md) | How it is built and why, read before modifying |
 | [CHANGELOG.md](CHANGELOG.md) | Release history |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Reporting issues, sending patches |
 
 ## Known limitations
 
-- **DST fall-back** — local time repeats an hour, so `HHMMSS` filenames collide.
+- **DST fall-back**: local time repeats an hour, so `HHMMSS` filenames collide.
   HTTP cameras get a `-1` suffix and keep everything; the RTSP path overwrites
   that hour. Video length varies on DST days.
 - **PTZ cameras** jump-cut between presets in the finished video.

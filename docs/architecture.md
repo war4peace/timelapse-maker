@@ -23,7 +23,7 @@ move finished videos to another machine.
 The design consequence is §2's split: capture holds no session state. Each
 frame is an independent HTTP fetch named after its wall-clock time and written
 into the day's directory. A camera that is unreachable for an hour contributes
-no frames for that hour and the day still encodes to one file — shorter, but
+no frames for that hour and the day still encodes to one file: shorter, but
 whole. Nothing about a camera restarting is visible to the encoder at all.
 
 **In scope:** pulling snapshots, encoding them into daily videos, reporting
@@ -31,7 +31,7 @@ results, shipping videos elsewhere.
 
 **Explicitly out of scope:** motion detection, object detection, alerting on
 camera content, recording video streams. Your NVR keeps doing all of that. This
-system shares *no* code, config, database or runtime dependency with any NVR —
+system shares *no* code, config, database or runtime dependency with any NVR;
 it only shares the cameras themselves, as one more HTTP client.
 
 **Design goal:** unattended operation. It should survive camera outages, host
@@ -80,7 +80,7 @@ independently.
 **Why two processes rather than one:** they have opposite lifecycles. Capture
 must run continuously and must not be interrupted; encoding is a batch job that
 runs once a day, can take an hour, and can crash without consequence. Coupling
-them would mean an encoder bug can stop capture — the one failure that loses
+them would mean an encoder bug can stop capture, the one failure that loses
 data permanently.
 
 ---
@@ -101,7 +101,7 @@ Invariants that both sides depend on:
 |---|---|
 | Filenames are zero-padded `HHMMSS` | Lexical sort == chronological sort. Nothing reads mtime. A PowerShell predecessor of this tool mixed `CreationTime` and `LastWriteTime` between its processing and deletion passes; making order a property of the *name* removes that class of bug entirely. |
 | One directory per camera per local date | Encoding is a directory glob. Cleanup is one `rmtree`. Determining "is this day finished" is a string compare against today. No scanning 100k+ files to filter by date. |
-| Files appear atomically | Capture writes `.<stem>.tmp` then `os.replace()`. A reader never sees a partial JPEG. `os.replace` is atomic *within a filesystem* — do not move the temp file to a different mount. |
+| Files appear atomically | Capture writes `.<stem>.tmp` then `os.replace()`. A reader never sees a partial JPEG. `os.replace` is atomic *within a filesystem*; do not move the temp file to a different mount. |
 | Dot-prefixed files are not frames | Temp files start with `.`; `glob("*.jpg")` skips them. Don't add non-frame files to a day directory without a dot prefix. |
 | A day directory older than today is complete and owned by the encoder | Capture never writes to a past date. The encoder is free to delete it. |
 
@@ -123,18 +123,18 @@ Long-running daemon. `systemd` `Type=simple`, `Restart=always`.
 | `STOP` | `threading.Event`, set by SIGTERM/SIGINT. Every loop uses `STOP.wait(n)` rather than `time.sleep(n)` so shutdown is immediate. |
 | `PAUSED` | `threading.Event`, set by `DiskGuard`. Capture threads check it and skip, but keep their scheduling loop running. |
 
-**`HttpCamera(threading.Thread)`** — one per `method: "http"` camera.
+**`HttpCamera(threading.Thread)`**: one per `method: "http"` camera.
 
-- `run()` — the scheduling loop. Computes `next_t` as an absolute epoch multiple
+- `run()`: the scheduling loop. Computes `next_t` as an absolute epoch multiple
   of `interval`, sleeps until it, fires, then advances. Because targets are
   absolute, the loop cannot accumulate drift from fetch latency. If it falls a
   full interval behind (slow camera, host suspend) it resyncs forward to the
   next boundary instead of replaying a backlog.
-- `_grab(dt, timeout=None)` — one fetch. Validates size ≥ `min_bytes` and JPEG
+- `_grab(dt, timeout=None)`: one fetch. Validates size ≥ `min_bytes` and JPEG
   SOI (`FF D8`), writes temp, `os.replace`s into place. Nothing is written until
   both checks pass, so a failed attempt leaves no partial file and no
   `_dest_path` collision for a retry to trip over.
-- `_retry_grab(dt, deadline, first_exc)` / `_retry_timeout(deadline, now)` — one
+- `_retry_grab(dt, deadline, first_exc)` / `_retry_timeout(deadline, now)`: one
   second attempt inside the same tick, controlled by `retry_within_tick`.
   Rationale: an ONVIF snapshot endpoint on a busy camera answers `500` in
   milliseconds rather than queueing, so the tick was being discarded with ~98%
@@ -143,7 +143,7 @@ Long-running daemon. `systemd` `Type=simple`, `Restart=always`.
   The field report that prompted this turned out **not** to be a case it can
   fix: the camera was being polled by AgentDVR's own timelapse schedule at the
   same time, which is a busy *window*, the 0% row below. Documented as a snag in
-  `install.md` §4 instead. The retry stands on the blip row alone — know that
+  `install.md` §4 instead. The retry stands on the blip row alone; know that
   before extending it.
 
   **Know what this does and does not fix.** Measured against a local server
@@ -157,13 +157,13 @@ Long-running daemon. `systemd` `Type=simple`, `Restart=always`.
 
   The zero is structural, not a tuning failure: if the camera is refusing for
   longer than `interval_seconds`, the next tick already *is* a retry, so nothing
-  inside this tick can beat it. Do not try to fix it by lengthening the delay —
+  inside this tick can beat it. Do not try to fix it by lengthening the delay:
   that only moves the frame's real timestamp away from its filename. Hence the
   `consec_fail` guard: a tick whose predecessor also failed is part of an outage
   and is not retried, which cut wasted requests in the window case by half
   (18 → 9 over a 72s run) while costing only 67% → 58% on blips.
 
-  The delay/timeout decision is **purely budget arithmetic** —
+  The delay/timeout decision is **purely budget arithmetic**,
   `(deadline - RETRY_GUARD) - (now + RETRY_DELAY)`, declined below
   `RETRY_MIN_BUDGET`. This is deliberately not a fast-failure heuristic: an
   attempt that *timed out* has already consumed the tick, so the same
@@ -172,23 +172,23 @@ Long-running daemon. `systemd` `Type=simple`, `Restart=always`.
   the following frame. `deadline` is the loop's `next_t`, so a resync forward
   legitimately widens the window.
 
-  A rescued tick increments `ok`, not `fail` — those counters mean *frames on
+  A rescued tick increments `ok`, not `fail`; those counters mean *frames on
   disk*, which is what the encoder's `Cov%` divides. `retried` is tracked
   separately and reported in the `capture stopped` line.
-- `_dest_path(dt)` — builds the destination, creating the day directory only
+- `_dest_path(dt)`: builds the destination, creating the day directory only
   when the date changes (cached in `self._last_dir`, so no `mkdir` syscall per
   frame).
   **Do not rename this method to `_target`.** `threading.Thread.__init__`
   assigns `self._target = None`, which silently shadows any method of that name;
   the symptom is `TypeError: 'NoneType' object is not callable` on every
   capture. This bug was hit during development. `self.name_` has a trailing
-  underscore for the same reason — `Thread.name` is taken.
+  underscore for the same reason: `Thread.name` is taken.
 - Failure logging is throttled: the first failure logs, then every
   `log_every_n_failures`-th. An offline camera produces 2 log lines per hour, not
   720. Recovery logs once. External uptime monitoring is the real alerting path
   for camera reachability; this log is for post-hoc diagnosis.
 
-**`RtspCamera(threading.Thread)`** — one per `method: "rtsp"` camera, for devices
+**`RtspCamera(threading.Thread)`**: one per `method: "rtsp"` camera, for devices
 with no HTTP snapshot endpoint (e.g. TP-Link Tapo).
 
 Supervises a persistent `ffmpeg` doing `-vf fps=1/N` into the image2 muxer with
@@ -218,7 +218,7 @@ Pipeline, in `main()`:
    `encode_day()` builds its filter chain from.** `testsrc` emits rgb24; left
    to negotiate, ffmpeg picks the closest format the encoder advertises, and
    `av1_nvenc` advertises `yuv444p`. NVENC on Ada cannot do AV1 in 4:4:4, so
-   the capability check failed and reported "No capable devices found" — which
+   the capability check failed and reported "No capable devices found", which
    declared an RTX 4060 incapable of AV1 it does perfectly well in 4:2:0. A
    probe that encodes something the pipeline never produces is worse than no
    probe. Both now read one constant so they cannot drift.
@@ -242,25 +242,25 @@ Pipeline, in `main()`:
 
 **`encode_day()`** is the core. Notable choices:
 
-- `valid_frames()` filters on file size and a 3-byte SOI read — cheap, ~17k stats
+- `valid_frames()` filters on file size and a 3-byte SOI read: cheap, ~17k stats
   and 3-byte reads. It should almost never reject anything now that capture
   writes atomically; it exists to defend the encode against the RTSP path and
   against filesystem damage.
 - `probe_dimensions()` ffprobes the *first* frame, and the scaler is pinned to
   that size. A stray odd-sized snapshot mid-day would otherwise break the concat
-  demuxer. Dimensions are rounded down to even — NVENC requires it. This call
+  demuxer. Dimensions are rounded down to even; NVENC requires it. This call
   lives *inside* the try block: a camera whose first frame won't probe must fail
   only itself, not abort the whole run.
 - **Colour handling.** JPEG decodes as `yuvj420p`, full range. The filter chain
   is `scale=W:H:in_range=full:out_range=limited,format=yuv420p` and the output is
   tagged `-color_range tv -colorspace bt709 -color_primaries bt709 -color_trc
   bt709`. A predecessor passed `-color_range 2`, which *tagged* full range
-  without *converting* — correct only in players that honour the tag. Converting
+  without *converting*, correct only in players that honour the tag. Converting
   and tagging consistently is correct everywhere. If you change one of these,
   change both.
-- `write_concat_list()` — ffmpeg concat demuxer format is `file 'path'` with
-  literal `'` escaped as `'\''`. Written with plain `open()` in UTF-8, **no BOM**
-  — the PowerShell predecessor hit `unknown keyword '﻿file'` because
+- `write_concat_list()`: ffmpeg concat demuxer format is `file 'path'` with
+  literal `'` escaped as `'\''`. Written with plain `open()` in UTF-8, **no BOM**;
+  the PowerShell predecessor hit `unknown keyword '﻿file'` because
   `Add-Content -Encoding UTF8` emitted one.
 - ffmpeg gets `-r` twice: before `-i` (input rate, i.e. how fast to consume
   stills) and after (output rate). Both must be the same value or frames get
@@ -272,20 +272,20 @@ Pipeline, in `main()`:
 
 `mount_problem()` runs first when `transfer.require_mountpoint` is set. An
 unmounted CIFS/NFS destination is an ordinary empty local directory, so rsync
-would fill the local disk and then delete the originals — strictly worse than
+would fill the local disk and then delete the originals, strictly worse than
 not transferring. Refusing returns a transfer failure, which by the rule below
 does not spoil the encode; the videos stay in `video_output` and ship next run.
 `true` walks up from the destination and fails if it reaches the filesystem
 root; a string checks that exact path with `os.path.ismount`, which is more
 precise when an intermediate directory is its own filesystem. One code path
 serves both a local mount (`/mnt/nas/timelapse/`) and a remote spec
-(`user@nas:/mnt/user/timelapse/`) — rsync doesn't care. A missing `rsync` binary
+(`user@nas:/mnt/user/timelapse/`); rsync doesn't care. A missing `rsync` binary
 or a non-zero exit returns a failure dict rather than raising: **a transfer
 failure must not turn a successful encode into a critical abort**, because the
 encode result and the Discord summary are still valid and the videos are still
 on disk. This was a real bug found in testing.
 
-**`send_discord()`** uses `urllib` only — no dependency. Posts through
+**`send_discord()`** uses `urllib` only, no dependency. Posts through
 `post_webhook()`, which sets an explicit `User-Agent`. This is not cosmetic:
 Discord is behind Cloudflare, which rejects urllib's default
 `Python-urllib/3.x` with **HTTP 403, Cloudflare error 1010**, before the
@@ -293,7 +293,7 @@ request reaches Discord at all. With the documented
 `DiscordBot ($url, $version)` form the same request reaches the API. Truncates
 to Discord's limits (4096 description, 1024 per field value, 25 fields). Failure is logged and
 swallowed, catching `Exception` deliberately: a socket timeout is not a
-`URLError`, and notification is never load-bearing — least of all in the
+`URLError`, and notification is never load-bearing, least of all in the
 critical-failure handler, where an exception would mask the original error.
 
 ### 4.3 `timelapse_test.py`
@@ -314,14 +314,14 @@ logic cannot drift between the two).
 It also hosts `--usage` (`timelapse usage`), which is a report rather than a
 check but belongs to the same "inspect this installation" job and reuses
 `test_disk`'s free-space handling. `report_usage()` walks `frames_root` with
-`os.scandir` — a stat per frame, so seconds on a six-figure tree — and prints
+`os.scandir` (a stat per frame, so seconds on a six-figure tree) and prints
 frames, bytes and date range per camera.
 
 Its real purpose is the third column. It compares directories on disk against
 the config and flags two states that `du` cannot show you:
 
-- **`ORPHAN`** — a directory with no config entry at all.
-- **`disabled`** — an entry with `enabled: false`.
+- **`ORPHAN`**: a directory with no config entry at all.
+- **`disabled`**: an entry with `enabled: false`.
 
 `find_pending()` walks only cameras *enabled* in the config, so in both cases
 nothing will ever encode or delete those frames. They are the usual answer to
@@ -336,7 +336,7 @@ inspection. `--probe-profiles` short-circuits everything else.
 ### 4.4 `timelapse_setup.py`
 
 Configuration wizard. Run by `install.sh`, or standalone as `timelapse setup`.
-Writes `config.json` and nothing else — it never touches systemd, never enables
+Writes `config.json` and nothing else: it never touches systemd, never enables
 anything, and is safe to re-run.
 
 **Storage discovery** parses `/proc/mounts` rather than shelling out to `lsblk`
@@ -359,7 +359,7 @@ these is best-effort: a `None` rotational just means the SSD/HDD hint is
 omitted.
 
 `recommend()` prefers the roomiest filesystem that is not `/`, provided it has
-at least 20 GB — the OS disk is a poor place to write 17k files a day.
+at least 20 GB; the OS disk is a poor place to write 17k files a day.
 
 **Two things it exists to get right**, both of which are silent failures by hand:
 
@@ -373,9 +373,9 @@ at least 20 GB — the OS disk is a poor place to write 17k files a day.
 **Focused modes.** The wizard is also the maintenance tool, so a change after
 install never means reinstalling or re-answering everything:
 
-- `--transfer-only` (`timelapse transfer`) — just the destination, including
+- `--transfer-only` (`timelapse transfer`): just the destination, including
   re-deriving `ReadWritePaths=` when a share is added after the fact.
-- `--cameras-only` (`timelapse cameras`) — add/edit/remove/enable/test, looping
+- `--cameras-only` (`timelapse cameras`): add/edit/remove/enable/test, looping
   on a listing. Both load the existing config, change one section, and write it
   back through `write_config()`, so ownership and the `.bak` copy are handled
   the same way as a full run.
@@ -383,7 +383,7 @@ install never means reinstalling or re-answering everything:
 `--cameras-only` carries two responsibilities that are easy to lose:
 
 1. **It restarts `timelapse-capture.service`.** The daemon reads its camera list
-   once at startup — the same trap `install.sh` had when it replaced scripts
+   once at startup, the same trap `install.sh` had when it replaced scripts
    under a live service. `restart_capture_if_running()` asks, and says what to
    run if declined. Cameras never change paths, so the units themselves are
    untouched.
@@ -391,7 +391,7 @@ install never means reinstalling or re-answering everything:
    iterates cameras *enabled* in the config and looks for
    `<frames_root>/<name>/`, so removing a camera, **disabling** one, or renaming
    one without moving its directory all orphan whatever it has already
-   captured — permanently, since nothing else will ever encode it.
+   captured, and permanently, since nothing else will ever encode it.
    `warn_stranded()` counts the un-encoded day directories and names the
    `timelapse encode --date` that would rescue them; `rename_camera_frames()`
    offers to move the directory instead. Disabling being just as destructive as
@@ -405,7 +405,7 @@ rather than the tail, because Reolink-style URLs are identical for their first
 cuts off the `***`, reading as though nothing were masked.
 
 **`choose_web()`** is the wizard step for the web UI, and `--web-only` re-runs
-just it — same reasoning as `--transfer-only`: turning the UI on later must not
+just it, same reasoning as `--transfer-only`: turning the UI on later must not
 mean walking the whole wizard, and a feature the wizard never offers is one
 nobody finds. It previews *where videos will be read from* and why, because
 that is the surprising part (see `resolve_library()` in §4.5), states the lack
@@ -417,7 +417,7 @@ read-only.
 
 **Input handling.** `init_tty()` picks a source: stdin if it is a terminal,
 otherwise `/dev/tty`, otherwise defaults-only. It must *never* silently read a
-piped stdin — under `curl … | bash` that pipe is the installer script itself.
+piped stdin: under `curl … | bash` that pipe is the installer script itself.
 `--stdin` opts in explicitly for scripted runs. Passwords go through
 `getpass` when a real terminal is present, so they stay out of scroll-back.
 
@@ -425,10 +425,10 @@ piped stdin — under `curl … | bash` that pipe is the installer script itself
 
 Long-running, `Type=simple`, `Restart=on-failure`. Optional: it exits 0 when
 `web.enabled` is false, which is why the unit is `on-failure` rather than
-`always` — that exit is a decision to respect, not a crash to restart through.
+`always`: that exit is a decision to respect, not a crash to restart through.
 
 **Read-only is a structural property, not a promise.** The service writes
-exactly one thing — its sqlite index — and `ReadWritePaths` names that
+exactly one thing, its sqlite index, and `ReadWritePaths` names that
 directory and nothing else. The video library, the captured frames and
 `config.json` are all read-only to it, enforced by the sandbox rather than by
 the source. Verified: a process with this unit's properties can write
@@ -444,7 +444,7 @@ for no benefit.
 
 **`PrivateTmp=true` hides `/tmp` and `/var/tmp` from the unit.** A library
 placed under either is invisible to the service and the page reports it as
-unreadable — which is correct but baffling. Cost an hour of a test run; worth
+unreadable, which is correct but baffling. Cost an hour of a test run; worth
 knowing before someone points `library_root` at a scratch directory.
 
 **`resolve_library()`** is the part with actual thinking in it. Videos are not
@@ -456,7 +456,7 @@ order is `web.library_root`, then `transfer.destination` when transfer is
 enabled, then `video_output`.
 
 A destination is not necessarily a path. `is_remote_spec()` classifies
-`user@nas:/path` and `rsync://host/mod` as remote — unreadable without SSH, and
+`user@nas:/path` and `rsync://host/mod` as remote: unreadable without SSH, and
 reported as such rather than rendered as an empty list. An absolute path is
 settled before the colon test, so `/mnt/odd:name/videos` stays local.
 
@@ -474,19 +474,19 @@ dropped NAS mount is a *correct* empty library, not a fault.
   video files in the surveyed library parse.
 - **A name is a place, not a camera.** Cameras get repurposed across years, so
   two similar names are not evidence of one thing. The index **never merges**
-  them — `Workshop` and `workshop` stay two rows — and only sorts
+  them (`Workshop` and `workshop` stay two rows) and only sorts
   case-insensitively so variants sit adjacent for the reader to judge.
 - **The path is the primary key.** `(camera, date)` is not unique in the wild.
 - **An extension allow-list**, because "not a directory" is not a test for "is
   a video": the surveyed library has a leftover `.ps1` in its root.
 - **The first scan runs in a background thread**, started only after the socket
   is listening, so the page reporting its progress is never delayed by it. No
-  duration budget is assumed anywhere — the one measurement taken (1.7 s for
+  duration budget is assumed anywhere; the one measurement taken (1.7 s for
   6,848 files) came from a 10G workstation while deployments read CIFS over 1G,
   and the work is round-trips rather than megabytes.
 - **Reconciliation is on access.** Opening a folder re-reads that one directory
   and diffs it; opening a file re-stats it. An earlier version gated the
-  directory read on its mtime and skipped it when unchanged — that was both a
+  directory read on its mtime and skipped it when unchanged; that was both a
   false economy (reading one directory is a single round trip) and a
   correctness hole, since mtime is stored at second granularity and anything
   added within the same second as the last scan stayed invisible.
@@ -498,14 +498,14 @@ dropped NAS mount is a *correct* empty library, not a fault.
 **Serving and handoff** (`/video/<path>`, `/play/<path>`).
 
 - **Playback is delegated, not embedded.** The default output is AV1 in
-  Matroska — close to the worst case for a browser `<video>`, and native to
+  Matroska, close to the worst case for a browser `<video>`, and native to
   VLC, mpv and MPC-HC. `/play/<path>` returns a one-line `.m3u` whose
   `Content-Disposition` filename ends in `.m3u`, which is what makes the
   desktop hand it to a player; the URL extension is irrelevant to that.
 - **Two playlists.** `/play/<path>` is one video; `/day/<YYYY-MM-DD>` is every
   video from one day, so reviewing a day means opening a single file rather
   than one per place. Entries are ordered `lower(camera)`, which puts two
-  spellings of a place adjacent without folding either into the other — the
+  spellings of a place adjacent without folding either into the other, the
   same rule the index itself follows.
 - **A day playlist re-stats every entry before emitting it.** A playlist is
   handed to a player that will not come back and ask again, so a dead URL in it
@@ -526,7 +526,7 @@ dropped NAS mount is a *correct* empty library, not a fault.
   so a reverse proxy terminating TLS produces working links.
 - **The extension allow-list is enforced in `reconcile_file()`, not only in the
   scan.** `/video/<path>` resolves through it, and without the check a request
-  could name any file the user keeps beside their videos — `abs_path()` stops
+  could name any file the user keeps beside their videos; `abs_path()` stops
   a request leaving the library, this stops it reading everything inside.
   Found by a test, having shipped through a full review as `200 OK` on a
   `.txt`.
@@ -534,13 +534,13 @@ dropped NAS mount is a *correct* empty library, not a fault.
   `Content-Length` already in the header rather than by EOF: a file that grew
   since the stat would otherwise corrupt the response, and one that shrank
   would leave a short body, which under keep-alive hangs the client instead of
-  failing it — so that case closes the connection. `BrokenPipeError` and
+  failing it, so that case closes the connection. `BrokenPipeError` and
   `ConnectionResetError` are caught and ignored, because a viewer quitting VLC
   is the normal way a video request ends.
 - **Range requests** (`parse_range()`) are what make scrubbing work. Single
   ranges only: closed (`bytes=0-499`), open (`bytes=500-`) and suffix
   (`bytes=-500`, which is how a player reads a Matroska trailer). An end past
-  the file is **clamped, not refused** — required by RFC 7233, and a common
+  the file is **clamped, not refused**: required by RFC 7233, and a common
   place to get a 416 wrong. A start past the file, a backwards range, or
   `bytes=-0` is 416, which still carries `Content-Range: bytes */<size>` so the
   client can correct itself.
@@ -552,7 +552,7 @@ dropped NAS mount is a *correct* empty library, not a fault.
   megabyte of digits, and arbitrary-precision arithmetic on that is real work
   for a request that was never going to be satisfiable.
 - **`ETag` and `Last-Modified` come from the fresh stat**, so they change
-  whenever the file does — that is what makes `If-Range` meaningful. A client
+  whenever the file does; that is what makes `If-Range` meaningful. A client
   resuming against a version we no longer have gets the whole current file
   instead of a slice, because splicing two encodes together produces a file
   that is corrupt in a way nothing would report.
@@ -560,7 +560,7 @@ dropped NAS mount is a *correct* empty library, not a fault.
   path, for a machine that has the mount, and the HTTP URL for VLC's *Open
   Network Stream*.
 
-**Status and logs** (`/status`, `/logs`) shell out, on request only — a page
+**Status and logs** (`/status`, `/logs`) shell out, on request only: a page
 load or a click. Nothing polls and nothing is collected in the background.
 
 - **A non-zero exit is not a failure.** `systemctl status` exits 3 for an
@@ -575,7 +575,7 @@ load or a click. Nothing polls and nothing is collected in the background.
   returns; a handler running it would hang until the client gave up. The web
   path is bounded (`-n`, `--no-pager`) with a subprocess timeout on top.
 - **The journal needs a group.** `journalctl -u` returns `-- No entries --`,
-  not a permission error, to a user outside `systemd-journal` — indistinguishable
+  not a permission error, to a user outside `systemd-journal`, indistinguishable
   from a quiet service, and it reads as a bug in the UI.
   `SupplementaryGroups=systemd-journal` in the unit grants it without putting
   the account in the group system-wide. `sync_units()` **deletes that line when
@@ -584,13 +584,13 @@ load or a click. Nothing polls and nothing is collected in the background.
   the empty result and explains it rather than leaving a blank pane.
 - **No request value reaches a command line.** `unit` and `n` are keys into
   `LOG_UNITS` and `LOG_LINES`; the *values* are what get executed, and an
-  unknown key falls back to the default rather than 400 — these come from
+  unknown key falls back to the default rather than 400: these come from
   links, and a stale bookmark should show the default log, not an error.
   `shell=True` appears nowhere.
 
 **Security posture.** Binds `127.0.0.1` by default and warns when it does not;
 `http.server` is not hardened and there is no TLS here. It never serves
-`config.json` and never renders a camera URL — those hold credentials. Routing
+`config.json` and never renders a camera URL; those hold credentials. Routing
 is an explicit allow-list; anything unrecognised is 404 with no filesystem
 lookup. `server_version`/`sys_version` are overridden so the interpreter
 version is not advertised.
@@ -606,20 +606,20 @@ dependencies, creates the `timelapse` system account, places scripts, units and
 a `timelapse` command wrapper, then calls the wizard and offers to enable.
 
 It uses the checkout it is running from when there is one, and otherwise
-downloads a tarball from `codeload.github.com` — so the same script serves both
+downloads a tarball from `codeload.github.com`, so the same script serves both
 `git clone && sudo ./install.sh` and the piped one-liner.
 
 `sync_units()` is the important part: it rewrites `User=`, `Group=`,
 `ExecStart=` and `ReadWritePaths=` in the installed units from the config the
 wizard just wrote. `timelapse-web.service` is templated **separately**, with
 its own narrower `ReadWritePaths` from `--print-web-paths`, and the state
-directory is created there too — `ReadWritePaths` naming a directory that does
+directory is created there too: `ReadWritePaths` naming a directory that does
 not exist stops the unit dead, and the service cannot create it because by then
 its parent is read-only to it.
 
 `RESTART_UNITS` lists every long-running unit. **A unit missing from it gets
 replaced on disk and keeps serving the old build while the installer reports
-success** — the bug this function exists to fix. The encoder is deliberately
+success**: the bug this function exists to fix. The encoder is deliberately
 absent: it is oneshot, so a run in flight finishes on the code it started with.
 
 Prompts read from `/dev/tty` for the same reason the wizard's do. `--uninstall`
@@ -677,15 +677,15 @@ is read with `.get(key, default)`.
 | Key | Notes |
 |---|---|
 | `enabled` | `false` by default. The program exits 0 when false, so the unit may be enabled without the server running. |
-| `bind` | `127.0.0.1` by default. There is no authentication and no TLS — any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup. |
+| `bind` | `127.0.0.1` by default. There is no authentication and no TLS; any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup. |
 | `port` | `8787` by default. |
-| `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path — typically a remote rsync destination that is *also* mounted locally. Not `/tmp` or `/var/tmp`: `PrivateTmp=true` hides those from the unit. |
-| `state_dir` | The **only** directory the web UI may write to; holds the sqlite index. The unit's `ReadWritePaths` is scoped to exactly this, so the library, the frames and the config stay read-only to it. `install.sh` creates it — a `ReadWritePaths` naming a missing directory stops the unit dead, and the service cannot create it itself. |
+| `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path, typically a remote rsync destination that is *also* mounted locally. Not `/tmp` or `/var/tmp`: `PrivateTmp=true` hides those from the unit. |
+| `state_dir` | The **only** directory the web UI may write to; holds the sqlite index. The unit's `ReadWritePaths` is scoped to exactly this, so the library, the frames and the config stay read-only to it. `install.sh` creates it: a `ReadWritePaths` naming a missing directory stops the unit dead, and the service cannot create it itself. |
 
 ### `cameras[]`
 | Key | Notes |
 |---|---|
-| `name` | **Used as the directory name.** Renaming a camera orphans its existing frames — the encoder walks directories under configured camera names, so frames under the old name are stranded. Rename with care. |
+| `name` | **Used as the directory name.** Renaming a camera orphans its existing frames; the encoder walks directories under configured camera names, so frames under the old name are stranded. Rename with care. |
 | `enabled` | Excluded from both capture and encode when false. |
 | `method` | `http` or `rtsp`. |
 | `auth` | `digest`, `basic`, or `none`. Cameras that put credentials in the query string → `none`. |
@@ -715,32 +715,32 @@ is read with `.get(key, default)`.
 
 Ordered roughly by how much of the existing design they disturb.
 
-**Add a camera** — one config entry. No code.
+**Add a camera**: one config entry. No code.
 
-**New snapshot protocol** — subclass `threading.Thread` in
+**New snapshot protocol**: subclass `threading.Thread` in
 `timelapse_capture.py` following `HttpCamera`, honour `STOP` and `PAUSED`, write
 via temp + `os.replace`, and dispatch on `method` in `main()`. Nothing in the
 encoder changes.
 
-**Per-camera settings** (different interval, resolution, quality) — the camera
+**Per-camera settings** (different interval, resolution, quality): the camera
 dict is already passed whole to the thread constructor; read from `cam` with a
 fallback to the global. The encoder's `Cov%` maths assumes the global interval
 and would need the per-camera value threading through `build_summary`.
 
-**Different notification sink** — `send_discord()` is the only
+**Different notification sink**: `send_discord()` is the only
 outbound-notification function and takes `(title, description, color, fields)`.
 Add a sibling and call both from `main()`; keep failures swallowed.
 
-**Camera restart on hang** — natural home is a new module invoked by the capture
+**Camera restart on hang**: natural home is a new module invoked by the capture
 daemon's failure path, gated on consecutive-failure count, with a cooldown so it
 can't reboot-loop a camera. Detection already exists (`consec_fail`); this is
 remediation only.
 
-**Frame retention beyond encode** — set `delete_frames_on_success: false` and add
+**Frame retention beyond encode**: set `delete_frames_on_success: false` and add
 a separate age-based sweeper. Do not add retention logic to `encode_day()`; keep
 "encode" and "delete" separable.
 
-**Parallel encoding** — currently sequential and deliberately so. NVENC session
+**Parallel encoding**: currently sequential and deliberately so. NVENC session
 limits on consumer GeForce cards are low, and the real bottleneck is CPU JPEG
 decode, which already uses all cores per job. Parallelism would contend, not
 help.
@@ -758,7 +758,7 @@ help.
   synchronised to the same instant.
 - **A frozen-but-reachable camera** produces a full frame count and a static
   video. No automatic detection; the tell is a suspiciously small output file.
-- **Video length varies with capture coverage** — a camera down for 6 hours
+- **Video length varies with capture coverage**: a camera down for 6 hours
   produces a shorter video, not a video with gaps.
 - `Cov%` is computed against a nominal `86400/interval` and will read ~104% or
   ~96% on DST days.
@@ -773,7 +773,7 @@ python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
 **Unit tests** (`tests/test_*.py`, stdlib `unittest`, 427 cases, about forty-five
-seconds — `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
+seconds; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
 `writable_paths`, credential quoting, `_dest_path` including the DST
@@ -781,7 +781,7 @@ collision suffixes, and the web UI's library resolution and routing. Anything
 needing a camera, a GPU or systemd is out of scope here by design.
 
 `test_web.py` drives the real handler through a fake socket rather than binding
-a port — a listening socket in a unit test is a flake waiting for a busy CI
+a port: a listening socket in a unit test is a flake waiting for a busy CI
 runner. The fake implements `sendall`, not a writable `makefile`, because
 `StreamRequestHandler` sets `wbufsize = 0` and wraps the socket directly.
 
@@ -796,11 +796,11 @@ exist.
 corrupt ones, named as real captures), runs `timelapse_encode.py` over it, and
 asserts what has actually broken before: bad frames rejected, exact output
 duration, `color_range=tv`, `color_space=bt709`, `pix_fmt=yuv420p`, frames
-deleted afterwards. Needs ffmpeg but no GPU — it falls back to libx264.
+deleted afterwards. Needs ffmpeg but no GPU; it falls back to libx264.
 
 **The suite was mutation-checked** when written: 18 deliberate breakages
 introduced one at a time, 16 caught. The two misses were tests passing for the
-wrong reason — a network-filesystem case rejected by the source filter before
+wrong reason: a network-filesystem case rejected by the source filter before
 the fstype rule ran, and a deduplication case filtered by a skip-prefix before
 deduplication happened. Both are fixed, and both are worth remembering as the
 failure mode to watch for when adding tests here: assert that the rule you
@@ -809,18 +809,18 @@ failure mode to watch for when adding tests here: assert that the rule you
 The rest was verified by hand. The methods, in case you want to re-verify after
 changes:
 
-- **Capture daemon** — two cameras against a local `http.server`, one valid URL
+- **Capture daemon**: two cameras against a local `http.server`, one valid URL
   and one 404. Confirmed: files land on exact interval boundaries, correct
   directory layout, no leftover `.tmp`, failure throttling works, clean SIGTERM
   shutdown.
-- **Installer and wizard** — Ubuntu 24.04 with real systemd. Confirmed: package
+- **Installer and wizard**: Ubuntu 24.04 with real systemd. Confirmed: package
   detection and dependency install, service account creation, unit templating
   (`systemd-analyze verify` clean), a live capture run against a local HTTP
   camera writing frames **at a non-default path under `ProtectSystem=strict`**
-  — which is what actually exercises the `ReadWritePaths` derivation — a nightly
+  (which is what actually exercises the `ReadWritePaths` derivation), a nightly
   encode as the service user, and a clean uninstall. Worth repeating on a distro
   using a different package manager; only apt has been exercised.
-- **Web UI** — Ubuntu 24.04 under real systemd. Confirmed: `web.enabled: false`
+- **Web UI**: Ubuntu 24.04 under real systemd. Confirmed: `web.enabled: false`
   exits 0 rather than serving; each library-resolution branch reports the right
   source (fallback, destination, remote spec, missing mount, explicit override);
   `/healthz`, 404 on unknown routes, no interpreter version in the `Server`
@@ -828,9 +828,9 @@ changes:
   install → re-install → uninstall cycle including `sync_units()` leaving the
   web unit without a `ReadWritePaths` line and `restart_upgraded_services()`
   picking the live unit up.
-- **Library index** — same host. Confirmed: `ReadWritePaths` really is scoped
+- **Library index**: same host. Confirmed: `ReadWritePaths` really is scoped
   (a process with the unit's properties can write the state directory and
-  **cannot** write the library or the frames — this is the claim worth
+  **cannot** write the library or the frames; this is the claim worth
   testing, not asserting); the state directory is created by the installer and
   owned by the service user; `--print-web-paths` agrees with the templated
   unit; a nine-file library indexes to eight with the `.ps1` excluded;
@@ -838,30 +838,30 @@ changes:
   human-named event folder survive; a folder view picks up a file added and a
   file deleted behind the service's back, and says the index had drifted;
   `/rescan` is 404 on GET and 303 on POST.
-- **Wizard and wiring** — same host. Confirmed: an unattended install leaves
+- **Wizard and wiring**: same host. Confirmed: an unattended install leaves
   the UI **off**; `timelapse web` runs the wizard (not the server) and writes
   the answers; the state directory is created and owned correctly; a re-install
   templates `ReadWritePaths` to that one directory; enabling the unit serves
   the configured `library_root` on the configured port; the wizard turns it
   back off again; `timelapse web-serve` still runs it in the foreground; and a
   non-loopback bind produces the reverse-proxy warning.
-- **Range** — same host, and verified with a real player rather than only with
+- **Range**: same host, and verified with a real player rather than only with
   curl. Byte-exact slices for closed, open-ended and suffix ranges; clamping;
   416 carrying the true size; multi-range and junk falling back to 200;
   `If-Range` honoured when it matches and ignored when it does not. Then the
   part that actually matters: **ffprobe read the container over HTTP and ffmpeg
-  seeked to 5s, 30s and 55s of a 60s video and decoded a frame at each** —
+  seeked to 5s, 30s and 55s of a 60s video and decoded a frame at each**,
   with the frames compared against each other, because three identical images
   would mean every seek had silently landed at byte zero. Repeated against a
   URL taken straight out of a day playlist.
-- **Day playlists** — same host, seven places across two days plus one
+- **Day playlists**: same host, seven places across two days plus one
   legacy-named file. Confirmed: the playlist carries all eight of that day's
   videos including the legacy name, leaks nothing from the neighbouring day,
   orders `Workshop` and `workshop` adjacent without merging them, is named
   `timelapse-<day>.m3u`, and **every URL inside it fetches**; a file deleted
   after the scan drops out rather than becoming a dead entry; and four
   malformed dates plus an empty day are all 404.
-- **Serving** — same host. Confirmed: a 5 MB video arrives with a matching
+- **Serving**: same host. Confirmed: a 5 MB video arrives with a matching
   sha256 and exact length; `Content-Type`, `Content-Length` and
   `Accept-Ranges: none` are right; `?download=1` sets an attachment; a folder
   name containing spaces round-trips percent-encoded; the `.m3u` carries the
@@ -871,20 +871,20 @@ changes:
   traversal shapes are refused; a file changed in place is re-stat'd on access
   and a deleted one 404s; and aborting a download mid-stream leaves the service
   running with no traceback in the journal.
-- **Status pane** — same host, **both** journal states exercised, which is the
+- **Status pane**: same host, **both** journal states exercised, which is the
   point: with `SupplementaryGroups=systemd-journal` the log pane returns real
   entries; with the line deleted the unit still starts, `systemctl status` still
   works (it needs no journal), and the log pane explains the empty result
   instead of showing a blank. The `sync_units()` guard was checked by shadowing
-  `getent` on `PATH` so the group appeared to be missing — the line is removed
+  `getent` on `PATH` so the group appeared to be missing: the line is removed
   and the installer says why. Also confirmed `systemctl` reaches PID 1 from
   inside the sandbox, which is what `RestrictAddressFamilies=…AF_UNIX` is for.
-- **Query-string credential encoding** — a password containing `@ & = #` fed
+- **Query-string credential encoding**: a password containing `@ & = #` fed
   through the wizard and parsed back out of the generated URL unchanged.
-- **Profile probe** — mock ONVIF endpoint serving 2560×1440 / 704×576 / 640×480
+- **Profile probe**: mock ONVIF endpoint serving 2560×1440 / 704×576 / 640×480
   for Profile_1/2/3. Confirmed it identifies the largest and recommends the
   config change.
-- **Transfer** — stub `rsync` on `PATH`.
+- **Transfer**: stub `rsync` on `PATH`.
 
 Regenerating a synthetic frame set:
 
@@ -929,8 +929,8 @@ AV1/HEVC), `rsync`. No virtualenv required, one pip package, no database. The
 web UI adds nothing: it is `http.server` and the stdlib.
 
 All three systemd units use `ProtectSystem=strict` with an explicit
-`ReadWritePaths`. **Any new write path — a different frames root, a CIFS
-mountpoint for transfer — must be added there**, or writes fail with a
+`ReadWritePaths`. **Any new write path (a different frames root, a CIFS
+mountpoint for transfer) must be added there**, or writes fail with a
 confusing read-only error. `timelapse-web.service` is scoped to a single
 directory, its index, and must stay that way: it is the only network-facing
 unit, and widening it to match the others would give it write access to every

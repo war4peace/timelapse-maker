@@ -1,4 +1,4 @@
-"""Unit tests for timelapse_encode.py — the pure logic, no ffmpeg involved.
+"""Unit tests for timelapse_encode.py: the pure logic, no ffmpeg involved.
 
 The end-to-end encode is covered separately by tests/smoke_test.py.
 """

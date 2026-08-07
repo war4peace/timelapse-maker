@@ -1,4 +1,4 @@
-"""Unit tests for timelapse_setup.py — storage discovery and config shaping.
+"""Unit tests for timelapse_setup.py: storage discovery and config shaping.
 
 The storage scan is the part with real bug surface: it has to reject a dozen
 kinds of thing that look like disks but aren't. These drive it with a synthetic
@@ -494,7 +494,7 @@ class TestCameraCounter(unittest.TestCase):
 
 
 class TestCameraManagement(unittest.TestCase):
-    """`timelapse cameras` — add/edit/remove against a live config.
+    """`timelapse cameras`: add/edit/remove against a live config.
 
     The bias in these tests is toward the ways this can silently lose data.
     The encoder builds its work list from the cameras *enabled* in the config

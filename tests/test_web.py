@@ -1,4 +1,4 @@
-"""Unit tests for timelapse_web.py — library resolution and request routing.
+"""Unit tests for timelapse_web.py: library resolution and request routing.
 
 No sockets are opened. The handler is exercised through a fake request rather
 than a live server: the routing and the escaping are the parts worth pinning,

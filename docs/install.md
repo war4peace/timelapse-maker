@@ -43,7 +43,7 @@ and offers to keep your existing config.
 The download and the execution are deliberately two steps, so you can read the
 script before running it as root.
 
-> **Piping straight to bash** (`curl -sL … | sudo bash`) also works — the
+> **Piping straight to bash** (`curl -sL … | sudo bash`) also works; the
 > installer and wizard read prompts from `/dev/tty` rather than stdin, because
 > under a pipe stdin *is* the script. If no terminal is reachable at all, both
 > fall back to accepting defaults instead of hanging.
@@ -66,7 +66,7 @@ What it does and does not touch:
 | `config.example.json` | Replaced, so you can diff it for new keys. |
 | Scripts and units | Replaced, then `ReadWritePaths` is re-derived from your config. |
 | Captured frames and videos | Never touched. |
-| A running capture daemon | Restarted, after asking — see below. |
+| A running capture daemon | Restarted, after asking; see below. |
 | An encode already in flight | Left alone. It is oneshot, so it finishes on the build it started with and the next nightly trigger uses the new one. |
 
 **Why the restart prompt matters.** A running daemon keeps executing the code it
@@ -78,7 +78,7 @@ on disk. Apply it later with:
 sudo systemctl restart timelapse-capture.service
 ```
 
-A restart costs only the frames due while it happens — a second or two.
+A restart costs only the frames due while it happens: a second or two.
 
 **New config keys** are read with defaults, so an older `config.json` keeps
 working; you get the new behaviour without editing anything. Re-run
@@ -120,8 +120,8 @@ sudo mkdir -p /var/lib/timelapse/{frames,videos,logs}
 sudo chown -R timelapse:timelapse /var/lib/timelapse
 ```
 
-Then edit `/etc/timelapse/config.json`: camera URLs, credentials, and — if you
-put frames anywhere other than `/var/lib/timelapse` — the `paths` block.
+Then edit `/etc/timelapse/config.json`: camera URLs, credentials, and, if you
+put frames anywhere other than `/var/lib/timelapse`, the `paths` block.
 
 > **If you change `paths`**, update `ReadWritePaths=` in *both* systemd units to
 > match. They run with `ProtectSystem=strict`, so an unlisted path fails with a
@@ -136,8 +136,8 @@ The installer runs it automatically. Run it again any time with:
 timelapse setup
 ```
 
-It scans `/proc/mounts` for real, writable, local filesystems — skipping pseudo
-filesystems, read-only mounts, snap/docker paths and network shares — reads free
+It scans `/proc/mounts` for real, writable, local filesystems (skipping pseudo
+filesystems, read-only mounts, snap/docker paths and network shares), reads free
 space with `statvfs`, and checks `/sys/block/<dev>/queue/rotational` to label
 each one SSD or HDD:
 
@@ -166,7 +166,7 @@ Two things it does that are easy to get wrong by hand:
   a read-only error that looks nothing like a permissions problem.
 
 Network filesystems (NFS, CIFS, 9p, sshfs) are deliberately excluded as frame
-storage — `os.replace()` gives no atomicity guarantee across the wire, and 17k
+storage: `os.replace()` gives no atomicity guarantee across the wire, and 17k
 small writes per camera per day over a network is painful. They are still fine
 as a *transfer destination*, which is a nightly bulk copy.
 
@@ -187,7 +187,7 @@ Fix everything red before going further.
 
 If any camera URL contains `Profile_N`, check which profile is actually the main
 stream. On Hikvision, **Profile_1 is normally the main stream, Profile_2 the
-substream, Profile_3 the third stream** — but the numbering is not consistent
+substream, Profile_3 the third stream**, but the numbering is not consistent
 across vendors, and nothing in the URL tells you which you got. Guessing wrong
 silently gives you a low-resolution timelapse.
 
@@ -213,18 +213,18 @@ budget.
 
 ### Common snags
 
-- **HTTP 401** — try the other auth scheme (`digest` ↔ `basic`). Some cameras
+- **HTTP 401**: try the other auth scheme (`digest` ↔ `basic`). Some cameras
   reject the admin account on ONVIF endpoints but accept a separate ONVIF user.
   If the URL works with no credentials at all, set `"auth": "none"` and drop
   the username/password.
 - **Reolink-style URLs** put credentials in the query string, so they need
   `"auth": "none"`. URL-encode any `&`, `#`, `+` or `%` in the password, or the
   URL silently parses wrong.
-- **A camera that passes one test fetch but fails in service** — some cameras
+- **A camera that passes one test fetch but fails in service**: some cameras
   cope badly with sustained polling. Watch the first hour:
   `grep <Camera> <log_dir>/capture.log`. Raising `interval_seconds` usually
   fixes it.
-- **Regular bursts of HTTP 500 from one camera, minutes apart** — check whether
+- **Regular bursts of HTTP 500 from one camera, minutes apart**: check whether
   your NVR is *also* pulling from it. This is the most likely snag on a shared
   host, because that is exactly where you would install this: leaving AgentDVR's
   own timelapse or snapshot schedule enabled points two clients at one camera,
@@ -232,13 +232,13 @@ budget.
 
   The signature is a *fixed number* of consecutive failures per burst (a
   duration, not a coin flip), recovering on its own each time. Turn off the
-  NVR's timelapse/snapshot schedule for cameras this tool owns — you are
+  NVR's timelapse/snapshot schedule for cameras this tool owns; you are
   replacing that feature, which is the point.
 
   You do not need to watch the journal for this. The nightly Discord summary
   prints `Cov%` per camera; one camera sitting a few points below the others is
   the same story.
-- **`av1_nvenc not available`** — distro ffmpeg builds often lack NVENC. Use a
+- **`av1_nvenc not available`**: distro ffmpeg builds often lack NVENC. Use a
   BtbN static build or `jellyfin-ffmpeg` and point `paths.ffmpeg` at it. The
   script falls back to HEVC then x264 rather than failing, but you lose AV1.
 
@@ -255,7 +255,7 @@ sudo systemctl enable --now timelapse-encode.timer
 journalctl -u timelapse-capture -f
 ```
 
-Check after an hour — at a 5s interval this should be ≈ 720 × cameras:
+Check after an hour: at a 5s interval this should be ≈ 720 × cameras:
 
 ```bash
 find /var/lib/timelapse/frames -name '*.jpg' | wc -l
@@ -273,7 +273,7 @@ without encoding, transferring or deleting anything. Safe on live data.
 
 ## 6. Transfer destination
 
-`transfer.destination` is either a local path or an rsync remote spec — one code
+`transfer.destination` is either a local path or an rsync remote spec; one code
 path serves both.
 
 **rsync over SSH (recommended, no stale-mount failure mode):**
@@ -301,7 +301,7 @@ sudo timelapse transfer
 Two things it exists to catch, both of which are silent by hand:
 
 - **`rsync -a` may or may not work.** `-a` implies `--owner --group`, which a
-  CIFS mount often cannot honour — rsync then exits `23` every night even
+  CIFS mount often cannot honour; rsync then exits `23` every night even
   though the files arrived. Whether it happens depends on the server and the
   mount options (`forceuid`/`forcegid` can make it a non-issue), so the script
   tries `-a`, `-rt` and `-a --no-perms --no-owner --no-group` and tells you
@@ -313,11 +313,11 @@ Two things it exists to catch, both of which are silent by hand:
   videos in `video_output` to ship on the next run.
 
 Whichever way you mount it, add the mountpoint to `ReadWritePaths=` in
-`timelapse-encode.service` — `ProtectSystem=strict` will otherwise fail the
+`timelapse-encode.service`; `ProtectSystem=strict` will otherwise fail the
 write read-only.
 
 Set `transfer.enabled` to `false` to keep videos on the local disk. Note that
-nothing then prunes `video_output` — add your own retention if you do this.
+nothing then prunes `video_output`; add your own retention if you do this.
 
 ## 7. Sizing
 
@@ -328,21 +328,21 @@ resident for up to two days (yesterday's are still there while the encoder works
 through them). Six cameras is therefore ~60 GB/day and ~130 GB resident.
 
 Full-resolution main streams can be several times larger than that. Trust
-`timelapse_test.py`'s projection over any estimate — it measures your actual
+`timelapse_test.py`'s projection over any estimate; it measures your actual
 snapshots. A spinning disk is fine for frames; the access pattern is sequential
 write-once/read-once.
 
 Write endurance is a non-issue on SSD: even 110 GB/day is ~40 TB/year against a
 typical 600 TBW consumer rating.
 
-## 8. Day to day — the `timelapse` command
+## 8. Day to day: the `timelapse` command
 
 The installer puts a single wrapper on `PATH`. Everything below is a subcommand
 of it; nothing needs a reinstall.
 
 | Command | What it does |
 |---|---|
-| `timelapse status` | `systemctl status` for the capture service and the encode timer, in one shot — running or not, how long, recent log lines, and when the next encode fires. |
+| `timelapse status` | `systemctl status` for the capture service and the encode timer, in one shot: running or not, how long, recent log lines, and when the next encode fires. |
 | `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and Discord. Run it after any change. |
@@ -350,7 +350,7 @@ of it; nothing needs a reinstall.
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
 | `timelapse web` | Turn the read-only web UI on or off and set its address, port and library path. §10. |
 | `timelapse web-serve` | Run the web UI in the foreground for a look at its log. The service normally does this. |
-| `timelapse setup` | The full wizard again — storage, capture settings, cameras, transfer, Discord. Overwrites the whole config, so prefer `cameras` or `transfer` for a single change. |
+| `timelapse setup` | The full wizard again: storage, capture settings, cameras, transfer, Discord. Overwrites the whole config, so prefer `cameras` or `transfer` for a single change. |
 | `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover. You are then responsible for restarting capture yourself. |
 | `timelapse encode` | Runs the nightly encode immediately instead of waiting for 00:05. Useful to clear a backlog. |
 | `timelapse version` | The installed version of each script, and a warning if the running daemon predates them. |
@@ -392,14 +392,14 @@ timelapse usage
 ```
 
 The two flagged rows are the point of the command. The encode job only walks
-cameras **enabled** in the config, so a camera you removed — or merely disabled
-— keeps everything it ever captured, and nothing will ever encode or delete it.
+cameras **enabled** in the config, so a camera you removed, or merely disabled,
+keeps everything it ever captured, and nothing will ever encode or delete it.
 That is normally what is eating the disk. Re-enable the camera, or encode the
 days out with `timelapse encode --date YYYY-MM-DD`.
 
 `ORPHAN` means no config entry at all; `disabled` means the entry exists with
 `enabled: false`. Frames are never deleted behind your back, so both are safe
-to leave — they just cost space.
+to leave; they just cost space.
 
 It stats every frame file, so on a busy install expect a few seconds.
 
@@ -432,7 +432,7 @@ loops on single-key actions:
 ```
 
 Adding uses the same preset list and live test as the installer. Passwords in
-the query string are masked in the listing — `ask_secret` keeps them out of
+the query string are masked in the listing; `ask_secret` keeps them out of
 scroll-back when you type them, so printing them back would defeat it.
 
 **It restarts capture for you.** The daemon reads its camera list once, at
@@ -449,7 +449,7 @@ already-captured frames, and each one warns first:
 | Action | What would be lost |
 |---|---|
 | Remove a camera | Every un-encoded day it has captured |
-| **Disable** a camera | The same — `enabled: false` hides it from the encoder too, which is easy to miss |
+| **Disable** a camera | The same: `enabled: false` hides it from the encoder too, which is easy to miss |
 | Rename a camera | Everything under the old directory name |
 
 ```
@@ -461,7 +461,7 @@ already-captured frames, and each one warns first:
 ```
 
 A rename offers to move the directory with it, so that case is normally
-handled for you. Frames are never deleted — a removed camera's directory stays
+handled for you. Frames are never deleted; a removed camera's directory stays
 on disk, and re-adding it under the same name picks it straight back up.
 
 Editing `config.json` by hand still works (`timelapse config`), but then the
@@ -483,7 +483,7 @@ Then open `http://127.0.0.1:8787/`.
 
 It gives you four things:
 
-- **Where your videos actually are** — see the warning below, this is the
+- **Where your videos actually are**: see the warning below, this is the
   question people get wrong.
 - **Service status and recent log**, on request. Same output as `timelapse
   status` and `journalctl`, without an SSH session.
@@ -496,7 +496,7 @@ It gives you four things:
 ### Your videos are probably not in `video_output`
 
 The nightly transfer runs `rsync --remove-source-files`, so once it has run,
-`paths.video_output` is **empty** — the videos are at `transfer.destination`.
+`paths.video_output` is **empty**; the videos are at `transfer.destination`.
 The UI works this out for you and says which path it chose. Two cases worth
 knowing:
 
@@ -508,14 +508,14 @@ knowing:
 
 Do not put the library under `/tmp` or `/var/tmp`. The unit sets
 `PrivateTmp=true`, so the service gets a private empty one and reports your
-library as unreadable — correct, and thoroughly confusing.
+library as unreadable: correct, and thoroughly confusing.
 
-### It is not secured — bind it accordingly
+### It is not secured, so bind it accordingly
 
 There is **no login and no HTTPS**. The default bind is `127.0.0.1`, which
 means only this machine can reach it; the wizard warns you if you change that.
 
-To watch from a phone you must bind to the LAN — and then anyone on that
+To watch from a phone you must bind to the LAN, and then anyone on that
 network can watch your cameras' footage. Put a reverse proxy with TLS and
 authentication in front of it for anything beyond a trusted home network, and
 do not port-forward it.
@@ -525,7 +525,7 @@ do not port-forward it.
 One directory: `web.state_dir`, default `/var/lib/timelapse/web`, which holds
 an index of your library. `timelapse-web.service` lists exactly that path in
 `ReadWritePaths=`, so the videos, the captured frames and `config.json` are
-read-only to it — enforced by systemd, not merely intended.
+read-only to it: enforced by systemd, not merely intended.
 
 The installer creates that directory. The service cannot: a `ReadWritePaths=`
 naming a directory that does not exist stops the unit from starting, and inside
@@ -546,8 +546,8 @@ sorted next to each other. A camera name is a *place*, places get recycled
 between cameras over the years, and deciding whether two labels mean the same
 thing is your call, not the index's.
 
-Videos too small to be a real day — a few kilobytes where a day is hundreds of
-megabytes — are listed under **Flagged** with their full path, so you can check
+Videos too small to be a real day (a few kilobytes where a day is hundreds of
+megabytes) are listed under **Flagged** with their full path, so you can check
 and delete them by whatever means you prefer. The UI will not do it for you.
 
 ### Snags
@@ -556,6 +556,6 @@ and delete them by whatever means you prefer. The UI will not do it for you.
 |---|---|
 | Log pane says "no entries" and names `systemd-journal` | The service account cannot read the journal. The unit asks for `SupplementaryGroups=systemd-journal`; the installer drops that line on a distro without the group. Add it back and `systemctl daemon-reload`. |
 | Library page says the directory is unreadable | The NAS is not mounted, or the library is under `/tmp`/`/var/tmp` (see above). |
-| Library is empty but the directory is right | The scan may still be running — the page says so. Otherwise nothing there matched a video extension. |
+| Library is empty but the directory is right | The scan may still be running; the page says so. Otherwise nothing there matched a video extension. |
 | Clicking *Play* downloads a file instead of opening VLC | Your browser has no handler for `.m3u`. Tell it to always open that type, or copy the stream URL shown under each entry into VLC's *Open Network Stream*. |
 | Seeking does nothing in a player | Check you are on 0.0.9 or later; earlier builds sent `Accept-Ranges: none`. |

@@ -9,11 +9,11 @@ Open an issue with:
 - what you expected and what happened
 - the relevant lines from `capture.log` or `encode.log`
 - your camera make/model and the *shape* of the snapshot URL
-  — **redact credentials, and don't paste your real config**
+  (**redact credentials, and don't paste your real config**)
 - `ffmpeg -version` output if it's an encoding problem
 - the output of `timelapse_test.py`, which usually identifies the cause
 
-"Camera X works" reports are useful too — they tell other people what URL form
+"Camera X works" reports are useful too; they tell other people what URL form
 and auth scheme to try.
 
 ## Before sending a patch
@@ -39,13 +39,13 @@ python3 tests/smoke_test.py                                     # needs ffmpeg
 bash -n install.sh && shellcheck --severity=warning install.sh
 ```
 
-Tests use stdlib `unittest` — please don't add pytest or any other test
+Tests use stdlib `unittest`; please don't add pytest or any other test
 dependency. §9 of the architecture doc covers what is and isn't tested, and how
 the parts that need a camera, a GPU or systemd were verified by hand.
 
 If you add tests, **check that the rule you mean to test is the one doing the
 work.** The storage scan rejects a mount for any of six reasons, so it is easy
-to write a case that passes for the wrong one — two of the original tests did
+to write a case that passes for the wrong one; two of the original tests did
 exactly that. The cheap way to confirm: break the rule on purpose and make sure
 your test fails.
 
@@ -58,4 +58,4 @@ Coverage is thin in obvious places. Welcome contributions:
 ## Scope
 
 This tool captures snapshots and encodes them. Motion detection, object
-detection and stream recording are out of scope — that is what an NVR is for.
+detection and stream recording are out of scope; that is what an NVR is for.

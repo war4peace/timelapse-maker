@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-timelapse_web.py — read-only web UI.
+timelapse_web.py: read-only web UI.
 
 Serves a status page and an index of the finished videos at the transfer
 destination, browsable by camera and by date.
@@ -871,7 +871,7 @@ OVERVIEW = """<section>
 <section>
   <h2>Not built yet</h2>
   <ul class="todo">
-    <li>Playback handoff &mdash; <code>.m3u</code> to VLC, plus a download link</li>
+    <li>Playback handoff: <code>.m3u</code> to VLC, plus a download link</li>
   </ul>
 </section>
 """
@@ -1231,7 +1231,7 @@ class Handler(BaseHTTPRequestHandler):
                     f'<td class="num">{escape(c["z"] or "-")}</td></tr>')
             parts.append("</table></div>"
                          '<p class="scan">Names are shown exactly as they are '
-                         'on disk and never merged &mdash; a name is a place, '
+                         'on disk and never merged; a name is a place, '
                          'and places get recycled between cameras. Sorted '
                          'case-insensitively so variants sit together.</p>'
                          "</section>")
@@ -1279,7 +1279,7 @@ class Handler(BaseHTTPRequestHandler):
                     '<p class="scan">Nothing indexed for that day.</p></section>')
         head = (f'<section><h2>{escape(day)}</h2>'
                 f'<p class="sub"><a href="/day/{escape(day)}"><strong>'
-                f'Play the whole day</strong></a> &mdash; one playlist, every '
+                f'Play the whole day</strong></a>: one playlist, every '
                 f'place in turn ({len(rows)} videos, '
                 f'{human_size(sum(r["size"] for r in rows))}).</p>')
         return head + self._file_table(rows, show_folder=True,
@@ -1314,7 +1314,7 @@ class Handler(BaseHTTPRequestHandler):
             '<section><h2>Flagged files</h2>',
             '<p class="scan">Smaller than ',
             human_size(SUSPECT_BYTES),
-            ' &mdash; a day of timelapse is hundreds of megabytes, so these '
+            '; a day of timelapse is hundreds of megabytes, so these '
             'are almost certainly failed encodes. Full paths are given so you '
             'can check and remove them yourself; this UI never deletes '
             'anything.</p>',

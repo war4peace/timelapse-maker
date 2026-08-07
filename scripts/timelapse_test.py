@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-timelapse_test.py — pre-flight check. Run this before enabling anything.
+timelapse_test.py: pre-flight check. Run this before enabling anything.
 
 Verifies, for each camera in the config:
   * the snapshot URL responds, with the right auth scheme

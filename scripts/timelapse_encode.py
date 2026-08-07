@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-timelapse_encode.py — nightly encode + notify + ship.
+timelapse_encode.py: nightly encode + notify + ship.
 
 Finds every completed day directory under <frames_root>/<Camera>/, encodes
 each to a 60 fps AV1 video, deletes the frames on success, sends a Discord

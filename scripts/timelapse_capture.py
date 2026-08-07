@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-timelapse_capture.py — long-running snapshot grabber.
+timelapse_capture.py: long-running snapshot grabber.
 
 One thread per camera. Each thread wakes on absolute wall-clock boundaries
 (00, 05, 10, ... seconds past the minute) so it cannot drift, fetches a

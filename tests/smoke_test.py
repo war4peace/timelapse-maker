@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-smoke_test.py — end-to-end check of the encode pipeline against synthetic frames.
+smoke_test.py: end-to-end check of the encode pipeline against synthetic frames.
 
 Builds a throwaway frames tree that looks exactly like a real capture day,
 runs timelapse_encode.py over it, and asserts the things that have actually
