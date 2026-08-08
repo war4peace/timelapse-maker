@@ -898,6 +898,23 @@ LAYOUT = """<!doctype html>
   pre {{ overflow-x: auto; background: rgba(128,128,128,.12); border-radius: 6px;
          padding: .8rem .9rem; font-size: .82rem; line-height: 1.45;
          margin: 0; }}
+  /* Command output pages (status, logs). The 54rem column above is right for
+     prose and tables and wrong for raw output: a journal line is as wide as
+     journald decided, so it is the window that should be the limit. Height is
+     capped at the viewport too, because a <pre> that grows to its content puts
+     its horizontal scrollbar hundreds of lines below the text it scrolls.
+     dvh after vh, so a browser without dvh still gets a bounded pane. */
+  body.pane-page {{ max-width: none; box-sizing: border-box;
+                    height: 100vh; height: 100dvh;
+                    display: flex; flex-direction: column; }}
+  body.pane-page > :not(section.pane) {{ flex: none; }}
+  /* min-height: 0 twice, and both are load-bearing: a flex item's default
+     min-height is its content, so without it the pre keeps its full height
+     and nothing ever scrolls. */
+  body.pane-page section.pane {{ display: flex; flex-direction: column;
+                                 min-height: 0; }}
+  body.pane-page section.pane > :not(pre) {{ flex: none; }}
+  body.pane-page section.pane pre {{ min-height: 0; overflow: auto; }}
   .cmd {{ font-size: .8rem; opacity: .55; margin: 0 0 .5rem; }}
   .sub {{ display: flex; gap: .5rem; flex-wrap: wrap; margin: 0 0 .8rem;
           font-size: .85rem; }}
@@ -925,6 +942,7 @@ LAYOUT = """<!doctype html>
             background: transparent; color: inherit; cursor: pointer; }}
   @media (prefers-color-scheme: dark) {{ .flag {{ color: #ff7b72; }} }}
 </style>
+<body class="{body_class}">
 <header>
   <h1>timelapse-maker</h1>
   <span class="ver">web {version}</span>
@@ -1009,7 +1027,8 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/library":
             self._send(200, self._render("library", self._library(args)))
         elif route == "/status":
-            self._send(200, self._render("status", self._report(status_report())))
+            self._send(200, self._render(
+                "status", self._report(status_report(), pane=True)))
         elif route == "/logs":
             self._send(200, self._render("logs", self._logs(args)))
         elif route == "/healthz":
@@ -1036,9 +1055,14 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "not found\n", "text/plain; charset=utf-8")
 
+    # Pages whose body is one pane of raw command output, which wants the whole
+    # window rather than the reading column the rest of the UI uses.
+    PANE_PAGES = ("status", "logs")
+
     def _render(self, page, content):
         return LAYOUT.format(
             version=__version__,
+            body_class="pane-page" if page in self.PANE_PAGES else "",
             on_home="on" if page == "home" else "",
             on_library="on" if page == "library" else "",
             on_status="on" if page == "status" else "",
@@ -1499,12 +1523,21 @@ class Handler(BaseHTTPRequestHandler):
             picker.append(f'<a href="/logs?unit={unit}&amp;n={key}">{mark}</a>')
         picker.append("</p>")
 
-        return "".join(picker) + self._report(journal_report(unit, lines))
+        return "".join(picker) + self._report(journal_report(unit, lines),
+                                              pane=True)
 
     @staticmethod
-    def _report(rep):
-        """One command's output in a <pre>, with whatever went wrong instead."""
-        parts = [f'<section><p class="cmd"><code>{escape(rep["command"])}</code></p>']
+    def _report(rep, pane=False):
+        """One command's output in a <pre>, with whatever went wrong instead.
+
+        pane marks this as the page's main output pane, which the stylesheet
+        then bounds to the viewport so the <pre> scrolls inside its own frame.
+        Only when there is output to scroll: stretching an error message to
+        the full window would be an empty box with one line in it.
+        """
+        cls = ' class="pane"' if pane and not rep["problem"] else ""
+        parts = [f'<section{cls}>'
+                 f'<p class="cmd"><code>{escape(rep["command"])}</code></p>']
         if rep["problem"]:
             parts.append(f'<p class="note">{escape(rep["problem"])}</p>')
         else:

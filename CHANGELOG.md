@@ -26,6 +26,11 @@ While the version is `0.x`, the configuration format may change in any release.
   too, since the service runs unprivileged.
 
 ### Fixed
+- **The status and log panes now use the whole window and scroll inside
+  themselves.** They were held to the same narrow reading column as the rest
+  of the page, so nearly every journal line overflowed, and because the pane
+  grew to fit all of them its horizontal scrollbar ended up far below the
+  fold. The pane is now as wide as the window and no taller than it.
 - **The day view no longer repeats the day.** Every row carried a link back to
   the page you were already reading, under a heading that states the same
   date. The column is dropped there and kept everywhere it distinguishes one

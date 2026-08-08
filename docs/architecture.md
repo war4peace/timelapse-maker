@@ -640,6 +640,20 @@ dropped NAS mount is a *correct* empty library, not a fault.
 **Status and logs** (`/status`, `/logs`) shell out, on request only: a page
 load or a click. Nothing polls and nothing is collected in the background.
 
+- **These two pages drop the 54rem reading column.** That width suits prose and
+  tables and is wrong for raw command output, whose line length journald and
+  systemctl decide, not us. `_render()` adds `pane-page` to `<body>` for them
+  and `_report(pane=True)` marks the output `<section>`; the page is then a
+  flex column of viewport height, so the `<pre>` is bounded and scrolls inside
+  its own frame on both axes. Before this the pane grew to its content and put
+  its horizontal scrollbar hundreds of lines below the text it scrolled.
+  `min-height: 0` on the flex items is load-bearing: a flex item's default
+  minimum is its content size, so without it the `<pre>` never shrinks and
+  nothing scrolls. The marker is withheld when the report carries a *problem*
+  rather than output, since stretching a one-line error to the full window
+  would render an almost empty box. Verified by measuring the real layout in
+  headless Chrome at 1400x900 and 700x600, not by reading the CSS.
+
 - **A non-zero exit is not a failure.** `systemctl status` exits 3 for an
   inactive unit and 4 for one that does not exist, and that output is precisely
   what the page is for. `run_command()` reports a problem only when the command
@@ -991,7 +1005,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 2112 lines
-scripts/timelapse_web.py         read-only web UI, 1635 lines
+scripts/timelapse_web.py         read-only web UI, 1668 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

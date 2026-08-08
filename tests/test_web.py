@@ -413,6 +413,37 @@ class TestStatusRoutes(unittest.TestCase):
             request("/healthz", self.config)
         run.assert_not_called()
 
+    def test_output_pages_ask_for_the_whole_window(self):
+        # A journal line is as wide as journald decided, so the 54rem reading
+        # column that suits prose and tables is the wrong frame for it. The
+        # stylesheet keys off these two classes; without them the pane went
+        # back to a fixed width with its scrollbar far below the fold.
+        for path in ("/status", "/logs"):
+            with self.subTest(path=path):
+                with mock.patch.object(web, "run_command",
+                                       return_value=("a line", "")):
+                    _, _, body = request(path, self.config)
+                self.assertIn('<body class="pane-page">', body)
+                self.assertIn('<section class="pane">', body)
+
+    def test_the_reading_column_is_left_alone_elsewhere(self):
+        # Assert on the body tag, not the document: the stylesheet defining
+        # .pane-page is inline, so the name appears on every page either way.
+        _, _, body = request("/", self.config)
+        self.assertIn('<body class="">', body)
+        self.assertNotIn('<section class="pane">', body)
+
+    def test_a_problem_message_is_not_stretched_to_the_window(self):
+        # The pane fills the viewport height. Applying that to a one-line
+        # error would render an almost empty box the height of the screen.
+        with mock.patch.object(web, "run_command",
+                               return_value=("", "systemctl is not installed.")):
+            _, _, body = request("/status", self.config)
+        self.assertIn("not installed", body)
+        self.assertNotIn('<section class="pane">', body)
+        # The page itself still gets the full width; only the box is normal.
+        self.assertIn('<body class="pane-page">', body)
+
 
 class TestParseName(unittest.TestCase):
     """Six conventions, all present in a real five-year library. The native
@@ -919,6 +950,12 @@ class TestLibraryRoutes(IndexCase):
             with self.subTest(path=path):
                 _, _, body = self.get(path)
                 self.assertEqual(self.sub_row_width(body), body.count("<th>"))
+
+    def test_the_library_keeps_the_reading_column(self):
+        # Tables and prose want the 54rem column; only raw command output
+        # takes the whole window.
+        _, _, body = self.get("/library")
+        self.assertIn('<body class="">', body)
 
     def test_the_path_lines_up_under_the_name(self):
         # The sub-row's empty leading cell exists only to skip the Day column.
