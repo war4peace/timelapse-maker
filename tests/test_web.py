@@ -7,6 +7,7 @@ and binding a port in a unit test invites flakiness on a CI runner.
 
 import contextlib
 import io
+import re
 import shutil
 import socket
 import sys
@@ -881,6 +882,52 @@ class TestLibraryRoutes(IndexCase):
         _, _, home = self.get("/library")
         self.assertIn('href="/library?camera="', home)
         self.assertIn('href="/library?folder="', home)
+
+    def test_the_day_view_drops_the_day_column(self):
+        # Every row carried a link back to the page being read, under a
+        # heading that already states the day.
+        _, _, body = self.get("/library?day=2024-01-01")
+        self.assertNotIn("<th>Day</th>", body)
+        self.assertNotIn("/library?day=2024-01-01\"", body)
+        self.assertIn("2024-01-01_Workshop.mp4", body)
+
+    def test_other_views_keep_the_day_column(self):
+        # There it discriminates between rows and links somewhere new.
+        for path in ("/library?camera=Gate", "/library?folder=",
+                     "/library?flagged=1"):
+            with self.subTest(path=path):
+                _, _, body = self.get(path)
+                self.assertIn("<th>Day</th>", body)
+
+    def sub_row_width(self, body):
+        """Cells in the first path sub-row, counting colspan."""
+        m = re.search(r'<tr class="sub-row">(.*?)</tr>', body, re.S)
+        self.assertIsNotNone(m, "no path sub-row rendered")
+        width = 0
+        for td in re.findall(r"<td[^>]*>", m.group(1)):
+            span = re.search(r'colspan="(\d+)"', td)
+            width += int(span.group(1)) if span else 1
+        return width
+
+    def test_tables_stay_rectangular(self):
+        # Guards a future column being added without adjusting the colspan.
+        # Note it does NOT catch the alignment bug below: dropping the Day
+        # column while keeping the leading cell is still rectangular, just
+        # wrong, which is why both tests exist.
+        for path in ("/library?day=2024-01-01", "/library?camera=Gate",
+                     "/library?folder=", "/library?flagged=1"):
+            with self.subTest(path=path):
+                _, _, body = self.get(path)
+                self.assertEqual(self.sub_row_width(body), body.count("<th>"))
+
+    def test_the_path_lines_up_under_the_name(self):
+        # The sub-row's empty leading cell exists only to skip the Day column.
+        # Keeping it when there is no Day column indents the share path and
+        # URL under Folder instead of under the file they belong to.
+        _, _, day = self.get("/library?day=2024-01-01")
+        _, _, camera = self.get("/library?camera=Gate")
+        self.assertNotIn('<tr class="sub-row"><td></td>', day)
+        self.assertIn('<tr class="sub-row"><td></td>', camera)
 
     def test_a_blank_day_is_still_refused(self):
         # keep_blank_values makes `?day=` reach the day view, where valid_day

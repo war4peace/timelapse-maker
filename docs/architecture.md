@@ -628,7 +628,14 @@ dropped NAS mount is a *correct* empty library, not a fault.
   that is corrupt in a way nothing would report.
 - Each listed file also shows two addresses that need no UI at all: the share
   path, for a machine that has the mount, and the HTTP URL for VLC's *Open
-  Network Stream*.
+  Network Stream*. They sit in a sub-row spanning the table, whose leading
+  empty cell exists solely to line the path up under the *name* it belongs to.
+- **`_file_table()` drops a column the heading already states.** `show_folder`
+  did this from the start; `show_day` was added after the day view shipped
+  giving every row a link back to the page being read. Both flags also move
+  the sub-row's leading cell, so a new column means checking that too: a table
+  can stay perfectly rectangular while the path indents under the wrong
+  heading, and a colspan test will not notice.
 
 **Status and logs** (`/status`, `/logs`) shell out, on request only: a page
 load or a click. Nothing polls and nothing is collected in the background.
@@ -984,7 +991,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 2112 lines
-scripts/timelapse_web.py         read-only web UI, 1619 lines
+scripts/timelapse_web.py         read-only web UI, 1635 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

@@ -26,6 +26,10 @@ While the version is `0.x`, the configuration format may change in any release.
   too, since the service runs unprivileged.
 
 ### Fixed
+- **The day view no longer repeats the day.** Every row carried a link back to
+  the page you were already reading, under a heading that states the same
+  date. The column is dropped there and kept everywhere it distinguishes one
+  row from another.
 - **Two library groups the page linked to could not be opened.** Clicking
   "(no name in filename)" or the root folder showed the library home page
   again instead of the files, because a blank query value was being discarded

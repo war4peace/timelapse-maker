@@ -1376,8 +1376,10 @@ class Handler(BaseHTTPRequestHandler):
                 f'Play the whole day</strong></a>: one playlist, every '
                 f'place in turn ({len(rows)} videos, '
                 f'{human_size(sum(r["size"] for r in rows))}).</p>')
-        return head + self._file_table(rows, show_folder=True,
-                                       full_path=True) + "</section>"
+        # No Day column: the heading is the day, and every link in that column
+        # pointed back at this same page.
+        return head + self._file_table(rows, show_folder=True, full_path=True,
+                                       show_day=False) + "</section>"
 
     def _camera_view(self, camera):
         rows = self.server.index.by_camera(camera)
@@ -1426,12 +1428,19 @@ class Handler(BaseHTTPRequestHandler):
             ]
         return "".join(parts)
 
-    def _file_table(self, rows, show_folder, full_path=False):
+    def _file_table(self, rows, show_folder, full_path=False, show_day=True):
+        """One table of videos.
+
+        show_folder and show_day drop a column whose value the heading above
+        the table already states and every row repeats. In the day view each
+        of those links pointed back at the page being read.
+        """
         if not rows:
             return '<p class="scan">Nothing here.</p>'
         root = self.server.index.root
         base = self._base_url()
-        cols = ["Day", "Name"]
+        cols = ["Day"] if show_day else []
+        cols.append("Name")
         if show_folder:
             cols.append("Folder")
         cols += ["Size", "Open"]
@@ -1441,9 +1450,11 @@ class Handler(BaseHTTPRequestHandler):
         for r in rows:
             enc = quote(r["path"])
             flag = ' class="flag"' if r["suspect"] else ""
-            day = (f'<a href="/library?day={escape(r["day"])}">'
-                   f'{escape(r["day"])}</a>') if r["day"] else "-"
-            out.append(f'<tr><td class="num">{day}</td>')
+            out.append("<tr>")
+            if show_day:
+                day = (f'<a href="/library?day={escape(r["day"])}">'
+                       f'{escape(r["day"])}</a>') if r["day"] else "-"
+                out.append(f'<td class="num">{day}</td>')
             out.append(f'<td{flag}>{escape(r["name"])}</td>')
             if show_folder:
                 out.append(f'<td>{escape(r["folder"] or "(root)")}</td>')
@@ -1456,8 +1467,13 @@ class Handler(BaseHTTPRequestHandler):
                 # VLC's "Open Network Stream" anywhere else. Selectable in one
                 # click, because that is the whole point of showing them.
                 whole = os.path.join(str(root), r["path"].replace("/", os.sep))
-                out.append(f'<tr class="sub-row"><td></td>'
-                           f'<td colspan="{len(cols) - 1}" class="path">'
+                # The empty leading cell exists only to skip the Day column,
+                # so that the path lines up under the name it belongs to. With
+                # no Day column there is nothing to skip.
+                skip = '<td></td>' if show_day else ""
+                span = len(cols) - 1 if show_day else len(cols)
+                out.append(f'<tr class="sub-row">{skip}'
+                           f'<td colspan="{span}" class="path">'
                            f'{escape(whole)}<br>{escape(base)}/video/{enc}'
                            f'</td></tr>')
         out.append("</table></div>")
