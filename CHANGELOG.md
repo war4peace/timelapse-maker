@@ -26,6 +26,12 @@ While the version is `0.x`, the configuration format may change in any release.
   too, since the service runs unprivileged.
 
 ### Fixed
+- **The indexing line now updates itself.** After pressing Rescan it sat at
+  whatever it said when the page was drawn, usually "0 files so far", until
+  you reloaded, which read as a stuck process. It now counts up once a second
+  while the scan runs and reloads the page once when it finishes. Two causes:
+  the line was a static snapshot, and the counter behind it only advanced once
+  per 500 files, so a library smaller than that finished still reporting zero.
 - **The status and log panes now use the whole window and scroll inside
   themselves.** They were held to the same narrow reading column as the rest
   of the page, so nearly every journal line overflowed, and because the pane

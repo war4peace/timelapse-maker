@@ -12,6 +12,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -611,6 +612,29 @@ class TestIndexScan(IndexCase):
         self.assertEqual(self.index.totals()["n"], 7)
 
 
+class TestScanProgress(IndexCase):
+
+    def test_the_count_advances_on_every_file(self):
+        """It used to advance once per 500-file write batch, which is the
+        wrong unit for a progress report: a library smaller than a batch
+        finished still reporting 0, and a slow share stalled the number for
+        500 files at a time. Both read as a stuck scan."""
+        real_walk = self.index._walk
+        seen = []
+
+        def watched():
+            # Records the counter as it stood before each row was counted,
+            # so a per-batch update would show 0 for all eight.
+            for row in real_walk():
+                seen.append(self.index.scan["files"])
+                yield row
+
+        with mock.patch.object(self.index, "_walk", watched):
+            self.scan()
+        self.assertEqual(seen, [0, 1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(self.index.scan["files"], 8)
+
+
 class TestIndexSurvivesAMissingLibrary(IndexCase):
     """A NAS that is not mounted yet must not cost you the index.
 
@@ -950,6 +974,59 @@ class TestLibraryRoutes(IndexCase):
             with self.subTest(path=path):
                 _, _, body = self.get(path)
                 self.assertEqual(self.sub_row_width(body), body.count("<th>"))
+
+    def running(self):
+        """Put the index into the running-scan state the banner reports."""
+        self.index.scan.update(running=True, files=1234, started=time.time())
+
+    def test_a_running_scan_marks_itself_and_ships_the_poller(self):
+        # Without this the line sat at its server-rendered value forever and
+        # read as a stuck process.
+        self.running()
+        _, _, body = self.get("/library")
+        self.assertIn('data-running="1"', body)
+        self.assertIn("setInterval", body)
+        self.assertIn("1,234 files so far", body)
+
+    def test_an_idle_page_ships_no_poller(self):
+        _, _, body = self.get("/library")
+        self.assertIn('data-running="0"', body)
+        self.assertNotIn("setInterval", body)
+
+    def test_the_running_banner_does_not_tell_you_to_reload(self):
+        # It updates itself now; the old text told you to reload. Scoped to
+        # the banner, since the poller itself calls location.reload().
+        self.running()
+        _, _, body = self.get("/scan")
+        self.assertIn("Indexing", body)
+        self.assertNotIn("reload", body.lower())
+
+    def test_scan_endpoint_returns_the_banner_alone(self):
+        self.running()
+        status, _, body = self.get("/scan")
+        self.assertEqual(status, 200)
+        self.assertIn('id="scan"', body)
+        self.assertIn("1,234 files so far", body)
+        # No script: a script assigned through outerHTML would not run, and
+        # shipping one that cannot work invites someone to debug it.
+        self.assertNotIn("setInterval", body)
+        # No page furniture either, so polling stays cheap.
+        self.assertNotIn("<h2>Folders</h2>", body)
+        self.assertNotIn("<nav>", body)
+
+    def test_scan_endpoint_reports_completion(self):
+        # This transition is what stops the poller and triggers the reload.
+        _, _, body = self.get("/scan")
+        self.assertIn('data-running="0"', body)
+
+    def test_scan_endpoint_touches_neither_disk_nor_index(self):
+        # Polled once a second during a scan, so it must not compete with the
+        # scan for the share it is reporting on.
+        with mock.patch.object(self.index, "reconcile_dir") as rec, \
+                mock.patch.object(self.index, "_query") as q:
+            self.get("/scan")
+        rec.assert_not_called()
+        q.assert_not_called()
 
     def test_the_library_keeps_the_reading_column(self):
         # Tables and prose want the 54rem column; only raw command output

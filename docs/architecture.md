@@ -524,6 +524,25 @@ dropped NAS mount is a *correct* empty library, not a fault.
   duration budget is assumed anywhere; the one measurement taken (1.7 s for
   6,848 files) came from a 10G workstation while deployments read CIFS over 1G,
   and the work is round-trips rather than megabytes.
+- **Progress is reported per file, and the banner updates itself.** Two
+  separate defects made a running scan look like a hung one. The counter
+  advanced once per 500-file write batch, which is the right unit for database
+  writes and the wrong one for a progress report: a library smaller than a
+  batch finished still reporting zero, and a slow share froze the number for
+  500 files at a time. And the line itself was a server-rendered snapshot, so
+  it never changed until the reader reloaded, having just been told the scan
+  had started. `_scan_banner()` now emits `<div id="scan" data-running>`, and
+  while a scan runs the page also carries `SCAN_POLL_JS`, which polls `/scan`
+  once a second, swaps the fragment in place, and reloads once on completion
+  so the tables below catch up. `/scan` returns that fragment and nothing
+  else; it reads an in-memory dict and touches neither the database nor the
+  library, which is what makes polling it during a scan free. The obvious
+  no-JS alternative, `<meta http-equiv="refresh">`, was rejected because it
+  re-requests whichever library view is open, and on a folder view that means
+  `reconcile_dir()` hitting the share once a second during the scan it is
+  competing with. Without JS the banner behaves as it always did. Verified in
+  headless Chrome: one navigation, six polls, six distinct banner texts, and
+  on completion a second navigation with polling stopped.
 - **Reconciliation is on access.** Opening a folder re-reads that one directory
   and diffs it; opening a file re-stats it. An earlier version gated the
   directory read on its mtime and skipped it when unchanged; that was both a
@@ -937,6 +956,13 @@ changes:
   human-named event folder survive; a folder view picks up a file added and a
   file deleted behind the service's back, and says the index had drifted;
   `/rescan` is 404 on GET and 303 on POST.
+- **Live scan banner**: headless Chrome against a real server, since a unit
+  test can assert the markup but not that a browser acts on it. Confirmed in
+  a single page load: six `/scan` polls and six distinct banner texts, so the
+  fragment is genuinely replaced in place rather than the page being
+  re-fetched; and on completion, polling stops and the page navigates exactly
+  once more. The layout of the status and log panes was measured the same way
+  at two window sizes.
 - **Wizard and wiring**: same host. Confirmed: an unattended install leaves
   the UI **off**; `timelapse web` runs the wizard (not the server) and writes
   the answers; the state directory is created and owned correctly; a re-install
@@ -1005,7 +1031,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 2112 lines
-scripts/timelapse_web.py         read-only web UI, 1668 lines
+scripts/timelapse_web.py         read-only web UI, 1734 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

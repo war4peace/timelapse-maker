@@ -399,11 +399,18 @@ class Index:
                     seen.add(row[0])
                     batch.append(row)
                     count += 1
+                    # Per file, not per batch. The batch exists to keep the
+                    # database writes efficient and is a poor unit for a
+                    # progress report: on a slow share 500 files is a long
+                    # stall showing a stale number, and on a fast one the
+                    # whole scan can finish before the first batch, leaving
+                    # the page reporting 0. An uncontended lock costs nothing
+                    # against the I/O this loop is already doing.
+                    with self._lock:
+                        self.scan["files"] = count
                     if len(batch) >= 500:
                         self._write(db, batch)
                         batch = []
-                        with self._lock:
-                            self.scan["files"] = count
                 if batch:
                     self._write(db, batch)
 
@@ -956,6 +963,43 @@ LAYOUT = """<!doctype html>
 {content}
 """
 
+# Emitted only while a scan is running, and only into a full page. A rendered
+# fragment cannot poll for itself, so this replaces the banner in place until
+# the scan ends and then reloads once so the tables below it catch up.
+#
+# It polls /scan, which reads an in-memory dict and touches no filesystem.
+# The obvious no-JS alternative, <meta http-equiv="refresh">, was rejected: it
+# would re-request whichever library view is open, and on a folder view that
+# means reconcile_dir() hitting a CIFS share once a second during the very
+# scan it is competing with. Without JS the banner behaves as it always has,
+# a server-rendered snapshot, which is what the Rescan button gives you.
+SCAN_POLL_JS = """<script>
+(function () {
+  var box = document.getElementById('scan');
+  if (!box || box.dataset.running !== '1') { return; }
+  // No fetch means a browser old enough that throwing once a second into its
+  // console is the only thing this would achieve. The static banner stands.
+  if (!window.fetch) { return; }
+  var timer = setInterval(function () {
+    fetch('/scan', {cache: 'no-store'}).then(function (r) {
+      if (!r.ok) { throw new Error(r.status); }
+      return r.text();
+    }).then(function (html) {
+      box.outerHTML = html;
+      // outerHTML replaces the node, so the old reference is now detached.
+      box = document.getElementById('scan');
+      if (!box || box.dataset.running !== '1') {
+        clearInterval(timer);
+        location.reload();
+      }
+    }).catch(function () {
+      // A restart or a dropped connection: stop rather than hammer it.
+      clearInterval(timer);
+    });
+  }, 1000);
+})();
+</script>"""
+
 OVERVIEW = """<section>
   <h2>Video library</h2>
   <dl>
@@ -1031,6 +1075,12 @@ class Handler(BaseHTTPRequestHandler):
                 "status", self._report(status_report(), pane=True)))
         elif route == "/logs":
             self._send(200, self._render("logs", self._logs(args)))
+        elif route == "/scan":
+            # The banner alone, for the poller. Deliberately cheap: it reads
+            # an in-memory dict and touches neither the database nor the
+            # library, so polling it once a second during a scan costs
+            # nothing and never competes with the scan for the share.
+            self._send(200, self._scan_banner(with_script=False))
         elif route == "/healthz":
             self._send(200, "ok\n", "text/plain; charset=utf-8")
         else:
@@ -1294,29 +1344,45 @@ class Handler(BaseHTTPRequestHandler):
             return self._scan_banner() + self._flagged_view()
         return self._scan_banner() + self._library_home()
 
-    def _scan_banner(self):
+    def _scan_banner(self, with_script=True):
+        """The indexing status line, wrapped so it can be replaced in place.
+
+        with_script adds the poller. Off for the /scan fragment: a script
+        assigned through outerHTML does not execute anyway, and relying on
+        that would be a subtle thing to leave for the next reader.
+        """
         s = dict(self.server.index.scan)
         rescan = ('<form class="inline" method="post" action="/rescan">'
                   '<button type="submit">Rescan</button></form>')
         if s["running"] and s["error"]:
             # Waiting on the library rather than reading it. Say which.
-            return (f'<p class="note">{escape(s["error"])}</p>'
+            body = (f'<p class="note">{escape(s["error"])}</p>'
                     f'<p class="scan">{rescan}</p>')
-        if s["running"]:
-            return (f'<p class="scan">Indexing&hellip; {s["files"]} files so far. '
-                    f'This page works while it runs; reload for more.</p>')
-        if s["error"]:
-            return (f'<p class="note">{escape(s["error"])}</p>'
+        elif s["running"]:
+            # No "reload for more": the poller below does that, and telling
+            # someone to reload a line that updates itself is worse than
+            # saying nothing.
+            body = (f'<p class="scan">Indexing&hellip; {s["files"]:,} files '
+                    f'so far. This page works while it runs.</p>')
+        elif s["error"]:
+            body = (f'<p class="note">{escape(s["error"])}</p>'
                     f'<p class="scan">{rescan}</p>')
-        if s["finished"]:
+        elif s["finished"]:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["finished"]))
             # Only claim a duration when the start was actually recorded;
             # otherwise the subtraction reports the age of the epoch.
             took = (f' in {s["finished"] - s["started"]:.1f}s'
                     if s["started"] else "")
-            return (f'<p class="scan">Indexed {s["files"]} files at {when}'
+            body = (f'<p class="scan">Indexed {s["files"]:,} files at {when}'
                     f'{took}. {rescan}</p>')
-        return f'<p class="scan">Not indexed yet. {rescan}</p>'
+        else:
+            body = f'<p class="scan">Not indexed yet. {rescan}</p>'
+
+        running = "1" if s["running"] else "0"
+        out = f'<div id="scan" data-running="{running}">{body}</div>'
+        if with_script and s["running"]:
+            out += SCAN_POLL_JS
+        return out
 
     def _library_home(self):
         index = self.server.index
