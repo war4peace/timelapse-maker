@@ -54,7 +54,7 @@
 
   "web": {
     "_comment": "Optional read-only status page and video index. It never changes anything - no encode triggers, no camera control, no config edits.",
-    "_comment_bind": "127.0.0.1 means only this machine can reach it. There is no login and no HTTPS, so any other bind address exposes it to your whole LAN; put a reverse proxy in front for anything wider.",
+    "_comment_bind": "127.0.0.1 means only this machine can reach it, which is the safe value to hand-edit but rarely the useful one on a headless recorder. 'timelapse web' suggests this host's LAN address instead and checks that the address exists before writing it. There is no login and no HTTPS, so anything other than 127.0.0.1 exposes the page to your LAN; put a reverse proxy in front for anything wider. Changing this needs 'systemctl restart timelapse-web' to take effect.",
     "_comment_library": "Leave library_root empty to work it out automatically: the transfer destination when transfer is enabled, otherwise paths.video_output. Set it when the videos are readable here under a different path - e.g. transfer sends them to a remote 'user@nas:/...' spec that is also mounted locally.",
     "_comment_state": "state_dir is the ONLY directory the web UI may write to - it holds the sqlite index of your video library. The systemd unit is scoped to exactly this path, so the videos, the frames and this config stay read-only to it.",
     "enabled": false,

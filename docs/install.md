@@ -510,7 +510,15 @@ sudo timelapse web
 sudo systemctl enable --now timelapse-web.service
 ```
 
-Then open `http://127.0.0.1:8787/`.
+It suggests this host's LAN address, so the page opens at whatever it reported,
+for example `http://192.168.1.50:8787/`. Read the section on securing it below
+before accepting that. If you would rather keep it to this machine, answer
+`127.0.0.1` at the prompt.
+
+Re-run `sudo timelapse web` any time to change the address, port or library
+path; it offers to restart the service so the change takes effect. Editing
+`config.json` by hand does not, so follow that with `sudo systemctl restart
+timelapse-web`: the server reads its config once, at startup.
 
 It gives you four things:
 
@@ -543,13 +551,19 @@ library as unreadable: correct, and thoroughly confusing.
 
 ### It is not secured, so bind it accordingly
 
-There is **no login and no HTTPS**. The default bind is `127.0.0.1`, which
-means only this machine can reach it; the wizard warns you if you change that.
+There is **no login and no HTTPS**. The wizard suggests this host's LAN
+address, because a page you can only open on the recorder itself is not much
+use, and it says so plainly when you accept it: **anyone on that network can
+watch your cameras' footage.**
 
-To watch from a phone you must bind to the LAN, and then anyone on that
-network can watch your cameras' footage. Put a reverse proxy with TLS and
-authentication in front of it for anything beyond a trusted home network, and
-do not port-forward it.
+That is the right trade on a trusted home LAN and the wrong one anywhere else.
+Answer `127.0.0.1` to keep it to this machine. Put a reverse proxy with TLS and
+authentication in front of it for anything wider, and do not port-forward it.
+
+The wizard also checks that the address you give actually exists on this host.
+It used to accept anything, and a wrong address is the worst kind of mistake
+here: the service starts, logs the address it is serving and is unreachable,
+with nothing in the journal to say why.
 
 ### What it is allowed to write
 

@@ -14,10 +14,12 @@ Every question has a default in [brackets]; pressing Enter accepts it.
 """
 
 import argparse
+import errno
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 from datetime import date
@@ -747,6 +749,69 @@ def edit_one_camera(cfg, cams, cam):
     return cam
 
 
+def unit_is_active(unit):
+    """True, False, or None when systemd cannot be asked at all."""
+    if not shutil.which("systemctl"):
+        return None
+    try:
+        r = subprocess.run(["systemctl", "is-active", "--quiet", unit],
+                           timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.returncode == 0
+
+
+def restart_unit(unit, success):
+    """Restart a unit and say what happened. True if it came back."""
+    try:
+        r = subprocess.run(["systemctl", "restart", unit], timeout=90)
+    except (OSError, subprocess.SubprocessError) as exc:
+        fail(f"Restart failed: {exc}")
+        return False
+    if r.returncode == 0:
+        good(success)
+        return True
+    fail("Restart failed (are you root?).")
+    note(f"See: journalctl -u {unit.split('.')[0]} -n 40")
+    return False
+
+
+def restart_web_if_running(cfg):
+    """The web server reads its config once, at startup.
+
+    The same trap restart_capture_if_running() exists for, and it bit a real
+    install: `systemctl enable --now` is a no-op on an already-active unit, so
+    the wizard printed a new bind address while the running process kept
+    serving the old one. It looked like the UI refusing connections on an
+    address the wizard had just reported as correct.
+    """
+    unit = "timelapse-web.service"
+    enabled = bool(cfg.get("web", {}).get("enabled"))
+    active = unit_is_active(unit)
+    if active is None:
+        return
+    if not active:
+        if enabled:
+            note(f"Start it with: systemctl enable --now {unit}")
+        return
+    print()
+    if not enabled:
+        # It exits 0 when disabled, so a restart is what stops it. Leaving it
+        # alone would keep serving a UI the operator just turned off.
+        warn("The web UI is still running with the settings it started on.")
+        if ask_yes("Stop it now?", True):
+            restart_unit(unit, "Web UI stopped.")
+        else:
+            note(f"Stop it with: systemctl stop {unit}")
+        return
+    note("The web UI is running on the settings it read at startup.")
+    if not ask_yes("Restart it so the new settings take effect now?", True):
+        warn("The running server still has the previous settings.")
+        note(f"Apply them with: systemctl restart {unit}")
+        return
+    restart_unit(unit, "Web UI restarted on the new settings.")
+
+
 def restart_capture_if_running():
     """Capture reads its config once, at startup.
 
@@ -1403,6 +1468,163 @@ def web_library_preview(cfg):
     return cfg["paths"].get("video_output", ""), "paths.video_output"
 
 
+# ----------------------------------------------------------------------------
+# Bind address
+#
+# A wrong bind address is the worst kind of error this wizard can write. The
+# service starts, reports itself healthy, logs the address it is serving and is
+# simply unreachable; nothing in the journal says "this host has no such
+# address". So it is settled here, against the kernel, before the file is
+# written.
+# ----------------------------------------------------------------------------
+
+LOOPBACK = ("127.0.0.1", "::1", "localhost")
+WILDCARD = ("0.0.0.0", "::")
+
+
+def lan_address():
+    """This host's primary LAN address, or "" if it cannot be worked out.
+
+    Asks the routing table which source address it would use to reach an
+    off-subnet destination. No packets are sent: connect() on a UDP socket
+    only fixes the peer locally, which is what makes this safe on a host with
+    no internet access. TEST-NET-1 is used as the target so that even a
+    misread of this code cannot point it at somebody's real server.
+
+    gethostname() is deliberately not used. On Debian it resolves to 127.0.1.1
+    to no useful purpose, which is exactly the answer this exists to avoid.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 1))
+        addr = s.getsockname()[0]
+    except OSError:
+        return ""                   # no default route, or no network at all
+    finally:
+        s.close()
+    return "" if not addr or addr.startswith("127.") else addr
+
+
+def host_addresses():
+    """Every address configured on this host, best effort, loopback last.
+
+    Display only. Validation never depends on this list: check_bind() asks the
+    kernel, so a host where neither command exists still gets a correct answer
+    to the question that matters.
+    """
+    found = []
+    try:
+        r = subprocess.run(["ip", "-j", "addr"], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=10)
+        if r.returncode == 0:
+            for iface in json.loads(r.stdout.decode("utf-8", "replace") or "[]"):
+                for info in iface.get("addr_info", []):
+                    if info.get("local"):
+                        found.append(info["local"])
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    if not found:
+        try:
+            r = subprocess.run(["hostname", "-I"], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=10)
+            if r.returncode == 0:
+                found = r.stdout.decode("utf-8", "replace").split()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    # IPv6 link-local is dropped: it cannot be bound without a scope id, so
+    # offering it as a choice would be offering something that does not work.
+    found = [a for a in found if not a.lower().startswith("fe80:")]
+    # Loopback is a valid answer, just never the interesting one.
+    return sorted(set(found),
+                  key=lambda a: (a.startswith("127.") or a == "::1", a))
+
+
+def check_bind(addr, port):
+    """Can the service actually listen there? Returns (kind, detail).
+
+    Binds it for real rather than comparing against a list of interfaces,
+    because the kernel is the authority and the failure modes need telling
+    apart. "unavailable" is the silent one this whole section exists for; a
+    port already taken is a different problem with a different fix.
+
+    SO_REUSEADDR matches what the server sets, so this probes the same
+    conditions the service will meet rather than stricter ones. It binds only,
+    never listens, and closes immediately.
+    """
+    if not str(addr).strip():
+        return "bad", "no address given"
+    try:
+        infos = socket.getaddrinfo(addr, port, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        return "bad", f"not an address this host can resolve ({exc})"
+
+    detail = "could not bind"
+    for family, socktype, proto, _canon, sockaddr in infos:
+        s = socket.socket(family, socktype, proto)
+        try:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(sockaddr)
+            return "ok", ""
+        except OSError as exc:
+            if exc.errno == errno.EADDRNOTAVAIL:
+                return "unavailable", f"no interface on this host has {addr}"
+            if exc.errno == errno.EADDRINUSE:
+                return "in-use", f"something is already listening on {addr}:{port}"
+            if exc.errno in (errno.EACCES, errno.EPERM):
+                return "denied", f"permission denied for port {port}"
+            detail = str(exc)
+        finally:
+            s.close()
+    return "error", detail
+
+
+def confirm_bind(addr, port):
+    """Report on a chosen address. True if it is worth writing to the config.
+
+    An address already in use is accepted rather than refused: the usual
+    reason is the web UI itself, still running on the settings it is being
+    reconfigured away from, and refusing to let someone change the port of a
+    running server would be absurd.
+    """
+    kind, detail = check_bind(addr, port)
+    if kind == "ok":
+        return True
+    if kind == "in-use":
+        note(f"{detail}.")
+        note("Usually the web UI itself; the restart below settles it.")
+        return True
+    if kind == "denied":
+        fail(f"{detail}.")
+        note("Ports below 1024 need privileges the service does not have.")
+        return False
+    if kind == "unavailable":
+        fail(f"{detail}.")
+        note("The service would start, report success and be unreachable.")
+        found = host_addresses()
+        if found:
+            note(f"This host has: {', '.join(found)}")
+        return False
+    fail(f"Cannot use {addr}:{port}: {detail}")
+    return False
+
+
+def suggest_bind(current):
+    """The address to offer in the prompt.
+
+    A working current setting wins: someone re-running the wizard to change
+    the library path should not silently have their bind address moved. Then
+    the LAN address, because a status page reachable only from the machine it
+    describes is of little use on a headless recorder. 0.0.0.0 last, which
+    always works but binds interfaces the operator may not have thought about.
+    """
+    current = (current or "").strip()
+    # "ok" specifically, not "anything but unavailable": junk in the config
+    # should be replaced by a working suggestion, not offered back.
+    if current and current not in LOOPBACK and check_bind(current, 0)[0] == "ok":
+        return current
+    return lan_address() or "0.0.0.0"
+
+
 def choose_web(cfg):
     heading("Web UI (optional)")
     note("A small read-only page: service status, and an index of your")
@@ -1418,11 +1640,51 @@ def choose_web(cfg):
     web["enabled"] = True
 
     print()
-    note("There is no login and no HTTPS. 127.0.0.1 means only this machine")
-    note("can reach it; any other address exposes it to your whole network.")
-    web["bind"] = ask("Listen on", web.get("bind", "127.0.0.1"))
-    web["port"] = ask_int("Port", int(web.get("port", 8787)), 1, 65535)
-    if web["bind"] not in ("127.0.0.1", "::1", "localhost"):
+    suggested = suggest_bind(web.get("bind"))
+    found = host_addresses()
+    if found:
+        note(f"This host's addresses: {', '.join(found)}")
+    note("There is no login and no HTTPS, so whoever can reach this address")
+    note("can watch your videos. A LAN address is the useful answer on a")
+    note("recorder you connect to from elsewhere; 127.0.0.1 restricts it to")
+    note("this machine, and 0.0.0.0 accepts every interface.")
+    if (web.get("bind") or "") in LOOPBACK and suggested not in LOOPBACK:
+        # Never move a deliberate loopback choice without saying so out loud.
+        print()
+        warn(f"This is currently {web['bind']}, reachable only from this host.")
+        warn(f"Accepting {suggested} below opens it to your network.")
+
+    while True:
+        chosen = ask("Listen on", suggested).strip()
+        # Port 0 asks the kernel only whether this host holds the address,
+        # which is the question at this prompt. Whether the port is free is a
+        # separate problem with a separate fix, so it is asked separately.
+        if confirm_bind(chosen, 0):
+            web["bind"] = chosen
+            break
+        # AUTO and a closed tty both return the default forever, so a rejected
+        # default would spin here rather than stop.
+        if AUTO or _TTY is None:
+            warn(f"Keeping {chosen} unverified; there is no terminal to ask.")
+            web["bind"] = chosen
+            break
+        print()
+
+    while True:
+        web["port"] = ask_int("Port", int(web.get("port", 8787)), 1, 65535)
+        if web["port"] < 1024:
+            # The probe below would very likely succeed and prove nothing: the
+            # wizard normally runs as root and the service does not. Testing
+            # as the wrong user is worse than not testing.
+            fail(f"Port {web['port']} is privileged; the service runs "
+                 f"unprivileged and could not bind it.")
+            note("Use something above 1023, or put a reverse proxy in front.")
+            if not (AUTO or _TTY is None):
+                continue
+        confirm_bind(web["bind"], web["port"])
+        break
+
+    if web["bind"] not in LOOPBACK:
         print()
         warn("Anyone who can reach this address can watch your videos.")
         warn("Keep it to a trusted LAN, or put a reverse proxy in front.")
@@ -1703,8 +1965,6 @@ def summarise_web(cfg):
     note(f"listen        http://{web.get('bind')}:{web.get('port')}/")
     note(f"library       {where or '(not set)'}  ({why})")
     note(f"index         {web.get('state_dir')}")
-    print()
-    note("Start it with: systemctl enable --now timelapse-web.service")
 
 
 # ----------------------------------------------------------------------------
@@ -1823,6 +2083,10 @@ def main():
         write_config(cfg, args.output, args.owner)
         good(f"Updated {args.output}")
         summarise_web(cfg)
+        # Before the summary would be tidier, but writing the file first means
+        # a declined restart still leaves the new settings on disk for the
+        # next start.
+        restart_web_if_running(cfg)
         print()
         return 0
 

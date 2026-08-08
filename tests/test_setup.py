@@ -8,11 +8,13 @@ kinds of thing that look like disks but aren't. These drive it with a synthetic
 import contextlib
 import io
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
 from datetime import date
 from pathlib import Path
+from unittest import mock
 from urllib.parse import parse_qs, urlparse
 
 import _support
@@ -940,14 +942,31 @@ class TestWebLibraryPreview(unittest.TestCase):
 
 class TestChooseWeb(unittest.TestCase):
 
-    def drive(self, keystrokes, cfg=None):
+    # The wizard now asks the kernel about the address it was given. Stubbed
+    # here so these tests describe the wizard rather than the machine running
+    # them: a real lan_address() would make the expected default whatever the
+    # CI runner happens to be numbered. The probes themselves are covered by
+    # TestBindProbe against the two addresses whose behaviour is universal.
+    LAN = "192.168.1.50"
+
+    def drive(self, keystrokes, cfg=None, checks=None, lan=LAN):
         prev_tty, prev_auto = setup._TTY, setup.AUTO
         setup.AUTO = False
         setup._TTY = FakeTTY(keystrokes, tty=False)
         cfg = cfg or setup.default_config()
         buf = io.StringIO()
+        # Keyed by address, not a call sequence: suggest_bind() probes too, so
+        # a positional list would make these tests depend on how many times
+        # the wizard happens to ask.
+        def fake_check(addr, port):
+            return (checks or {}).get(addr, ("ok", ""))
+
         try:
-            with contextlib.redirect_stdout(buf):
+            with contextlib.redirect_stdout(buf), \
+                    mock.patch.object(setup, "check_bind", fake_check), \
+                    mock.patch.object(setup, "lan_address", lambda: lan), \
+                    mock.patch.object(setup, "host_addresses",
+                                      lambda: [lan, "127.0.0.1"]):
                 setup.choose_web(cfg)
         finally:
             setup._TTY, setup.AUTO = prev_tty, prev_auto
@@ -962,12 +981,22 @@ class TestChooseWeb(unittest.TestCase):
         web, _ = self.drive("\n")
         self.assertFalse(web["enabled"])
 
-    def test_accepting_defaults_binds_to_loopback(self):
+    def test_accepting_defaults_binds_to_the_lan_address(self):
+        # A status page reachable only from the machine it describes is close
+        # to useless on a headless recorder, so the LAN address is offered.
         web, _ = self.drive("y\n\n\n\n\n")
         self.assertTrue(web["enabled"])
-        self.assertEqual(web["bind"], "127.0.0.1")
+        self.assertEqual(web["bind"], self.LAN)
         self.assertEqual(web["port"], 8787)
         self.assertEqual(web["state_dir"], "/var/lib/timelapse/web")
+
+    def test_wildcard_is_the_fallback_when_there_is_no_lan_address(self):
+        web, _ = self.drive("y\n\n\n\n\n", lan="")
+        self.assertEqual(web["bind"], "0.0.0.0")
+
+    def test_loopback_can_still_be_chosen(self):
+        web, _ = self.drive("y\n127.0.0.1\n\n\n\n")
+        self.assertEqual(web["bind"], "127.0.0.1")
 
     def test_the_lack_of_auth_is_stated_before_the_bind_prompt(self):
         _, out = self.drive("y\n\n\n\n\n")
@@ -980,8 +1009,45 @@ class TestChooseWeb(unittest.TestCase):
         self.assertIn("reverse proxy", out)
 
     def test_loopback_gets_no_scare_warning(self):
-        _, out = self.drive("y\n\n\n\n\n")
+        _, out = self.drive("y\n127.0.0.1\n\n\n\n")
         self.assertNotIn("reverse proxy", out)
+
+    def test_moving_an_existing_loopback_bind_is_called_out(self):
+        # The default moved from 127.0.0.1 to the LAN address, so pressing
+        # Enter through the wizard would otherwise quietly expose an install
+        # that had deliberately been kept local.
+        cfg = setup.default_config()
+        cfg["web"] = {"enabled": True, "bind": "127.0.0.1", "port": 8787}
+        _, out = self.drive("y\n\n\n\n\n", cfg)
+        before = out.split("Listen on", 1)[0]
+        self.assertIn("reachable only from this host", before)
+        self.assertIn("opens it to your network", before)
+
+    def test_an_address_this_host_lacks_is_refused_and_reasked(self):
+        # The bug this exists for: the service starts, logs the address it is
+        # serving, and is unreachable. Nothing says the address was wrong.
+        web, out = self.drive(
+            "y\n10.9.9.9\n192.168.1.50\n\n\n\n",
+            checks={"10.9.9.9": ("unavailable", "no interface has 10.9.9.9")})
+        self.assertEqual(web["bind"], "192.168.1.50")
+        self.assertIn("no interface has 10.9.9.9", out)
+        self.assertIn("unreachable", out)
+
+    def test_a_port_in_use_is_accepted_with_a_note(self):
+        # Almost always the web UI itself, about to be restarted. Refusing to
+        # let someone change the port of a running server would be absurd.
+        web, out = self.drive(
+            "y\n\n\n\n\n",
+            checks={self.LAN: ("in-use", "something is already listening")})
+        self.assertEqual(web["bind"], self.LAN)
+        self.assertIn("already listening", out)
+
+    def test_a_privileged_port_is_refused(self):
+        # The probe would pass as root and prove nothing: the service runs
+        # unprivileged.
+        web, out = self.drive("y\n\n80\n8787\n\n\n")
+        self.assertEqual(web["port"], 8787)
+        self.assertIn("privileged", out)
 
     def test_it_says_where_videos_will_come_from(self):
         cfg = setup.default_config()
@@ -1001,6 +1067,8 @@ class TestChooseWeb(unittest.TestCase):
         self.assertEqual(web["library_root"], "")
 
     def test_reconfiguring_offers_the_existing_values_as_defaults(self):
+        # A working bind address is kept: someone re-running the wizard to
+        # change the library path must not have their address moved under them.
         cfg = setup.default_config()
         cfg["web"] = {"enabled": True, "bind": "10.0.0.5", "port": 9000,
                       "library_root": "/srv/tl", "state_dir": "/srv/idx"}
@@ -1009,6 +1077,155 @@ class TestChooseWeb(unittest.TestCase):
         self.assertEqual(web["port"], 9000)
         self.assertEqual(web["library_root"], "/srv/tl")
         self.assertEqual(web["state_dir"], "/srv/idx")
+
+
+class TestBindProbe(unittest.TestCase):
+    """The real probes, unmocked, against the two addresses whose behaviour is
+    the same on every host: loopback always binds, and TEST-NET-3 is reserved
+    for documentation so nothing should ever hold it. No DNS is involved in
+    any of these, so they cannot hang on a runner with a slow resolver."""
+
+    def test_loopback_is_bindable(self):
+        self.assertEqual(setup.check_bind("127.0.0.1", 0)[0], "ok")
+
+    def test_wildcard_is_bindable(self):
+        self.assertEqual(setup.check_bind("0.0.0.0", 0)[0], "ok")
+
+    def test_an_address_this_host_lacks_is_unavailable(self):
+        kind, detail = setup.check_bind("203.0.113.99", 0)
+        self.assertEqual(kind, "unavailable")
+        self.assertIn("203.0.113.99", detail)
+
+    def test_junk_is_rejected_without_a_traceback(self):
+        self.assertEqual(setup.check_bind("!!!", 0)[0], "bad")
+
+    def test_empty_is_rejected(self):
+        self.assertEqual(setup.check_bind("", 0)[0], "bad")
+
+    @unittest.skipIf(sys.platform == "win32",
+                     "Windows SO_REUSEADDR permits binding an active "
+                     "listener, where Linux refuses; the service is Linux-only")
+    def test_a_taken_port_reads_as_in_use(self):
+        s = socket.socket()
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("127.0.0.1", 0))
+        s.listen(1)
+        self.addCleanup(s.close)
+        kind, _ = setup.check_bind("127.0.0.1", s.getsockname()[1])
+        self.assertEqual(kind, "in-use")
+
+    def test_the_probe_leaves_the_port_free(self):
+        # It binds without listening and closes immediately; if it leaked the
+        # socket, the service it just approved could not start.
+        setup.check_bind("127.0.0.1", 8787)
+        again = socket.socket()
+        again.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.addCleanup(again.close)
+        again.bind(("127.0.0.1", 8787))     # raises if the probe held on
+
+    def test_lan_address_is_never_loopback(self):
+        # It may legitimately be "" on a host with no default route; what it
+        # must never be is the 127.0.1.1 that gethostname() would have given.
+        addr = setup.lan_address()
+        self.assertFalse(addr.startswith("127."))
+
+    def test_suggest_keeps_a_working_address(self):
+        with mock.patch.object(setup, "lan_address", lambda: "192.168.1.50"), \
+                mock.patch.object(setup, "check_bind", lambda a, p: ("ok", "")):
+            self.assertEqual(setup.suggest_bind("10.0.0.5"), "10.0.0.5")
+
+    def test_suggest_keeps_the_wildcard(self):
+        # Unmocked: 0.0.0.0 binds on any host, so this pins the same rule
+        # without asserting anything about the machine running the test.
+        with mock.patch.object(setup, "lan_address", lambda: "192.168.1.50"):
+            self.assertEqual(setup.suggest_bind("0.0.0.0"), "0.0.0.0")
+
+    def test_suggest_replaces_junk(self):
+        with mock.patch.object(setup, "lan_address", lambda: "192.168.1.50"):
+            self.assertEqual(setup.suggest_bind("!!!"), "192.168.1.50")
+
+    def test_suggest_replaces_loopback(self):
+        with mock.patch.object(setup, "lan_address", lambda: "192.168.1.50"):
+            self.assertEqual(setup.suggest_bind("127.0.0.1"), "192.168.1.50")
+
+    def test_suggest_replaces_an_address_the_host_lost(self):
+        # A NIC renumbered since the last run must not be offered again.
+        with mock.patch.object(setup, "lan_address", lambda: "192.168.1.50"):
+            self.assertEqual(setup.suggest_bind("203.0.113.99"), "192.168.1.50")
+
+    def test_suggest_falls_back_to_the_wildcard(self):
+        with mock.patch.object(setup, "lan_address", lambda: ""):
+            self.assertEqual(setup.suggest_bind(""), "0.0.0.0")
+
+
+class TestRestartWeb(unittest.TestCase):
+    """`systemctl enable --now` is a no-op on an already-active unit, so the
+    wizard used to print a new bind address while the running process kept
+    serving the old one. That shipped, and looked like the UI refusing
+    connections on an address the wizard had just called correct."""
+
+    def drive(self, keystrokes, enabled=True, active=True):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=False)
+        cfg = {"web": {"enabled": enabled}}
+        buf = io.StringIO()
+        restarted = []
+        try:
+            with contextlib.redirect_stdout(buf), \
+                    mock.patch.object(setup, "unit_is_active",
+                                      lambda unit: active), \
+                    mock.patch.object(setup, "restart_unit",
+                                      lambda unit, msg: restarted.append(unit)):
+                setup.restart_web_if_running(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return restarted, buf.getvalue()
+
+    def test_a_running_service_is_restarted(self):
+        restarted, _ = self.drive("y\n")
+        self.assertEqual(restarted, ["timelapse-web.service"])
+
+    def test_enter_accepts_the_restart(self):
+        # The whole point is that the common path applies the change.
+        restarted, _ = self.drive("\n")
+        self.assertEqual(restarted, ["timelapse-web.service"])
+
+    def test_declining_says_the_settings_are_not_live(self):
+        restarted, out = self.drive("n\n")
+        self.assertEqual(restarted, [])
+        self.assertIn("previous settings", out)
+        self.assertIn("systemctl restart", out)
+
+    def test_a_stopped_service_is_told_how_to_start(self):
+        restarted, out = self.drive("", active=False)
+        self.assertEqual(restarted, [])
+        self.assertIn("enable --now", out)
+
+    def test_disabling_offers_to_stop_a_running_service(self):
+        # It exits 0 when disabled, so a restart is what stops it. Left alone
+        # it would keep serving a UI the operator just turned off.
+        restarted, out = self.drive("y\n", enabled=False)
+        self.assertEqual(restarted, ["timelapse-web.service"])
+        self.assertIn("still running", out)
+
+    def test_a_stopped_and_disabled_service_says_nothing(self):
+        restarted, out = self.drive("", enabled=False, active=False)
+        self.assertEqual(restarted, [])
+        self.assertNotIn("enable --now", out)
+
+    def test_no_systemd_means_no_prompt(self):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY("", tty=False)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), \
+                    mock.patch.object(setup, "unit_is_active", lambda u: None):
+                setup.restart_web_if_running({"web": {"enabled": True}})
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        self.assertEqual(buf.getvalue(), "")
 
 
 class TestWebStateDir(unittest.TestCase):

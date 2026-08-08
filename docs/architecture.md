@@ -454,6 +454,39 @@ placed under either is invisible to the service and the page reports it as
 unreadable, which is correct but baffling. Cost an hour of a test run; worth
 knowing before someone points `library_root` at a scratch directory.
 
+**The bind address is settled against the kernel, not against a list.**
+`check_bind()` binds the address for real (SO_REUSEADDR set, matching the
+server; bind only, never listen, closed at once) because the kernel is the
+authority and the failure modes need telling apart. An address this host does
+not have is the silent one worth catching: the service starts, logs the
+address it is serving and is simply unreachable, with nothing in the journal
+naming the cause. A port already in use is accepted with a note, since the
+usual holder is the web UI itself being reconfigured. A port below 1024 is
+refused without probing at all: the wizard normally runs as root and the
+service does not, so that probe would pass and prove nothing.
+
+`lan_address()` asks the routing table for the source address it would use to
+reach TEST-NET-1. No packets are sent; a UDP `connect()` only fixes the peer
+locally, so it works on a host with no internet access and returns `""` on one
+with no default route. `gethostname()` is deliberately not used: on Debian it
+resolves to 127.0.1.1, which is the exact useless answer this avoids.
+
+The suggested default is the LAN address, not loopback. A status page reachable
+only from the machine it describes is of little use on a headless recorder.
+An address already in the config is kept when it still works, and moving an
+install that deliberately sat on loopback is called out at the prompt rather
+than done quietly. The *config* default stays `127.0.0.1`, so a hand-edited
+`config.json` still starts closed; only the wizard, where an operator is
+present to read the warning, suggests otherwise.
+
+**Changing any of this requires a restart, and the wizard now does it.**
+`systemctl enable --now` is a no-op on an already-active unit, so
+`restart_web_if_running()` exists for the same reason
+`restart_capture_if_running()` does. This shipped broken in 0.0.9: the wizard
+printed a new bind address while the running process kept serving the one it
+read at startup, which presented as the UI refusing connections on an address
+the wizard had just called correct.
+
 **`resolve_library()`** is the part with actual thinking in it. Videos are not
 where a naive reading of the config says they are: `transfer()` runs rsync with
 `--remove-source-files` and `transfer.delete_local_after_transfer` defaults to
@@ -943,7 +976,7 @@ install.sh                       bootstrap installer, 615 lines
 scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
-scripts/timelapse_setup.py       configuration wizard, 1848 lines
+scripts/timelapse_setup.py       configuration wizard, 2112 lines
 scripts/timelapse_web.py         read-only web UI, 1607 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests

@@ -9,7 +9,27 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Changed
+- **`timelapse web` now suggests this host's LAN address** rather than
+  `127.0.0.1`. A status page reachable only from the machine it describes is
+  of little use on a headless recorder. It falls back to `0.0.0.0` when no
+  LAN address can be worked out, keeps an address you already have set, and
+  says so plainly when accepting the suggestion would move an install that
+  was deliberately kept local. The config file default is unchanged: a
+  hand-edited `config.json` still starts closed.
+
+### Added
+- **The wizard checks the bind address against the kernel** before writing it.
+  An address this host does not have is refused at the prompt, with the
+  addresses it does have listed, instead of producing a config whose service
+  starts, reports success and is unreachable. A privileged port is refused
+  too, since the service runs unprivileged.
+
 ### Fixed
+- **`timelapse web` now restarts the service.** `systemctl enable --now` is a
+  no-op on an already-running unit, so changing the bind address or port
+  reported success and changed nothing until the next reboot. It now offers
+  the restart, and offers to stop the service if you turn the UI off.
 - **The web UI no longer logs a traceback when a viewer closes a video.**
   Playing or seeking a timelapse and then quitting the player left a
   `ConnectionResetError` traceback in the journal, tagged as an error. The
