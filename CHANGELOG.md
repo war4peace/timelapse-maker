@@ -9,6 +9,14 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+- **The web UI no longer logs a traceback when a viewer closes a video.**
+  Playing or seeking a timelapse and then quitting the player left a
+  `ConnectionResetError` traceback in the journal, tagged as an error. The
+  playback itself was fine; the log was reporting normal behaviour as a
+  crash. Disconnects are now recorded at debug level, and genuine faults go
+  through the logger with a timestamp and a level instead of to bare stderr.
+
 ## [0.0.9] - 2026-08-07
 
 ### Added

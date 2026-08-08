@@ -31,6 +31,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -58,6 +59,14 @@ DEFAULT_STATE_DIR = "/var/lib/timelapse/web"
 # it there looks like a timeout and is not one. On the handler it reaches
 # socket.settimeout() via StreamRequestHandler.setup().
 SOCKET_TIMEOUT = 30
+
+# Exceptions that mean "the client went away", which is not a fault. Python 3.10
+# made socket.timeout an alias of TimeoutError; on 3.9 it is a distinct OSError
+# subclass that TimeoutError does not cover, so both are named. getattr rather
+# than the attribute, because the docs call the alias deprecated and an
+# AttributeError at import would take the whole service down over a log message.
+DISCONNECTED = (ConnectionError, TimeoutError,
+                getattr(socket, "timeout", TimeoutError))
 
 
 def load_config(path):
@@ -1507,6 +1516,29 @@ class Server(ThreadingHTTPServer):
         super().__init__(addr, handler)
         self.cfg = cfg
         self.index = index
+
+    def handle_error(self, request, client_address):
+        """A client that walks away is not an error.
+
+        Video playback makes this routine. A player opens a connection, takes
+        the byte range it wanted, and abandons it; the handler is then blocked
+        in readline() waiting for a request that never comes, and the socket
+        resets under it. socketserver's default prints a full traceback to
+        stderr for that, which journald tags as an error, so an ordinary seek
+        in VLC reads as a crash in the log.
+
+        _pump() already swallows a disconnect *during* the body, which is why
+        that case never showed up. This catches the same thing happening
+        between requests, where no code of ours is on the stack to catch it.
+
+        Real faults still get reported, but through the logger instead of a
+        bare stderr traceback, so they carry a timestamp and a level.
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, DISCONNECTED):
+            log.debug("%s disconnected: %s", client_address[0], exc)
+            return
+        log.exception("Unhandled error serving %s", client_address[0])
 
 
 def main():

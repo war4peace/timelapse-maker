@@ -556,6 +556,17 @@ dropped NAS mount is a *correct* empty library, not a fault.
   failing it, so that case closes the connection. `BrokenPipeError` and
   `ConnectionResetError` are caught and ignored, because a viewer quitting VLC
   is the normal way a video request ends.
+- **`Server.handle_error()` exists because that `_pump()` guard is not enough.**
+  The common disconnect happens *between* requests, not during one: the client
+  takes its byte range, the handler loops back into `readline()` waiting for
+  the next request on the keep-alive connection, and the socket resets under
+  it with no code of ours on the stack. `socketserver` prints a full traceback
+  to **stderr** for that, and journald tags stderr as an error, so an ordinary
+  seek in VLC reads as a crash in the log. `ConnectionError`, `TimeoutError`
+  and `socket.timeout` (a separate class before 3.10) are logged at debug;
+  everything else goes through the logger, which also gains it a timestamp and
+  a level that the default traceback never had. Reproduced before and after by
+  completing one keep-alive request and closing with `SO_LINGER 0`.
 - **Range requests** (`parse_range()`) are what make scrubbing work. Single
   ranges only: closed (`bytes=0-499`), open (`bytes=500-`) and suffix
   (`bytes=-500`, which is how a player reads a Matroska trailer). An end past
@@ -933,7 +944,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 1848 lines
-scripts/timelapse_web.py         read-only web UI, 1581 lines
+scripts/timelapse_web.py         read-only web UI, 1607 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

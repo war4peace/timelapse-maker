@@ -5,8 +5,10 @@ than a live server: the routing and the escaping are the parts worth pinning,
 and binding a port in a unit test invites flakiness on a CI runner.
 """
 
+import contextlib
 import io
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
@@ -1377,6 +1379,54 @@ class TestEscape(unittest.TestCase):
 
     def test_accepts_non_strings(self):
         self.assertEqual(web.escape(Path("/tmp/x")), str(Path("/tmp/x")))
+
+
+class TestHandleError(unittest.TestCase):
+    """A client disconnect is noise; a bug is not. socketserver's default
+    prints a bare traceback to stderr for both, and journald tags stderr as an
+    error, so closing VLC mid-playback looked exactly like a crash."""
+
+    def setUp(self):
+        # __new__ because handle_error touches nothing __init__ sets up, and a
+        # real Server would bind a port.
+        self.server = web.Server.__new__(web.Server)
+
+    def _handle(self, exc):
+        """Call handle_error with exc live, the way process_request_thread
+        does: it reads sys.exc_info() rather than taking an argument."""
+        with mock.patch.object(web, "log") as logger:
+            try:
+                raise exc
+            except BaseException:
+                self.server.handle_error(None, ("192.168.2.90", 14539))
+        return logger
+
+    def test_disconnects_are_debug_only(self):
+        for exc in (ConnectionResetError(104, "Connection reset by peer"),
+                    BrokenPipeError(32, "Broken pipe"),
+                    ConnectionAbortedError(103, "Connection aborted"),
+                    socket.timeout("timed out")):
+            with self.subTest(exc=type(exc).__name__):
+                logger = self._handle(exc)
+                self.assertTrue(logger.debug.called)
+                self.assertFalse(logger.exception.called)
+                self.assertFalse(logger.warning.called)
+
+    def test_real_errors_are_still_reported(self):
+        logger = self._handle(ValueError("a genuine bug"))
+        self.assertTrue(logger.exception.called)
+        self.assertFalse(logger.debug.called)
+
+    def test_disconnect_writes_nothing_to_stderr(self):
+        # The reported symptom was a traceback in the journal, so assert on
+        # the channel that produced it rather than only on the logger.
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            try:
+                raise ConnectionResetError(104, "Connection reset by peer")
+            except BaseException:
+                self.server.handle_error(None, ("192.168.2.90", 14539))
+        self.assertEqual(buf.getvalue(), "")
 
 
 if __name__ == "__main__":
