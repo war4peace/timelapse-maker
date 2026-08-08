@@ -20,7 +20,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        # 3.9 is the floor (RHEL 9 and Debian 11 ship it as the system
+        # python3). 3.14 is what the author's deployment actually runs, and
+        # until it was added nothing tested the interpreter in production.
+        # 3.12 is the common middle: Debian 13, Ubuntu 24.04.
+        python-version: ["3.9", "3.12", "3.14"]
 
     steps:
       - uses: actions/checkout@v5
