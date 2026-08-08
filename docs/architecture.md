@@ -546,6 +546,13 @@ dropped NAS mount is a *correct* empty library, not a fault.
   prunes normally.
 - **An unusable state directory degrades rather than crashes.** Status and logs
   still work; the library page explains that the unit needs `ReadWritePaths`.
+- **Query parsing keeps blank values.** Two of the groups the index itself
+  offers links to are keyed on the empty string: the library root's `folder`,
+  and the `camera` of every file whose name carries no camera. `parse_qs`
+  discards blank values by default, so `?folder=` and `?camera=` parsed to no
+  filter at all and fell through to the home page, which reads as the group
+  being empty rather than as a broken link. Both groups are large in a real
+  library. `valid_day()` still rejects a blank `?day=`, which now reaches it.
 
 **Serving and handoff** (`/video/<path>`, `/play/<path>`).
 
@@ -977,7 +984,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 2112 lines
-scripts/timelapse_web.py         read-only web UI, 1607 lines
+scripts/timelapse_web.py         read-only web UI, 1619 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

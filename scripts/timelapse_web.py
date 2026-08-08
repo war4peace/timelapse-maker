@@ -984,7 +984,13 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path, _, query = self.path.partition("?")
         route = path.rstrip("/") or "/"
-        args = parse_qs(query)
+        # keep_blank_values, because an empty value is a real answer here and
+        # not an absent one. The library root's folder is "" and files with no
+        # camera in the name group under camera "", so `?folder=` and
+        # `?camera=` are the only way to reach two groups the index itself
+        # offers links to. Dropping them silently fell through to the home
+        # page, which looked like the group being empty.
+        args = parse_qs(query, keep_blank_values=True)
 
         # Prefix routes first: the rest of the path is a library-relative file
         # path, which may contain slashes, spaces and non-ASCII.

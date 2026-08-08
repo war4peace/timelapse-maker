@@ -26,6 +26,11 @@ While the version is `0.x`, the configuration format may change in any release.
   too, since the service runs unprivileged.
 
 ### Fixed
+- **Two library groups the page linked to could not be opened.** Clicking
+  "(no name in filename)" or the root folder showed the library home page
+  again instead of the files, because a blank query value was being discarded
+  before the filter was applied. Both groups are large in a real library: 450
+  files and 1,246 files respectively on the author's.
 - **`timelapse web` now restarts the service.** `systemctl enable --now` is a
   no-op on an already-running unit, so changing the bind address or port
   reported success and changed nothing until the next reboot. It now offers

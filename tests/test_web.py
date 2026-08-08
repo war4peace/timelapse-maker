@@ -856,6 +856,38 @@ class TestLibraryRoutes(IndexCase):
         _, _, body = self.get("/library")
         self.assertIn("no name in filename", body)
 
+    def test_the_unnamed_camera_group_opens(self):
+        # `?camera=` is a real filter, not an absent one: files with no camera
+        # in the name group under "". parse_qs drops blank values by default,
+        # so this fell through to the home page and the group the index links
+        # to looked empty. 450 files were unreachable on the real library.
+        _, _, body = self.get("/library?camera=")
+        self.assertIn("no name in filename", body)
+        self.assertIn("2021-11-01.mp4", body)
+        # The home page, which is what used to be served instead.
+        self.assertNotIn("<h2>Folders</h2>", body)
+
+    def test_the_root_folder_opens(self):
+        # Same bug, other route: the library root's folder value is "".
+        _, _, body = self.get("/library?folder=")
+        self.assertIn("(root)", body)
+        self.assertIn("Gate.20260707.mkv", body)
+        self.assertIn("Re-checked against disk", body)
+        self.assertNotIn("<h2>Folders</h2>", body)
+
+    def test_the_links_the_index_offers_are_the_ones_that_work(self):
+        # The two views above are only reachable by the links on the home
+        # page, so pin that they are still generated in the form just tested.
+        _, _, home = self.get("/library")
+        self.assertIn('href="/library?camera="', home)
+        self.assertIn('href="/library?folder="', home)
+
+    def test_a_blank_day_is_still_refused(self):
+        # keep_blank_values makes `?day=` reach the day view, where valid_day
+        # must reject it rather than querying for a day of "".
+        _, _, body = self.get("/library?day=")
+        self.assertIn("Not a date", body)
+
     def test_index_error_is_explained_not_hidden(self):
         broken = web.Index(Path(self.tmp) / "nope" / "x", self.root)
         broken.error = "boom, needs ReadWritePaths"
