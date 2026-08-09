@@ -10,6 +10,13 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Fixed
+- **The tabs no longer move between pages.** Status and logs use the whole
+  window while the other pages keep a narrower reading column, and the tabs
+  were positioned by whichever it was, so they jumped about 240 pixels as you
+  moved between them. The title and the tabs are now centred on the window
+  and stay put whatever the page below them does. The scrollbar's width is
+  reserved on every page too, since otherwise a page long enough to scroll
+  shifted them another 8 pixels.
 - **A failed update check no longer costs you a day.** A momentary DNS
   failure was recorded as though it were a successful check, so the
   once-a-day interval gated the retry: a blip lasting seconds left the panel

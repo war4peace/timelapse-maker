@@ -436,6 +436,34 @@ class TestStatusRoutes(unittest.TestCase):
                 self.assertIn('<body class="pane-page">', body)
                 self.assertIn('<section class="pane">', body)
 
+    def test_the_tabs_are_centred_independently_of_the_page_width(self):
+        """Reported: the tabs jumped ~240px between the overview and the log
+        page, because the wide pages drop the 54rem column and the nav was
+        left-aligned inside it. Centring on the viewport makes their position
+        independent of the content. This pins the rules; the positions
+        themselves were measured in Chrome, see architecture.md section 9."""
+        _, _, body = request("/", self.config)
+        css = body.split("</style>", 1)[0]
+        self.assertIn("scrollbar-gutter: stable", css)
+        nav = css.split("nav {", 1)[1].split("}", 1)[0]
+        self.assertIn("justify-content: center", nav)
+        head = css.split("header {", 1)[1].split("}", 1)[0]
+        self.assertIn("justify-content: center", head)
+
+    def test_every_page_carries_the_same_nav(self):
+        # Whatever the layout does, the controls themselves must not differ
+        # between pages.
+        navs = set()
+        for path in ("/", "/status", "/logs"):
+            with mock.patch.object(web, "run_command", return_value=("x", "")):
+                _, _, body = request(path, self.config)
+            # Strip the whole class attribute, not just "on": the inactive
+            # links carry class="", so removing only the active marker leaves
+            # a different residue on each page.
+            navs.add(re.sub(r'\s*class="[^"]*"', "",
+                            body.split("<nav>", 1)[1].split("</nav>", 1)[0]))
+        self.assertEqual(len(navs), 1)
+
     def test_the_reading_column_is_left_alone_elsewhere(self):
         # Assert on the body tag, not the document: the stylesheet defining
         # .pane-page is inline, so the name appears on every page either way.

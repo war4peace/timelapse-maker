@@ -1187,12 +1187,23 @@ LAYOUT = """<!doctype html>
 <title>timelapse-maker</title>
 <style>
   :root {{ color-scheme: light dark; }}
+  /* Reserve the scrollbar's width whether or not the page needs one. Without
+     it, anything centred sits ~8px further left on a page long enough to
+     scroll (the library) than on one that is not (the overview), and the tabs
+     shift as you move between them. */
+  html {{ scrollbar-gutter: stable; }}
   body {{ font: 15px/1.5 system-ui, sans-serif; margin: 0; padding: 2rem 1.25rem;
          max-width: 54rem; margin-inline: auto; }}
   h1 {{ font-size: 1.3rem; margin: 0; }}
   h2 {{ font-size: .95rem; text-transform: uppercase; letter-spacing: .06em;
         opacity: .6; margin: 0 0 .6rem; }}
+  /* Centred, not left-aligned in the content column. The title and the tabs
+     are the fixed furniture of every page, and the pages are not all the same
+     width: status and logs drop the 54rem column for the whole window, which
+     moved both to the far left. Centring on the viewport makes their position
+     independent of whatever the page below them is doing. */
   header {{ display: flex; align-items: baseline; gap: .75rem;
+            justify-content: center;
             border-bottom: 1px solid rgba(128,128,128,.3);
             padding-bottom: .9rem; margin-bottom: 1.5rem; }}
   .ver {{ opacity: .55; font-size: .85rem; }}
@@ -1210,7 +1221,8 @@ LAYOUT = """<!doctype html>
     .ok {{ color: #4ac26b; }} .bad {{ color: #ff7b72; }}
   }}
   ul.todo {{ margin: 0; padding-left: 1.1rem; opacity: .65; font-size: .9rem; }}
-  nav {{ display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1.25rem; }}
+  nav {{ display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1.25rem;
+         justify-content: center; }}
   nav a {{ text-decoration: none; border: 1px solid rgba(128,128,128,.35);
            border-radius: 999px; padding: .25rem .8rem; font-size: .9rem;
            color: inherit; }}

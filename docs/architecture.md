@@ -715,6 +715,17 @@ connection this service makes, and should stay the only one.
 **Status and logs** (`/status`, `/logs`) shell out, on request only: a page
 load or a click. Nothing polls and nothing is collected in the background.
 
+- **The title and tabs are centred on the window, not on the content.** They
+  are the fixed furniture of every page and the pages are not all the same
+  width, so positioning them by the content column made them jump about 240px
+  between the overview and the log page. `justify-content: center` on
+  `header` and `nav` makes their position independent of whatever is below.
+  `scrollbar-gutter: stable` on `html` closes the remaining 8px: without it a
+  page long enough to scroll (the library) is that much narrower than one that
+  is not, and anything centred moves with it. Measured in Chrome across all
+  four pages at two window sizes: 240px of drift before, 1px after, the
+  remainder being sub-pixel rounding when centring inside containers of
+  different widths.
 - **These two pages drop the 54rem reading column.** That width suits prose and
   tables and is wrong for raw command output, whose line length journald and
   systemctl decide, not us. `_render()` adds `pane-page` to `<body>` for them
@@ -1087,7 +1098,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 2123 lines
-scripts/timelapse_web.py         read-only web UI, 2180 lines
+scripts/timelapse_web.py         read-only web UI, 2192 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
