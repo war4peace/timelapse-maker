@@ -520,7 +520,7 @@ path; it offers to restart the service so the change takes effect. Editing
 `config.json` by hand does not, so follow that with `sudo systemctl restart
 timelapse-web`: the server reads its config once, at startup.
 
-It gives you four things:
+It gives you five things:
 
 - **Where your videos actually are**: see the warning below, this is the
   question people get wrong.
@@ -531,6 +531,32 @@ It gives you four things:
   (or mpv, or whatever opens `.m3u`) a playlist pointing back at the server,
   plus a *Download* link. There is also **one playlist per day**: open it and
   your player queues that day's videos from every camera in turn.
+- **Whether there is a new version**, with what changed and the commands to
+  upgrade. See below; you can turn it off.
+
+### The update check, and the only packet this UI sends
+
+The Overview page tells you which version you are running and whether a newer
+one has been tagged, along with its changelog entry and the upgrade commands.
+
+It asks `api.github.com` **at most once a day**, and only while somebody has
+the page open, so a service nobody looks at never contacts anything. The
+answer is cached in `web.state_dir` and survives restarts.
+
+**This is the only outbound connection the web UI ever makes.** It sends no
+configuration, no camera names, and nothing about your videos or your library.
+GitHub sees this host's IP address and a User-Agent naming the project and
+version, the same as any browser visiting the repository page would.
+
+`timelapse web` asks whether you want it, and it is on by default, including
+after an upgrade. To turn it off:
+
+```bash
+sudo timelapse web        # answer "n" to "Check GitHub for updates?"
+```
+
+or set `"update_check": false` in the `web` section of `config.json` and run
+`sudo systemctl restart timelapse-web`.
 
 ### Your videos are probably not in `video_output`
 

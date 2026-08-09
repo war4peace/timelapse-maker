@@ -656,6 +656,39 @@ dropped NAS mount is a *correct* empty library, not a fault.
   can stay perfectly rectangular while the path indents under the wrong
   heading, and a colspan test will not notice.
 
+**The update check** (`UpdateChecker`, on the overview) is the one outbound
+connection this service makes, and should stay the only one.
+
+- **Opt-out, and asked for.** `web.update_check` defaults true, `choose_web()`
+  asks, and the panel itself names the host it contacts and how to switch it
+  off. It sends an HTTPS GET and nothing else: no config, no camera names,
+  nothing about the library. What GitHub learns is the IP and the version in
+  the User-Agent.
+- **Lazy, not scheduled.** A request for the overview starts a check only if
+  the cached answer is older than a day, and returns immediately either way,
+  so nothing here can delay a page. A service nobody looks at never calls out.
+  This follows the same rule as status and logs: on request, never polling.
+- **Releases first, tags second.** This is not a detail. The repo publishes
+  git tags and **no GitHub Releases**, so `/releases/latest` answers 404; an
+  implementation that knew only about Releases would report "up to date"
+  forever, on its own project. The fallback reads `/tags` and takes the
+  highest parsed version, not the first, because that endpoint's ordering is
+  not documented. Publishing real Releases would make the notes richer with no
+  code change, since a release body is preferred when one exists.
+- **`parse_version` compares tuples, never strings.** `0.0.10` sorts below
+  `0.0.9` lexically, and that is the very next version this project will cut.
+- **The notes come from the changelog** when the tag has no release body,
+  fetched only when there is actually an update to describe, so the ordinary
+  case is one request. `plain_notes()` strips heading markers because the text
+  lands in a `<div>`, not a markdown renderer.
+- **An explicit User-Agent is mandatory.** GitHub rejects a request without
+  one, exactly as Cloudflare does for the Discord webhook. Two vendors, one
+  trap; see `post_webhook()`.
+- **Every failure is somebody else's outage.** `_check()` catches everything,
+  records it, keeps the last good answer and never reaches a page as a 500.
+  The cache lives in `state_dir`, the single writable directory, so a service
+  that restarts often does not spend the 60-per-hour anonymous rate limit.
+
 **Status and logs** (`/status`, `/logs`) shell out, on request only: a page
 load or a click. Nothing polls and nothing is collected in the background.
 
@@ -1030,8 +1063,8 @@ install.sh                       bootstrap installer, 615 lines
 scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
-scripts/timelapse_setup.py       configuration wizard, 2112 lines
-scripts/timelapse_web.py         read-only web UI, 1734 lines
+scripts/timelapse_setup.py       configuration wizard, 2123 lines
+scripts/timelapse_web.py         read-only web UI, 2063 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

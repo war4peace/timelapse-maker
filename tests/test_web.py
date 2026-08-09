@@ -12,8 +12,10 @@ import shutil
 import socket
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -164,12 +166,17 @@ class FakeRequest:
 
 
 class FakeServer:
-    def __init__(self, config, index=None):
+    def __init__(self, config, index=None, updates=None):
         self.cfg = config
         self.index = index
+        # Disabled by default, and that is not incidental: an enabled checker
+        # would have the overview page reaching api.github.com from the test
+        # suite. Tests that want the panel populated set the state directly.
+        self.updates = updates or web.UpdateChecker(None, enabled=False)
 
 
-def request_bytes(path, config, index=None, method="GET", headers=""):
+def request_bytes(path, config, index=None, method="GET", headers="",
+                  updates=None):
     """Drive one request through the real handler; body stays bytes.
 
     Extra headers go first, and Host is only defaulted when they do not supply
@@ -186,16 +193,17 @@ def request_bytes(path, config, index=None, method="GET", headers=""):
     handler.rfile = None
     # BaseHTTPRequestHandler does all its work from __init__.
     web.Handler.__init__(handler, req, ("127.0.0.1", 5555),
-                         FakeServer(config, index))
+                         FakeServer(config, index, updates))
     out = bytes(req.sent)
     head, _, body = out.partition(b"\r\n\r\n")
     head = head.decode("latin-1")
     return int(head.split()[1]), head, body
 
 
-def request(path, config, index=None, method="GET", headers=""):
+def request(path, config, index=None, method="GET", headers="", updates=None):
     """As request_bytes, with the body decoded for HTML assertions."""
-    status, head, body = request_bytes(path, config, index, method, headers)
+    status, head, body = request_bytes(path, config, index, method, headers,
+                                       updates)
     return status, head, body.decode("utf-8", "replace")
 
 
@@ -1558,6 +1566,345 @@ class TestLibraryLinks(IndexCase):
         _, _, body = request("/library?folder=2024-01", self.config, self.index)
         self.assertIn(str(self.root), body)          # share path, for a mount
         self.assertIn("http://nas.local/video/", body)  # URL, for any player
+
+
+class TestParseVersion(unittest.TestCase):
+
+    def test_accepts_both_spellings_of_a_tag(self):
+        self.assertEqual(web.parse_version("v0.0.9"), (0, 0, 9))
+        self.assertEqual(web.parse_version("0.0.9"), (0, 0, 9))
+
+    def test_junk_is_none_rather_than_a_guess(self):
+        for bad in ("", None, "latest", "v", "main", "0.1"):
+            self.assertIsNone(web.parse_version(bad), bad)
+
+    def test_ordering_is_numeric_not_lexical(self):
+        # The whole point: "0.0.10" sorts BELOW "0.0.9" as a string, and the
+        # next release after 0.0.9 is exactly that.
+        self.assertGreater(web.parse_version("v0.0.10"),
+                           web.parse_version("v0.0.9"))
+        self.assertGreater(web.parse_version("v0.1.0"),
+                           web.parse_version("v0.0.99"))
+
+
+class TestChangelogSection(unittest.TestCase):
+
+    SAMPLE = "\n".join([
+        "# Changelog", "", "Preamble that belongs to nobody.", "",
+        "## [Unreleased]", "- not this one", "",
+        "## [0.1.0] - 2026-08-09", "### Fixed", "- the thing", "- and another",
+        "", "## [0.0.9] - 2026-08-07", "- older, must not appear", ""])
+
+    def test_extracts_only_the_named_release(self):
+        got = web.changelog_section(self.SAMPLE, "0.1.0")
+        self.assertIn("the thing", got)
+        self.assertIn("and another", got)
+        self.assertNotIn("older", got)
+        self.assertNotIn("not this one", got)
+        self.assertNotIn("Preamble", got)
+
+    def test_an_absent_version_yields_nothing(self):
+        self.assertEqual(web.changelog_section(self.SAMPLE, "9.9.9"), "")
+
+    def test_empty_input_is_not_an_error(self):
+        self.assertEqual(web.changelog_section("", "0.1.0"), "")
+
+
+class TestLatestRelease(unittest.TestCase):
+    """This repo publishes tags and no GitHub Releases, so /releases/latest
+    404s. An implementation that knew only about Releases would report "up to
+    date" forever, on its own project."""
+
+    def test_a_published_release_is_preferred(self):
+        with mock.patch.object(web, "fetch_json", return_value={
+                "tag_name": "v1.2.3", "html_url": "u", "body": "notes here"}):
+            ver, tag, url, notes = web.latest_release()
+        self.assertEqual((ver, tag, notes), ((1, 2, 3), "v1.2.3", "notes here"))
+
+    def test_falls_back_to_tags_on_404(self):
+        err = urllib.error.HTTPError("u", 404, "Not Found", None, None)
+        calls = []
+
+        def fake(url, timeout=10):
+            calls.append(url)
+            if url.endswith("/releases/latest"):
+                raise err
+            return [{"name": "v0.0.9"}, {"name": "v0.0.10"}, {"name": "v0.0.8"}]
+
+        with mock.patch.object(web, "fetch_json", fake):
+            ver, tag, url, notes = web.latest_release()
+        # Highest, not first: the API's ordering is its own business.
+        self.assertEqual((ver, tag), ((0, 0, 10), "v0.0.10"))
+        self.assertEqual(notes, "")
+        self.assertTrue(any("/tags" in c for c in calls))
+
+    def test_an_http_error_that_is_not_404_propagates(self):
+        err = urllib.error.HTTPError("u", 403, "rate limited", None, None)
+        with mock.patch.object(web, "fetch_json", side_effect=err):
+            with self.assertRaises(urllib.error.HTTPError):
+                web.latest_release()
+
+    def test_unparseable_tags_are_skipped(self):
+        err = urllib.error.HTTPError("u", 404, "Not Found", None, None)
+
+        def fake(url, timeout=10):
+            if url.endswith("/releases/latest"):
+                raise err
+            return [{"name": "nightly"}, {"name": "v0.2.0"}, {"name": "x"}]
+
+        with mock.patch.object(web, "fetch_json", fake):
+            ver, tag, _, _ = web.latest_release()
+        self.assertEqual(tag, "v0.2.0")
+
+
+class TestUpdateChecker(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def make(self, enabled=True, current="0.0.9"):
+        return web.UpdateChecker(self.tmp, enabled=enabled, current=current)
+
+    def test_disabled_never_calls_out(self):
+        # The one outbound connection this service makes, so "off" has to
+        # mean off rather than "checked and discarded".
+        c = self.make(enabled=False)
+        with mock.patch.object(web, "latest_release") as call:
+            c.refresh_if_stale()
+            time.sleep(0.1)
+        call.assert_not_called()
+
+    def test_a_check_records_the_newer_version(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u", "notes")):
+            c._check()
+        s = c.snapshot()
+        self.assertTrue(s["available"])
+        self.assertEqual(s["latest"], "0.1.0")
+        self.assertEqual(s["tag"], "v0.1.0")
+        self.assertEqual(s["notes"], "notes")
+
+    def test_the_same_version_is_not_an_update(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 0, 9), "v0.0.9", "u", "")):
+            c._check()
+        s = c.snapshot()
+        self.assertFalse(s["available"])
+        self.assertTrue(s["known"])
+
+    def test_an_older_tag_is_not_an_update(self):
+        # A local build ahead of the tags must not be told to downgrade.
+        c = self.make(current="0.2.0")
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u", "")):
+            c._check()
+        self.assertFalse(c.snapshot()["available"])
+
+    def test_a_failure_is_recorded_not_raised(self):
+        # Somebody else's outage must not reach the page as a 500.
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               side_effect=OSError("no route to host")):
+            c._check()
+        s = c.snapshot()
+        self.assertIn("no route to host", s["error"])
+        self.assertFalse(s["available"])
+
+    def test_a_failure_keeps_the_last_good_answer(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u", "n")):
+            c._check()
+        with mock.patch.object(web, "latest_release",
+                               side_effect=OSError("dns")):
+            c._check()
+        s = c.snapshot()
+        self.assertTrue(s["available"])       # still known to be behind
+        self.assertIn("dns", s["error"])
+
+    def test_the_result_survives_a_restart(self):
+        # Without this, a service that restarts often would ask on every boot
+        # and spend the 60-per-hour anonymous rate limit.
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u", "n")):
+            c._check()
+        again = self.make()
+        self.assertEqual(again.snapshot()["latest"], "0.1.0")
+        self.assertTrue(again.snapshot()["available"])
+
+    def test_a_fresh_answer_is_not_rechecked(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u", "n")):
+            c._check()
+        with mock.patch.object(web, "latest_release") as call:
+            c.refresh_if_stale()
+            time.sleep(0.1)
+        call.assert_not_called()
+
+    def test_a_stale_answer_is_rechecked(self):
+        c = self.make()
+        c.state["checked"] = time.time() - web.UPDATE_INTERVAL - 1
+        done = threading.Event()
+
+        def slow():
+            done.set()
+            return (0, 1, 0), "v0.1.0", "u", "n"
+
+        with mock.patch.object(web, "latest_release", slow):
+            c.refresh_if_stale()
+            self.assertTrue(done.wait(5))
+
+    def test_a_corrupt_cache_is_ignored_not_fatal(self):
+        Path(self.tmp, "update.json").write_text("{ this is not json",
+                                                 encoding="utf-8")
+        self.assertEqual(self.make().snapshot()["latest"], "")
+
+    def test_notes_come_from_the_changelog_when_there_is_no_release(self):
+        # The tags fallback yields no body, and that is the normal case for
+        # this repo, so "what's new" has to come from somewhere.
+        c = self.make()
+        text = "## [0.1.0] - 2026-08-09\n- a real change\n\n## [0.0.9]\n- old\n"
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u", "")), \
+                mock.patch.object(web, "fetch_text", return_value=text):
+            c._check()
+        self.assertIn("a real change", c.snapshot()["notes"])
+        self.assertNotIn("old", c.snapshot()["notes"])
+
+    def test_a_changelog_failure_still_leaves_the_update_known(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u", "")), \
+                mock.patch.object(web, "fetch_text", side_effect=OSError("x")):
+            c._check()
+        s = c.snapshot()
+        self.assertTrue(s["available"])
+        self.assertEqual(s["notes"], "")
+        self.assertEqual(s["error"], "")
+
+    def test_no_changelog_fetch_when_up_to_date(self):
+        # One request in the common case, which is what keeps this cheap.
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 0, 9), "v0.0.9", "u", "")), \
+                mock.patch.object(web, "fetch_text") as text:
+            c._check()
+        text.assert_not_called()
+
+
+class TestUpdatePanel(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        Path(self.tmp, "videos").mkdir()
+        self.config = cfg(self.tmp, transfer={"enabled": False})
+
+    def checker(self, enabled=True, **state):
+        c = web.UpdateChecker(None, enabled=enabled)
+        c.state.update(state)
+        return c
+
+    def get(self, checker):
+        return request("/", self.config, updates=checker)[2]
+
+    def test_an_available_update_shows_the_tag_and_the_commands(self):
+        body = self.get(self.checker(checked=time.time(), tag="v0.1.0",
+                                     latest="0.1.0", url="https://example/rel"))
+        self.assertIn("An update is available", body)
+        self.assertIn("v0.1.0", body)
+        self.assertIn("install_timelapse.sh", body)
+        self.assertIn("sudo bash install_timelapse.sh", body)
+        self.assertIn("https://example/rel", body)
+
+    def test_release_notes_are_shown_and_escaped(self):
+        body = self.get(self.checker(
+            checked=time.time(), tag="v0.1.0", latest="0.1.0",
+            notes="- fixed <script>alert(1)</script>"))
+        self.assertIn("What is new", body)
+        self.assertNotIn("<script>alert", body)
+        self.assertIn("&lt;script&gt;", body)
+
+    def test_changelog_heading_markers_are_stripped(self):
+        # The notes go into a <div>, not a markdown renderer, so a literal
+        # "### Fixed" reads as a mistake rather than as formatting.
+        body = self.get(self.checker(
+            checked=time.time(), tag="v0.1.0", latest="0.1.0",
+            notes="### Fixed\n- a thing"))
+        self.assertIn("Fixed", body)
+        self.assertNotIn("### Fixed", body)
+        self.assertIn("- a thing", body)
+
+    def test_up_to_date_says_so_without_commands(self):
+        body = self.get(self.checker(checked=time.time(), tag="v0.0.9",
+                                     latest="0.0.9"))
+        self.assertIn("Up to date", body)
+        self.assertNotIn("install_timelapse.sh", body)
+
+    def test_disabled_says_how_to_turn_it_on(self):
+        body = self.get(self.checker(enabled=False))
+        self.assertIn("timelapse web", body)
+        self.assertNotIn("Checking GitHub", body)
+
+    def test_a_failed_check_is_quiet_not_alarming(self):
+        body = self.get(self.checker(checked=time.time(),
+                                     error="URLError: no route"))
+        self.assertIn("Last check failed", body)
+        self.assertIn("no route", body)
+
+    def test_the_page_says_where_it_connects_and_how_to_stop_it(self):
+        body = self.get(self.checker(checked=time.time(), latest="0.0.9",
+                                     tag="v0.0.9"))
+        self.assertIn("only request this service makes to the internet", body)
+
+    def test_a_check_in_flight_ships_the_poller(self):
+        c = self.checker()
+        c._busy = True
+        body = self.get(c)
+        self.assertIn('data-busy="1"', body)
+        self.assertIn("Checking GitHub", body)
+        self.assertIn("setInterval", body)
+
+    def test_a_settled_panel_ships_no_poller(self):
+        body = self.get(self.checker(checked=time.time(), latest="0.0.9"))
+        self.assertIn('data-busy="0"', body)
+        self.assertNotIn("setInterval", body)
+
+    def test_the_update_endpoint_returns_the_panel_alone(self):
+        c = self.checker(checked=time.time(), tag="v0.1.0", latest="0.1.0")
+        status, _, body = request("/update", self.config, updates=c)
+        self.assertEqual(status, 200)
+        self.assertIn('id="update"', body)
+        self.assertIn("v0.1.0", body)
+        self.assertNotIn("setInterval", body)
+        self.assertNotIn("<nav>", body)
+
+    def test_the_overview_never_waits_on_the_network(self):
+        # refresh_if_stale must hand off to a thread. If it ever blocks, this
+        # page render blocks with it.
+        c = self.checker()
+        c.state["checked"] = 0.0
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow():
+            started.set()
+            release.wait(10)
+            return (0, 1, 0), "v0.1.0", "u", ""
+
+        with mock.patch.object(web, "latest_release", slow):
+            t0 = time.time()
+            body = self.get(c)
+            elapsed = time.time() - t0
+            self.assertTrue(started.wait(5), "the check never started")
+            release.set()
+        self.assertLess(elapsed, 2.0, "the overview blocked on the check")
+        self.assertIn("Checking GitHub", body)
 
 
 class TestEscape(unittest.TestCase):

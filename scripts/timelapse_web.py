@@ -37,6 +37,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -801,6 +803,231 @@ LOG_LINES = {"200": "200", "1000": "1000"}
 DEFAULT_LOG_UNIT = "capture"
 DEFAULT_LOG_LINES = "200"
 
+# ----------------------------------------------------------------------------
+# Update check
+#
+# The one outbound connection this service makes, and the only one it ever
+# should. It is opt-out (web.update_check), never blocks a page, and sends
+# nothing but an HTTPS GET: no config, no camera names, no library contents.
+# What GitHub learns is the deployment's IP and the version in the User-Agent.
+# ----------------------------------------------------------------------------
+
+GITHUB_REPO = "war4peace/timelapse-maker"
+GITHUB_API = "https://api.github.com/repos/" + GITHUB_REPO
+CHANGELOG_URL = (f"https://raw.githubusercontent.com/{GITHUB_REPO}"
+                 f"/main/CHANGELOG.md")
+RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
+
+# GitHub rejects a request with no User-Agent outright. Exactly the trap
+# post_webhook() documents for Discord's Cloudflare, from a different vendor.
+UPDATE_UA = f"timelapse-maker/{__version__} (+https://github.com/{GITHUB_REPO})"
+
+UPDATE_TIMEOUT = 10
+# Unauthenticated GitHub allows 60 requests an hour per IP. One a day leaves
+# that entirely to the operator, and a release is not a thing that happens
+# hourly.
+UPDATE_INTERVAL = 24 * 3600
+# A release body is somebody's prose and goes on a page; cap what is rendered.
+NOTES_LIMIT = 4000
+
+VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+
+UPDATE_COMMANDS = (
+    "curl -sL https://raw.githubusercontent.com/" + GITHUB_REPO +
+    "/main/install.sh -o install_timelapse.sh\n"
+    "sudo bash install_timelapse.sh\n"
+    "rm install_timelapse.sh"
+)
+
+
+def parse_version(text):
+    """(major, minor, patch) or None. None sorts nothing and compares to
+    nothing, which is what an unparseable tag deserves."""
+    m = VERSION_RE.match((text or "").strip())
+    return tuple(int(g) for g in m.groups()) if m else None
+
+
+def fetch_json(url, timeout=UPDATE_TIMEOUT):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": UPDATE_UA,
+        "Accept": "application/vnd.github+json",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def fetch_text(url, limit, timeout=UPDATE_TIMEOUT):
+    req = urllib.request.Request(url, headers={"User-Agent": UPDATE_UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(limit).decode("utf-8", "replace")
+
+
+def plain_notes(text):
+    """Changelog markdown, de-fanged for a <div> that is not a renderer.
+
+    Only the heading markers, which is the part that looks like a mistake
+    rather than like formatting. Bullets and backticks read fine as they are,
+    and half-rendering markdown is worse than not rendering it.
+    """
+    out = [re.sub(r"^#+\s*", "", line) for line in (text or "").splitlines()]
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+
+
+def changelog_section(text, version):
+    """The one release's entry out of a Keep a Changelog file.
+
+    Used when the tag has no GitHub Release behind it, which is the case for
+    this repo today: every version is a plain git tag, so /releases/latest
+    404s and there is no release body to show. The changelog is then the only
+    place the "what's new" actually exists.
+    """
+    want = f"## [{version}]"
+    out, taking = [], False
+    for line in (text or "").splitlines():
+        if line.startswith("## "):
+            if taking:
+                break
+            taking = line.startswith(want)
+            continue
+        if taking:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
+def latest_release():
+    """(version, tag, url, notes). Raises on a network or parse failure.
+
+    Tries Releases first, because a published release carries the notes with
+    it. Falls back to tags: this repo has nine tags and no Releases, so an
+    implementation that only knew about /releases/latest would report "up to
+    date" forever, on its own project.
+    """
+    try:
+        rel = fetch_json(GITHUB_API + "/releases/latest")
+        tag = rel.get("tag_name") or ""
+        if parse_version(tag):
+            return (parse_version(tag), tag,
+                    rel.get("html_url") or RELEASES_URL,
+                    (rel.get("body") or "").strip())
+    except urllib.error.HTTPError as exc:
+        # 404 is the normal answer for a repo that tags without releasing.
+        if exc.code != 404:
+            raise
+
+    best = None
+    for item in fetch_json(GITHUB_API + "/tags"):
+        tag = item.get("name") or ""
+        ver = parse_version(tag)
+        # Highest version, not first in the list: the API's order is its own
+        # business and not documented as sorted.
+        if ver and (best is None or ver > best[0]):
+            best = (ver, tag)
+    if best is None:
+        raise ValueError("no version tags found")
+    ver, tag = best
+    return ver, tag, f"https://github.com/{GITHUB_REPO}/releases/tag/{tag}", ""
+
+
+class UpdateChecker:
+    """Asks GitHub, at most once a day, whether there is a newer version.
+
+    Checked lazily: a request for the overview kicks off a refresh only when
+    the cached answer is stale, and renders whatever is already known. So a
+    service nobody looks at never calls out at all, and a page render never
+    waits on the network.
+
+    The result is cached in state_dir, which is the one directory this service
+    may write. Surviving a restart is the point: without it, a service that
+    restarts often would ask on every boot and burn the rate limit.
+    """
+
+    def __init__(self, state_dir, enabled=True, current=__version__):
+        self.enabled = bool(enabled)
+        self.current = parse_version(current)
+        self.current_text = current
+        self.path = Path(state_dir) / "update.json" if state_dir else None
+        self._lock = threading.Lock()
+        self._busy = False
+        self.state = {"checked": 0.0, "tag": "", "latest": "", "url": "",
+                      "notes": "", "error": ""}
+        self._load()
+
+    def _load(self):
+        if not self.path:
+            return
+        try:
+            with open(self.path, encoding="utf-8") as fh:
+                saved = json.load(fh)
+            if isinstance(saved, dict):
+                self.state.update({k: saved[k] for k in self.state
+                                   if k in saved})
+        except (OSError, ValueError):
+            pass            # No cache yet, or a corrupt one. Ask again.
+
+    def _save(self):
+        if not self.path:
+            return
+        try:
+            tmp = self.path.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(self.state, fh)
+            os.replace(tmp, self.path)
+        except OSError as exc:
+            # An unwritable state dir already has its own visible symptom.
+            log.debug("Could not cache the update check: %s", exc)
+
+    def snapshot(self):
+        with self._lock:
+            s = dict(self.state)
+            s["busy"] = self._busy
+        s["enabled"] = self.enabled
+        s["current"] = self.current_text
+        latest = parse_version(s["latest"])
+        s["available"] = bool(latest and self.current and latest > self.current)
+        s["known"] = bool(s["checked"])
+        return s
+
+    def refresh_if_stale(self):
+        """Start a check in the background if the cache has aged out."""
+        if not self.enabled:
+            return
+        with self._lock:
+            if self._busy:
+                return
+            if time.time() - self.state["checked"] < UPDATE_INTERVAL:
+                return
+            self._busy = True
+        threading.Thread(target=self._check, daemon=True).start()
+
+    def _check(self):
+        try:
+            ver, tag, url, notes = latest_release()
+            if not notes and self.current and ver > self.current:
+                # No Release behind the tag, so the changelog is where the
+                # "what's new" lives. Fetched only when there is an update, so
+                # the usual case is a single request.
+                try:
+                    text = fetch_text(CHANGELOG_URL, 256 * 1024)
+                    notes = changelog_section(text, ".".join(str(n) for n in ver))
+                except Exception as exc:          # noqa: BLE001
+                    log.debug("Changelog fetch failed: %s", exc)
+            with self._lock:
+                self.state.update(checked=time.time(), tag=tag,
+                                  latest=".".join(str(n) for n in ver),
+                                  url=url, notes=notes[:NOTES_LIMIT], error="")
+        except Exception as exc:                  # noqa: BLE001
+            # Every failure here is somebody else's outage. Record it, keep
+            # the last good answer, and never let it reach the page as a 500.
+            with self._lock:
+                self.state["checked"] = time.time()
+                self.state["error"] = f"{type(exc).__name__}: {exc}"
+            log.info("Update check failed: %s", exc)
+        finally:
+            with self._lock:
+                self._busy = False
+            self._save()
+
+
 JOURNAL_DENIED = (
     "No entries. If the unit has been running, this process cannot read the "
     "journal rather than the journal being empty: journalctl shows nothing to "
@@ -943,6 +1170,10 @@ LAYOUT = """<!doctype html>
   tr.sub-row td {{ border-bottom: 1px solid rgba(128,128,128,.14);
                    padding-top: 0; }}
   .scan {{ font-size: .85rem; opacity: .7; margin: 0 0 1rem; }}
+  .new {{ background: rgba(26,127,55,.14); }}
+  .notes {{ max-height: 22rem; overflow: auto; white-space: pre-wrap;
+            font-size: .85rem; margin: .6rem 0 0; }}
+  .quiet {{ font-size: .8rem; opacity: .55; margin: .6rem 0 0; }}
   form.inline {{ display: inline; }}
   button {{ font: inherit; font-size: .85rem; padding: .25rem .8rem;
             border-radius: 999px; border: 1px solid rgba(128,128,128,.35);
@@ -973,6 +1204,28 @@ LAYOUT = """<!doctype html>
 # means reconcile_dir() hitting a CIFS share once a second during the very
 # scan it is competing with. Without JS the banner behaves as it always has,
 # a server-rendered snapshot, which is what the Rescan button gives you.
+# The update check runs on a thread, so the first view of the overview would
+# otherwise show "checking" and sit there. Same shape as the scan poller, minus
+# the reload: only this one section changes, so replacing it is enough.
+UPDATE_POLL_JS = """<script>
+(function () {
+  var box = document.getElementById('update');
+  if (!box || box.dataset.busy !== '1' || !window.fetch) { return; }
+  var tries = 0;
+  var timer = setInterval(function () {
+    if (++tries > 30) { clearInterval(timer); return; }
+    fetch('/update', {cache: 'no-store'}).then(function (r) {
+      if (!r.ok) { throw new Error(r.status); }
+      return r.text();
+    }).then(function (html) {
+      box.outerHTML = html;
+      box = document.getElementById('update');
+      if (!box || box.dataset.busy !== '1') { clearInterval(timer); }
+    }).catch(function () { clearInterval(timer); });
+  }, 1000);
+})();
+</script>"""
+
 SCAN_POLL_JS = """<script>
 (function () {
   var box = document.getElementById('scan');
@@ -1010,12 +1263,7 @@ OVERVIEW = """<section>
   {lib_note}
 </section>
 
-<section>
-  <h2>Not built yet</h2>
-  <ul class="todo">
-    <li>Playback handoff: <code>.m3u</code> to VLC, plus a download link</li>
-  </ul>
-</section>
+{update}
 """
 
 
@@ -1081,6 +1329,10 @@ class Handler(BaseHTTPRequestHandler):
             # library, so polling it once a second during a scan costs
             # nothing and never competes with the scan for the share.
             self._send(200, self._scan_banner(with_script=False))
+        elif route == "/update":
+            # The version panel alone, for its poller. Reads cached state; the
+            # network call it is waiting on is already on its own thread.
+            self._send(200, self._update_panel(with_script=False))
         elif route == "/healthz":
             self._send(200, "ok\n", "text/plain; charset=utf-8")
         else:
@@ -1126,13 +1378,81 @@ class Handler(BaseHTTPRequestHandler):
         # no page. It is two stat() calls.
         lib = resolve_library(self.server.cfg)
         note = f'<p class="note">{escape(lib["note"])}</p>' if lib["note"] else ""
+        # Kicked off here rather than at startup: a service nobody looks at
+        # never calls out, and this returns immediately either way.
+        self.server.updates.refresh_if_stale()
         return OVERVIEW.format(
             lib_path=escape(str(lib["path"]) if lib["path"] else "-"),
             lib_source=escape(lib["source"] or "-"),
             lib_class="ok" if lib["usable"] else "bad",
             lib_state="yes" if lib["usable"] else "no",
             lib_note=note,
+            update=self._update_panel(),
         )
+
+    def _update_panel(self, with_script=True):
+        """The version section, wrapped so the poller can replace it."""
+        u = self.server.updates.snapshot()
+        body = [f'<h2>Version</h2><dl><dt>Installed</dt>'
+                f'<dd><code>{escape(u["current"])}</code></dd>']
+
+        if not u["enabled"]:
+            body.append('<dt>Update check</dt><dd>off</dd></dl>'
+                        '<p class="quiet">Turn it on with <code>timelapse web'
+                        '</code> to be told when a new version is tagged.</p>')
+            return self._wrap_update("".join(body), busy=False)
+
+        if u["available"]:
+            body.append(f'<dt>Latest</dt><dd class="ok"><strong>'
+                        f'{escape(u["tag"] or u["latest"])}</strong></dd></dl>')
+        elif u["known"] and u["latest"]:
+            body.append(f'<dt>Latest</dt><dd>{escape(u["tag"] or u["latest"])}'
+                        f'</dd></dl>')
+        else:
+            body.append("</dl>")
+
+        if u["busy"] and not u["known"]:
+            body.append('<p class="scan">Checking GitHub&hellip;</p>')
+        elif u["available"]:
+            body.append(
+                f'<p class="note new"><strong>An update is available.</strong> '
+                f'You have {escape(u["current"])}; '
+                f'<a href="{escape(u["url"])}">{escape(u["tag"])}</a> is out.'
+                f'</p>'
+                f'<p class="cmd">Re-running the installer is the supported '
+                f'upgrade. It keeps your config, your frames and your videos.'
+                f'</p><pre>{escape(UPDATE_COMMANDS)}</pre>')
+            if u["notes"]:
+                # The tag is in the line above; repeating it in an h2 would
+                # only show it uppercased, since that is what h2 does here.
+                body.append(f'<h2 style="margin-top:1rem">What is new</h2>'
+                            f'<div class="notes">'
+                            f'{escape(plain_notes(u["notes"]))}</div>')
+        elif u["known"] and not u["error"]:
+            body.append('<p class="scan">Up to date.</p>')
+
+        if u["error"]:
+            # An outage upstream is not a fault here, and the last good answer
+            # above still stands. Say which, quietly.
+            body.append(f'<p class="quiet">Last check failed: '
+                        f'{escape(u["error"])}</p>')
+        if u["checked"]:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(u["checked"]))
+            body.append(f'<p class="quiet">Checked {when}, at most once a day. '
+                        f'This is the only request this service makes to the '
+                        f'internet; turn it off with <code>timelapse web</code>.'
+                        f'</p>')
+        return self._wrap_update("".join(body),
+                                 busy=u["busy"] and not u["known"],
+                                 with_script=with_script)
+
+    @staticmethod
+    def _wrap_update(body, busy, with_script=True):
+        out = (f'<section id="update" data-busy="{"1" if busy else "0"}">'
+               f'{body}</section>')
+        if with_script and busy:
+            out += UPDATE_POLL_JS
+        return out
 
     # -- files and playlists -------------------------------------------------
 
@@ -1633,10 +1953,13 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, handler, cfg, index):
+    def __init__(self, addr, handler, cfg, index, updates=None):
         super().__init__(addr, handler)
         self.cfg = cfg
         self.index = index
+        # Default to a disabled checker rather than None: every page that
+        # renders the panel would otherwise need to know it might be absent.
+        self.updates = updates or UpdateChecker(None, enabled=False)
 
     def handle_error(self, request, client_address):
         """A client that walks away is not an error.
@@ -1700,9 +2023,15 @@ def main():
 
     state_dir = web.get("state_dir", DEFAULT_STATE_DIR)
     index = Index(Path(state_dir) / "index.db", lib["path"])
+    # .get with a default: an upgrade keeps the existing config.json, so a key
+    # read with [] would break every install that predates this feature.
+    updates = UpdateChecker(state_dir, web.get("update_check", True))
+    if not updates.enabled:
+        log.info("Update check is off; this service makes no outbound "
+                 "connections.")
 
     try:
-        httpd = Server((bind, port), Handler, cfg, index)
+        httpd = Server((bind, port), Handler, cfg, index, updates)
     except OSError as exc:
         # Almost always "address already in use" or a bind address that does
         # not exist on this host. Both are config errors, not crashes.

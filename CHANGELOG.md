@@ -19,6 +19,17 @@ While the version is `0.x`, the configuration format may change in any release.
   hand-edited `config.json` still starts closed.
 
 ### Added
+- **An update check on the Overview page.** It says which version you have,
+  whether a newer one is tagged, what changed in it, and the commands to
+  upgrade. It asks GitHub at most once a day, and only while somebody has the
+  page open, so a service nobody looks at never calls out at all.
+
+  This is the **only outbound connection the web UI makes**. It sends no
+  configuration, no camera names and nothing about your videos; GitHub sees
+  this host's IP and the version string. `timelapse web` asks whether you want
+  it and the page says how to turn it off; set `web.update_check` to `false`
+  to disable it entirely. An upgrade turns it on, so turn it off there if you
+  would rather it stayed quiet.
 - **The wizard checks the bind address against the kernel** before writing it.
   An address this host does not have is refused at the prompt, with the
   addresses it does have listed, instead of producing a config whose service

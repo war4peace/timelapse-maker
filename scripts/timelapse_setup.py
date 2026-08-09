@@ -1710,6 +1710,16 @@ def choose_web(cfg):
     web["state_dir"] = ask("Index directory",
                            web.get("state_dir", "/var/lib/timelapse/web"))
 
+    print()
+    note("The Overview page can tell you when a new version is tagged, and")
+    note("show what changed and the commands to upgrade.")
+    note("It asks api.github.com once a day, and only while someone has the")
+    note("page open. It sends no configuration, no camera names and nothing")
+    note("about your videos; GitHub sees this host's IP and the version.")
+    note("This is the only outbound connection the web UI ever makes.")
+    web["update_check"] = ask_yes("Check GitHub for updates?",
+                                  web.get("update_check", True))
+
 
 def choose_discord(cfg, config_path=None):
     heading("Notifications (optional)")
@@ -1965,6 +1975,7 @@ def summarise_web(cfg):
     note(f"listen        http://{web.get('bind')}:{web.get('port')}/")
     note(f"library       {where or '(not set)'}  ({why})")
     note(f"index         {web.get('state_dir')}")
+    note(f"update check  {'on' if web.get('update_check', True) else 'off'}")
 
 
 # ----------------------------------------------------------------------------

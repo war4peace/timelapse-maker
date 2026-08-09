@@ -1066,6 +1066,27 @@ class TestChooseWeb(unittest.TestCase):
         web, _ = self.drive("y\n\n\n\n\n")
         self.assertEqual(web["library_root"], "")
 
+    def test_the_update_check_defaults_on(self):
+        web, out = self.drive("y\n\n\n\n\n\n")
+        self.assertTrue(web["update_check"])
+        # Consent means saying what it does before asking.
+        before = out.split("Check GitHub for updates?", 1)[0]
+        self.assertIn("api.github.com", before)
+        self.assertIn("only outbound connection", before)
+
+    def test_the_update_check_can_be_declined(self):
+        web, _ = self.drive("y\n\n\n\n\nn\n")
+        self.assertFalse(web["update_check"])
+
+    def test_an_existing_choice_to_decline_is_kept(self):
+        # Re-running the wizard must not quietly switch outbound traffic back
+        # on for someone who turned it off.
+        cfg = setup.default_config()
+        cfg["web"] = {"enabled": True, "bind": "10.0.0.5", "port": 9000,
+                      "update_check": False}
+        web, _ = self.drive("y\n\n\n\n\n\n", cfg)
+        self.assertFalse(web["update_check"])
+
     def test_reconfiguring_offers_the_existing_values_as_defaults(self):
         # A working bind address is kept: someone re-running the wizard to
         # change the library path must not have their address moved under them.
