@@ -676,7 +676,8 @@ connection this service makes, and should stay the only one.
   not documented. Publishing real Releases would make the notes richer with no
   code change, since a release body is preferred when one exists.
 - **`parse_version` compares tuples, never strings.** `0.0.10` sorts below
-  `0.0.9` lexically, and that is the very next version this project will cut.
+  `0.0.9` lexically, and `0.10.0` below `0.9.0`. A two-digit component is
+  not a hypothetical for a project on its tenth release.
 - **The notes come from the changelog** when the tag has no release body,
   fetched only when there is actually an update to describe, so the ordinary
   case is one request. `plain_notes()` strips heading markers because the text

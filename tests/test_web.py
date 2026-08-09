@@ -1805,8 +1805,12 @@ class TestUpdatePanel(unittest.TestCase):
         Path(self.tmp, "videos").mkdir()
         self.config = cfg(self.tmp, transfer={"enabled": False})
 
-    def checker(self, enabled=True, **state):
-        c = web.UpdateChecker(None, enabled=enabled)
+    def checker(self, enabled=True, current="0.0.9", **state):
+        # Pinned, not web.__version__: these describe what the panel renders
+        # for a given pair of versions. Letting the installed version leak in
+        # made three of them fail the moment 0.1.0 was cut, which would have
+        # repeated at every release.
+        c = web.UpdateChecker(None, enabled=enabled, current=current)
         c.state.update(state)
         return c
 

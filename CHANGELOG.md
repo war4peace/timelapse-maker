@@ -9,6 +9,12 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-08-09
+
+First release with the web UI in general use, and the first published as a
+GitHub Release rather than a bare tag. Everything below came out of running
+0.0.9 on a real deployment for two days.
+
 ### Changed
 - **`timelapse web` now suggests this host's LAN address** rather than
   `127.0.0.1`. A status page reachable only from the machine it describes is
@@ -526,5 +532,6 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.0]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.0
 [0.0.9]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.0.9
 [0.0.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.0.1
