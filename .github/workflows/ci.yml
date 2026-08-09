@@ -136,6 +136,19 @@ jobs:
           test -x /opt/timelapse/timelapse_capture.py
           test -x /opt/timelapse/timelapse_setup.py
           test -x /usr/local/bin/timelapse
+          bash -n /usr/local/bin/timelapse
+          # --help exits 0, a bare invocation is a usage error, and every
+          # subcommand the wrapper dispatches is actually documented. The
+          # help is generated text, so it can drift from the case statement
+          # without anything else noticing.
+          timelapse --help > /tmp/help.txt
+          timelapse > /tmp/bare.txt || true
+          cmp /tmp/help.txt /tmp/bare.txt
+          for c in setup cameras transfer web config test usage status \
+                   logs version encode web-serve; do
+            grep -qE "^  $c " /tmp/help.txt || { echo "undocumented: $c"; exit 1; }
+          done
+          test "$(awk '{ if (length($0) > 80) c++ } END { print c+0 }' /tmp/help.txt)" = 0
           test -f /etc/systemd/system/timelapse-capture.service
           test -f /etc/systemd/system/timelapse-encode.timer
           id timelapse

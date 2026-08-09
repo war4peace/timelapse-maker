@@ -182,10 +182,12 @@ cd timelapse-maker && sudo ./install.sh
 For a fully manual install, see [docs/install.md](docs/install.md).
 </details>
 
-After installing, a `timelapse` command wraps the common operations:
+After installing, a `timelapse` command wraps the common operations. Run
+`timelapse --help` for the full list, what each one does, and which need
+`sudo`:
 
 ```
-timelapse status | logs | test | encode | config | setup | transfer
+timelapse status | logs | test | encode | config | setup | transfer | web
 ```
 
 Run `timelapse test` before enabling anything; it fetches one snapshot per

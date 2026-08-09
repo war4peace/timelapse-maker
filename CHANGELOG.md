@@ -43,6 +43,14 @@ While the version is `0.x`, the configuration format may change in any release.
   "Checked 09:01" for an attempt that resolved nothing; a successful check
   and an attempt are now tracked separately.
 
+### Added
+- **`timelapse --help`.** The bare `timelapse` command printed one line
+  listing eleven subcommand names and nothing about what any of them did.
+  There is now a real help page: what each command is for, which need `sudo`
+  and why, the options worth knowing, and where the config lives. `-h`,
+  `help` and a bare `timelapse` all print it; `--help` exits 0 and a bare
+  invocation exits 1, since that one is a usage error.
+
 ### Documentation
 - **README now marks which `timelapse` subcommands need `sudo`.** Anything
   that reads or writes the config does; `status`, `logs` and `version` do not.

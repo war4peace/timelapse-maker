@@ -243,6 +243,84 @@ install_files() {
     cat > /usr/local/bin/timelapse <<EOF
 #!/usr/bin/env bash
 # timelapse-maker command wrapper
+#
+# The help text below is inside a quoted heredoc so nothing in it expands at
+# runtime, but this outer heredoc is unquoted, which is how the paths get
+# baked in at install time. Anything meant to survive as a literal dollar
+# sign therefore needs escaping here, the same as \$@ does above.
+show_help() {
+    cat <<'HELP'
+timelapse - unattended daily timelapses from IP cameras
+
+USAGE
+  timelapse <command> [options]
+
+Commands marked [sudo] read or write the configuration file, which is mode
+0640 root:timelapse because it holds your camera passwords. Without sudo
+they say so and stop; nothing half-runs. The path is under FILES below: it
+is not inlined here because it moves with --prefix and would then wrap.
+
+CONFIGURING
+  setup        [sudo]  The full wizard: storage, capture interval, cameras,
+                       transfer, Discord and the web UI. It rewrites the
+                       whole config, backing up the old one first, so prefer
+                       the targeted commands below for a single change.
+  cameras      [sudo]  Add, edit, remove, enable or disable a camera, and
+                       test one against the real hardware. Offers to restart
+                       capture afterwards, which is what makes the change
+                       take effect.
+  transfer     [sudo]  Reconfigure where finished videos are sent, including
+                       mounting an SMB/CIFS share and re-deriving the
+                       ReadWritePaths= the systemd units need.
+  web          [sudo]  Turn the read-only web UI on or off and set its
+                       address, port and library path. Offers to restart it.
+  config       [sudo]  Open the config in \$EDITOR for anything the wizards
+                       do not cover. You restart capture yourself after.
+
+CHECKING
+  test         [sudo]  Pre-flight, and the thing to run after any change.
+                       Fetches one snapshot per enabled camera and reports
+                       resolution, size, latency and authentication; probes
+                       the encoders; checks disk headroom, the transfer
+                       destination and the Discord webhook.
+  usage        [sudo]  Disk report: frames, bytes and date range per camera,
+                       plus totals, videos and free space. Also names frame
+                       folders that no enabled camera will ever encode, which
+                       is how stranded frames get found.
+  status               systemctl status for all four units at once: capture,
+                       the encode timer and the encode service, and the web
+                       UI. The encode service is listed separately from its
+                       timer on purpose, because a failed run leaves the
+                       service failed while the timer still looks healthy.
+  logs                 Follow the capture journal live. Ctrl-C to stop.
+  version              The installed version of each script, and a warning
+                       if the running daemon started before they were
+                       installed and is therefore still the previous build.
+
+RUNNING BY HAND
+  encode       [sudo]  Run the nightly encode now rather than at 00:05.
+                       Useful for clearing a backlog.
+  web-serve    [sudo]  Run the web UI in the foreground to watch its log.
+                       The systemd service normally does this for you.
+
+Anything after the command is passed through, so for example:
+  timelapse test --probe-profiles   find which ONVIF profile is full resolution
+  timelapse encode --dry-run        show what would encode, change nothing
+  timelapse setup --defaults        accept every default without asking
+  timelapse cameras --help          the options that command takes
+
+FILES
+  $CONFIG
+      your configuration, mode 0640 root:timelapse
+  $CONFDIR/config.example.json
+      a commented template, replaced on every upgrade so you can diff it
+  $PREFIX/
+      the scripts themselves
+
+Guide:  https://github.com/war4peace/timelapse-maker/blob/main/docs/install.md
+HELP
+}
+
 case "\${1:-}" in
     test)      shift; exec python3 $PREFIX/timelapse_test.py "$CONFIG" "\$@" ;;
     encode)    shift; exec python3 $PREFIX/timelapse_encode.py "$CONFIG" "\$@" ;;
@@ -286,11 +364,15 @@ case "\${1:-}" in
             fi
         fi
         ;;
+    -h|--help|help)
+        show_help ;;
+    "")
+        # Same text as --help, but a bare invocation is a usage error, so the
+        # exit status says so for anything scripting around this.
+        show_help; exit 1 ;;
     *)
-        echo "usage: timelapse {setup|cameras|transfer|web|test|usage|encode|config|logs|status|version}"
-        echo "  web        configure the read-only web UI"
-        echo "  web-serve  run it in the foreground (the service normally does)"
-        exit 1 ;;
+        printf 'timelapse: unknown command "%s"\\n\\n' "\$1" >&2
+        show_help; exit 1 ;;
 esac
 EOF
     chmod 0755 /usr/local/bin/timelapse
