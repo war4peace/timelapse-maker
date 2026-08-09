@@ -387,10 +387,25 @@ of it; nothing needs a reinstall.
 | `timelapse version` | The installed version of each script, and a warning if the running daemon predates them. |
 
 **Which need root.** `config.json` is `0640 root:timelapse` because it holds
-camera credentials. So `setup`, `cameras`, `transfer`, `web` and `config` need
-`sudo` (they write it), and `test`, `usage` and `encode` need either `sudo` or
-membership of the `timelapse` group (they read it). `status`, `logs` and
-`version` work unprivileged.
+camera credentials, so anything that touches it needs `sudo`:
+
+| Needs `sudo` | Works unprivileged |
+|---|---|
+| `setup`, `cameras`, `transfer`, `web`, `config` (they write the config) | `status` |
+| `encode`, `web-serve` (they read it, and write frames and videos) | `version` |
+| `test`, `usage` (they read it) | `logs` |
+
+`test` and `usage` also work if you add yourself to the `timelapse` group,
+since they only read. The ones that write the config still need root: mode
+`0640` grants the group read but not write. `encode` needs root regardless,
+because group membership does not get it write access to the frame and video
+directories either.
+
+`logs` runs unprivileged but shows only your own messages unless you are in
+the `adm` or `systemd-journal` group, and says so when you are not.
+
+Getting this wrong is not dangerous: the command says which file it could not
+read and stops, rather than half-running.
 
 **A config change only reaches capture when it restarts.** The daemon reads its
 camera list once, at startup. `timelapse cameras` handles that for you; after a

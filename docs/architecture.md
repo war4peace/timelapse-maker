@@ -1097,7 +1097,7 @@ install.sh                       bootstrap installer, 615 lines
 scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
-scripts/timelapse_setup.py       configuration wizard, 2123 lines
+scripts/timelapse_setup.py       configuration wizard, 2145 lines
 scripts/timelapse_web.py         read-only web UI, 2192 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests

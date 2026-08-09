@@ -749,6 +749,37 @@ def edit_one_camera(cfg, cams, cam):
     return cam
 
 
+def load_existing_config(path):
+    """An existing config for the --*-only sections, or None after saying why.
+
+    The distinction between "not there" and "not readable by you" is the whole
+    point. config.json is 0640 root:timelapse so camera passwords stay
+    private, so running any of these without sudo hits PermissionError; the
+    old message called that "No existing config" and told the operator to run
+    the full wizard, which would have offered to overwrite the config they
+    could not read. The daemons' load_config() has always drawn this
+    distinction properly; this brings the wizard in line with it.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        fail(f"No config at {path}.")
+        note("Run: sudo timelapse setup")
+    except PermissionError:
+        fail(f"Cannot read {path}: permission denied.")
+        note("It is 0640 root:timelapse so your camera passwords stay private,")
+        note("which means changing it needs root. Try the same command again")
+        note("with sudo.")
+    except json.JSONDecodeError as exc:
+        fail(f"{path} is not valid JSON: {exc}")
+        note("Fix it by hand, or run 'sudo timelapse setup' to write a fresh")
+        note("one. The wizard backs up whatever is there first.")
+    except OSError as exc:
+        fail(f"Cannot read {path}: {exc}")
+    return None
+
+
 def unit_is_active(unit):
     """True, False, or None when systemd cannot be asked at all."""
     if not shutil.which("systemctl"):
@@ -2029,11 +2060,8 @@ def main():
     # initial install must not mean re-running the whole wizard, and must not
     # mean reinstalling: nothing here touches paths, so the units are unchanged.
     if args.cameras_only:
-        try:
-            with open(args.output, encoding="utf-8") as fh:
-                cfg = json.load(fh)
-        except OSError:
-            fail(f"No existing config at {args.output}; run the full wizard.")
+        cfg = load_existing_config(args.output)
+        if cfg is None:
             return 1
         if not manage_cameras(cfg):
             print()
@@ -2051,11 +2079,8 @@ def main():
     # Re-run just the transfer section against an existing config, so a share
     # can be set up after the fact without walking the whole wizard again.
     if args.transfer_only:
-        try:
-            with open(args.output, encoding="utf-8") as fh:
-                cfg = json.load(fh)
-        except OSError:
-            fail(f"No existing config at {args.output}; run the full wizard.")
+        cfg = load_existing_config(args.output)
+        if cfg is None:
             return 1
         cfg.setdefault("transfer", default_config()["transfer"])
         choose_transfer(cfg, args.owner)
@@ -2082,11 +2107,8 @@ def main():
     # UI on later must not mean walking the whole wizard, and a feature the
     # wizard never offers is one nobody finds.
     if args.web_only:
-        try:
-            with open(args.output, encoding="utf-8") as fh:
-                cfg = json.load(fh)
-        except OSError:
-            fail(f"No existing config at {args.output}; run the full wizard.")
+        cfg = load_existing_config(args.output)
+        if cfg is None:
             return 1
         choose_web(cfg)
         heading("Writing configuration")

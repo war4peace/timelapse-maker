@@ -1249,6 +1249,59 @@ class TestRestartWeb(unittest.TestCase):
         self.assertEqual(buf.getvalue(), "")
 
 
+class TestLoadExistingConfig(unittest.TestCase):
+    """`timelapse cameras` without sudo said "No existing config" about a file
+    that exists, and told the operator to run the full wizard, which would
+    have offered to overwrite the config they could not read."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = Path(self.tmp) / "config.json"
+
+    def run_load(self, path=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = setup.load_existing_config(str(path or self.path))
+        return got, buf.getvalue()
+
+    def test_a_readable_config_is_returned(self):
+        self.path.write_text('{"cameras": []}', encoding="utf-8")
+        got, _ = self.run_load()
+        self.assertEqual(got, {"cameras": []})
+
+    def test_a_missing_file_says_to_run_setup(self):
+        got, out = self.run_load()
+        self.assertIsNone(got)
+        self.assertIn("No config at", out)
+        self.assertIn("timelapse setup", out)
+
+    def test_permission_denied_says_to_use_sudo(self):
+        # The reported case. It must not be reported as absence, and must not
+        # send the operator at the full wizard.
+        self.path.write_text('{"cameras": []}', encoding="utf-8")
+        with mock.patch("builtins.open", side_effect=PermissionError(13, "no")):
+            got, out = self.run_load()
+        self.assertIsNone(got)
+        self.assertIn("permission denied", out.lower())
+        self.assertIn("sudo", out)
+        self.assertNotIn("No config at", out)
+        self.assertNotIn("run the full wizard", out)
+
+    def test_malformed_json_says_so(self):
+        # Previously an uncaught ValueError, so a stray comma was a traceback.
+        self.path.write_text("{ not json", encoding="utf-8")
+        got, out = self.run_load()
+        self.assertIsNone(got)
+        self.assertIn("not valid JSON", out)
+
+    def test_other_os_errors_are_reported_as_themselves(self):
+        with mock.patch("builtins.open", side_effect=IsADirectoryError(21, "dir")):
+            got, out = self.run_load()
+        self.assertIsNone(got)
+        self.assertIn("Cannot read", out)
+
+
 class TestWebStateDir(unittest.TestCase):
 
     def setUp(self):

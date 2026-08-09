@@ -10,6 +10,13 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Fixed
+- **`timelapse cameras` without `sudo` now says so.** It reported "No existing
+  config at /etc/timelapse/config.json" about a file that exists but is
+  `0640 root:timelapse`, and told you to run the full wizard, which would have
+  offered to overwrite the config you could not read. `cameras`, `transfer`
+  and `web` now tell permission denied apart from missing, name the mode and
+  owner, and say to try again with sudo. Malformed JSON is reported as such
+  too, instead of a traceback.
 - **The tabs no longer move between pages.** Status and logs use the whole
   window while the other pages keep a narrower reading column, and the tabs
   were positioned by whichever it was, so they jumped about 240 pixels as you
@@ -35,6 +42,10 @@ While the version is `0.x`, the configuration format may change in any release.
 - **The panel no longer claims to have checked when it failed.** It said
   "Checked 09:01" for an attempt that resolved nothing; a successful check
   and an attempt are now tracked separately.
+
+### Documentation
+- **README now marks which `timelapse` subcommands need `sudo`.** Anything
+  that reads or writes the config does; `status`, `logs` and `version` do not.
 
 ## [0.1.0] - 2026-08-09
 

@@ -54,17 +54,31 @@ see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 
-| | |
-|---|---|
-| `timelapse status` | Are the service and timer healthy, when does the next encode fire |
-| `timelapse logs` | Follow the capture journal live |
-| `timelapse usage` | Frames, bytes and date range per camera, and which folders nothing will ever encode |
-| `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord |
-| `timelapse cameras` | Add, edit, remove or disable a camera, then restart capture |
-| `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed |
-| `timelapse web` | Turn the read-only web UI on or off, set its address and library path |
-| `timelapse encode` | Run tonight's encode now |
-| `timelapse setup` · `config` · `version` | Full wizard · edit the JSON · what's installed |
+| | | |
+|---|---|---|
+| `timelapse status` | Are the service and timer healthy, when does the next encode fire | |
+| `timelapse logs` | Follow the capture journal live | |
+| `timelapse version` | What is installed, and whether the daemon is still running an older build | |
+| `timelapse usage` | Frames, bytes and date range per camera, and which folders nothing will ever encode | **sudo** |
+| `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord | **sudo** |
+| `timelapse cameras` | Add, edit, remove or disable a camera, then restart capture | **sudo** |
+| `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed | **sudo** |
+| `timelapse web` | Turn the read-only web UI on or off, set its address and library path | **sudo** |
+| `timelapse encode` | Run tonight's encode now | **sudo** |
+| `timelapse setup` · `config` | Full wizard · edit the JSON | **sudo** |
+
+**Anything that reads or writes the config needs `sudo`.**
+`/etc/timelapse/config.json` is mode `640`, owned `root:timelapse`, because it
+holds your camera passwords. Without it the command tells you so and stops; it
+does not half-run.
+
+`status`, `logs` and `version` need nothing. For `logs` to show more than your
+own messages you must be in the `adm` or `systemd-journal` group, which is
+usually already true of the account that installed this.
+
+Read-only commands (`test`, `usage`) also work if you add yourself to the
+`timelapse` group instead. The ones that *write* the config still need root,
+since mode `640` grants the group read but not write.
 
 Full descriptions in [docs/install.md](docs/install.md#8-day-to-day-the-timelapse-command).
 
