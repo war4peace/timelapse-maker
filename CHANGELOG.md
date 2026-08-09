@@ -9,6 +9,26 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+- **A failed update check no longer costs you a day.** A momentary DNS
+  failure was recorded as though it were a successful check, so the
+  once-a-day interval gated the retry: a blip lasting seconds left the panel
+  showing an error until tomorrow. A failure now retries in about 15 minutes,
+  backing off on repeated failures so a host with no internet settles at the
+  normal daily rate rather than asking every quarter hour forever. There is
+  also a **Check now** button, and the panel says when it would try anyway.
+
+  An `update.json` written by 0.1.0 is repaired on load, so this reaches the
+  installs that actually hit the bug rather than only new ones.
+- **Update check failures are now readable.** `URLError: <urlopen error
+  [Errno -3] Temporary failure in name resolution>` became "DNS lookup
+  failed, so this is your resolver rather than GitHub or this program", with
+  the original text kept on the end because that is the part worth searching
+  for. Rate limiting, timeouts and TLS failures are named too.
+- **The panel no longer claims to have checked when it failed.** It said
+  "Checked 09:01" for an attempt that resolved nothing; a successful check
+  and an attempt are now tracked separately.
+
 ## [0.1.0] - 2026-08-09
 
 First release with the web UI in general use, and the first published as a

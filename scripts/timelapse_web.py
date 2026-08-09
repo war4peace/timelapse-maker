@@ -827,6 +827,14 @@ UPDATE_TIMEOUT = 10
 # that entirely to the operator, and a release is not a thing that happens
 # hourly.
 UPDATE_INTERVAL = 24 * 3600
+# A failed check must not be cached like a successful one. A DNS blip lasting
+# seconds would otherwise cost a day of not asking again, which is what
+# happened to the first operator to hit it: an overloaded local resolver
+# during an upgrade, and the panel then sat on the error until tomorrow.
+# Retry soon, then back off, so a genuinely offline host settles at the normal
+# daily rate instead of asking every quarter of an hour forever.
+UPDATE_RETRY = 15 * 60
+UPDATE_RETRY_MAX = UPDATE_INTERVAL
 # A release body is somebody's prose and goes on a page; cap what is rendered.
 NOTES_LIMIT = 4000
 
@@ -838,6 +846,37 @@ UPDATE_COMMANDS = (
     "sudo bash install_timelapse.sh\n"
     "rm install_timelapse.sh"
 )
+
+
+def friendly_error(exc):
+    """A failed update check, said in words an operator can act on.
+
+    The raw text is kept on the end because it is the part worth searching
+    for, but leading with "URLError: <urlopen error [Errno -3] Temporary
+    failure in name resolution>" tells somebody nothing about whose fault it
+    is. It is almost never this program's.
+    """
+    raw = str(exc) or type(exc).__name__
+    low = raw.lower()
+    if isinstance(exc, urllib.error.HTTPError):
+        if exc.code == 403 and "rate limit" in low:
+            lead = "GitHub is rate limiting this address"
+        elif exc.code == 404:
+            lead = "GitHub has no release or tag to report"
+        else:
+            lead = f"GitHub answered {exc.code}"
+    elif "name resolution" in low or "getaddrinfo" in low or "name or service" in low:
+        lead = ("DNS lookup failed, so this is your resolver rather than "
+                "GitHub or this program")
+    elif "timed out" in low or isinstance(exc, socket.timeout):
+        lead = "The connection to GitHub timed out"
+    elif "certificate" in low or "ssl" in low:
+        lead = "The TLS connection to GitHub could not be verified"
+    elif isinstance(exc, urllib.error.URLError):
+        lead = "Could not reach GitHub"
+    else:
+        lead = "The update check failed"
+    return f"{lead} ({raw})"
 
 
 def parse_version(text):
@@ -948,8 +987,13 @@ class UpdateChecker:
         self.path = Path(state_dir) / "update.json" if state_dir else None
         self._lock = threading.Lock()
         self._busy = False
-        self.state = {"checked": 0.0, "tag": "", "latest": "", "url": "",
-                      "notes": "", "error": ""}
+        # "checked" is the last SUCCESSFUL check and "attempted" the last try,
+        # which are different things and used to be conflated. Recording a
+        # failure as a check both gated the retry for a day and made the page
+        # claim it had checked when it had not.
+        self.state = {"checked": 0.0, "attempted": 0.0, "failures": 0,
+                      "tag": "", "latest": "", "url": "", "notes": "",
+                      "error": ""}
         self._load()
 
     def _load(self):
@@ -961,8 +1005,25 @@ class UpdateChecker:
             if isinstance(saved, dict):
                 self.state.update({k: saved[k] for k in self.state
                                    if k in saved})
+                self._migrate(saved)
         except (OSError, ValueError):
             pass            # No cache yet, or a corrupt one. Ask again.
+
+    def _migrate(self, saved):
+        """Repair a cache written by 0.1.0, which set `checked` on failure.
+
+        Without this the fix does not reach the people who hit the bug: their
+        cached file records a failed attempt as a successful check, so the
+        daily interval would still gate the retry and they would still wait a
+        day. If the stored error is non-empty then the last write was a
+        failure, `checked` is that failure's timestamp, and the time of the
+        last real success is not recoverable. Treat it as one failure, which
+        puts the next attempt a few minutes out.
+        """
+        if saved.get("error") and not saved.get("failures"):
+            self.state["failures"] = 1
+            self.state["attempted"] = saved.get("checked", 0.0)
+            self.state["checked"] = 0.0
 
     def _save(self):
         if not self.path:
@@ -985,19 +1046,38 @@ class UpdateChecker:
         latest = parse_version(s["latest"])
         s["available"] = bool(latest and self.current and latest > self.current)
         s["known"] = bool(s["checked"])
+        s["retry_at"] = self._retry_at(s)
         return s
 
-    def refresh_if_stale(self):
-        """Start a check in the background if the cache has aged out."""
+    @staticmethod
+    def _retry_at(s):
+        """When the next automatic attempt is due, as an epoch time."""
+        if s["failures"]:
+            wait = min(UPDATE_RETRY * (2 ** (s["failures"] - 1)),
+                       UPDATE_RETRY_MAX)
+            return s["attempted"] + wait
+        return s["checked"] + UPDATE_INTERVAL
+
+    def refresh(self, force=False):
+        """Start a check in the background unless one is already running.
+
+        force is the retry button: an operator looking at a failure should not
+        have to wait out a backoff they can see is stale, because they usually
+        know what they just fixed.
+        """
         if not self.enabled:
-            return
+            return False
         with self._lock:
             if self._busy:
-                return
-            if time.time() - self.state["checked"] < UPDATE_INTERVAL:
-                return
+                return False
+            if not force and time.time() < self._retry_at(self.state):
+                return False
             self._busy = True
         threading.Thread(target=self._check, daemon=True).start()
+        return True
+
+    def refresh_if_stale(self):
+        return self.refresh(force=False)
 
     def _check(self):
         try:
@@ -1011,16 +1091,22 @@ class UpdateChecker:
                     notes = changelog_section(text, ".".join(str(n) for n in ver))
                 except Exception as exc:          # noqa: BLE001
                     log.debug("Changelog fetch failed: %s", exc)
+            now = time.time()
             with self._lock:
-                self.state.update(checked=time.time(), tag=tag,
+                self.state.update(checked=now, attempted=now, failures=0,
+                                  tag=tag,
                                   latest=".".join(str(n) for n in ver),
                                   url=url, notes=notes[:NOTES_LIMIT], error="")
         except Exception as exc:                  # noqa: BLE001
             # Every failure here is somebody else's outage. Record it, keep
             # the last good answer, and never let it reach the page as a 500.
+            # "checked" is deliberately not touched: nothing was checked, and
+            # writing it here is what used to make a momentary DNS failure
+            # cost a full day before the next attempt.
             with self._lock:
-                self.state["checked"] = time.time()
-                self.state["error"] = f"{type(exc).__name__}: {exc}"
+                self.state["attempted"] = time.time()
+                self.state["failures"] = self.state["failures"] + 1
+                self.state["error"] = friendly_error(exc)
             log.info("Update check failed: %s", exc)
         finally:
             with self._lock:
@@ -1341,21 +1427,31 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def do_POST(self):
-        """The one action a read-only UI has: rescan its own index.
+        """The two actions a read-only UI has, both about its own state:
+        rescan the index, and retry the update check.
 
-        POST rather than a link so a crawler, a prefetch or a refresh cannot
-        set a full scan going. It still changes nothing outside our own
-        database.
+        POST rather than links so a crawler, a prefetch or a refresh cannot
+        set either going. Neither changes anything outside our own state
+        directory, and the update retry is the only one that leaves the host
+        at all.
         """
         route = self.path.split("?", 1)[0].rstrip("/") or "/"
         if route == "/rescan":
             self.server.index.start_scan("requested")
-            self.send_response(303)
-            self.send_header("Location", "/library")
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._redirect("/library")
+        elif route == "/check-update":
+            # force: the point of the button is to skip a backoff the operator
+            # can see is stale, usually because they just fixed the thing.
+            self.server.updates.refresh(force=True)
+            self._redirect("/")
         else:
             self._send(404, "not found\n", "text/plain; charset=utf-8")
+
+    def _redirect(self, where):
+        self.send_response(303)
+        self.send_header("Location", where)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     # Pages whose body is one pane of raw command output, which wants the whole
     # window rather than the reading column the rest of the UI uses.
@@ -1411,7 +1507,7 @@ class Handler(BaseHTTPRequestHandler):
         else:
             body.append("</dl>")
 
-        if u["busy"] and not u["known"]:
+        if u["busy"]:
             body.append('<p class="scan">Checking GitHub&hellip;</p>')
         elif u["available"]:
             body.append(
@@ -1431,20 +1527,41 @@ class Handler(BaseHTTPRequestHandler):
         elif u["known"] and not u["error"]:
             body.append('<p class="scan">Up to date.</p>')
 
-        if u["error"]:
-            # An outage upstream is not a fault here, and the last good answer
-            # above still stands. Say which, quietly.
-            body.append(f'<p class="quiet">Last check failed: '
-                        f'{escape(u["error"])}</p>')
+        retry = ('<form class="inline" method="post" action="/check-update">'
+                 '<button type="submit">Check now</button></form>')
+
+        if u["error"] and not u["busy"]:
+            # Upstream being down is not a fault here, and any earlier answer
+            # above still stands. Say so, offer the retry, and say when it
+            # would otherwise happen: a operator who has just fixed their
+            # resolver should not have to guess whether waiting will help.
+            body.append(f'<p class="note">{escape(u["error"])}</p>'
+                        f'<p class="quiet">Nothing here is broken by this; the '
+                        f'page and the library work regardless. '
+                        f'{self._next_try(u)} {retry}</p>')
+
         if u["checked"]:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(u["checked"]))
-            body.append(f'<p class="quiet">Checked {when}, at most once a day. '
-                        f'This is the only request this service makes to the '
-                        f'internet; turn it off with <code>timelapse web</code>.'
-                        f'</p>')
-        return self._wrap_update("".join(body),
-                                 busy=u["busy"] and not u["known"],
+            body.append(
+                f'<p class="quiet">Last successful check {when}, and at most '
+                f'once a day. This is the only request this service makes to '
+                f'the internet; turn it off with <code>timelapse web</code>. '
+                f'{"" if u["error"] or u["busy"] else retry}</p>')
+        elif not u["error"] and not u["busy"]:
+            body.append(f'<p class="quiet">Not checked yet. {retry}</p>')
+        return self._wrap_update("".join(body), busy=u["busy"],
                                  with_script=with_script)
+
+    @staticmethod
+    def _next_try(u):
+        """When the automatic retry is due, in words rather than a timestamp."""
+        left = u["retry_at"] - time.time()
+        if left <= 0:
+            return "It will try again on the next page load."
+        mins = int(left // 60) + 1
+        if mins < 90:
+            return f"It will try again by itself in about {mins} minutes."
+        return f"It will try again by itself in about {int(mins // 60)} hours."
 
     @staticmethod
     def _wrap_update(body, busy, with_script=True):

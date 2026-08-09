@@ -689,6 +689,28 @@ connection this service makes, and should stay the only one.
   records it, keeps the last good answer and never reaches a page as a 500.
   The cache lives in `state_dir`, the single writable directory, so a service
   that restarts often does not spend the 60-per-hour anonymous rate limit.
+- **A failure is not a check, and conflating them shipped as a bug.** 0.1.0
+  set `checked` on both paths, so the daily interval gated a *failed* attempt:
+  the first operator to hit it had a saturated local resolver for a few
+  seconds during an upgrade and the panel then sat on the error until the
+  next day. `checked` is now the last success and `attempted` the last try.
+  Failures retry after `UPDATE_RETRY`, doubling per consecutive failure and
+  capped at the daily interval, so a transient blip recovers in minutes while
+  a permanently offline host settles at the normal rate instead of asking
+  every quarter hour forever. `POST /check-update` forces one immediately,
+  because somebody looking at the error usually knows what they just fixed.
+  It is a POST for the same reason `/rescan` is: a prefetch must not be able
+  to make this service reach the internet.
+- **`_migrate()` repairs a 0.1.0 cache on load.** Without it the fix reaches
+  only new installs: an existing `update.json` records the failed attempt as
+  a successful check, and the interval would still gate the retry. A non-empty
+  stored `error` means the last write was a failure, so `checked` is that
+  failure's timestamp and the real last-success time is unrecoverable; it is
+  treated as one failure.
+- **`friendly_error()` leads with whose fault it is.** The raw
+  `URLError: <urlopen error [Errno -3] Temporary failure in name resolution>`
+  tells an operator nothing actionable. The original text is kept on the end,
+  because that is the part worth searching for.
 
 **Status and logs** (`/status`, `/logs`) shell out, on request only: a page
 load or a click. Nothing polls and nothing is collected in the background.
@@ -1065,7 +1087,7 @@ scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 709 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
 scripts/timelapse_setup.py       configuration wizard, 2123 lines
-scripts/timelapse_web.py         read-only web UI, 2063 lines
+scripts/timelapse_web.py         read-only web UI, 2180 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

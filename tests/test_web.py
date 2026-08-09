@@ -7,6 +7,7 @@ and binding a port in a unit test invites flakiness on a CI runner.
 
 import contextlib
 import io
+import json
 import re
 import shutil
 import socket
@@ -1703,6 +1704,93 @@ class TestUpdateChecker(unittest.TestCase):
             c._check()
         self.assertFalse(c.snapshot()["available"])
 
+    def test_a_failure_does_not_count_as_a_check(self):
+        """The reported bug. A momentary DNS failure during an upgrade set
+        `checked`, so the daily cache gated the retry and the operator was
+        told to wait a day over a blip that lasted seconds."""
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               side_effect=OSError("temporary failure")):
+            c._check()
+        s = c.snapshot()
+        self.assertEqual(s["checked"], 0.0)      # nothing was checked
+        self.assertGreater(s["attempted"], 0.0)  # but it was tried
+        self.assertEqual(s["failures"], 1)
+
+    def test_a_failure_retries_in_minutes_not_a_day(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               side_effect=OSError("dns")):
+            c._check()
+        wait = c.snapshot()["retry_at"] - time.time()
+        self.assertLess(wait, web.UPDATE_INTERVAL / 10)
+        self.assertLessEqual(wait, web.UPDATE_RETRY + 1)
+
+    def test_repeated_failures_back_off(self):
+        # A host with no internet at all should settle at the daily rate
+        # rather than asking every quarter of an hour forever.
+        c = self.make()
+        waits = []
+        with mock.patch.object(web, "latest_release", side_effect=OSError("x")):
+            for _ in range(4):
+                c._check()
+                waits.append(c.snapshot()["retry_at"] - c.state["attempted"])
+        self.assertEqual(waits, sorted(waits))
+        self.assertGreater(waits[-1], waits[0])
+
+    def test_the_backoff_is_capped(self):
+        c = self.make()
+        c.state.update(failures=40, attempted=time.time())
+        wait = c.snapshot()["retry_at"] - c.state["attempted"]
+        self.assertLessEqual(wait, web.UPDATE_RETRY_MAX)
+
+    def test_a_success_clears_the_failure_count(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release", side_effect=OSError("x")):
+            c._check()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u", "n")):
+            c._check()
+        s = c.snapshot()
+        self.assertEqual(s["failures"], 0)
+        self.assertEqual(s["error"], "")
+        self.assertGreater(s["checked"], 0.0)
+
+    def test_a_failure_is_retried_on_a_later_view(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release", side_effect=OSError("x")):
+            c._check()
+        # Pretend the backoff has elapsed; the next page view must try again.
+        c.state["attempted"] = time.time() - web.UPDATE_RETRY - 1
+        done = threading.Event()
+        with mock.patch.object(web, "latest_release",
+                               lambda: (done.set(),
+                                        ((0, 1, 0), "v0.1.0", "u", ""))[1]):
+            c.refresh_if_stale()
+            self.assertTrue(done.wait(5))
+
+    def test_force_skips_the_backoff(self):
+        # What the retry button is for: the operator has just fixed their DNS
+        # and should not have to wait out a backoff they can see is stale.
+        c = self.make()
+        with mock.patch.object(web, "latest_release", side_effect=OSError("x")):
+            c._check()
+        done = threading.Event()
+        with mock.patch.object(web, "latest_release",
+                               lambda: (done.set(),
+                                        ((0, 1, 0), "v0.1.0", "u", ""))[1]):
+            self.assertFalse(c.refresh(force=False))   # still backed off
+            self.assertTrue(c.refresh(force=True))
+            self.assertTrue(done.wait(5))
+
+    def test_force_does_nothing_when_disabled(self):
+        # The button must not become a way around web.update_check: false.
+        c = self.make(enabled=False)
+        with mock.patch.object(web, "latest_release") as call:
+            self.assertFalse(c.refresh(force=True))
+            time.sleep(0.1)
+        call.assert_not_called()
+
     def test_a_failure_is_recorded_not_raised(self):
         # Somebody else's outage must not reach the page as a 500.
         c = self.make()
@@ -1759,6 +1847,31 @@ class TestUpdateChecker(unittest.TestCase):
             c.refresh_if_stale()
             self.assertTrue(done.wait(5))
 
+    def test_a_010_cache_written_by_a_failure_is_repaired(self):
+        """0.1.0 set `checked` on failure too. Without repairing that on load,
+        the fix never reaches the people who actually hit the bug: their
+        cached file still claims a successful check a minute ago."""
+        failed_at = time.time() - 60
+        Path(self.tmp, "update.json").write_text(json.dumps({
+            "checked": failed_at, "tag": "", "latest": "", "url": "",
+            "notes": "", "error": "URLError: name resolution"}),
+            encoding="utf-8")
+        s = self.make().snapshot()
+        self.assertEqual(s["checked"], 0.0)
+        self.assertEqual(s["failures"], 1)
+        # Minutes away, not a day.
+        self.assertLess(s["retry_at"] - time.time(), web.UPDATE_RETRY + 1)
+
+    def test_a_010_cache_from_a_success_is_left_alone(self):
+        ok_at = time.time() - 60
+        Path(self.tmp, "update.json").write_text(json.dumps({
+            "checked": ok_at, "tag": "v0.1.0", "latest": "0.1.0",
+            "url": "u", "notes": "n", "error": ""}), encoding="utf-8")
+        s = self.make().snapshot()
+        self.assertAlmostEqual(s["checked"], ok_at, places=3)
+        self.assertEqual(s["failures"], 0)
+        self.assertTrue(s["known"])
+
     def test_a_corrupt_cache_is_ignored_not_fatal(self):
         Path(self.tmp, "update.json").write_text("{ this is not json",
                                                  encoding="utf-8")
@@ -1795,6 +1908,36 @@ class TestUpdateChecker(unittest.TestCase):
                 mock.patch.object(web, "fetch_text") as text:
             c._check()
         text.assert_not_called()
+
+
+class TestFriendlyError(unittest.TestCase):
+    """The first operator to hit a failure was shown "URLError: <urlopen error
+    [Errno -3] Temporary failure in name resolution>", which says nothing
+    about whose fault it is. It is almost never this program's."""
+
+    def test_dns_says_it_is_the_resolver(self):
+        got = web.friendly_error(
+            urllib.error.URLError(
+                OSError(-3, "Temporary failure in name resolution")))
+        self.assertIn("DNS lookup failed", got)
+        self.assertIn("your resolver", got)
+
+    def test_rate_limiting_is_named(self):
+        got = web.friendly_error(urllib.error.HTTPError(
+            "u", 403, "rate limit exceeded", None, None))
+        self.assertIn("rate limiting", got)
+
+    def test_a_timeout_is_named(self):
+        self.assertIn("timed out", web.friendly_error(OSError("timed out")))
+
+    def test_the_raw_text_is_kept_for_searching(self):
+        got = web.friendly_error(urllib.error.URLError("no route to host"))
+        self.assertIn("no route to host", got)
+
+    def test_an_unknown_failure_still_reads_as_a_sentence(self):
+        got = web.friendly_error(ValueError("something odd"))
+        self.assertIn("update check failed", got.lower())
+        self.assertIn("something odd", got)
 
 
 class TestUpdatePanel(unittest.TestCase):
@@ -1856,10 +1999,38 @@ class TestUpdatePanel(unittest.TestCase):
         self.assertNotIn("Checking GitHub", body)
 
     def test_a_failed_check_is_quiet_not_alarming(self):
-        body = self.get(self.checker(checked=time.time(),
-                                     error="URLError: no route"))
-        self.assertIn("Last check failed", body)
-        self.assertIn("no route", body)
+        body = self.get(self.checker(checked=time.time(), attempted=time.time(),
+                                     failures=1, error="Could not reach GitHub"))
+        self.assertIn("Could not reach GitHub", body)
+        self.assertIn("Nothing here is broken by this", body)
+
+    def test_a_failure_offers_a_retry_and_says_when_it_would_try_anyway(self):
+        # The reported bug: a momentary DNS failure left the panel sitting on
+        # the error with no way to ask again short of waiting a day.
+        body = self.get(self.checker(attempted=time.time(), failures=1,
+                                     error="DNS lookup failed"))
+        self.assertIn("/check-update", body)
+        self.assertIn("Check now", body)
+        self.assertIn("try again by itself in about", body)
+
+    def test_a_failure_does_not_claim_to_have_checked(self):
+        # It said "Checked 09:01" for an attempt that resolved nothing.
+        body = self.get(self.checker(attempted=time.time(), failures=1,
+                                     error="DNS lookup failed"))
+        self.assertNotIn("Last successful check", body)
+
+    def test_a_good_check_still_reports_when_it_happened(self):
+        body = self.get(self.checker(checked=time.time(), attempted=time.time(),
+                                     tag="v0.0.9", latest="0.0.9"))
+        self.assertIn("Last successful check", body)
+        self.assertIn("Check now", body)
+
+    def test_a_check_in_flight_offers_no_retry_button(self):
+        c = self.checker(attempted=time.time(), failures=1, error="boom")
+        c._busy = True
+        body = self.get(c)
+        self.assertIn("Checking GitHub", body)
+        self.assertNotIn("Check now", body)
 
     def test_the_page_says_where_it_connects_and_how_to_stop_it(self):
         body = self.get(self.checker(checked=time.time(), latest="0.0.9",
@@ -1878,6 +2049,22 @@ class TestUpdatePanel(unittest.TestCase):
         body = self.get(self.checker(checked=time.time(), latest="0.0.9"))
         self.assertIn('data-busy="0"', body)
         self.assertNotIn("setInterval", body)
+
+    def test_the_retry_needs_a_post(self):
+        # A GET link would let a prefetch or a refresh reach out to GitHub,
+        # which is exactly what /rescan is a POST to avoid.
+        status, _, _ = request("/check-update", self.config,
+                               updates=self.checker())
+        self.assertEqual(status, 404)
+
+    def test_the_retry_post_forces_a_check_and_redirects(self):
+        c = self.checker(attempted=time.time(), failures=1, error="dns")
+        with mock.patch.object(c, "refresh") as refresh:
+            status, head, _ = request("/check-update", self.config,
+                                      method="POST", updates=c)
+        self.assertEqual(status, 303)
+        self.assertIn("Location: /", head)
+        refresh.assert_called_once_with(force=True)
 
     def test_the_update_endpoint_returns_the_panel_alone(self):
         c = self.checker(checked=time.time(), tag="v0.1.0", latest="0.1.0")
