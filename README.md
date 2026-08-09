@@ -3,7 +3,7 @@
 > [!WARNING]
 > ## ⚠️ EXPERIMENTAL: IN DEVELOPMENT
 >
-> **Version 0.1.0.** This is early software that has run on exactly one machine.
+> **Version 0.1.1.** This is early software that has run on exactly one machine.
 > It has not been tested across different distributions, camera makes, GPUs or
 > disk layouts, and it almost certainly has rough edges nobody has hit yet.
 >
@@ -168,7 +168,7 @@ download and the run are separate steps above precisely so you can inspect
 ```bash
 sudo bash install_timelapse.sh --unattended   # no questions, sane defaults
 sudo bash install_timelapse.sh --no-wizard    # install files only
-sudo bash install_timelapse.sh --ref v0.1.0   # pin to a tag
+sudo bash install_timelapse.sh --ref v0.1.1   # pin to a tag
 sudo bash install_timelapse.sh --uninstall    # remove; captured data is kept
 ```
 

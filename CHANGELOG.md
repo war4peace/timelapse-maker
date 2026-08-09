@@ -9,6 +9,12 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-09
+
+A maintenance release. Everything here came out of the first day of running
+0.1.0 on a real deployment: each item is something an operator hit, not
+something found by reading the code.
+
 ### Fixed
 - **`timelapse cameras` without `sudo` now says so.** It reported "No existing
   config at /etc/timelapse/config.json" about a file that exists but is
@@ -578,6 +584,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.1
 [0.1.0]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.0
 [0.0.9]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.0.9
 [0.0.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.0.1
