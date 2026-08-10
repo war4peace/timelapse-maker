@@ -897,6 +897,45 @@ removes programs and units but never captured data.
 
 ---
 
+### 4.8 Per-camera interval and frame rate
+
+`capture.interval_seconds` and `encode.framerate` are defaults. A camera
+carrying `interval_seconds` or `framerate` itself uses that instead. **Absent
+is the override mechanism**: it means "follow the default", so raising the
+global interval still moves every camera nobody has pinned. The wizard
+enforces this by *removing* the key when you answer with the global value
+rather than storing an equal copy, which would silently pin a camera somebody
+had merely looked at.
+
+Four things follow from it that are not obvious:
+
+- **The fetch timeout is clamped, not configured.** `capture.timeout_seconds`
+  is chosen against the *global* interval, so a camera that opts into a
+  shorter one inherits a timeout that can outlast its own tick: every request
+  still in flight when the next is due. `camera_timeout()` clamps it to
+  `interval - 1`, floored at 1 because requests treats 0 as no timeout at all.
+  A third knob would have no useful setting other than "under the interval".
+- **`gop` follows the frame rate.** 120 frames is two seconds at 60fps and
+  four at 30. The codec is probed once per run, but `encode_day()` rebuilds
+  the arguments from `build_candidates(enc, gop)` for each camera, rather than
+  appending a second `-g` and leaving the command carrying two values for one
+  option. An explicit per-camera `gop` still wins, and a camera that does not
+  set its own frame rate keeps a hand-tuned global one.
+- **`Cov%` is measured against the camera's interval.** Each result row
+  carries the interval it ran at. Against the global, a camera at one frame a
+  minute reads as 8% coverage: a complete day reported as a near-total outage,
+  every night.
+- **The disk projection sums, it does not multiply.** One camera at 60s and
+  five at 5s is not six times any single figure.
+
+`timelapse test` has a **Cadence** section reporting what each camera will
+produce, because the consequence of these two numbers, how long tonight's
+video is, cannot be read off the config. It fails a camera whose frames/day
+falls below `encode.min_frames`: the encoder `SKIP`s that, so the camera would
+produce nothing at all, every night, without ever failing.
+
+---
+
 ## 5. Configuration reference
 
 Single JSON file, default `/etc/timelapse/config.json`, mode `640`. Both programs
@@ -959,6 +998,9 @@ is read with `.get(key, default)`.
 | `enabled` | Excluded from both capture and encode when false. |
 | `method` | `http` or `rtsp`. |
 | `auth` | `digest`, `basic`, or `none`. Cameras that put credentials in the query string → `none`. |
+| `interval_seconds` | Optional. This camera's seconds between snapshots. Absent means `capture.interval_seconds`. |
+| `framerate` | Optional. This camera's playback rate. Absent means `encode.framerate`, and `gop` follows it. |
+| `quality` | RTSP only: ffmpeg `-q:v`, 2 = high. |
 | `_note` | Ignored by code. Keys starting with `_` are documentation. |
 
 ---
@@ -992,10 +1034,10 @@ Ordered roughly by how much of the existing design they disturb.
 via temp + `os.replace`, and dispatch on `method` in `main()`. Nothing in the
 encoder changes.
 
-**Per-camera settings** (different interval, resolution, quality): the camera
-dict is already passed whole to the thread constructor; read from `cam` with a
-fallback to the global. The encoder's `Cov%` maths assumes the global interval
-and would need the per-camera value threading through `build_summary`.
+**Per-camera settings**: interval and frame rate are done (see §4.8);
+resolution and quality would follow the same shape. The camera dict is passed
+whole to the thread constructor, so it is `cam.get(key) or <global>` and
+nothing structural.
 
 **Different notification sink**: `send_discord()` is the only
 outbound-notification function and takes `(title, description, color, fields)`.
@@ -1042,7 +1084,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 637 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 668 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1196,10 +1238,10 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 
 ```
 install.sh                       bootstrap installer, 738 lines
-scripts/timelapse_capture.py     daemon, 415 lines
-scripts/timelapse_encode.py      batch job, 725 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
-scripts/timelapse_setup.py       configuration wizard, 2604 lines
+scripts/timelapse_capture.py     daemon, 448 lines
+scripts/timelapse_encode.py      batch job, 783 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 724 lines
+scripts/timelapse_setup.py       configuration wizard, 2671 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_web.py         read-only web UI, 2093 lines
 tests/_support.py                path setup and fakes

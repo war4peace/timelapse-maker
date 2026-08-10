@@ -1,15 +1,13 @@
 {
   "_comment": "Copy to config.json and edit. chmod 640 the copy - it holds camera credentials.",
-
   "paths": {
     "_comment": "frames_root needs room for ~2 days of frames. Point it at your largest disk.",
-    "frames_root":  "/var/lib/timelapse/frames",
+    "frames_root": "/var/lib/timelapse/frames",
     "video_output": "/var/lib/timelapse/videos",
-    "log_dir":      "/var/lib/timelapse/logs",
-    "ffmpeg":       "/usr/bin/ffmpeg",
-    "ffprobe":      "/usr/bin/ffprobe"
+    "log_dir": "/var/lib/timelapse/logs",
+    "ffmpeg": "/usr/bin/ffmpeg",
+    "ffprobe": "/usr/bin/ffprobe"
   },
-
   "capture": {
     "_comment": "timeout_seconds must stay below interval_seconds. min_free_gb 0 disables the disk guard.",
     "interval_seconds": 5,
@@ -19,7 +17,6 @@
     "log_every_n_failures": 60,
     "retry_within_tick": true
   },
-
   "encode": {
     "_comment": "av1_preset p1 fastest .. p7 slowest. Lower cq/crf = higher quality, bigger files.",
     "framerate": 60,
@@ -33,25 +30,26 @@
     "delete_frames_on_success": true,
     "max_backlog_days": 7
   },
-
   "transfer": {
     "_comment": "Set enabled false to keep videos local. destination is a local mount path OR a remote rsync spec such as user@nas:/mnt/user/timelapse/",
     "_comment_cifs": "On a CIFS/SMB mount, '-a' implies -o -g and rsync exits 23 because the share cannot set owner/group. Use ['-rt','--partial','--remove-source-files'] there. 'timelapse transfer' measures which flags your share accepts and writes them for you.",
     "_comment_mount": "require_mountpoint refuses to transfer when the destination is not on a mounted filesystem - otherwise a dropped NAS mount turns into rsync filling your local disk. true checks the destination; a string checks that exact mount point, which is more precise.",
     "enabled": false,
     "destination": "/mnt/nas/timelapse/",
-    "rsync_args": ["-a", "--partial", "--remove-source-files"],
+    "rsync_args": [
+      "-a",
+      "--partial",
+      "--remove-source-files"
+    ],
     "delete_local_after_transfer": true,
     "require_mountpoint": false
   },
-
   "discord": {
     "_comment": "Optional nightly summary. Leave webhook_url empty to disable.",
     "enabled": false,
     "webhook_url": "",
     "username": "Timelapse Bot"
   },
-
   "web": {
     "_comment": "Optional read-only status page and video index. It never changes anything - no encode triggers, no camera control, no config edits.",
     "_comment_bind": "127.0.0.1 means only this machine can reach it, which is the safe value to hand-edit but rarely the useful one on a headless recorder. 'timelapse web' suggests this host's LAN address instead and checks that the address exists before writing it. There is no login and no HTTPS, so anything other than 127.0.0.1 exposes the page to your LAN; put a reverse proxy in front for anything wider. Changing this needs 'systemctl restart timelapse-web' to take effect.",
@@ -65,7 +63,6 @@
     "state_dir": "/var/lib/timelapse/web",
     "update_check": true
   },
-
   "_cameras_comment": [
     "name     -> used as the on-disk directory name; renaming orphans existing frames",
     "enabled  -> false excludes the camera from both capture and encode",
@@ -74,7 +71,6 @@
     "keys starting with _ are documentation and ignored by the code",
     "run timelapse_test.py before enabling anything, and again after any URL change"
   ],
-
   "cameras": [
     {
       "name": "Driveway",
@@ -102,7 +98,9 @@
       "auth": "digest",
       "username": "USERNAME",
       "password": "PASSWORD",
-      "_note": "Hikvision-style ONVIF snapshot. Profile_1 is normally the main stream, Profile_2 the substream, Profile_3 the third stream. Run 'timelapse_test.py config.json --probe-profiles' to see which one actually returns full resolution on your camera."
+      "interval_seconds": 60,
+      "framerate": 30,
+      "_note": "Per-camera overrides. interval_seconds and framerate default to capture.interval_seconds and encode.framerate; set either here and this camera alone uses it. A wide general view is fine at one frame a minute played at 30fps (1440 frames = 0:48 of video); a workbench wants a shorter interval. Omit them to follow the global settings, including when those change. The fetch timeout is clamped below whichever interval applies, and the keyframe interval follows the frame rate."
     },
     {
       "name": "Backyard",

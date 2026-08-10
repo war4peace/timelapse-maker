@@ -538,6 +538,69 @@ The warnings about stranded frames below apply exactly as they do in the menu,
 and `-t` writes nothing at all, so it neither backs up your config nor offers
 to restart capture.
 
+### Giving one camera its own interval and frame rate
+
+The capture interval and the frame rate are global defaults, and **any camera
+can override either**. Editing a camera asks:
+
+```
+  This camera can run on its own cadence. The defaults are one frame
+  every 5s, played at 60fps.
+  Answer with the default to go back to following it.
+  Seconds between snapshots for this camera [5]: 60
+  Frame rate for this camera [60]: 30
+  1,440 frames/day -> 0:48 of video at 30fps
+```
+
+A wide general view of a courtyard is fine at one frame a minute played at
+30fps. A workbench, where you want to watch a print finish or a miniature get
+painted, wants three seconds and produces a much longer video. Both can run on
+the same host at the same time.
+
+**Answering with the global value removes the setting rather than storing a
+copy.** That is deliberate: a camera you have not pinned keeps following the
+defaults, so changing the global interval later still moves it. Only cameras
+you deliberately set stay put, and `timelapse cameras -l` marks them:
+
+```
+     #  Name           On  Cadence    Type  URL
+     1  Driveway       yes 5s/60      http  http://192.0.2.10/cg...l=1&subtype=0
+     2  Roof           yes 60s/30*    http  http://192.0.2.12:80...hot?Profile_1
+    * has its own interval or frame rate; the rest follow the global settings.
+```
+
+Four things happen automatically, so they are not extra settings:
+
+- The **fetch timeout** is clamped below whichever interval applies. The
+  global timeout is chosen against the global interval, so a camera on a
+  shorter one would otherwise still have a request in flight when its next
+  snapshot is due.
+- The **keyframe interval** follows the frame rate, staying at two seconds'
+  worth rather than becoming four seconds at 30fps.
+- **`Cov%`** in the nightly Discord summary is measured against that camera's
+  interval. Otherwise a camera at one frame a minute would report 8% coverage
+  after a perfect day.
+- The **disk projection** in `timelapse test` sums per camera rather than
+  multiplying one figure by the camera count.
+
+`timelapse test` gained a **Cadence** section that spells out what each camera
+will produce:
+
+```
+=== Cadence ===
+  ....  Defaults: one frame every 5s, played at 60fps
+  PASS  Driveway: every 5s at 60fps -> 17,280 frames/day, 4:48 of video (default)
+  PASS  Roof: every 60s at 30fps -> 1,440 frames/day, 0:48 of video (own)
+```
+
+It **fails** a camera whose frames per day fall below `encode.min_frames`
+(default 100), because the nightly encode skips a day with fewer than that.
+An interval of 15 minutes or longer would otherwise produce nothing at all,
+every night, without anything ever reporting a failure.
+
+Capture reads its camera list at startup, so this takes effect when it
+restarts, which the command offers to do.
+
 **It restarts capture for you.** The daemon reads its camera list once, at
 startup, so an edit does nothing until it restarts; you are asked, and told the
 command if you decline. Nothing here touches paths, so the systemd units are

@@ -101,6 +101,34 @@ def setup_logging(log_dir):
 
 
 # ----------------------------------------------------------------------------
+# Per-camera settings
+#
+# `capture.interval_seconds` and `encode.framerate` are the defaults; a camera
+# may carry either key itself and is then on its own cadence. A wide courtyard
+# view is fine at one frame a minute, and a workbench is not. Absent means
+# "follow the default", so raising the global interval still moves every camera
+# that has not opted out.
+# ----------------------------------------------------------------------------
+
+def camera_interval(cam, cfg):
+    """Seconds between snapshots for this camera."""
+    return int(cam.get("interval_seconds") or cfg["capture"]["interval_seconds"])
+
+
+def camera_timeout(cam, cfg):
+    """Fetch timeout, never allowed to reach this camera's own interval.
+
+    The global timeout is chosen against the global interval, so a camera that
+    opts into a shorter one inherits a timeout that can outlast its own tick.
+    That is not a slow camera, it is a camera whose every request is still in
+    flight when the next one is due. Clamped rather than made a third knob:
+    there is no useful answer other than "under the interval".
+    """
+    interval = camera_interval(cam, cfg)
+    return max(1, min(int(cfg["capture"]["timeout_seconds"]), interval - 1))
+
+
+# ----------------------------------------------------------------------------
 # HTTP snapshot cameras
 # ----------------------------------------------------------------------------
 
@@ -111,8 +139,8 @@ class HttpCamera(threading.Thread):
         self.cam = cam
         self.name_ = cam["name"]
         self.url = cam["url"]
-        self.interval = cfg["capture"]["interval_seconds"]
-        self.timeout = cfg["capture"]["timeout_seconds"]
+        self.interval = camera_interval(cam, cfg)
+        self.timeout = camera_timeout(cam, cfg)
         self.min_bytes = cfg["capture"]["min_bytes"]
         self.log_every = cfg["capture"].get("log_every_n_failures", 60)
         self.retry = cfg["capture"].get("retry_within_tick", True)
@@ -212,7 +240,12 @@ class HttpCamera(threading.Thread):
     def run(self):
         self.root.mkdir(parents=True, exist_ok=True)
         next_t = math.ceil(time.time() / self.interval) * self.interval
-        self.log.info("capture started (%ss interval)", self.interval)
+        # The timeout is logged because it can differ from the configured one:
+        # a camera on a shorter interval than the global has it clamped, and
+        # the journal is where that becomes visible.
+        self.log.info("capture started (%ss interval, %ss timeout%s)",
+                      self.interval, self.timeout,
+                      ", per-camera" if self.cam.get("interval_seconds") else "")
 
         while not STOP.is_set():
             wait = next_t - time.time()
@@ -273,7 +306,7 @@ class RtspCamera(threading.Thread):
         self.cam = cam
         self.name_ = cam["name"]
         self.url = cam["url"]
-        self.interval = cfg["capture"]["interval_seconds"]
+        self.interval = camera_interval(cam, cfg)
         self.ffmpeg = cfg["paths"]["ffmpeg"]
         self.root = Path(cfg["paths"]["frames_root"]) / self.name_
         self.quality = str(cam.get("quality", 2))

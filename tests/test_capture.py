@@ -146,6 +146,62 @@ class TestCameraConstruction(unittest.TestCase):
         self.assertEqual(c.min_bytes, 4096)
 
 
+class TestPerCameraCadence(unittest.TestCase):
+    """A camera may carry its own interval; absent means follow the global.
+
+    Absent, rather than a copy of the global value, is the whole design: a
+    camera nobody has pinned still moves when the global interval changes.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = make_config(self.tmp)          # 5s interval, 4s timeout
+
+    def build(self, **cam):
+        base = {"name": "Cam", "url": "http://192.0.2.1/snap"}
+        base.update(cam)
+        return cap.HttpCamera(base, self.cfg)
+
+    def test_no_override_follows_the_global(self):
+        self.assertEqual(cap.camera_interval({}, self.cfg), 5)
+
+    def test_an_override_wins(self):
+        self.assertEqual(
+            cap.camera_interval({"interval_seconds": 60}, self.cfg), 60)
+
+    def test_the_thread_runs_on_its_own_interval(self):
+        self.assertEqual(self.build(interval_seconds=60).interval, 60)
+
+    def test_a_longer_interval_keeps_the_global_timeout(self):
+        # 4s is already comfortably under 60s; there is nothing to clamp.
+        self.assertEqual(self.build(interval_seconds=60).timeout, 4)
+
+    def test_a_shorter_interval_clamps_the_timeout_under_it(self):
+        # The global 4s timeout would otherwise still be in flight when the
+        # next 3s tick fires, so every request overruns its own slot.
+        self.assertEqual(self.build(interval_seconds=3).timeout, 2)
+
+    def test_the_clamp_never_reaches_zero(self):
+        # A 1s interval has no room under it; 1s beats a timeout of 0, which
+        # requests treats as "no timeout at all".
+        self.assertEqual(self.build(interval_seconds=1).timeout, 1)
+
+    def test_a_zero_or_missing_override_is_not_an_override(self):
+        # 0 is not a cadence, and reading it as one would busy-loop.
+        for value in (0, None):
+            self.assertEqual(
+                cap.camera_interval({"interval_seconds": value}, self.cfg), 5)
+
+    def test_the_rtsp_thread_honours_it_too(self):
+        # ffmpeg gets fps=1/interval, so this is the same setting by another
+        # route; leaving it global would make the two paths disagree.
+        c = cap.RtspCamera({"name": "R", "url": "rtsp://192.0.2.1/s",
+                            "interval_seconds": 120}, self.cfg)
+        self.assertEqual(c.interval, 120)
+        self.assertIn("fps=1/120", c._cmd())
+
+
 class TestScheduleMath(unittest.TestCase):
     """The absolute-boundary arithmetic that keeps capture drift-free."""
 

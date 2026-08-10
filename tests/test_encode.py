@@ -646,6 +646,68 @@ class TestBuildSummary(unittest.TestCase):
         self.assertTrue(out.startswith("```"))
         self.assertTrue(out.rstrip().endswith("```"))
 
+    def test_coverage_uses_the_cameras_own_interval(self):
+        # A full day at one frame a minute is 1,440 frames. Measured against
+        # the global 5s interval that reads as 8% coverage: a complete day
+        # reported as a near-total outage, every single night.
+        out = enc.build_summary([self.row(frames=1440, interval=60)], 5)
+        self.assertIn("100", out)
+        self.assertNotIn(" 8 ", out)
+
+    def test_a_row_without_an_interval_falls_back_to_the_global(self):
+        # Rows built before this existed, and any caller that does not set it.
+        row = self.row()
+        row.pop("interval", None)
+        self.assertIn("100", enc.build_summary([row], 5))
+
+
+class TestPerCameraEncodeSettings(unittest.TestCase):
+
+    CFG = {"capture": {"interval_seconds": 5},
+           "encode": {"framerate": 60, "gop": 120},
+           "cameras": [{"name": "Roof", "interval_seconds": 60,
+                        "framerate": 30},
+                       {"name": "Drive"}]}
+
+    def test_a_camera_without_overrides_uses_the_globals(self):
+        cam = enc.camera_entry(self.CFG, "Drive")
+        self.assertEqual(enc.camera_framerate(self.CFG, cam), 60)
+        self.assertEqual(enc.camera_interval(self.CFG, cam), 5)
+        self.assertEqual(enc.camera_gop(self.CFG, cam), 120)
+
+    def test_a_camera_with_overrides_uses_them(self):
+        cam = enc.camera_entry(self.CFG, "Roof")
+        self.assertEqual(enc.camera_framerate(self.CFG, cam), 30)
+        self.assertEqual(enc.camera_interval(self.CFG, cam), 60)
+
+    def test_gop_follows_a_per_camera_frame_rate(self):
+        # 120 frames is two seconds at 60fps and four at 30. Left global, a
+        # camera at 30fps silently gets half the keyframes it should.
+        cam = enc.camera_entry(self.CFG, "Roof")
+        self.assertEqual(enc.camera_gop(self.CFG, cam), 30 * enc.GOP_SECONDS)
+
+    def test_an_explicit_per_camera_gop_wins(self):
+        self.assertEqual(
+            enc.camera_gop(self.CFG, {"framerate": 30, "gop": 250}), 250)
+
+    def test_a_hand_tuned_global_gop_survives_for_cameras_that_follow(self):
+        # Only a camera setting its own frame rate gets a derived gop; one
+        # following the globals keeps whatever was configured by hand.
+        cfg = {"capture": {"interval_seconds": 5},
+               "encode": {"framerate": 60, "gop": 250}}
+        self.assertEqual(enc.camera_gop(cfg, {}), 250)
+
+    def test_an_unknown_camera_gets_the_defaults_not_an_error(self):
+        self.assertEqual(enc.camera_entry(self.CFG, "Ghost"), {})
+        self.assertEqual(enc.camera_framerate(self.CFG, {}), 60)
+
+    def test_the_arguments_are_rebuilt_for_that_gop(self):
+        # The codec is probed once per run; the arguments must still carry
+        # this camera's keyframe interval rather than the run's.
+        args = enc.build_candidates({"gop": 120}, gop=60)[0]["args"]
+        self.assertIn("60", args)
+        self.assertNotIn("120", args)
+
 
 if __name__ == "__main__":
     unittest.main()

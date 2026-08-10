@@ -30,6 +30,23 @@ While the version is `0.x`, the configuration format may change in any release.
   and 9:36 at 30. `encode.gop` is derived from it rather than asked, so a
   keyframe stays two seconds apart at any rate instead of drifting to four
   seconds at 30fps. Existing configs are untouched.
+- **Per-camera capture interval and frame rate.** `capture.interval_seconds`
+  and `encode.framerate` remain the defaults, and a camera may now carry
+  either key itself. A wide courtyard view is fine at one frame a minute
+  played at 30fps; a workbench wants three seconds. Set them with
+  `sudo timelapse cameras -e:NAME`, which offers the current effective values
+  and stores nothing when you answer with the global one, so a camera nobody
+  has pinned still moves when the global setting changes.
+
+  Everything downstream follows: the capture thread runs on that cadence (HTTP
+  and RTSP alike), the encoder uses that frame rate and derives the keyframe
+  interval from it, `Cov%` in the nightly summary is measured against the
+  camera's own interval, and `timelapse test` grew a **Cadence** section
+  showing what each camera will produce. The fetch timeout is clamped below
+  whichever interval applies rather than becoming a third setting. The disk
+  projection sums per camera instead of multiplying, since they no longer
+  share a cadence. `timelapse cameras -l` shows the effective cadence and
+  marks the cameras that are not following the defaults.
 - **Rotating config backups, and `sudo timelapse restore`.** A backup is taken
   before every change, five deep, named for when it was taken. `restore` lists
   them with the date, the size and what is actually in each one (camera count,

@@ -47,6 +47,24 @@ def warn(msg):  print(f"  {YELLOW}WARN{RESET}  {msg}")
 def info(msg):  print(f"  {DIM}....{RESET}  {msg}")
 
 
+# A camera may carry its own cadence and frame rate; absent means follow the
+# global. Kept as three one-line lookups rather than an import from the capture
+# daemon: a `.get` with a default is not an algorithm worth sharing, and the
+# pre-flight must not depend on the daemon importing cleanly to run at all.
+def camera_interval(cam, cfg):
+    return int(cam.get("interval_seconds") or cfg["capture"]["interval_seconds"])
+
+
+def camera_timeout(cam, cfg):
+    """Matches the clamp the daemon applies, so the test measures what runs."""
+    return max(1, min(int(cfg["capture"]["timeout_seconds"]),
+                      camera_interval(cam, cfg) - 1))
+
+
+def camera_framerate(cam, cfg):
+    return int(cam.get("framerate") or cfg["encode"].get("framerate", 60))
+
+
 def dimensions(ffprobe, path):
     try:
         r = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
@@ -67,8 +85,8 @@ def test_http(cam, cfg):
     elif mode == "basic":
         sess.auth = HTTPBasicAuth(cam.get("username"), cam.get("password"))
 
-    interval = cfg["capture"]["interval_seconds"]
-    timeout = cfg["capture"]["timeout_seconds"]
+    interval = camera_interval(cam, cfg)
+    timeout = camera_timeout(cam, cfg)
 
     t0 = time.time()
     try:
@@ -99,8 +117,11 @@ def test_http(cam, cfg):
 
     ok(f"{name}: {len(data)/1024:.0f} KB, {dims}, {dt:.2f}s  -> {sample}")
     if dt > interval * 0.6:
-        warn(f"{name}: {dt:.2f}s fetch is slow relative to the {interval}s "
-             f"interval; consider raising capture.timeout_seconds or the interval")
+        # Against this camera's own interval: one on a 3s cadence is in
+        # trouble at 2s where one on 60s is not, and the whole point of the
+        # per-camera setting is that they differ.
+        warn(f"{name}: {dt:.2f}s fetch is slow relative to its {interval}s "
+             f"interval; consider raising the interval for this camera")
     return len(data)
 
 
@@ -299,20 +320,62 @@ def diagnose_encoders(cfg):
     print()
 
 
+def test_cadence(cfg, cams):
+    """What each camera will actually produce, and whether that is sane.
+
+    Worth its own section because the two numbers behind it are the ones a
+    per-camera override changes, and their consequence (how long tonight's
+    video is) is not something you can read off the config.
+    """
+    min_frames = cfg.get("encode", {}).get("min_frames", 100)
+    g_int = cfg["capture"]["interval_seconds"]
+    g_fps = cfg["encode"].get("framerate", 60)
+    info(f"Defaults: one frame every {g_int}s, played at {g_fps}fps")
+    for cam in cams:
+        name = cam["name"]
+        interval, fps = camera_interval(cam, cfg), camera_framerate(cam, cfg)
+        per_day = int(86400 / interval)
+        secs = per_day / fps
+        own = "own" if (cam.get("interval_seconds") or cam.get("framerate")) \
+            else "default"
+        line = (f"{name}: every {interval}s at {fps}fps -> {per_day:,} "
+                f"frames/day, {int(secs // 60)}:{int(secs % 60):02d} of video "
+                f"({own})")
+        if per_day < min_frames:
+            # The encoder SKIPs below min_frames, so this camera would produce
+            # nothing at all, silently, every night. Cheap to catch here.
+            bad(f"{line} - below encode.min_frames ({min_frames}), so it will "
+                f"be SKIPped every night")
+        elif camera_timeout(cam, cfg) < cfg["capture"]["timeout_seconds"]:
+            warn(f"{line} - fetch timeout clamped to "
+                 f"{camera_timeout(cam, cfg)}s to stay under the interval")
+        else:
+            ok(line)
+
+
 def test_disk(cfg, avg_bytes, n_cameras):
     root = Path(cfg["paths"]["frames_root"])
     probe = root if root.exists() else root.parent
     while not probe.exists() and probe != probe.parent:
         probe = probe.parent
     free = shutil.disk_usage(probe).free
-    interval = cfg["capture"]["interval_seconds"]
-    per_day = int(86400 / interval)
+
+    # Summed per camera rather than multiplied, because they no longer share a
+    # cadence. One camera at 60s and five at 5s is not six times any single
+    # figure, and the multiplied version overstated it by 5x for that camera.
+    enabled = [c for c in cfg.get("cameras", []) if c.get("enabled", True)]
+    frames = [int(86400 / camera_interval(c, cfg)) for c in enabled]
+    per_day = sum(frames)
+    mixed = len(set(frames)) > 1
 
     info(f"{free/1024**3:.0f} GB free on {probe}")
-    if avg_bytes and n_cameras:
-        daily = avg_bytes * per_day * n_cameras
-        info(f"Projected: {per_day} frames/camera/day x {n_cameras} cameras "
-             f"@ ~{avg_bytes/1024:.0f} KB = {daily/1024**3:.0f} GB/day")
+    if avg_bytes and n_cameras and per_day:
+        daily = avg_bytes * per_day
+        shape = (f"{per_day:,} frames/day across {len(enabled)} cameras"
+                 if mixed else
+                 f"{frames[0]:,} frames/camera/day x {len(enabled)} cameras")
+        info(f"Projected: {shape} @ ~{avg_bytes/1024:.0f} KB "
+             f"= {daily/1024**3:.0f} GB/day")
         needed = daily * 2.2      # yesterday + today + margin
         if free < needed:
             bad(f"Need roughly {needed/1024**3:.0f} GB resident; only "
@@ -636,6 +699,9 @@ def main():
         got = test_http(cam, cfg) if method == "http" else test_rtsp(cam, cfg)
         if got:
             sizes.append(got)
+
+    print("\n=== Cadence ===")
+    test_cadence(cfg, cams)
 
     print("\n=== Encoders ===")
     test_encoders(cfg)

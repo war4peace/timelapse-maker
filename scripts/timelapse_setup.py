@@ -703,24 +703,46 @@ def name_taken(cams, name, skip=None):
                for c in cams)
 
 
+def camera_interval(cfg, cam):
+    return int(cam.get("interval_seconds")
+               or cfg.get("capture", {}).get("interval_seconds", 5))
+
+
+def camera_framerate(cfg, cam):
+    return int(cam.get("framerate")
+               or cfg.get("encode", {}).get("framerate", 60))
+
+
+def camera_overrides(cam):
+    return bool(cam.get("interval_seconds") or cam.get("framerate"))
+
+
 def list_cameras(cfg):
     cams = cfg.get("cameras", [])
     if not cams:
         note("No cameras configured.")
         return
     print()
-    print(f"    {'#':>2}  {'Name':<14} {'On':<4}{'Type':<6}URL")
+    print(f"    {'#':>2}  {'Name':<14} {'On':<4}{'Cadence':<11}{'Type':<6}URL")
     for i, cam in enumerate(cams, 1):
         # Elide the middle, not the tail. Reolink-style URLs are identical for
         # their first 40 characters, so a plain truncation makes every camera
         # look the same - and it would hide the *** that shows the password is
-        # masked, which reads as though nothing were redacted at all.
+        # masked, which reads as though nothing were redacted at all. The head
+        # is kept long enough for the IP, which is the part that differs.
         url = redact_url(str(cam.get("url", "")))
-        if len(url) > 44:
-            url = url[:24] + "..." + url[-17:]
+        if len(url) > 36:
+            url = url[:20] + "..." + url[-13:]
         state = "yes" if cam.get("enabled", True) else dim("no")
+        # A trailing * means this camera is not following the global settings,
+        # which is what decides whether changing them will move it.
+        cad = (f"{camera_interval(cfg, cam)}s/{camera_framerate(cfg, cam)}"
+               + ("*" if camera_overrides(cam) else ""))
         print(f"    {i:>2}  {str(cam.get('name', '')):<14} {state:<4}"
-              f"{str(cam.get('method', 'http')):<6}{dim(url)}")
+              f"{cad:<11}{str(cam.get('method', 'http')):<6}{dim(url)}")
+    if any(camera_overrides(c) for c in cams):
+        note("  * has its own interval or frame rate; the rest follow the "
+             "global settings.")
 
 
 def pick_camera(cams, verb):
@@ -823,9 +845,54 @@ def edit_one_camera(cfg, cams, cam):
     if new_name != old_name:
         rename_camera_frames(cfg, old_name, new_name)
         cam["name"] = new_name
+
+    edit_camera_cadence(cfg, cam)
+
     if ask_yes("Test it now?", True):
         test_camera(cam, cfg)
     return cam
+
+
+def edit_camera_cadence(cfg, cam):
+    """Per-camera interval and frame rate, or back to following the global.
+
+    Answering with the global value *removes* the key rather than storing the
+    same number. That is the whole design: absent means "follow the default",
+    so a camera left alone still moves when the global interval changes, and
+    only the ones deliberately pinned stay put.
+    """
+    g_int = int(cfg.get("capture", {}).get("interval_seconds", 5))
+    g_fps = int(cfg.get("encode", {}).get("framerate", 60))
+    print()
+    note(f"This camera can run on its own cadence. The defaults are one frame "
+         f"every {g_int}s, played at {g_fps}fps.")
+    note("Answer with the default to go back to following it.")
+
+    interval = ask_int("Seconds between snapshots for this camera",
+                       camera_interval(cfg, cam), 1, 3600)
+    fps = ask_int("Frame rate for this camera",
+                  camera_framerate(cfg, cam), 1, 240)
+
+    for key, value, default in (("interval_seconds", interval, g_int),
+                                ("framerate", fps, g_fps)):
+        if value == default:
+            cam.pop(key, None)
+        else:
+            cam[key] = value
+
+    per_day = int(86400 / interval)
+    note(f"{per_day:,} frames/day -> {video_length(per_day, fps)} of video "
+         f"at {fps}fps"
+         + ("" if camera_overrides(cam) else ", following the defaults"))
+
+    min_frames = int(cfg.get("encode", {}).get("min_frames", 100))
+    if per_day < min_frames:
+        # The encoder SKIPs a day below min_frames, so this would produce
+        # nothing at all, every night, without ever failing.
+        warn(f"That is under encode.min_frames ({min_frames}), so the nightly "
+             f"encode would skip this camera every night.")
+        note(f"A {interval}s interval needs min_frames below {per_day} to "
+             f"produce anything.")
 
 
 def load_existing_config(path):

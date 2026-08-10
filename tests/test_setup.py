@@ -8,6 +8,7 @@ kinds of thing that look like disks but aren't. These drive it with a synthetic
 import contextlib
 import io
 import json
+import re
 import shutil
 import socket
 import sys
@@ -1681,6 +1682,128 @@ class TestFramerate(unittest.TestCase):
     def test_video_length_survives_a_zero_rate(self):
         # Never let the wizard divide by zero while describing a bad answer.
         self.assertEqual(setup.video_length(60, 0), "1:00")
+
+
+class TestPerCameraCadence(unittest.TestCase):
+    """Editing one camera's interval and frame rate.
+
+    The rule that makes the whole thing work: answering with the global value
+    *removes* the key. Storing a copy would silently pin the camera, so a
+    later change to the global would move every camera except the ones
+    somebody had merely looked at.
+    """
+
+    def setUp(self):
+        self.cfg = {"capture": {"interval_seconds": 5},
+                    "encode": {"framerate": 60, "min_frames": 100}}
+        setup.AUTO, setup._TTY = False, None
+
+    def tearDown(self):
+        setup.AUTO, setup._TTY = False, None
+
+    def edit(self, cam, keys):
+        setup._TTY = FakeTTY(keys, tty=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            setup.edit_camera_cadence(self.cfg, cam)
+        return cam, buf.getvalue()
+
+    def test_answering_with_the_globals_stores_nothing(self):
+        cam, _ = self.edit({"name": "C"}, "5\n60\n")
+        self.assertNotIn("interval_seconds", cam)
+        self.assertNotIn("framerate", cam)
+
+    def test_pressing_enter_twice_stores_nothing(self):
+        # The defaults offered are the effective values, so Enter means
+        # "leave it alone", which for an unpinned camera means unpinned.
+        cam, _ = self.edit({"name": "C"}, "\n\n")
+        self.assertEqual(cam, {"name": "C"})
+
+    def test_different_values_are_stored_on_the_camera(self):
+        cam, _ = self.edit({"name": "C"}, "60\n30\n")
+        self.assertEqual(cam["interval_seconds"], 60)
+        self.assertEqual(cam["framerate"], 30)
+
+    def test_going_back_to_the_global_clears_the_override(self):
+        cam, _ = self.edit({"name": "C", "interval_seconds": 60,
+                            "framerate": 30}, "5\n60\n")
+        self.assertNotIn("interval_seconds", cam)
+        self.assertNotIn("framerate", cam)
+
+    def test_the_current_override_is_the_default_offered(self):
+        cam, out = self.edit({"name": "C", "interval_seconds": 60,
+                              "framerate": 30}, "\n\n")
+        self.assertEqual(cam["interval_seconds"], 60)
+        self.assertEqual(cam["framerate"], 30)
+        self.assertIn("[60]", out)
+
+    def test_one_override_alone_is_allowed(self):
+        cam, _ = self.edit({"name": "C"}, "5\n30\n")
+        self.assertNotIn("interval_seconds", cam)
+        self.assertEqual(cam["framerate"], 30)
+
+    def test_it_says_what_the_result_will_be(self):
+        # 86400/60 = 1440 frames, at 30fps = 48 seconds.
+        _, out = self.edit({"name": "C"}, "60\n30\n")
+        self.assertIn("1,440", out)
+        self.assertIn("0:48", out)
+
+    def test_a_cadence_below_min_frames_warns(self):
+        # 86400/900 = 96 frames, under min_frames 100, so the nightly encode
+        # would SKIP this camera every night without ever failing.
+        _, out = self.edit({"name": "C"}, "900\n30\n")
+        self.assertIn("min_frames", out)
+        self.assertIn("skip", out.lower())
+
+    def test_a_normal_cadence_does_not_warn(self):
+        _, out = self.edit({"name": "C"}, "60\n30\n")
+        self.assertNotIn("min_frames", out)
+
+
+class TestCadenceListing(unittest.TestCase):
+
+    def show(self, cams):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            setup.list_cameras({"capture": {"interval_seconds": 5},
+                                "encode": {"framerate": 60},
+                                "cameras": cams})
+        return buf.getvalue()
+
+    def test_the_effective_cadence_is_shown(self):
+        out = self.show([{"name": "A", "url": "http://h/s"}])
+        self.assertIn("5s/60", out)
+
+    def test_an_override_is_marked_and_explained(self):
+        # Which cameras a change to the global will actually move is not
+        # something you can see from names and URLs.
+        out = self.show([{"name": "A", "url": "http://h/s"},
+                         {"name": "B", "url": "http://h/s",
+                          "interval_seconds": 60, "framerate": 30}])
+        self.assertIn("60s/30*", out)
+        self.assertIn("own interval or frame rate", out)
+
+    def test_no_overrides_means_no_footnote(self):
+        out = self.show([{"name": "A", "url": "http://h/s"}])
+        self.assertNotIn("own interval or frame rate", out)
+
+    def test_the_listing_still_fits_eighty_columns(self):
+        # It gained a Cadence column, and the URL elision was shortened from
+        # 44 to 36 characters to pay for it. A name longer than its 14-wide
+        # column pushes the row wider, which it always did, so the contract
+        # here is a name that fits.
+        out = self.show([{"name": "DoorbellFront", "interval_seconds": 3,
+                          "url": "http://192.0.2.11/cgi-bin/api.cgi?cmd=Snap"
+                                 "&channel=0&user=admin&password=hunter2"}])
+        for line in out.splitlines():
+            self.assertLessEqual(len(re.sub(r"\x1b\[[0-9;]*m", "", line)), 80,
+                                 line)
+
+    def test_passwords_are_still_masked_after_the_column_change(self):
+        out = self.show([{"name": "A", "interval_seconds": 3,
+                          "url": "http://h/api?user=admin&password=hunter2"}])
+        self.assertNotIn("hunter2", out)
+        self.assertIn("***", out)
 
 
 class TestConfigBackups(unittest.TestCase):

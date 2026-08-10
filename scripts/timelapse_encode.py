@@ -80,9 +80,15 @@ def human_size(n):
 # Encoder selection
 # ----------------------------------------------------------------------------
 
-def build_candidates(enc):
-    """Ordered encoder candidates: AV1 -> HEVC -> x264."""
-    gop = str(enc.get("gop", 120))
+def build_candidates(enc, gop=None):
+    """Ordered encoder candidates: AV1 -> HEVC -> x264.
+
+    `gop` is a parameter because a camera on its own frame rate needs its own
+    keyframe interval: 120 frames is two seconds at 60fps and four at 30. The
+    codec is chosen once per run by probing; the arguments are rebuilt per
+    camera from the same function, so the two cannot drift.
+    """
+    gop = str(enc.get("gop", 120) if gop is None else gop)
     return [
         {
             "name": "AV1 (av1_nvenc)",
@@ -313,16 +319,58 @@ def write_concat_list(frames, target):
             fh.write("file '%s'\n" % str(p).replace("'", "'\\''"))
 
 
+GOP_SECONDS = 2
+
+
+def camera_entry(cfg, name):
+    """The config entry for a camera name, or {}.
+
+    {} rather than an error: the encoder builds its work list from the config,
+    so a name it is asked about is normally there, and a caller that has one
+    from somewhere else should get the defaults rather than a traceback.
+    """
+    for cam in cfg.get("cameras", []):
+        if cam.get("name") == name:
+            return cam
+    return {}
+
+
+def camera_interval(cfg, cam):
+    return int(cam.get("interval_seconds") or cfg["capture"]["interval_seconds"])
+
+
+def camera_framerate(cfg, cam):
+    return int(cam.get("framerate") or cfg["encode"].get("framerate", 60))
+
+
+def camera_gop(cfg, cam):
+    """Keyframe interval in frames, following this camera's frame rate.
+
+    An explicit per-camera `gop` wins. Otherwise a camera that sets its own
+    frame rate gets two seconds' worth at that rate, and one that does not
+    keeps whatever the global config says, which may have been hand-tuned.
+    """
+    if cam.get("gop"):
+        return int(cam["gop"])
+    if cam.get("framerate"):
+        return camera_framerate(cfg, cam) * GOP_SECONDS
+    return int(cfg["encode"].get("gop", 120))
+
+
 def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
     enc = cfg["encode"]
     ffmpeg = cfg["paths"]["ffmpeg"]
     ffprobe = cfg["paths"].get("ffprobe", "ffprobe")
-    fps = str(enc.get("framerate", 60))
+    cam = camera_entry(cfg, camera)
+    fps = str(camera_framerate(cfg, cam))
     day = day_dir.name
     started = time.time()
 
+    # Carried in the result so the summary can work out coverage against the
+    # cadence this camera actually ran at, rather than the global one.
     result = {"camera": camera, "date": day, "status": "FAIL", "frames": 0,
-              "bad": 0, "size": 0, "seconds": 0, "note": ""}
+              "bad": 0, "size": 0, "seconds": 0, "note": "",
+              "interval": camera_interval(cfg, cam), "fps": int(fps)}
 
     frames, bad = valid_frames(day_dir, cfg["capture"]["min_bytes"])
     result["frames"], result["bad"] = len(frames), bad
@@ -352,16 +400,23 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
 
         write_concat_list(frames, concat_path)
 
+        # Rebuilt for this camera's keyframe interval, from the codec the run
+        # already probed. Appending a second -g instead would leave the
+        # command carrying two values for one option, which is exactly the
+        # confusion the duplicated -r below has to be commented for.
+        args = next((c["args"] for c in build_candidates(enc, camera_gop(cfg, cam))
+                     if c["codec"] == encoder["codec"]), encoder["args"])
+
         cmd = ([ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-nostats",
                 "-f", "concat", "-safe", "0", "-r", fps, "-i", str(concat_path),
                 "-vf", vf]
-               + encoder["args"]
+               + args
                + ["-color_range", "tv", "-colorspace", "bt709",
                   "-color_primaries", "bt709", "-color_trc", "bt709",
                   "-r", fps, str(out_file)])
 
-        log.info("  %s %s: encoding %d frames (%dx%d, %d bad) -> %s",
-                 camera, day, len(frames), w, h, bad, out_file.name)
+        log.info("  %s %s: encoding %d frames (%dx%d, %d bad) at %sfps -> %s",
+                 camera, day, len(frames), w, h, bad, fps, out_file.name)
 
         if dry_run:
             result["status"] = "DRY"
@@ -531,11 +586,14 @@ def send_discord(cfg, title, description, color, fields):
 
 
 def build_summary(results, interval):
-    expected = int(86400 / interval)
     fmt = "{:<12} {:<10} {:<5} {:>7} {:>5} {:>9} {:>8}"
     rows = [fmt.format("Camera", "Date", "St", "Frames", "Cov%", "Size", "Time"),
             "-" * 62]
     for r in results:
+        # Against the cadence this camera ran at. Using the global interval
+        # made a camera at one frame a minute read as 8% coverage every night,
+        # which is a full day of frames reported as a near-total outage.
+        expected = int(86400 / (r.get("interval") or interval))
         cov = f"{100.0 * r['frames'] / expected:.0f}" if r["frames"] else "-"
         rows.append(fmt.format(
             r["camera"][:12], r["date"], r["status"],

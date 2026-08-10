@@ -62,7 +62,7 @@ Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 | `timelapse version` | What is installed, and whether the daemon is still running an older build | |
 | `timelapse usage` | Frames, bytes and date range per camera, and which folders nothing will ever encode | **sudo** |
 | `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord | **sudo** |
-| `timelapse cameras` | Add, edit, remove or disable a camera, then restart capture. `-l` lists; `-a`, `-e:NAME`, `-x:NAME`, `-t:NAME`, `-r:NAME` skip the menu | **sudo** |
+| `timelapse cameras` | Add, edit, remove or disable a camera, set its own interval and frame rate, then restart capture. `-l` lists; `-a`, `-e:NAME`, `-x:NAME`, `-t:NAME`, `-r:NAME` skip the menu | **sudo** |
 | `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed | **sudo** |
 | `timelapse web` | Turn the read-only web UI on or off, set its address and library path | **sudo** |
 | `timelapse encode` | Run tonight's encode now | **sudo** |
@@ -125,6 +125,11 @@ so either can be stopped, replaced or rewritten without touching the other.
 - `rsync`, only if you enable transfer
 - Cameras exposing an HTTP snapshot URL (Dahua, Hikvision/ONVIF, Reolink and
   similar) or, failing that, RTSP
+
+Capture interval and frame rate are global defaults that **any camera can
+override**. A wide general view is fine at one frame a minute played at 30fps;
+a workbench is not. Set it with `sudo timelapse cameras -e:Roof`; leave it
+alone and the camera follows the defaults, including when you change them.
 
 Roughly **17,280 frames per camera per day** at the default 5s interval, which
 is 4:48 of video at 60fps. Budget disk accordingly: at ~600 KB per 1440p
