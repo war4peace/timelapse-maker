@@ -1597,95 +1597,6 @@ class TestLibraryLinks(IndexCase):
         self.assertIn("http://nas.local/video/", body)  # URL, for any player
 
 
-class TestParseVersion(unittest.TestCase):
-
-    def test_accepts_both_spellings_of_a_tag(self):
-        self.assertEqual(web.parse_version("v0.0.9"), (0, 0, 9))
-        self.assertEqual(web.parse_version("0.0.9"), (0, 0, 9))
-
-    def test_junk_is_none_rather_than_a_guess(self):
-        for bad in ("", None, "latest", "v", "main", "0.1"):
-            self.assertIsNone(web.parse_version(bad), bad)
-
-    def test_ordering_is_numeric_not_lexical(self):
-        # The whole point: "0.0.10" sorts BELOW "0.0.9" as a string, and the
-        # next release after 0.0.9 is exactly that.
-        self.assertGreater(web.parse_version("v0.0.10"),
-                           web.parse_version("v0.0.9"))
-        self.assertGreater(web.parse_version("v0.1.0"),
-                           web.parse_version("v0.0.99"))
-
-
-class TestChangelogSection(unittest.TestCase):
-
-    SAMPLE = "\n".join([
-        "# Changelog", "", "Preamble that belongs to nobody.", "",
-        "## [Unreleased]", "- not this one", "",
-        "## [0.1.0] - 2026-08-09", "### Fixed", "- the thing", "- and another",
-        "", "## [0.0.9] - 2026-08-07", "- older, must not appear", ""])
-
-    def test_extracts_only_the_named_release(self):
-        got = web.changelog_section(self.SAMPLE, "0.1.0")
-        self.assertIn("the thing", got)
-        self.assertIn("and another", got)
-        self.assertNotIn("older", got)
-        self.assertNotIn("not this one", got)
-        self.assertNotIn("Preamble", got)
-
-    def test_an_absent_version_yields_nothing(self):
-        self.assertEqual(web.changelog_section(self.SAMPLE, "9.9.9"), "")
-
-    def test_empty_input_is_not_an_error(self):
-        self.assertEqual(web.changelog_section("", "0.1.0"), "")
-
-
-class TestLatestRelease(unittest.TestCase):
-    """This repo publishes tags and no GitHub Releases, so /releases/latest
-    404s. An implementation that knew only about Releases would report "up to
-    date" forever, on its own project."""
-
-    def test_a_published_release_is_preferred(self):
-        with mock.patch.object(web, "fetch_json", return_value={
-                "tag_name": "v1.2.3", "html_url": "u", "body": "notes here"}):
-            ver, tag, url, notes = web.latest_release()
-        self.assertEqual((ver, tag, notes), ((1, 2, 3), "v1.2.3", "notes here"))
-
-    def test_falls_back_to_tags_on_404(self):
-        err = urllib.error.HTTPError("u", 404, "Not Found", None, None)
-        calls = []
-
-        def fake(url, timeout=10):
-            calls.append(url)
-            if url.endswith("/releases/latest"):
-                raise err
-            return [{"name": "v0.0.9"}, {"name": "v0.0.10"}, {"name": "v0.0.8"}]
-
-        with mock.patch.object(web, "fetch_json", fake):
-            ver, tag, url, notes = web.latest_release()
-        # Highest, not first: the API's ordering is its own business.
-        self.assertEqual((ver, tag), ((0, 0, 10), "v0.0.10"))
-        self.assertEqual(notes, "")
-        self.assertTrue(any("/tags" in c for c in calls))
-
-    def test_an_http_error_that_is_not_404_propagates(self):
-        err = urllib.error.HTTPError("u", 403, "rate limited", None, None)
-        with mock.patch.object(web, "fetch_json", side_effect=err):
-            with self.assertRaises(urllib.error.HTTPError):
-                web.latest_release()
-
-    def test_unparseable_tags_are_skipped(self):
-        err = urllib.error.HTTPError("u", 404, "Not Found", None, None)
-
-        def fake(url, timeout=10):
-            if url.endswith("/releases/latest"):
-                raise err
-            return [{"name": "nightly"}, {"name": "v0.2.0"}, {"name": "x"}]
-
-        with mock.patch.object(web, "fetch_json", fake):
-            ver, tag, _, _ = web.latest_release()
-        self.assertEqual(tag, "v0.2.0")
-
-
 class TestUpdateChecker(unittest.TestCase):
 
     def setUp(self):
@@ -1900,6 +1811,42 @@ class TestUpdateChecker(unittest.TestCase):
         self.assertEqual(s["failures"], 0)
         self.assertTrue(s["known"])
 
+    def test_long_notes_are_clipped_and_the_clip_is_recorded(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u",
+                                             "- a line\n" * 2000)):
+            c._check()
+        s = c.snapshot()
+        self.assertTrue(s["clipped"])
+        self.assertLessEqual(len(s["notes"]), web.NOTES_LIMIT)
+        self.assertTrue(s["notes"].endswith("- a line"))   # whole lines only
+
+    def test_short_notes_are_not_flagged_as_clipped(self):
+        c = self.make()
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 0), "v0.1.0", "u", "- one")):
+            c._check()
+        s = c.snapshot()
+        self.assertFalse(s["clipped"])
+        self.assertEqual(s["notes"], "- one")
+
+    def test_a_cache_from_before_the_flag_infers_it_from_the_length(self):
+        """0.1.0 and 0.1.1 sliced at exactly NOTES_LIMIT and recorded nothing.
+        Without inferring it, an install carrying such a cache shows the
+        half-sentence with no way to reach the rest until it next checks."""
+        Path(self.tmp, "update.json").write_text(json.dumps({
+            "checked": time.time(), "tag": "v0.1.0", "latest": "0.1.0",
+            "url": "u", "notes": "x" * web.NOTES_LIMIT, "error": ""}),
+            encoding="utf-8")
+        self.assertTrue(self.make().snapshot()["clipped"])
+
+    def test_a_short_cache_from_before_the_flag_is_not_flagged(self):
+        Path(self.tmp, "update.json").write_text(json.dumps({
+            "checked": time.time(), "tag": "v0.1.0", "latest": "0.1.0",
+            "url": "u", "notes": "- short", "error": ""}), encoding="utf-8")
+        self.assertFalse(self.make().snapshot()["clipped"])
+
     def test_a_corrupt_cache_is_ignored_not_fatal(self):
         Path(self.tmp, "update.json").write_text("{ this is not json",
                                                  encoding="utf-8")
@@ -1938,36 +1885,6 @@ class TestUpdateChecker(unittest.TestCase):
         text.assert_not_called()
 
 
-class TestFriendlyError(unittest.TestCase):
-    """The first operator to hit a failure was shown "URLError: <urlopen error
-    [Errno -3] Temporary failure in name resolution>", which says nothing
-    about whose fault it is. It is almost never this program's."""
-
-    def test_dns_says_it_is_the_resolver(self):
-        got = web.friendly_error(
-            urllib.error.URLError(
-                OSError(-3, "Temporary failure in name resolution")))
-        self.assertIn("DNS lookup failed", got)
-        self.assertIn("your resolver", got)
-
-    def test_rate_limiting_is_named(self):
-        got = web.friendly_error(urllib.error.HTTPError(
-            "u", 403, "rate limit exceeded", None, None))
-        self.assertIn("rate limiting", got)
-
-    def test_a_timeout_is_named(self):
-        self.assertIn("timed out", web.friendly_error(OSError("timed out")))
-
-    def test_the_raw_text_is_kept_for_searching(self):
-        got = web.friendly_error(urllib.error.URLError("no route to host"))
-        self.assertIn("no route to host", got)
-
-    def test_an_unknown_failure_still_reads_as_a_sentence(self):
-        got = web.friendly_error(ValueError("something odd"))
-        self.assertIn("update check failed", got.lower())
-        self.assertIn("something odd", got)
-
-
 class TestUpdatePanel(unittest.TestCase):
 
     def setUp(self):
@@ -1988,14 +1905,35 @@ class TestUpdatePanel(unittest.TestCase):
     def get(self, checker):
         return request("/", self.config, updates=checker)[2]
 
-    def test_an_available_update_shows_the_tag_and_the_commands(self):
+    def test_an_available_update_shows_the_tag_and_the_command(self):
         body = self.get(self.checker(checked=time.time(), tag="v0.1.0",
                                      latest="0.1.0", url="https://example/rel"))
         self.assertIn("An update is available", body)
         self.assertIn("v0.1.0", body)
-        self.assertIn("install_timelapse.sh", body)
-        self.assertIn("sudo bash install_timelapse.sh", body)
+        self.assertIn("sudo timelapse update", body)
         self.assertIn("https://example/rel", body)
+
+    def test_clipped_notes_say_so_and_link_to_the_rest(self):
+        # A cap that silently eats the end of somebody's release notes reads
+        # as this program losing them, and leaves no way to go and read them.
+        body = self.get(self.checker(
+            checked=time.time(), tag="v0.1.0", latest="0.1.0",
+            url="https://example/rel", notes="- a change", clipped=True))
+        self.assertIn("shortened", body)
+        self.assertIn("https://example/rel", body)
+
+    def test_unclipped_notes_do_not_claim_anything_is_missing(self):
+        body = self.get(self.checker(
+            checked=time.time(), tag="v0.1.0", latest="0.1.0",
+            notes="- a change", clipped=False))
+        self.assertIn("What is new", body)
+        self.assertNotIn("shortened", body)
+
+    def test_a_clip_with_no_release_url_still_offers_somewhere_to_go(self):
+        body = self.get(self.checker(
+            checked=time.time(), tag="v0.1.0", latest="0.1.0", url="",
+            notes="- a change", clipped=True))
+        self.assertIn(web.RELEASES_URL, body)
 
     def test_release_notes_are_shown_and_escaped(self):
         body = self.get(self.checker(

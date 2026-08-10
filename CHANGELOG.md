@@ -9,6 +9,49 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Added
+- **`sudo timelapse update`.** Asks GitHub for the newest release, shows what
+  changed, and installs it after one confirmation. It keeps your
+  configuration, your captured frames and your videos, and restarts the
+  services, because underneath it is the same re-run of the installer that
+  has always been the supported upgrade. It downloads `install.sh` **from the
+  tag it is about to install**, so the installer and the tree it unpacks are
+  the same version, and it checks that what came back is really the installer
+  and is valid bash before running it as root.
+  `timelapse update --check` reports without installing and is the one command
+  here that needs no root at all; it exits 10 when an update is available, so
+  a cron job can notify on it. Also `--yes`, `--force` and
+  `--ref v0.1.0` for pinning to a specific tag or going back to one.
+- **Shortcuts for `timelapse cameras`.** Every action the menu offers is now
+  also a flag, so a single change is a single command: `-l` lists, `-a` adds,
+  and `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` edit, enable/disable, test and
+  remove one camera. `CAM` is a name or the number `-l` prints, so `-x:3` and
+  `-x:Garage` do the same thing. A name beats a number if you have a camera
+  actually called `2`, and `#2` forces the position. Nothing is fuzzy-matched:
+  one of these actions is "remove". The warnings about stranding un-encoded
+  frames apply exactly as they do in the menu, and `-t` writes nothing.
+
+### Fixed
+- **Release notes are no longer cut mid-sentence.** The web UI caps what it
+  renders at 4,000 characters, and v0.1.0's own release body was 4,020: the
+  panel sliced it three characters into a sentence with nothing to say it had,
+  so it read as this program having lost the rest. The cut now lands on a line
+  boundary, the page says the notes were shortened, and it links to the full
+  text. A cache written by 0.1.0 or 0.1.1 has the same repair applied on load,
+  so the fix reaches an install that is already carrying clipped notes rather
+  than waiting for its next check.
+
+### Changed
+- The version panel's upgrade instructions are now one line,
+  `sudo timelapse update`, in place of the three-line `curl` recipe. The
+  manual form still works and is unchanged.
+- The GitHub release query (which tag is newest, what its notes say, why a
+  request failed) moved out of `timelapse_web.py` into the new
+  `timelapse_update.py`, which the web UI imports. Two callers needed it, and
+  two copies of "compare versions as tuples, not strings" is one copy too
+  many. This is the first import between this project's scripts; they are
+  installed side by side, so it resolves for either entry point.
+
 ## [0.1.1] - 2026-08-09
 
 A maintenance release. Everything here came out of the first day of running

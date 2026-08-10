@@ -37,12 +37,21 @@ import subprocess
 import sys
 import threading
 import time
-import urllib.error
-import urllib.request
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
+
+# The only import between this project's scripts, and deliberately one-way.
+# The release query is the same knowledge whether a page or a command asks it,
+# and two copies of "compare versions as tuples, not strings" is one copy too
+# many. Installed side by side in the same directory, which is sys.path[0] for
+# either entry point; the tests put scripts/ on the path for the same reason.
+from timelapse_update import (                            # noqa: E402
+    CHANGELOG_URL, NOTES_LIMIT, RELEASES_URL, changelog_section, clip_notes,
+    fetch_json, fetch_text, friendly_error, latest_release, parse_version,
+    version_text,
+)
 
 __version__ = "0.1.1"
 
@@ -812,17 +821,6 @@ DEFAULT_LOG_LINES = "200"
 # What GitHub learns is the deployment's IP and the version in the User-Agent.
 # ----------------------------------------------------------------------------
 
-GITHUB_REPO = "war4peace/timelapse-maker"
-GITHUB_API = "https://api.github.com/repos/" + GITHUB_REPO
-CHANGELOG_URL = (f"https://raw.githubusercontent.com/{GITHUB_REPO}"
-                 f"/main/CHANGELOG.md")
-RELEASES_URL = f"https://github.com/{GITHUB_REPO}/releases"
-
-# GitHub rejects a request with no User-Agent outright. Exactly the trap
-# post_webhook() documents for Discord's Cloudflare, from a different vendor.
-UPDATE_UA = f"timelapse-maker/{__version__} (+https://github.com/{GITHUB_REPO})"
-
-UPDATE_TIMEOUT = 10
 # Unauthenticated GitHub allows 60 requests an hour per IP. One a day leaves
 # that entirely to the operator, and a release is not a thing that happens
 # hourly.
@@ -835,70 +833,12 @@ UPDATE_INTERVAL = 24 * 3600
 # daily rate instead of asking every quarter of an hour forever.
 UPDATE_RETRY = 15 * 60
 UPDATE_RETRY_MAX = UPDATE_INTERVAL
-# A release body is somebody's prose and goes on a page; cap what is rendered.
-NOTES_LIMIT = 4000
 
-VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
-
-UPDATE_COMMANDS = (
-    "curl -sL https://raw.githubusercontent.com/" + GITHUB_REPO +
-    "/main/install.sh -o install_timelapse.sh\n"
-    "sudo bash install_timelapse.sh\n"
-    "rm install_timelapse.sh"
-)
-
-
-def friendly_error(exc):
-    """A failed update check, said in words an operator can act on.
-
-    The raw text is kept on the end because it is the part worth searching
-    for, but leading with "URLError: <urlopen error [Errno -3] Temporary
-    failure in name resolution>" tells somebody nothing about whose fault it
-    is. It is almost never this program's.
-    """
-    raw = str(exc) or type(exc).__name__
-    low = raw.lower()
-    if isinstance(exc, urllib.error.HTTPError):
-        if exc.code == 403 and "rate limit" in low:
-            lead = "GitHub is rate limiting this address"
-        elif exc.code == 404:
-            lead = "GitHub has no release or tag to report"
-        else:
-            lead = f"GitHub answered {exc.code}"
-    elif "name resolution" in low or "getaddrinfo" in low or "name or service" in low:
-        lead = ("DNS lookup failed, so this is your resolver rather than "
-                "GitHub or this program")
-    elif "timed out" in low or isinstance(exc, socket.timeout):
-        lead = "The connection to GitHub timed out"
-    elif "certificate" in low or "ssl" in low:
-        lead = "The TLS connection to GitHub could not be verified"
-    elif isinstance(exc, urllib.error.URLError):
-        lead = "Could not reach GitHub"
-    else:
-        lead = "The update check failed"
-    return f"{lead} ({raw})"
-
-
-def parse_version(text):
-    """(major, minor, patch) or None. None sorts nothing and compares to
-    nothing, which is what an unparseable tag deserves."""
-    m = VERSION_RE.match((text or "").strip())
-    return tuple(int(g) for g in m.groups()) if m else None
-
-
-def fetch_json(url, timeout=UPDATE_TIMEOUT):
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UPDATE_UA,
-        "Accept": "application/vnd.github+json",
-    })
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8", "replace"))
-
-
-def fetch_text(url, limit, timeout=UPDATE_TIMEOUT):
-    req = urllib.request.Request(url, headers={"User-Agent": UPDATE_UA})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read(limit).decode("utf-8", "replace")
+# One command now, because timelapse_update.py exists to be that command. The
+# three-line curl form it replaced is still what the installer's own
+# documentation says, and still works; this is the same thing with the version
+# check and the confirmation attached.
+UPDATE_COMMANDS = "sudo timelapse update"
 
 
 def plain_notes(text):
@@ -910,61 +850,6 @@ def plain_notes(text):
     """
     out = [re.sub(r"^#+\s*", "", line) for line in (text or "").splitlines()]
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
-
-
-def changelog_section(text, version):
-    """The one release's entry out of a Keep a Changelog file.
-
-    Used when the tag has no GitHub Release behind it, which is the case for
-    this repo today: every version is a plain git tag, so /releases/latest
-    404s and there is no release body to show. The changelog is then the only
-    place the "what's new" actually exists.
-    """
-    want = f"## [{version}]"
-    out, taking = [], False
-    for line in (text or "").splitlines():
-        if line.startswith("## "):
-            if taking:
-                break
-            taking = line.startswith(want)
-            continue
-        if taking:
-            out.append(line)
-    return "\n".join(out).strip()
-
-
-def latest_release():
-    """(version, tag, url, notes). Raises on a network or parse failure.
-
-    Tries Releases first, because a published release carries the notes with
-    it. Falls back to tags: this repo has nine tags and no Releases, so an
-    implementation that only knew about /releases/latest would report "up to
-    date" forever, on its own project.
-    """
-    try:
-        rel = fetch_json(GITHUB_API + "/releases/latest")
-        tag = rel.get("tag_name") or ""
-        if parse_version(tag):
-            return (parse_version(tag), tag,
-                    rel.get("html_url") or RELEASES_URL,
-                    (rel.get("body") or "").strip())
-    except urllib.error.HTTPError as exc:
-        # 404 is the normal answer for a repo that tags without releasing.
-        if exc.code != 404:
-            raise
-
-    best = None
-    for item in fetch_json(GITHUB_API + "/tags"):
-        tag = item.get("name") or ""
-        ver = parse_version(tag)
-        # Highest version, not first in the list: the API's order is its own
-        # business and not documented as sorted.
-        if ver and (best is None or ver > best[0]):
-            best = (ver, tag)
-    if best is None:
-        raise ValueError("no version tags found")
-    ver, tag = best
-    return ver, tag, f"https://github.com/{GITHUB_REPO}/releases/tag/{tag}", ""
 
 
 class UpdateChecker:
@@ -993,7 +878,7 @@ class UpdateChecker:
         # claim it had checked when it had not.
         self.state = {"checked": 0.0, "attempted": 0.0, "failures": 0,
                       "tag": "", "latest": "", "url": "", "notes": "",
-                      "error": ""}
+                      "clipped": False, "error": ""}
         self._load()
 
     def _load(self):
@@ -1024,6 +909,13 @@ class UpdateChecker:
             self.state["failures"] = 1
             self.state["attempted"] = saved.get("checked", 0.0)
             self.state["checked"] = 0.0
+        # Notes cached by 0.1.0 or 0.1.1 were sliced at exactly NOTES_LIMIT
+        # with nothing recording that anything was lost, so a body that landed
+        # on the boundary is one that was cut. The page would otherwise show
+        # yesterday's half-sentence with no hint that the rest exists, for up
+        # to a day, which is the whole complaint this change answers.
+        if "clipped" not in saved and len(saved.get("notes") or "") >= NOTES_LIMIT:
+            self.state["clipped"] = True
 
     def _save(self):
         if not self.path:
@@ -1088,15 +980,16 @@ class UpdateChecker:
                 # the usual case is a single request.
                 try:
                     text = fetch_text(CHANGELOG_URL, 256 * 1024)
-                    notes = changelog_section(text, ".".join(str(n) for n in ver))
+                    notes = changelog_section(text, version_text(ver))
                 except Exception as exc:          # noqa: BLE001
                     log.debug("Changelog fetch failed: %s", exc)
+            notes, clipped = clip_notes(notes)
             now = time.time()
             with self._lock:
                 self.state.update(checked=now, attempted=now, failures=0,
-                                  tag=tag,
-                                  latest=".".join(str(n) for n in ver),
-                                  url=url, notes=notes[:NOTES_LIMIT], error="")
+                                  tag=tag, latest=version_text(ver),
+                                  url=url, notes=notes, clipped=clipped,
+                                  error="")
         except Exception as exc:                  # noqa: BLE001
             # Every failure here is somebody else's outage. Record it, keep
             # the last good answer, and never let it reach the page as a 500.
@@ -1527,8 +1420,8 @@ class Handler(BaseHTTPRequestHandler):
                 f'You have {escape(u["current"])}; '
                 f'<a href="{escape(u["url"])}">{escape(u["tag"])}</a> is out.'
                 f'</p>'
-                f'<p class="cmd">Re-running the installer is the supported '
-                f'upgrade. It keeps your config, your frames and your videos.'
+                f'<p class="cmd">Upgrading re-runs the installer, which keeps '
+                f'your config, your frames and your videos.'
                 f'</p><pre>{escape(UPDATE_COMMANDS)}</pre>')
             if u["notes"]:
                 # The tag is in the line above; repeating it in an h2 would
@@ -1536,6 +1429,14 @@ class Handler(BaseHTTPRequestHandler):
                 body.append(f'<h2 style="margin-top:1rem">What is new</h2>'
                             f'<div class="notes">'
                             f'{escape(plain_notes(u["notes"]))}</div>')
+                if u["clipped"]:
+                    # Say it, and link past it. A cap that silently eats the
+                    # end of somebody's release notes reads as this program
+                    # losing them, and leaves no way to go and read the rest.
+                    body.append(
+                        f'<p class="quiet">These notes were shortened to fit. '
+                        f'<a href="{escape(u["url"] or RELEASES_URL)}">Read '
+                        f'the full notes for {escape(u["tag"])}</a>.</p>')
         elif u["known"] and not u["error"]:
             body.append('<p class="scan">Up to date.</p>')
 

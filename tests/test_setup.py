@@ -629,6 +629,238 @@ class TestCameraManagement(unittest.TestCase):
         self.assertNotIn("p%40ss", red)
 
 
+class TestResolveCamera(unittest.TestCase):
+    """`timelapse cameras -e:2` and `-e:Doorbell` reach the same camera.
+
+    The number is the position 'timelapse cameras -l' prints. Nothing in the
+    config is a stable id, so the number is an artefact of the order cameras
+    were added, which is why a name that matches beats a position that does.
+    """
+
+    CAMS = [{"name": "Gate"}, {"name": "Doorbell"}, {"name": "Roof"}]
+
+    def resolve(self, token, cams=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            got = setup.resolve_camera(self.CAMS if cams is None else cams,
+                                       token)
+        return got, buf.getvalue()
+
+    def test_a_number_is_the_position_in_the_listing(self):
+        self.assertEqual(self.resolve("2")[0], 1)
+        self.assertEqual(self.resolve("1")[0], 0)
+
+    def test_a_name_matches_whatever_its_case(self):
+        self.assertEqual(self.resolve("doorbell")[0], 1)
+        self.assertEqual(self.resolve("DOORBELL")[0], 1)
+
+    def test_a_number_out_of_range_says_how_many_there_are(self):
+        got, out = self.resolve("9")
+        self.assertIsNone(got)
+        self.assertIn("there are 3", out)
+
+    def test_an_unknown_name_is_refused_rather_than_guessed(self):
+        # Never fuzzy-match: the actions behind this include "remove".
+        got, out = self.resolve("Gat")
+        self.assertIsNone(got)
+        self.assertIn("No camera is called 'Gat'", out)
+
+    def test_a_camera_actually_called_2_wins_over_position_2(self):
+        cams = [{"name": "Gate"}, {"name": "Roof"}, {"name": "2"}]
+        got, out = self.resolve("2", cams)
+        self.assertEqual(got, 2)
+        self.assertIn("#2", out)          # and it says which one it took
+
+    def test_a_hash_forces_the_position_for_that_config(self):
+        cams = [{"name": "Gate"}, {"name": "Roof"}, {"name": "2"}]
+        self.assertEqual(self.resolve("#2", cams)[0], 1)
+
+    def test_an_empty_target_asks_for_one(self):
+        got, out = self.resolve("")
+        self.assertIsNone(got)
+        self.assertIn("-e:Doorbell", out)
+
+    def test_no_cameras_at_all_is_said_plainly(self):
+        got, out = self.resolve("1", [])
+        self.assertIsNone(got)
+        self.assertIn("No cameras are configured", out)
+
+
+class TestStripColon(unittest.TestCase):
+
+    def test_the_documented_form_survives_argparse(self):
+        # argparse hands a short option everything attached to it, so
+        # -e:Doorbell arrives as ":Doorbell".
+        self.assertEqual(setup.strip_colon(":Doorbell"), "Doorbell")
+
+    def test_the_ordinary_form_is_untouched(self):
+        self.assertEqual(setup.strip_colon("Doorbell"), "Doorbell")
+        self.assertEqual(setup.strip_colon("2"), "2")
+
+
+class TestCameraActions(unittest.TestCase):
+    """The menu's actions, reached directly.
+
+    Same bias as TestCameraManagement: these are the paths that can silently
+    strand captured frames, and now they can be reached in one command with
+    no list on screen first.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = {"paths": {"frames_root": str(self.tmp)},
+                    "capture": {"timeout_seconds": 4},
+                    "cameras": [
+                        {"name": "Gate", "enabled": True, "method": "http",
+                         "url": "http://192.0.2.1/snap", "auth": "none"},
+                        {"name": "Roof", "enabled": False, "method": "http",
+                         "url": "http://192.0.2.2/snap", "auth": "none"}]}
+
+    def tearDown(self):
+        setup._TTY, setup.AUTO = None, False
+
+    def act(self, action, target=None, keys=""):
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keys, tty=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            changed, okay = setup.camera_action(self.cfg, action, target)
+        return changed, okay, buf.getvalue()
+
+    def names(self):
+        return [(c["name"], c.get("enabled", True))
+                for c in self.cfg["cameras"]]
+
+    def test_toggle_disables_an_enabled_camera(self):
+        changed, okay, _ = self.act("toggle", "Gate", "y\n")
+        self.assertEqual((changed, okay), (True, True))
+        self.assertEqual(self.names(), [("Gate", False), ("Roof", False)])
+
+    def test_toggle_enables_a_disabled_camera_without_asking(self):
+        # Enabling strands nothing, so there is nothing to warn about.
+        changed, okay, out = self.act("toggle", "2")
+        self.assertEqual((changed, okay), (True, True))
+        self.assertEqual(self.names(), [("Gate", True), ("Roof", True)])
+        self.assertNotIn("un-encoded", out)
+
+    def test_disabling_still_warns_about_stranded_frames(self):
+        (self.tmp / "Gate" / "2020-01-01").mkdir(parents=True)
+        changed, okay, out = self.act("toggle", "Gate", "n\n")
+        self.assertIn("1 un-encoded day", out)
+        # Declined is not a failure, and nothing was written.
+        self.assertEqual((changed, okay), (False, True))
+        self.assertEqual(self.names()[0], ("Gate", True))
+
+    def test_remove_takes_one_confirmation_and_takes_it(self):
+        changed, okay, _ = self.act("remove", "Gate", "y\n")
+        self.assertEqual((changed, okay), (True, True))
+        self.assertEqual(self.names(), [("Roof", False)])
+
+    def test_a_declined_removal_is_not_a_failure(self):
+        changed, okay, out = self.act("remove", "Roof", "n\n")
+        self.assertEqual((changed, okay), (False, True))
+        self.assertIn("Nothing removed", out)
+        self.assertEqual(len(self.cfg["cameras"]), 2)
+
+    def test_an_unknown_target_fails_without_touching_the_config(self):
+        before = self.names()
+        changed, okay, _ = self.act("remove", "Nope", "y\n")
+        self.assertEqual((changed, okay), (False, False))
+        self.assertEqual(self.names(), before)
+
+    def test_test_changes_nothing_even_when_the_camera_answers(self):
+        # Read-only: it must not report "changed" and so must not trigger a
+        # config write or a capture restart.
+        with mock.patch.object(setup, "test_camera", return_value=True):
+            changed, okay, _ = self.act("test", "Gate")
+        self.assertEqual((changed, okay), (False, True))
+
+    def test_a_failing_test_is_a_non_zero_result(self):
+        with mock.patch.object(setup, "test_camera", return_value=False):
+            changed, okay, _ = self.act("test", "Gate")
+        self.assertEqual((changed, okay), (False, False))
+
+    def test_list_prints_the_numbers_the_other_flags_take(self):
+        changed, okay, out = self.act("list")
+        self.assertEqual((changed, okay), (False, True))
+        self.assertIn("Gate", out)
+        self.assertIn("Roof", out)
+
+    def test_add_refuses_a_name_that_is_already_taken(self):
+        with mock.patch.object(setup, "add_one_camera",
+                               return_value={"name": "Gate"}):
+            changed, okay, out = self.act("add")
+        self.assertEqual((changed, okay), (False, False))
+        self.assertIn("already exists", out)
+        self.assertEqual(len(self.cfg["cameras"]), 2)
+
+    def test_add_appends_and_reports_the_new_total(self):
+        with mock.patch.object(setup, "add_one_camera",
+                               return_value={"name": "Shed", "enabled": True}):
+            changed, okay, out = self.act("add")
+        self.assertEqual((changed, okay), (True, True))
+        self.assertIn("3 configured", out)
+
+    def test_a_cancelled_add_is_not_a_failure(self):
+        with mock.patch.object(setup, "add_one_camera", return_value=None):
+            changed, okay, _ = self.act("add")
+        self.assertEqual((changed, okay), (False, True))
+
+
+class TestCameraActionDispatch(unittest.TestCase):
+    """Which flag means which action, and what refuses to run headless."""
+
+    def args(self, **kw):
+        base = dict(cam_list=False, cam_add=False, edit=None, toggle=None,
+                    test=None, remove=None)
+        base.update(kw)
+        return mock.Mock(**base)
+
+    def test_each_flag_maps_to_its_action(self):
+        self.assertEqual(setup.chosen_camera_action(self.args(cam_add=True)),
+                         ("add", None))
+        self.assertEqual(setup.chosen_camera_action(self.args(edit="2")),
+                         ("edit", "2"))
+        self.assertEqual(setup.chosen_camera_action(self.args(toggle="Gate")),
+                         ("toggle", "Gate"))
+        self.assertEqual(setup.chosen_camera_action(self.args(test="Gate")),
+                         ("test", "Gate"))
+        self.assertEqual(setup.chosen_camera_action(self.args(remove="1")),
+                         ("remove", "1"))
+        self.assertEqual(setup.chosen_camera_action(self.args(cam_list=True)),
+                         ("list", None))
+
+    def test_no_flag_means_the_menu(self):
+        self.assertEqual(setup.chosen_camera_action(self.args()), (None, None))
+
+    def test_every_action_the_menu_offers_is_reachable_by_flag(self):
+        # An action added to the menu with no flag behind it is the drift this
+        # catches: the two lists have to stay the same length.
+        flags = {"list": {"cam_list": True}, "add": {"cam_add": True},
+                 "edit": {"edit": "1"}, "toggle": {"toggle": "1"},
+                 "test": {"test": "1"}, "remove": {"remove": "1"}}
+        self.assertEqual(set(flags), set(setup.CAMERA_ACTIONS))
+        for action, kw in flags.items():
+            got, _ = setup.chosen_camera_action(self.args(**kw))
+            self.assertEqual(got, action)
+
+    def test_the_writing_actions_refuse_to_run_without_a_terminal(self):
+        # Accepting defaults would write a camera entry pointing at nothing.
+        setup.AUTO, setup._TTY = True, None
+        self.addCleanup(lambda: setattr(setup, "AUTO", False))
+        for action, kw in (("add", {"cam_add": True}), ("edit", {"edit": "1"}),
+                           ("toggle", {"toggle": "1"}),
+                           ("remove", {"remove": "1"})):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    contextlib.redirect_stderr(buf):
+                rc = setup.run_camera_action({"cameras": []},
+                                             self.args(output="x", **kw))
+            self.assertEqual(rc, 1, action)
+            self.assertIn("needs a terminal", buf.getvalue())
+
+
 class TestWebhookVerificationMarker(unittest.TestCase):
     """One test message, not two.
 

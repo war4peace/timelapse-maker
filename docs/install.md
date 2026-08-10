@@ -50,13 +50,36 @@ script before running it as root.
 
 ### Upgrading
 
-Re-run the same installer. It is the supported upgrade path, and it is safe on
-a live install:
+```bash
+sudo timelapse update
+```
+
+That asks GitHub for the newest release, shows you what changed, and installs
+it after one confirmation. `timelapse update --check` reports without
+installing and is the one command here that needs no root at all.
+
+Under the covers it is the same thing the documentation has always said:
+re-run the installer. It downloads `install.sh` **from the tag it is about to
+install**, so the installer and the tree it unpacks are the same version, and
+it checks that what came back is really the installer and is valid bash before
+running it as root. The manual form still works and is unchanged:
 
 ```bash
 curl -sL https://raw.githubusercontent.com/war4peace/timelapse-maker/main/install.sh -o install_timelapse.sh
 sudo bash install_timelapse.sh
 ```
+
+Other forms:
+
+```bash
+sudo timelapse update --check        # is there one? (no root needed)
+sudo timelapse update --yes          # no questions, here or in the installer
+sudo timelapse update --ref v0.1.0   # a specific tag, including going back
+sudo timelapse update --force        # reinstall the version you already have
+```
+
+`--check` exits 0 when up to date and 10 when an update is available, so a cron
+job can notify on it without a human reading the output.
 
 What it does and does not touch:
 
@@ -377,7 +400,7 @@ of it; nothing needs a reinstall.
 | `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and Discord. Run it after any change. |
-| `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. §9. |
+| `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. A menu with no options; `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` go straight to one. §9. |
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
 | `timelapse web` | Turn the read-only web UI on or off and set its address, port and library path. §10. |
 | `timelapse web-serve` | Run the web UI in the foreground for a look at its log. The service normally does this. |
@@ -385,6 +408,7 @@ of it; nothing needs a reinstall.
 | `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover. You are then responsible for restarting capture yourself. |
 | `timelapse encode` | Runs the nightly encode immediately instead of waiting for 00:05. Useful to clear a backlog. |
 | `timelapse version` | The installed version of each script, and a warning if the running daemon predates them. |
+| `timelapse update` | Ask GitHub for the newest release, show what changed, and install it. §2. |
 
 **Which need root.** `config.json` is `0640 root:timelapse` because it holds
 camera credentials, so anything that touches it needs `sudo`:
@@ -392,6 +416,7 @@ camera credentials, so anything that touches it needs `sudo`:
 | Needs `sudo` | Works unprivileged |
 |---|---|
 | `setup`, `cameras`, `transfer`, `web`, `config` (they write the config) | `status` |
+| `update` (it writes `/opt/timelapse`) | `update --check` |
 | `encode`, `web-serve` (they read it, and write frames and videos) | `version` |
 | `test`, `usage` (they read it) | `logs` |
 
@@ -481,6 +506,36 @@ Adding uses the same preset list and live test as the installer. Passwords in
 the query string are masked in the listing; `ask_secret` keeps them out of
 scroll-back when you type them, so printing them back would defeat it.
 
+### Skipping the menu
+
+Every action above is also a flag, so a single change is a single command:
+
+```bash
+sudo timelapse cameras -l              # just the list, with the numbers
+sudo timelapse cameras -a              # add one
+sudo timelapse cameras -e:Doorbell     # edit it
+sudo timelapse cameras -x:Doorbell     # enable if disabled, disable if enabled
+sudo timelapse cameras -t:Doorbell     # fetch one snapshot; changes nothing
+sudo timelapse cameras -r:Doorbell     # remove it, after one confirmation
+```
+
+Each takes **a name or the number `-l` prints**, so `-x:3` and `-x:Garage` are
+the same command. `-e 3`, `-e3` and `--edit=3` work too; the colon form is
+just the one that reads well next to a name.
+
+Two details worth knowing:
+
+- **A name beats a number.** If you actually have a camera called `2`, then
+  `-e:2` edits *it*, not the second one in the list, and says so. Write `-e:#2`
+  to force the position. The number is only a position: nothing in the config
+  is a stable id, so it changes when you add or remove cameras above it.
+- **Nothing is fuzzy-matched.** `-r:Doorbel` is refused rather than guessed at.
+  One of these actions is "remove".
+
+The warnings about stranded frames below apply exactly as they do in the menu,
+and `-t` writes nothing at all, so it neither backs up your config nor offers
+to restart capture.
+
 **It restarts capture for you.** The daemon reads its camera list once, at
 startup, so an edit does nothing until it restarts; you are asked, and told the
 command if you decline. Nothing here touches paths, so the systemd units are
@@ -546,13 +601,16 @@ It gives you five things:
   (or mpv, or whatever opens `.m3u`) a playlist pointing back at the server,
   plus a *Download* link. There is also **one playlist per day**: open it and
   your player queues that day's videos from every camera in turn.
-- **Whether there is a new version**, with what changed and the commands to
+- **Whether there is a new version**, with what changed and the command to
   upgrade. See below; you can turn it off.
 
 ### The update check, and the only packet this UI sends
 
 The Overview page tells you which version you are running and whether a newer
-one has been tagged, along with its changelog entry and the upgrade commands.
+one has been tagged, along with its release notes and the command to upgrade
+(`sudo timelapse update`). Release notes longer than 4,000 characters are cut
+at a line boundary, and the page says so and links to the full text rather
+than stopping mid-sentence.
 
 It asks `api.github.com` **at most once a day**, and only while somebody has
 the page open, so a service nobody looks at never contacts anything. The

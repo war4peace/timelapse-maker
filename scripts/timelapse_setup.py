@@ -695,6 +695,49 @@ def pick_camera(cams, verb):
     return None if n == 0 else n - 1
 
 
+def resolve_camera(cams, token):
+    """Index of the camera `token` names or numbers, or None after saying why.
+
+    The number is the position 'timelapse cameras -l' prints, which is the
+    only identifier a camera has: nothing in the config is a stable id, and
+    inventing one would be a schema change for the sake of a command line.
+    That makes the number an artefact of the order cameras were added, so a
+    name that matches wins over a position that matches. '#2' forces the
+    position, for the one config where a camera is actually called "2".
+    """
+    tok = (token or "").strip()
+    if not cams:
+        fail("No cameras are configured.")
+        return None
+    if not tok:
+        fail("Give a camera name or number, as in -e:2 or -e:Doorbell.")
+        return None
+
+    by_position = tok.startswith("#")
+    if by_position:
+        tok = tok[1:].strip()
+    else:
+        low = tok.lower()
+        for i, cam in enumerate(cams):
+            if str(cam.get("name", "")).lower() == low:
+                if tok.isdigit() and i != int(tok) - 1:
+                    note(f"'{tok}' is the name of camera #{i + 1}, so that is "
+                         f"the one meant. Use '#{tok}' for the position.")
+                return i
+
+    if tok.isdigit():
+        n = int(tok)
+        if 1 <= n <= len(cams):
+            return n - 1
+        fail(f"There is no camera #{n}; there are {len(cams)}.")
+    elif by_position:
+        fail(f"'#{tok}' is not a number.")
+    else:
+        fail(f"No camera is called '{tok}'.")
+    note("Run 'timelapse cameras -l' for the list.")
+    return None
+
+
 def rename_camera_frames(cfg, old, new):
     """Move the frames directory so a rename does not orphan what it captured."""
     src, dst = camera_frames_dir(cfg, old), camera_frames_dir(cfg, new)
@@ -942,6 +985,84 @@ def manage_cameras(cfg):
 
         else:
             fail(f"Unknown action '{action}'.")
+
+
+# The menu's actions, reachable directly. Adding a camera should not mean
+# reading a list, choosing 'a', and answering the same questions; and the
+# targeted forms are what makes anything scriptable, since the menu needs a
+# terminal and a human. Same letters as the menu on purpose.
+CAMERA_ACTIONS = ("list", "add", "edit", "toggle", "test", "remove")
+
+# Everything except list and test writes the config, so everything except list
+# and test needs the questions a terminal can answer.
+CAMERA_ACTIONS_WRITING = ("add", "edit", "toggle", "remove")
+
+
+def camera_action(cfg, action, token):
+    """One targeted camera command. (config changed, succeeded).
+
+    "Changed" and "succeeded" are separate answers because declining a
+    confirmation is neither a change nor a failure: 'timelapse cameras
+    -r:Doorbell' answered with 'n' has done exactly what was asked of it.
+    """
+    cams = cfg.setdefault("cameras", [])
+
+    if action == "list":
+        list_cameras(cfg)
+        return False, True
+
+    if action == "add":
+        cam = add_one_camera(cfg, len(cams) + 1)
+        if not cam:
+            note("Nothing added.")
+            return False, True
+        if name_taken(cams, cam["name"]):
+            fail(f"A camera called '{cam['name']}' already exists; "
+                 "two cameras cannot share a frames directory.")
+            return False, False
+        cams.append(cam)
+        good(f"Added '{cam['name']}' ({len(cams)} configured)")
+        return True, True
+
+    i = resolve_camera(cams, token)
+    if i is None:
+        return False, False
+    cam = cams[i]
+    name = str(cam.get("name", ""))
+
+    if action == "test":
+        # Read-only, so it neither writes the config nor offers a restart.
+        return False, bool(test_camera(cam, cfg))
+
+    if action == "edit":
+        edit_one_camera(cfg, cams, cam)
+        return True, True
+
+    if action == "toggle":
+        if not cam.get("enabled", True):
+            cam["enabled"] = True
+            good(f"'{name}' enabled")
+            return True, True
+        # Disabling strands frames exactly as removing does: the encoder
+        # builds its list from the cameras that are enabled, so whatever this
+        # one has already captured stops being encoded by anything.
+        if not warn_stranded(cfg, name, "disable"):
+            note(f"'{name}' left enabled.")
+            return False, True
+        cam["enabled"] = False
+        good(f"'{name}' disabled")
+        return True, True
+
+    if action == "remove":
+        if not warn_stranded(cfg, name, "remove"):
+            note("Nothing removed.")
+            return False, True
+        cams.pop(i)
+        good(f"Removed '{name}'")
+        return True, True
+
+    fail(f"Unknown camera action '{action}'.")
+    return False, False
 
 
 def explain_payload(data):
@@ -2011,6 +2132,51 @@ def summarise_web(cfg):
 
 # ----------------------------------------------------------------------------
 
+def strip_colon(value):
+    """Accept -e:NAME as well as -e NAME.
+
+    argparse hands a short option everything attached to it, so -e:Doorbell
+    arrives as ":Doorbell". Nothing is lost by stripping that leading colon:
+    sanitise_name() keeps only alphanumerics, '-' and '_', so no camera can be
+    called ':anything'.
+    """
+    return value[1:] if value.startswith(":") else value
+
+
+def chosen_camera_action(args):
+    """(action, target) from the shortcut flags, or (None, None) for the menu."""
+    for action, value in (("add", args.cam_add), ("edit", args.edit),
+                          ("toggle", args.toggle), ("test", args.test),
+                          ("remove", args.remove)):
+        if value:
+            return action, (None if value is True else value)
+    return (("list", None) if args.cam_list else (None, None))
+
+
+def run_camera_action(cfg, args):
+    """--cameras-only with a shortcut flag. Exit status."""
+    action, target = chosen_camera_action(args)
+    if action in CAMERA_ACTIONS_WRITING and (AUTO or _TTY is None):
+        # Not a soft failure: pretending to add a camera by accepting defaults
+        # would write a config entry pointing at nothing.
+        fail(f"'{action}' asks questions, so it needs a terminal.")
+        return 1
+
+    changed, okay = camera_action(cfg, action, target)
+    if not changed:
+        print()
+        return 0 if okay else 1
+
+    heading("Writing configuration")
+    write_config(cfg, args.output, args.owner)
+    good(f"Updated {args.output}")
+    enabled = [c for c in cfg["cameras"] if c.get("enabled", True)]
+    note(f"{len(cfg['cameras'])} camera(s), {len(enabled)} enabled")
+    restart_capture_if_running()
+    print()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("--output", default="/etc/timelapse/config.json")
@@ -2028,6 +2194,26 @@ def main():
                     help="add, edit or remove cameras in an existing config")
     ap.add_argument("--web-only", action="store_true",
                     help="reconfigure just the web UI")
+    # Camera shortcuts. The documented spelling is -e:2 / -e:Doorbell, which
+    # reaches argparse as the value ":2" because a short option swallows
+    # whatever is attached to it; strip_colon puts it back. -e 2, -e2 and
+    # --edit=2 all work too, and cost nothing to allow.
+    cam = ap.add_argument_group(
+        "camera actions",
+        "with --cameras-only, go straight to one camera instead of the menu")
+    cam.add_argument("-l", "--list", action="store_true", dest="cam_list",
+                     help="print the camera list and stop")
+    picked = cam.add_mutually_exclusive_group()
+    picked.add_argument("-a", "--add", action="store_true", dest="cam_add",
+                        help="add a camera")
+    picked.add_argument("-e", "--edit", metavar="CAM", type=strip_colon,
+                        help="edit CAM, by name or by its number in --list")
+    picked.add_argument("-x", "--toggle", metavar="CAM", type=strip_colon,
+                        help="enable CAM if disabled, disable it if enabled")
+    picked.add_argument("-t", "--test", metavar="CAM", type=strip_colon,
+                        help="fetch one snapshot from CAM; changes nothing")
+    picked.add_argument("-r", "--remove", metavar="CAM", type=strip_colon,
+                        help="remove CAM, after one confirmation")
     ap.add_argument("--print-paths", metavar="CONFIG",
                     help="print the paths systemd must be allowed to write")
     ap.add_argument("--print-web-paths", metavar="CONFIG",
@@ -2035,6 +2221,13 @@ def main():
     ap.add_argument("--version", action="version",
                     version=f"%(prog)s {__version__}")
     args = ap.parse_args()
+
+    # These only mean anything against an existing camera list. Silently
+    # ignoring them would be worse than refusing: 'timelapse_setup.py -r:2'
+    # reads as a removal and would instead rewrite the whole config.
+    if chosen_camera_action(args) != (None, None) and not args.cameras_only:
+        ap.error("the camera actions need --cameras-only "
+                 "(the 'timelapse cameras' command passes it for you)")
 
     # Machine-readable mode used by install.sh to template the systemd units.
     if args.print_paths:
@@ -2049,12 +2242,16 @@ def main():
 
     init_tty(force_defaults=args.defaults, use_stdin=args.stdin)
 
-    print()
-    print(bold("  ╔══════════════════════════════════════════════════════════╗"))
-    print(bold("  ║              timelapse-maker  ·  setup                   ║"))
-    print(bold("  ╚══════════════════════════════════════════════════════════╝"))
-    print()
-    note("Press Enter to accept the [default] shown for any question.")
+    # A shortcut is a command, not a wizard. Announcing the setup wizard and
+    # explaining how defaults work, above four lines of camera list, is noise
+    # in something meant to be run from a shell prompt or a script.
+    if chosen_camera_action(args) == (None, None):
+        print()
+        print(bold("  ╔══════════════════════════════════════════════════════════╗"))
+        print(bold("  ║              timelapse-maker  ·  setup                   ║"))
+        print(bold("  ╚══════════════════════════════════════════════════════════╝"))
+        print()
+        note("Press Enter to accept the [default] shown for any question.")
 
     # Manage cameras against an existing config. Adding a camera after the
     # initial install must not mean re-running the whole wizard, and must not
@@ -2063,6 +2260,8 @@ def main():
         cfg = load_existing_config(args.output)
         if cfg is None:
             return 1
+        if chosen_camera_action(args) != (None, None):
+            return run_camera_action(cfg, args)
         if not manage_cameras(cfg):
             print()
             note("No changes made.")

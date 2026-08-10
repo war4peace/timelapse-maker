@@ -51,6 +51,7 @@ see [CONTRIBUTING.md](CONTRIBUTING.md).
 | `timelapse_test.py` | Pre-flight checker, run before enabling anything | manually |
 | `timelapse_setup.py` | Storage-aware configuration wizard | installer, or `timelapse setup` |
 | `timelapse_web.py` | Optional read-only web UI: status, video index, hands playback to VLC | systemd service, off by default |
+| `timelapse_update.py` | Asks GitHub what the latest release is, and installs it | `timelapse update`, and the web UI's version panel |
 
 Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 
@@ -61,18 +62,19 @@ Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 | `timelapse version` | What is installed, and whether the daemon is still running an older build | |
 | `timelapse usage` | Frames, bytes and date range per camera, and which folders nothing will ever encode | **sudo** |
 | `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord | **sudo** |
-| `timelapse cameras` | Add, edit, remove or disable a camera, then restart capture | **sudo** |
+| `timelapse cameras` | Add, edit, remove or disable a camera, then restart capture. `-l` lists; `-a`, `-e:NAME`, `-x:NAME`, `-t:NAME`, `-r:NAME` skip the menu | **sudo** |
 | `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed | **sudo** |
 | `timelapse web` | Turn the read-only web UI on or off, set its address and library path | **sudo** |
 | `timelapse encode` | Run tonight's encode now | **sudo** |
 | `timelapse setup` · `config` | Full wizard · edit the JSON | **sudo** |
+| `timelapse update` | Check GitHub for a new release and install it, keeping your config | **sudo** (`--check` does not) |
 
 **Anything that reads or writes the config needs `sudo`.**
 `/etc/timelapse/config.json` is mode `640`, owned `root:timelapse`, because it
 holds your camera passwords. Without it the command tells you so and stops; it
 does not half-run.
 
-`status`, `logs` and `version` need nothing. For `logs` to show more than your
+`status`, `logs`, `version` and `timelapse update --check` need nothing. For `logs` to show more than your
 own messages you must be in the `adm` or `systemd-journal` group, which is
 usually already true of the account that installed this.
 
@@ -187,7 +189,7 @@ After installing, a `timelapse` command wraps the common operations. Run
 `sudo`:
 
 ```
-timelapse status | logs | test | encode | config | setup | transfer | web
+timelapse status | logs | test | encode | config | setup | transfer | web | update
 ```
 
 Run `timelapse test` before enabling anything; it fetches one snapshot per

@@ -76,6 +76,7 @@ jobs:
           python scripts/timelapse_test.py --version
           python scripts/timelapse_capture.py --version
           python scripts/timelapse_setup.py --version
+          python scripts/timelapse_update.py --version
 
       - name: Wizard runs headless and derives systemd paths
         run: |
@@ -135,7 +136,15 @@ jobs:
           set -x
           test -x /opt/timelapse/timelapse_capture.py
           test -x /opt/timelapse/timelapse_setup.py
+          test -x /opt/timelapse/timelapse_update.py
           test -x /usr/local/bin/timelapse
+          # The web server imports the update module by name. It resolves via
+          # sys.path[0], so the two only work side by side in the same dir -
+          # which is a property of the install, not of the source tree.
+          (cd /opt/timelapse && python3 -c 'import timelapse_web')
+          # --check must work as a normal user: asking whether an update
+          # exists is the one thing here that needs no root.
+          timelapse update --help > /dev/null
           bash -n /usr/local/bin/timelapse
           # --help exits 0, a bare invocation is a usage error, and every
           # subcommand the wrapper dispatches is actually documented. The
@@ -145,7 +154,7 @@ jobs:
           timelapse > /tmp/bare.txt || true
           cmp /tmp/help.txt /tmp/bare.txt
           for c in setup cameras transfer web config test usage status \
-                   logs version encode web-serve; do
+                   logs version encode web-serve update; do
             grep -qE "^  $c " /tmp/help.txt || { echo "undocumented: $c"; exit 1; }
           done
           test "$(awk '{ if (length($0) > 80) c++ } END { print c+0 }' /tmp/help.txt)" = 0

@@ -346,6 +346,26 @@ Configuration wizard. Run by `install.sh`, or standalone as `timelapse setup`.
 Writes `config.json` and nothing else: it never touches systemd, never enables
 anything, and is safe to re-run.
 
+**Camera management** (`--cameras-only`) is a menu, and every action in it is
+also a flag: `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM`, `-r:CAM`. Three things
+about that are not obvious:
+
+- **`-e:CAM` reaches argparse as `":CAM"`**, because a short option swallows
+  whatever is attached to it. `strip_colon()` puts it back. Nothing is lost:
+  `sanitise_name()` keeps only alphanumerics, `-` and `_`, so no camera can be
+  called `:anything`.
+- **A name beats a number.** The number is the position `-l` prints, and it is
+  an artefact of insertion order, because nothing in the config schema is a
+  stable id. `#2` forces the position for a config with a camera called `2`.
+  Nothing is ever fuzzy-matched: one of these actions is "remove".
+- **The writing actions refuse to run without a terminal.** Accepting defaults
+  would write a camera entry pointing at nothing. `-l` and `-t` do not write
+  and so do not need one, and `-t` neither backs up the config nor offers a
+  capture restart.
+
+`CAMERA_ACTIONS` and the flag list are checked against each other by a test:
+an action added to the menu with no flag behind it is the drift to expect.
+
 **Storage discovery** parses `/proc/mounts` rather than shelling out to `lsblk`
 or `df`, so it has no dependency beyond the stdlib. Filtering, in order:
 
@@ -682,6 +702,18 @@ connection this service makes, and should stay the only one.
   fetched only when there is actually an update to describe, so the ordinary
   case is one request. `plain_notes()` strips heading markers because the text
   lands in a `<div>`, not a markdown renderer.
+- **The 4,000-character cap degrades, rather than truncating.** v0.1.0's own
+  release body was 4,020 characters, and a plain slice cut it three characters
+  into a sentence with nothing recording that it had: the page read as though
+  this program had lost the rest. `clip_notes()` cuts on the last line break
+  instead (word break, then a blunt cut, for notes written as one paragraph),
+  and returns whether anything was dropped, so the panel can say so and link
+  to the release. The half-limit floor stops a body whose only newline is near
+  the start being trimmed to almost nothing. A cache written before the flag
+  existed is repaired on load by inferring it from the length: without that,
+  the fix would not reach an install already carrying clipped notes until its
+  next check, which is up to a day. **Never cap rendered text without
+  reporting the cap and offering the whole thing somewhere.**
 - **An explicit User-Agent is mandatory.** GitHub rejects a request without
   one, exactly as Cloudflare does for the Discord webhook. Two vendors, one
   trap; see `post_webhook()`.
@@ -776,7 +808,40 @@ version is not advertised.
 consulted by `handle_request()`, which `serve_forever()` never calls, so
 setting it there looks like a timeout and is not one.
 
-### 4.6 `install.sh`
+### 4.6 `timelapse_update.py`
+
+Two things in one file, because they are the same knowledge: the GitHub
+release query, and the `timelapse update` command.
+
+**The one import between this project's scripts**, and deliberately one-way:
+`timelapse_web.py` imports the query half for its version panel. Everything
+else here is standalone, and this exception earns itself. Two callers need to
+know which tag is newest, and two copies of that means two places to get the
+tuple comparison wrong (`0.0.10` sorts below `0.0.9` as a string), two places
+to forget GitHub's mandatory User-Agent, and two places that have to know this
+repo has nine tags with no Release behind them. It resolves because both files
+are installed into the same directory, which is `sys.path[0]` for either entry
+point; the tests put `scripts/` on the path for the same reason.
+
+Upgrading is re-running the installer, so that is what this does:
+
+1. Ask which release is newest, and compare as tuples.
+2. Show the notes, clipped on a line boundary (§4.5) rather than mid-sentence.
+3. Confirm, unless `--yes`.
+4. Download `install.sh` **for that tag**, not for `main`. An installer newer
+   than the tree it unpacks can expect files that tree does not contain.
+5. Refuse it unless it looks like the installer and passes `bash -n`. This
+   runs as root; a 404 page, a captive portal and a proxy error all arrive as
+   a perfectly successful HTTP response.
+6. Hand over, into a directory holding nothing but `install.sh`, so the
+   installer's `obtain_source()` does not mistake it for a checkout.
+
+The privilege check sits between steps 3 and 4, not at the top of `main()`:
+`--check` answers the question without root, and only acting on the answer
+needs it. `--check` exits **10** when an update is available, so a cron job
+can notify without a human reading the output.
+
+### 4.7 `install.sh`
 
 Bootstrap. Detects the package manager (apt/dnf/yum/pacman/zypper/apk), installs
 dependencies, creates the `timelapse` system account, places scripts, units and
@@ -949,8 +1014,8 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 436 cases, about forty-five
-seconds; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 611 cases, about a
+minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
 `writable_paths`, credential quoting, `_dest_path` including the DST
@@ -961,6 +1026,15 @@ needing a camera, a GPU or systemd is out of scope here by design.
 a port: a listening socket in a unit test is a flake waiting for a busy CI
 runner. The fake implements `sendall`, not a writable `makefile`, because
 `StreamRequestHandler` sets `wbufsize = 0` and wraps the socket directly.
+
+`test_update.py` never reaches the network. Every test that would patches
+`fetch_json` or `fetch_text`, and one exists specifically to prove the module
+makes no request at import, since the web server imports it at startup. When
+the release query lived in `timelapse_web.py`, four tests patched
+`web.fetch_json` and then called `web.latest_release()`; after the move that
+name resolved in the *other* module's namespace and the tests silently started
+hitting api.github.com for real. They passed, against the live repo. Patch the
+module that owns the function, not the one that re-exports it.
 
 Three seams exist purely for testability, and should be preserved:
 `scan_filesystems(mounts_path, statvfs, rotational)` and
@@ -1093,16 +1167,18 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 615 lines
+install.sh                       bootstrap installer, 723 lines
 scripts/timelapse_capture.py     daemon, 415 lines
-scripts/timelapse_encode.py      batch job, 709 lines
+scripts/timelapse_encode.py      batch job, 725 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
-scripts/timelapse_setup.py       configuration wizard, 2145 lines
-scripts/timelapse_web.py         read-only web UI, 2192 lines
+scripts/timelapse_setup.py       configuration wizard, 2344 lines
+scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
+scripts/timelapse_web.py         read-only web UI, 2093 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
 tests/test_setup.py              unit tests
+tests/test_update.py             unit tests
 tests/test_usage.py              unit tests
 tests/test_web.py                unit tests
 tests/smoke_test.py              end-to-end encode check, needs ffmpeg

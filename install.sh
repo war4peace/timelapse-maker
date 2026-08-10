@@ -232,6 +232,7 @@ install_files() {
                     "$SRC/scripts/timelapse_encode.py" \
                     "$SRC/scripts/timelapse_test.py" \
                     "$SRC/scripts/timelapse_setup.py" \
+                    "$SRC/scripts/timelapse_update.py" \
                     "$SRC/scripts/timelapse_web.py" "$PREFIX/"
     ok "Scripts -> $PREFIX"
 
@@ -266,9 +267,14 @@ CONFIGURING
                        whole config, backing up the old one first, so prefer
                        the targeted commands below for a single change.
   cameras      [sudo]  Add, edit, remove, enable or disable a camera, and
-                       test one against the real hardware. Offers to restart
-                       capture afterwards, which is what makes the change
-                       take effect.
+                       test one against the real hardware. With no options it
+                       opens a menu. The shortcuts go straight to one camera,
+                       by name or by the number 'timelapse cameras -l' shows:
+                         -a         add a camera
+                         -e:NAME    edit it        -t:NAME   test it
+                         -x:NAME    enable/disable -r:NAME   remove it
+                       Changes offer to restart capture afterwards, which is
+                       what makes them take effect.
   transfer     [sudo]  Reconfigure where finished videos are sent, including
                        mounting an SMB/CIFS share and re-deriving the
                        ReadWritePaths= the systemd units need.
@@ -297,6 +303,14 @@ CHECKING
                        if the running daemon started before they were
                        installed and is therefore still the previous build.
 
+STAYING CURRENT
+  update       [sudo]  Ask GitHub for the newest release, show what is new,
+                       and install it after one confirmation. Re-runs the
+                       installer, so it keeps your configuration, your frames
+                       and your videos, and restarts the services.
+                       'timelapse update --check' only reports, and is the
+                       one command here that needs no root at all.
+
 RUNNING BY HAND
   encode       [sudo]  Run the nightly encode now rather than at 00:05.
                        Useful for clearing a backlog.
@@ -307,6 +321,8 @@ Anything after the command is passed through, so for example:
   timelapse test --probe-profiles   find which ONVIF profile is full resolution
   timelapse encode --dry-run        show what would encode, change nothing
   timelapse setup --defaults        accept every default without asking
+  timelapse update --check          is there a new version? (no root needed)
+  timelapse cameras -x:Doorbell     stop capturing that camera for now
   timelapse cameras --help          the options that command takes
 
 FILES
@@ -335,6 +351,10 @@ case "\${1:-}" in
     web)       shift; exec python3 $PREFIX/timelapse_setup.py --web-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     web-serve) shift; exec python3 $PREFIX/timelapse_web.py "$CONFIG" "\$@" ;;
+    # No "$CONFIG": updating neither reads nor writes it, which is why
+    # 'timelapse update --check' is the one configuring command that needs
+    # no root at all.
+    update)    shift; exec python3 $PREFIX/timelapse_update.py "\$@" ;;
     config)    exec \${EDITOR:-nano} "$CONFIG" ;;
     logs)      exec journalctl -u timelapse-capture -f ;;
     # timelapse-encode.service is listed, not just its timer: it is oneshot,
@@ -345,7 +365,7 @@ case "\${1:-}" in
                     timelapse-encode.timer timelapse-encode.service \\
                     timelapse-web.service ;;
     version)
-        for f in capture encode test setup web; do
+        for f in capture encode test setup update web; do
             printf '  %-8s %s\n' "\$f" \\
                 "\$(sed -n 's/^__version__ = "\(.*\)"/\1/p' $PREFIX/timelapse_\$f.py)"
         done
@@ -594,7 +614,7 @@ offer_enable() {
     fi
 
     printf '\n'
-    say "${B}timelapse${N} status | logs | test | usage | encode | config | cameras | transfer | web"
+    say "${B}timelapse${N} status | logs | test | usage | encode | config | cameras | transfer | web | update"
 }
 
 as_service_user() {
