@@ -346,6 +346,34 @@ Configuration wizard. Run by `install.sh`, or standalone as `timelapse setup`.
 Writes `config.json` and nothing else: it never touches systemd, never enables
 anything, and is safe to re-run.
 
+**Config backups** are taken by `write_config()`, which is the single write
+path for the wizard, all four `--*-only` sections and every camera shortcut.
+Five are kept, named `config.json.bak.<YYYYmmdd-HHMMSS>`. Two things here are
+not obvious:
+
+- **The counter for a repeated second is `max(used) + 1`, never the first free
+  slot.** Pruning leaves holes, and refilling one gives the newest backup the
+  oldest-sorting name, so it is deleted immediately. Measured before the fix:
+  eight writes inside one second kept backups 1 to 5 and threw away 6, the
+  newest. The same shape of bug as any "find the first gap" allocator paired
+  with deletion.
+- **Backups sort on the parsed `(stamp, counter)`, not on the name.** `-10`
+  sorts below `-2` as text, and ten config writes inside a second is a shell
+  loop rather than a hypothetical. The unstamped `config.json.bak` that 0.1.1
+  and earlier wrote parses to `("", 0)` and therefore sorts first, which is
+  correct: it is older than anything written since.
+
+`timelapse config` hands the file to `$EDITOR` and so does not pass through
+`write_config()` at all; the wrapper calls `--backup-now` first for exactly
+that reason. **A new write path means adding a backup call, or that path
+silently opts out of the history.**
+
+`restore_config()` deliberately does not load the current config first. "I
+broke it" and "it is gone" are the two reasons to run it, and requiring a
+readable config would refuse precisely then. It backs the current one up
+before overwriting, which is what makes a wrong choice recoverable, and
+restarts both daemons afterwards because both read the config only at startup.
+
 **Camera management** (`--cameras-only`) is a menu, and every action in it is
 also a flag: `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM`, `-r:CAM`. Three things
 about that are not obvious:
@@ -896,9 +924,9 @@ take an optional path as their first positional argument. See
 ### `encode`
 | Key | Default | Notes |
 |---|---|---|
-| `framerate` | 60 | Applied to both input and output. |
+| `framerate` | 60 | Applied to both input and output, and asked by the wizard. A day's frames at a 5s interval are 4:48 of video at 60 and 9:36 at 30. |
 | `container` | `mkv` | Extension only; ffmpeg infers the muxer. |
-| `gop` | 120 | 2s at 60fps. Lower = better scrubbing, larger files. |
+| `gop` | 120 | 2s at 60fps. The wizard derives it as `framerate * 2` so that stays true at any rate; set it here to override. Lower = better scrubbing, larger files. |
 | `av1_preset` / `av1_cq` | `p6` / 26 | p1 fastest … p7 slowest. Lower cq = higher quality. |
 | `hevc_cq`, `x264_crf` | 24, 20 | Fallback encoders only. |
 | `min_frames` | 100 | Below this, `SKIP` rather than produce a 2-second video. |
@@ -1014,7 +1042,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 611 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 637 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1167,11 +1195,11 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 723 lines
+install.sh                       bootstrap installer, 738 lines
 scripts/timelapse_capture.py     daemon, 415 lines
 scripts/timelapse_encode.py      batch job, 725 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 658 lines
-scripts/timelapse_setup.py       configuration wizard, 2344 lines
+scripts/timelapse_setup.py       configuration wizard, 2604 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_web.py         read-only web UI, 2093 lines
 tests/_support.py                path setup and fakes

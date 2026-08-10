@@ -22,6 +22,23 @@ While the version is `0.x`, the configuration format may change in any release.
   here that needs no root at all; it exits 10 when an update is available, so
   a cron job can notify on it. Also `--yes`, `--force` and
   `--ref v0.1.0` for pinning to a specific tag or going back to one.
+- **The video frame rate is a wizard question.** `encode.framerate` has been
+  in the config since the beginning and is read with a default of 60, but the
+  wizard set it and never asked, so the only way to change it was to edit the
+  JSON by hand. It is now asked in the Capture section, which shows what each
+  rate means for the finished video: the same day's frames are 4:48 at 60fps
+  and 9:36 at 30. `encode.gop` is derived from it rather than asked, so a
+  keyframe stays two seconds apart at any rate instead of drifting to four
+  seconds at 30fps. Existing configs are untouched.
+- **Rotating config backups, and `sudo timelapse restore`.** A backup is taken
+  before every change, five deep, named for when it was taken. `restore` lists
+  them with the date, the size and what is actually in each one (camera count,
+  interval, frame rate), and puts the one you pick back. It backs up the
+  current config first, so a wrong choice is undone by running it again. It
+  also works when `config.json` is corrupt or missing entirely, which is when
+  you need it. `timelapse restore -l` lists without restoring.
+  `timelapse config` takes a backup before opening `$EDITOR`, since that is
+  the one write path the wizard does not own.
 - **Shortcuts for `timelapse cameras`.** Every action the menu offers is now
   also a flag, so a single change is a single command: `-l` lists, `-a` adds,
   and `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` edit, enable/disable, test and

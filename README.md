@@ -67,6 +67,7 @@ Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 | `timelapse web` | Turn the read-only web UI on or off, set its address and library path | **sudo** |
 | `timelapse encode` | Run tonight's encode now | **sudo** |
 | `timelapse setup` · `config` | Full wizard · edit the JSON | **sudo** |
+| `timelapse restore` | Put back an earlier config; one is kept before every change, five deep | **sudo** |
 | `timelapse update` | Check GitHub for a new release and install it, keeping your config | **sudo** (`--check` does not) |
 
 **Anything that reads or writes the config needs `sudo`.**
@@ -189,7 +190,7 @@ After installing, a `timelapse` command wraps the common operations. Run
 `sudo`:
 
 ```
-timelapse status | logs | test | encode | config | setup | transfer | web | update
+timelapse status | logs | test | encode | config | setup | transfer | web | update | restore
 ```
 
 Run `timelapse test` before enabling anything; it fetches one snapshot per

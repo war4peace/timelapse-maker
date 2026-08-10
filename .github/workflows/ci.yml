@@ -145,6 +145,14 @@ jobs:
           # --check must work as a normal user: asking whether an update
           # exists is the one thing here that needs no root.
           timelapse update --help > /dev/null
+          # A fresh install has no backups, and saying so is the right answer
+          # rather than an error.
+          sudo timelapse restore -l | grep -q "No backups"
+          # Every config write takes one, including this bare backup call,
+          # which is what `timelapse config` uses before opening $EDITOR.
+          sudo python3 /opt/timelapse/timelapse_setup.py --backup-now \
+               --output /etc/timelapse/config.json
+          sudo timelapse restore -l | grep -q "camera(s)"
           bash -n /usr/local/bin/timelapse
           # --help exits 0, a bare invocation is a usage error, and every
           # subcommand the wrapper dispatches is actually documented. The
@@ -154,7 +162,7 @@ jobs:
           timelapse > /tmp/bare.txt || true
           cmp /tmp/help.txt /tmp/bare.txt
           for c in setup cameras transfer web config test usage status \
-                   logs version encode web-serve update; do
+                   logs version encode web-serve update restore; do
             grep -qE "^  $c " /tmp/help.txt || { echo "undocumented: $c"; exit 1; }
           done
           test "$(awk '{ if (length($0) > 80) c++ } END { print c+0 }' /tmp/help.txt)" = 0

@@ -402,10 +402,11 @@ of it; nothing needs a reinstall.
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and Discord. Run it after any change. |
 | `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. A menu with no options; `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` go straight to one. §9. |
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
-| `timelapse web` | Turn the read-only web UI on or off and set its address, port and library path. §10. |
+| `timelapse web` | Turn the read-only web UI on or off and set its address, port and library path. §11. |
 | `timelapse web-serve` | Run the web UI in the foreground for a look at its log. The service normally does this. |
 | `timelapse setup` | The full wizard again: storage, capture settings, cameras, transfer, Discord. Overwrites the whole config, so prefer `cameras` or `transfer` for a single change. |
-| `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover. You are then responsible for restarting capture yourself. |
+| `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover, such as the encoder's container and quality. A backup is taken first. You are then responsible for restarting capture yourself. |
+| `timelapse restore` | Put back an earlier config. One is kept before every change, five deep. §10. |
 | `timelapse encode` | Runs the nightly encode immediately instead of waiting for 00:05. Useful to clear a backlog. |
 | `timelapse version` | The installed version of each script, and a warning if the running daemon predates them. |
 | `timelapse update` | Ask GitHub for the newest release, show what changed, and install it. §2. |
@@ -417,6 +418,7 @@ camera credentials, so anything that touches it needs `sudo`:
 |---|---|
 | `setup`, `cameras`, `transfer`, `web`, `config` (they write the config) | `status` |
 | `update` (it writes `/opt/timelapse`) | `update --check` |
+| `restore` (it writes the config) | |
 | `encode`, `web-serve` (they read it, and write frames and videos) | `version` |
 | `test`, `usage` (they read it) | `logs` |
 
@@ -570,7 +572,63 @@ restart and the stranding checks are yours to remember.
 
 ---
 
-## 10. The web UI
+## 10. Config backups and restoring
+
+A backup is taken **before every change**, automatically, and the five most
+recent are kept. That covers the wizard, `timelapse cameras`, `transfer`,
+`web`, and `timelapse config` before it opens your editor.
+
+They live beside the config, named for when they were taken:
+
+```
+/etc/timelapse/config.json
+/etc/timelapse/config.json.bak.20260810-194229
+/etc/timelapse/config.json.bak.20260810-194230
+```
+
+To put one back:
+
+```bash
+sudo timelapse restore
+```
+
+```
+     #  Taken                    Size  Contents
+     1  2026-08-10 19:42:30      6592  5 camera(s), 5 enabled, 5s, 60fps
+     2  2026-08-10 19:42:29      6593  5 camera(s), 4 enabled, 5s, 60fps
+     3  2026-08-10 19:42:28      6473  5 camera(s), 3 enabled, 5s, 60fps  = current
+     4  2026-01-01 00:00:00         9  unreadable (JSONDecodeError)
+
+  Restore which backup? (0 cancels) [0]:
+```
+
+Newest first. The listing reads each one and says what is in it, so you are
+picking a configuration rather than a timestamp. Three things it tells you:
+
+- **`= current`** marks a backup identical to what you are running, compared
+  on the parsed settings rather than the bytes, so a trailing newline does not
+  make two identical configs look different.
+- **`unreadable`** marks one that will not parse. It is still listed, and still
+  numbered, but picking it is refused rather than acted on.
+- **Restoring is reversible.** The current config is backed up first, so if you
+  pick the wrong one it is number 1 in the same list next time.
+
+`sudo timelapse restore -l` lists without restoring, and works headless.
+
+**It does not need a working config.** "I broke it" and "it is gone" are the
+two reasons to run this, so it reads the backups directly and never refuses
+because `config.json` is corrupt or missing.
+
+Restoring restarts capture and the web UI for you, after asking, since both
+read the config only at startup.
+
+Backups carry the config's `0640`, because they hold the same camera
+passwords. They are owned by `root` rather than `root:timelapse`: the service
+has no reason to read one.
+
+---
+
+## 11. The web UI
 
 Optional, off by default, and read-only: it never triggers an encode, controls
 a camera, edits the config or deletes anything. Turn it on with:

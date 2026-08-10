@@ -7,6 +7,7 @@ kinds of thing that look like disks but aren't. These drive it with a synthetic
 
 import contextlib
 import io
+import json
 import shutil
 import socket
 import sys
@@ -812,7 +813,7 @@ class TestCameraActionDispatch(unittest.TestCase):
     """Which flag means which action, and what refuses to run headless."""
 
     def args(self, **kw):
-        base = dict(cam_list=False, cam_add=False, edit=None, toggle=None,
+        base = dict(list_only=False, cam_add=False, edit=None, toggle=None,
                     test=None, remove=None)
         base.update(kw)
         return mock.Mock(**base)
@@ -828,7 +829,7 @@ class TestCameraActionDispatch(unittest.TestCase):
                          ("test", "Gate"))
         self.assertEqual(setup.chosen_camera_action(self.args(remove="1")),
                          ("remove", "1"))
-        self.assertEqual(setup.chosen_camera_action(self.args(cam_list=True)),
+        self.assertEqual(setup.chosen_camera_action(self.args(list_only=True)),
                          ("list", None))
 
     def test_no_flag_means_the_menu(self):
@@ -837,7 +838,7 @@ class TestCameraActionDispatch(unittest.TestCase):
     def test_every_action_the_menu_offers_is_reachable_by_flag(self):
         # An action added to the menu with no flag behind it is the drift this
         # catches: the two lists have to stay the same length.
-        flags = {"list": {"cam_list": True}, "add": {"cam_add": True},
+        flags = {"list": {"list_only": True}, "add": {"cam_add": True},
                  "edit": {"edit": "1"}, "toggle": {"toggle": "1"},
                  "test": {"test": "1"}, "remove": {"remove": "1"}}
         self.assertEqual(set(flags), set(setup.CAMERA_ACTIONS))
@@ -1624,6 +1625,259 @@ class TestDefaultConfig(unittest.TestCase):
         self.assertIn("paths", setup.default_config("/nonexistent.json"))
 
 
+class TestFramerate(unittest.TestCase):
+    """`encode.framerate` was in the schema from the beginning and read with a
+    default of 60, but the wizard never asked, so the only way to change it was
+    to edit the JSON by hand."""
+
+    def ask(self, answer, cfg=None):
+        cfg = cfg if cfg is not None else {"encode": {}}
+        with mock.patch.object(setup, "ask_int", return_value=answer):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                setup.choose_framerate(cfg, 17280)
+        return cfg, out.getvalue()
+
+    def test_the_answer_lands_in_the_config(self):
+        cfg, _ = self.ask(30)
+        self.assertEqual(cfg["encode"]["framerate"], 30)
+
+    def test_the_default_offered_is_sixty(self):
+        with mock.patch.object(setup, "ask_int", return_value=60) as ask:
+            with contextlib.redirect_stdout(io.StringIO()):
+                setup.choose_framerate({"encode": {}}, 17280)
+        self.assertEqual(ask.call_args[0][1], 60)
+
+    def test_an_existing_value_becomes_the_default(self):
+        # Re-running the wizard must offer what you already chose, not 60.
+        with mock.patch.object(setup, "ask_int", return_value=24) as ask:
+            with contextlib.redirect_stdout(io.StringIO()):
+                setup.choose_framerate({"encode": {"framerate": 24}}, 17280)
+        self.assertEqual(ask.call_args[0][1], 24)
+
+    def test_gop_follows_the_frame_rate(self):
+        # Shipped as gop 120 against framerate 60, which is two seconds. Left
+        # alone, 30fps would put a keyframe every four seconds instead.
+        for fps in (24, 30, 60):
+            cfg, _ = self.ask(fps)
+            self.assertEqual(cfg["encode"]["gop"], fps * setup.GOP_SECONDS)
+
+    def test_the_bounds_refuse_a_zero_frame_rate(self):
+        with mock.patch.object(setup, "ask_int", return_value=60) as ask:
+            with contextlib.redirect_stdout(io.StringIO()):
+                setup.choose_framerate({"encode": {}}, 17280)
+        self.assertEqual(ask.call_args[0][2], 1)      # lo
+
+    def test_it_says_how_long_a_day_becomes(self):
+        # The reason to ask at all: the same frames are 4:48 at 60fps and
+        # 9:36 at 30, and that is not obvious from a number in a JSON file.
+        _, out = self.ask(30)
+        self.assertIn("9:36", out)
+
+    def test_video_length_is_minutes_and_seconds(self):
+        self.assertEqual(setup.video_length(17280, 60), "4:48")
+        self.assertEqual(setup.video_length(17280, 30), "9:36")
+        self.assertEqual(setup.video_length(0, 60), "0:00")
+
+    def test_video_length_survives_a_zero_rate(self):
+        # Never let the wizard divide by zero while describing a bad answer.
+        self.assertEqual(setup.video_length(60, 0), "1:00")
+
+
+class TestConfigBackups(unittest.TestCase):
+    """Every write goes through write_config(), so the rotation lives there."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.out = self.tmp / "config.json"
+
+    def write(self, marker):
+        with contextlib.redirect_stdout(io.StringIO()):
+            setup.write_config({"marker": marker}, self.out)
+
+    def backup(self):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return setup.backup_config(self.out)
+
+    def markers(self):
+        return [json.loads(p.read_text(encoding="utf-8"))["marker"]
+                for p in setup.backup_paths(self.out)]
+
+    def test_nothing_to_back_up_is_not_an_error(self):
+        self.assertIsNone(self.backup())
+
+    def test_it_keeps_five_and_drops_the_oldest(self):
+        for i in range(8):
+            self.write(i)
+        self.assertEqual(len(setup.backup_paths(self.out)), setup.BACKUP_KEEP)
+        # The five most recent, oldest first. Write n backs up marker n-1.
+        self.assertEqual(self.markers(), [2, 3, 4, 5, 6])
+
+    def test_two_writes_in_the_same_second_are_both_kept(self):
+        # The stamp has one-second resolution and two camera commands in a row
+        # are well under that; the second must not replace the first.
+        with mock.patch.object(setup.time, "strftime",
+                               return_value="20260810-120000"):
+            self.write("first")
+            self.write("second")
+            self.write("third")
+        self.assertEqual(self.markers(), ["first", "second"])
+
+    def test_a_backup_carries_the_config_mode(self):
+        # It holds the same camera passwords the config does.
+        self.write("a")
+        self.write("b")
+        made = setup.backup_paths(self.out)[0]
+        self.assertEqual(made.stat().st_mode & 0o777,
+                         self.out.stat().st_mode & 0o777)
+
+    def test_a_failed_backup_does_not_block_the_write(self):
+        # The backup exists to protect the write; it must never prevent it.
+        self.write("first")
+        with mock.patch.object(setup.shutil, "copy2",
+                               side_effect=OSError("read-only")):
+            self.write("second")
+        self.assertEqual(json.loads(self.out.read_text(encoding="utf-8")),
+                         {"marker": "second"})
+
+    def test_the_bare_bak_from_older_versions_is_still_found(self):
+        # 0.1.1 and earlier wrote one unstamped file. It is somebody's only
+        # backup; it must appear in the list rather than being ignored.
+        self.out.write_text('{"marker": "legacy"}', encoding="utf-8")
+        (self.tmp / "config.json.bak").write_text('{"marker": "legacy"}',
+                                                  encoding="utf-8")
+        self.write("new")
+        self.assertEqual(self.markers()[0], "legacy")   # oldest, sorts first
+
+    def test_the_temp_file_is_never_mistaken_for_a_backup(self):
+        self.write("a")
+        (self.tmp / "config.json.tmp").write_text("{}", encoding="utf-8")
+        self.assertEqual(setup.backup_paths(self.out), [])
+
+
+class TestRestore(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.out = self.tmp / "config.json"
+        setup.AUTO, setup._TTY = False, None
+
+    def tearDown(self):
+        setup.AUTO, setup._TTY = False, None
+
+    def write(self, cams=1, fps=60):
+        cfg = {"cameras": [{"name": f"C{i}", "enabled": True}
+                           for i in range(cams)],
+               "capture": {"interval_seconds": 5},
+               "encode": {"framerate": fps}}
+        with contextlib.redirect_stdout(io.StringIO()):
+            setup.write_config(cfg, self.out)
+
+    def restore(self, keys):
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keys, tty=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = setup.restore_config(self.out)
+        return rc, buf.getvalue()
+
+    def cams(self):
+        return len(json.loads(self.out.read_text(encoding="utf-8"))["cameras"])
+
+    def test_no_backups_is_reported_rather_than_a_traceback(self):
+        rc, out = self.restore("")
+        self.assertEqual(rc, 1)
+        self.assertIn("No backups", out)
+
+    def test_it_lists_newest_first(self):
+        for n in (1, 2, 3):
+            self.write(cams=n)
+        _, out = self.restore("0\n")
+        rows = [l for l in out.splitlines() if l.strip().startswith(("1 ", "2 "))]
+        self.assertIn("2 camera", rows[0])      # newest backup: the 2-cam one
+        self.assertIn("1 camera", rows[1])
+
+    def test_zero_cancels_and_changes_nothing(self):
+        self.write(cams=1)
+        self.write(cams=2)
+        rc, out = self.restore("0\n")
+        self.assertEqual(rc, 0)
+        self.assertIn("Nothing was restored", out)
+        self.assertEqual(self.cams(), 2)
+
+    def test_a_declined_confirmation_changes_nothing(self):
+        self.write(cams=1)
+        self.write(cams=2)
+        rc, _ = self.restore("1\nn\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.cams(), 2)
+
+    def test_restoring_puts_the_older_config_back(self):
+        self.write(cams=1)
+        self.write(cams=2)
+        self.write(cams=3)
+        rc, _ = self.restore("2\ny\n")      # the 1-camera one
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.cams(), 1)
+
+    def test_restoring_is_itself_reversible(self):
+        # The point of backing up the current config first: pick the wrong one
+        # and what you replaced is number 1 in the same list.
+        self.write(cams=1)
+        self.write(cams=5)
+        self.restore("1\ny\n")
+        self.assertEqual(self.cams(), 1)
+        rc, _ = self.restore("1\ny\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.cams(), 5)
+
+    def test_it_works_when_the_config_is_gone_entirely(self):
+        # "I deleted it" is one of the two reasons anybody runs this, so it
+        # must not require a readable config first.
+        self.write(cams=4)
+        self.write(cams=4)
+        self.out.unlink()
+        rc, _ = self.restore("1\ny\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.cams(), 4)
+
+    def test_a_corrupt_backup_is_listed_but_refused(self):
+        self.write(cams=1)
+        self.write(cams=2)
+        (self.tmp / "config.json.bak.20260101-000000").write_text(
+            "{ not json", encoding="utf-8")
+        rc, out = self.restore("2\n")       # the corrupt one, by date
+        self.assertIn("unreadable", out)
+        self.assertEqual(rc, 1)
+        self.assertEqual(self.cams(), 2)    # and nothing was touched
+
+    def test_the_backup_matching_the_running_config_is_marked(self):
+        self.write(cams=1)
+        self.write(cams=1)
+        _, out = self.restore("0\n")
+        self.assertIn("= current", out)
+
+    def test_choosing_needs_a_terminal(self):
+        self.write(cams=1)
+        self.write(cams=2)
+        setup.AUTO, setup._TTY = True, None
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            rc = setup.restore_config(self.out)
+        self.assertEqual(rc, 1)
+        self.assertIn("restore -l", buf.getvalue())
+        self.assertEqual(self.cams(), 2)
+
+    def test_describe_reads_a_backup_without_restoring_it(self):
+        self.write(cams=2, fps=24)
+        self.write(cams=2, fps=24)
+        _, summary = setup.describe_backup(setup.backup_paths(self.out)[0])
+        self.assertIn("2 camera", summary)
+        self.assertIn("24fps", summary)
+        self.assertIn("5s", summary)
+
+
 class TestWriteConfig(unittest.TestCase):
 
     def setUp(self):
@@ -1649,9 +1903,9 @@ class TestWriteConfig(unittest.TestCase):
         out = self.tmp / "config.json"
         self.write({"marker": "first"}, out)
         self.write({"marker": "second"}, out)
-        self.assertTrue((self.tmp / "config.json.bak").exists())
-        self.assertIn("first",
-                      (self.tmp / "config.json.bak").read_text(encoding="utf-8"))
+        backups = setup.backup_paths(out)
+        self.assertEqual(len(backups), 1)
+        self.assertIn("first", backups[0].read_text(encoding="utf-8"))
 
     def test_leaves_no_temporary_file_behind(self):
         out = self.tmp / "config.json"

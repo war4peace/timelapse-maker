@@ -22,6 +22,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import time
 from datetime import date
 from pathlib import Path, PurePosixPath
 
@@ -459,10 +460,7 @@ def choose_capture(cfg, disk):
     cfg["capture"]["timeout_seconds"] = timeout
 
     per_day = int(86400 / interval)
-    video_secs = per_day / cfg["encode"]["framerate"]
-    note(f"{per_day:,} frames/camera/day -> "
-         f"{int(video_secs // 60)}:{int(video_secs % 60):02d} of video at "
-         f"{cfg['encode']['framerate']}fps")
+    choose_framerate(cfg, per_day)
 
     n_cams = ask_int("Roughly how many cameras will you run?", 4, 1, 64)
     estimate_budget(cfg, disk, n_cams, per_day)
@@ -475,6 +473,44 @@ def choose_capture(cfg, disk):
     cfg["capture"]["min_free_gb"] = ask_int(
         "Pause capture below how many GB free? (0 disables)", default_guard, 0)
     return n_cams
+
+
+# Two seconds' worth of frames. The default config has shipped gop 120 against
+# framerate 60 since the beginning; deriving it keeps that relationship true at
+# any frame rate instead of leaving a keyframe every four seconds at 30fps.
+GOP_SECONDS = 2
+
+
+def video_length(per_day, fps):
+    """m:ss of finished video for a full day's frames at this rate."""
+    secs = per_day / max(1, fps)
+    return f"{int(secs // 60)}:{int(secs % 60):02d}"
+
+
+def choose_framerate(cfg, per_day):
+    """The one encode setting worth asking about.
+
+    It is the whole shape of the result: the same day's frames are five
+    minutes of video at 60fps and ten at 30. Everything else under `encode`
+    (container, gop, crf, min_frames) is a sane default that almost nobody
+    needs to move, and moving them is what `timelapse config` is for.
+    """
+    enc = cfg.setdefault("encode", {})
+    current = int(enc.get("framerate", 60))
+    note(f"{per_day:,} frames/camera/day. The frame rate decides how long "
+         f"that is:")
+    for fps in (24, 30, 60):
+        note(f"  {fps:>3} fps -> {video_length(per_day, fps)} "
+             f"{'(smoother, and what most players expect)' if fps == 60 else ''}"
+             .rstrip())
+    fps = ask_int("Video frame rate (fps)", current, 1, 240)
+    enc["framerate"] = fps
+    # Derived, not asked: it is a codec detail, and asking about keyframe
+    # intervals is not a question an operator should have to have an opinion
+    # about. Anyone who does can set it with `timelapse config`.
+    enc["gop"] = fps * GOP_SECONDS
+    note(f"A day is {video_length(per_day, fps)} of video at {fps}fps, "
+         f"keyframe every {GOP_SECONDS}s.")
 
 
 AVG_SNAPSHOT_KB = 600          # a 1440p JPEG; refined later by timelapse_test.py
@@ -2044,6 +2080,82 @@ def summarise(cfg, out_path):
     print(f"  {'Config':<12}{out_path}")
 
 
+# ----------------------------------------------------------------------------
+# Config backups
+#
+# Every write goes through write_config(), so hooking rotation here covers the
+# wizard, all four --*-only sections and every camera shortcut. The one path
+# that does not is `timelapse config`, which hands the file to $EDITOR; the
+# wrapper calls --backup-now first for exactly that reason.
+# ----------------------------------------------------------------------------
+
+BACKUP_KEEP = 5
+BACKUP_STAMP = "%Y%m%d-%H%M%S"
+BACKUP_RE = re.compile(r"\.bak\.(\d{8}-\d{6})(?:-(\d+))?$")
+
+
+def backup_key(path):
+    """Sort key: (stamp, counter within that second).
+
+    Parsed rather than lexical. `-10` sorts below `-2` as text, and ten config
+    writes inside one second is a shell loop, not a hypothetical. The bare
+    `config.json.bak` written by 0.1.1 and earlier has no stamp and sorts
+    first, which is right: it is certainly older than anything written since.
+    """
+    m = BACKUP_RE.search(Path(path).name)
+    return (m.group(1), int(m.group(2) or 0)) if m else ("", 0)
+
+
+def backup_paths(out_path):
+    """Every backup of this config, oldest first."""
+    out = Path(out_path)
+    legacy = out.name + ".bak"
+    return sorted((p for p in out.parent.glob(out.name + ".bak*")
+                   if p.name == legacy or BACKUP_RE.search(p.name)),
+                  key=backup_key)
+
+
+def backup_config(out_path, keep=BACKUP_KEEP):
+    """Copy the config aside and prune to `keep`. Path, or None if there was
+    nothing to copy."""
+    out = Path(out_path)
+    if not out.exists():
+        return None
+    stamp = time.strftime(BACKUP_STAMP)
+    # Two writes in the same second are one `timelapse cameras -x:A -x:B`
+    # away, and the second must not silently replace the first. The counter is
+    # the highest already used this second plus one, never the first free
+    # slot: pruning leaves holes, and refilling one hands the newest backup
+    # the oldest-sorting name, which then prunes it on the spot. Measured -
+    # eight writes in one second kept markers 1..5 and threw away 6.
+    used = [c for s, c in map(backup_key, backup_paths(out)) if s == stamp]
+    n = max(used) + 1 if used else 0
+    dest = out.with_suffix(out.suffix + f".bak.{stamp}" + (f"-{n}" if n else ""))
+    while dest.exists():                       # belt and braces
+        n += 1
+        dest = out.with_suffix(out.suffix + f".bak.{stamp}-{n}")
+    try:
+        # copy2, so the 0640 comes with it. The group does not: a backup is
+        # root's business, and the service has no reason to read one.
+        shutil.copy2(out, dest)
+    except OSError as exc:
+        # Never let a backup failure block the write it was protecting.
+        warn(f"Could not back up {out}: {exc}")
+        return None
+
+    old = backup_paths(out)[:-keep] if keep > 0 else []
+    for p in old:
+        try:
+            p.unlink()
+        except OSError:
+            pass
+    if old:
+        note(f"Backed up to {dest.name} ({len(old)} older one(s) removed)")
+    else:
+        note(f"Backed up to {dest.name}")
+    return dest
+
+
 def write_config(cfg, out_path, owner=None):
     """Write the config 0640, readable by the service account.
 
@@ -2054,10 +2166,7 @@ def write_config(cfg, out_path, owner=None):
     """
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    if out.exists():
-        backup = out.with_suffix(out.suffix + ".bak")
-        shutil.copy2(out, backup)
-        note(f"Existing config backed up to {backup}")
+    backup_config(out)
     tmp = out.with_suffix(out.suffix + ".tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)
@@ -2072,6 +2181,134 @@ def write_config(cfg, out_path, owner=None):
             shutil.chown(out, group=owner)
         except (OSError, LookupError):
             pass
+
+
+def load_json(path):
+    """Parsed JSON, or None. For inspecting files we are not about to trust."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def describe_backup(path):
+    """(when, summary). What is actually in a backup, without restoring it."""
+    m = BACKUP_RE.search(path.name)
+    if m:
+        when = f"{m.group(1)[:4]}-{m.group(1)[4:6]}-{m.group(1)[6:8]} " \
+               f"{m.group(1)[9:11]}:{m.group(1)[11:13]}:{m.group(1)[13:]}"
+    else:
+        # The bare .bak from 0.1.1 and earlier carries no stamp in its name.
+        try:
+            when = time.strftime("%Y-%m-%d %H:%M:%S",
+                                 time.localtime(path.stat().st_mtime))
+        except OSError:
+            when = "unknown"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError) as exc:
+        # Shown, not hidden: a corrupt backup is exactly what you want to know
+        # about before you pick it, and it is still listed so the numbering
+        # matches what a second look would show.
+        return when, red(f"unreadable ({type(exc).__name__})")
+    cams = cfg.get("cameras") or []
+    on = sum(1 for c in cams if c.get("enabled", True))
+    bits = [f"{len(cams)} camera(s), {on} enabled"]
+    interval = cfg.get("capture", {}).get("interval_seconds")
+    if interval:
+        bits.append(f"{interval}s")
+    fps = cfg.get("encode", {}).get("framerate")
+    if fps:
+        bits.append(f"{fps}fps")
+    return when, ", ".join(bits)
+
+
+def list_backups(out_path):
+    """Print the numbered listing the picker uses. Newest first."""
+    backups = list(reversed(backup_paths(out_path)))
+    if not backups:
+        note(f"No backups of {out_path} yet.")
+        note("One is taken automatically before every change.")
+        return []
+    current = load_json(out_path)
+    print()
+    print(f"    {'#':>2}  {'Taken':<21}{'Size':>8}  Contents")
+    for i, p in enumerate(backups, 1):
+        when, summary = describe_backup(p)
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = 0
+        # Parsed, not byte-compared. Two files holding the same settings can
+        # differ by a trailing newline or key order, and reporting those as
+        # different configs would be reporting on the formatter.
+        same = current is not None and load_json(p) == current
+        # Marking the identical one matters: after a restore, the newest
+        # backup is the config you just replaced, and the one below it is what
+        # you are running. Without this the list is six lines of near-identical
+        # timestamps.
+        mark = dim("  = current") if same else ""
+        print(f"    {i:>2}  {when:<21}{size:>8}  {summary}{mark}")
+    return backups
+
+
+def restore_config(out_path, owner=None):
+    """Put a backup back. Exit status.
+
+    Deliberately does not require the current config to be readable, or to
+    exist at all: "I broke it" and "it is gone" are the two reasons anybody
+    runs this.
+    """
+    heading("Restore configuration")
+    backups = list_backups(out_path)
+    if not backups:
+        return 1
+    print()
+
+    if AUTO or _TTY is None:
+        fail("Choosing a backup needs a terminal.")
+        note("List them with: timelapse restore -l")
+        return 1
+
+    n = ask_int("Restore which backup? (0 cancels)", 0, 0, len(backups))
+    if n == 0:
+        note("Nothing was restored.")
+        return 0
+    chosen = backups[n - 1]
+
+    try:
+        with open(chosen, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError) as exc:
+        fail(f"{chosen.name} cannot be read as a config: {exc}")
+        note("Pick another one; the listing says which are readable.")
+        return 1
+
+    when, summary = describe_backup(chosen)
+    print()
+    note(f"About to restore the config from {when} ({summary}).")
+    if Path(out_path).exists():
+        # The restore is itself a change, so it takes a backup too. That is
+        # what makes it undoable: get the wrong one and the config you just
+        # replaced is now number 1 in this same list.
+        note("The current config is backed up first, so this is reversible.")
+    if not ask_yes(f"Overwrite {out_path}?", False):
+        note("Nothing was restored.")
+        return 0
+
+    write_config(cfg, out_path, owner)
+    good(f"Restored {chosen.name} -> {out_path}")
+    cams = cfg.get("cameras") or []
+    note(f"{len(cams)} camera(s), "
+         f"{sum(1 for c in cams if c.get('enabled', True))} enabled")
+
+    # Both daemons read the config once, at startup, so a restore that does
+    # not restart them has changed a file and nothing else.
+    restart_capture_if_running()
+    restart_web_if_running(cfg)
+    return 0
 
 
 def create_directories(cfg, owner=None):
@@ -2150,7 +2387,7 @@ def chosen_camera_action(args):
                           ("remove", args.remove)):
         if value:
             return action, (None if value is True else value)
-    return (("list", None) if args.cam_list else (None, None))
+    return (("list", None) if args.list_only else (None, None))
 
 
 def run_camera_action(cfg, args):
@@ -2194,6 +2431,10 @@ def main():
                     help="add, edit or remove cameras in an existing config")
     ap.add_argument("--web-only", action="store_true",
                     help="reconfigure just the web UI")
+    ap.add_argument("--restore-only", action="store_true",
+                    help="restore a previous config from the backups")
+    ap.add_argument("--backup-now", action="store_true",
+                    help="take a config backup and print its path, then stop")
     # Camera shortcuts. The documented spelling is -e:2 / -e:Doorbell, which
     # reaches argparse as the value ":2" because a short option swallows
     # whatever is attached to it; strip_colon puts it back. -e 2, -e2 and
@@ -2201,8 +2442,8 @@ def main():
     cam = ap.add_argument_group(
         "camera actions",
         "with --cameras-only, go straight to one camera instead of the menu")
-    cam.add_argument("-l", "--list", action="store_true", dest="cam_list",
-                     help="print the camera list and stop")
+    ap.add_argument("-l", "--list", action="store_true", dest="list_only",
+                    help="with --cameras-only or --restore-only: list and stop")
     picked = cam.add_mutually_exclusive_group()
     picked.add_argument("-a", "--add", action="store_true", dest="cam_add",
                         help="add a camera")
@@ -2225,9 +2466,18 @@ def main():
     # These only mean anything against an existing camera list. Silently
     # ignoring them would be worse than refusing: 'timelapse_setup.py -r:2'
     # reads as a removal and would instead rewrite the whole config.
-    if chosen_camera_action(args) != (None, None) and not args.cameras_only:
+    if chosen_camera_action(args) != (None, None) and not (args.cameras_only
+                                                           or args.restore_only):
         ap.error("the camera actions need --cameras-only "
                  "(the 'timelapse cameras' command passes it for you)")
+
+    # Machine-readable, and the reason `timelapse config` is covered by the
+    # backup rotation at all: the wrapper calls this before handing the file
+    # to $EDITOR, which is the one write path that does not go through
+    # write_config().
+    if args.backup_now:
+        made = backup_config(args.output)
+        return 0 if made else 1
 
     # Machine-readable mode used by install.sh to template the systemd units.
     if args.print_paths:
@@ -2245,13 +2495,23 @@ def main():
     # A shortcut is a command, not a wizard. Announcing the setup wizard and
     # explaining how defaults work, above four lines of camera list, is noise
     # in something meant to be run from a shell prompt or a script.
-    if chosen_camera_action(args) == (None, None):
+    if chosen_camera_action(args) == (None, None) and not args.restore_only:
         print()
         print(bold("  ╔══════════════════════════════════════════════════════════╗"))
         print(bold("  ║              timelapse-maker  ·  setup                   ║"))
         print(bold("  ╚══════════════════════════════════════════════════════════╝"))
         print()
         note("Press Enter to accept the [default] shown for any question.")
+
+    # Restore reads the backups, not the config, so it deliberately does not
+    # load one first: "I broke it" and "it is gone" are the two reasons to run
+    # this, and refusing on an unreadable config would refuse exactly then.
+    if args.restore_only:
+        if args.list_only:
+            list_backups(args.output)
+            print()
+            return 0
+        return restore_config(args.output, args.owner)
 
     # Manage cameras against an existing config. Adding a camera after the
     # initial install must not mean re-running the whole wizard, and must not

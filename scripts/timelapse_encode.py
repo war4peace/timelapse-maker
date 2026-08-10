@@ -566,8 +566,8 @@ def load_config(path):
                  f"to the 'timelapse' group.")
     except json.JSONDecodeError as exc:
         sys.exit(f"{path} is not valid JSON: {exc}\n"
-                 f"Fix it with 'sudo timelapse config', or restore the backup "
-                 f"at {path}.bak")
+                 f"Fix it with 'sudo timelapse config', or put back the last "
+                 f"good one with 'sudo timelapse restore'.")
     except OSError as exc:
         sys.exit(f"Cannot read {path}: {exc}")
 

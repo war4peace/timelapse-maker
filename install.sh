@@ -281,7 +281,14 @@ CONFIGURING
   web          [sudo]  Turn the read-only web UI on or off and set its
                        address, port and library path. Offers to restart it.
   config       [sudo]  Open the config in \$EDITOR for anything the wizards
-                       do not cover. You restart capture yourself after.
+                       do not cover, such as the encoder's container and
+                       quality. A backup is taken first. You restart capture
+                       yourself after.
+  restore      [sudo]  Put back an earlier config. One is kept automatically
+                       before every change, five deep, and the listing says
+                       when each was taken and what is in it. Restoring backs
+                       up the current one too, so it is reversible.
+                       'timelapse restore -l' just lists them.
 
 CHECKING
   test         [sudo]  Pre-flight, and the thing to run after any change.
@@ -355,7 +362,15 @@ case "\${1:-}" in
     # 'timelapse update --check' is the one configuring command that needs
     # no root at all.
     update)    shift; exec python3 $PREFIX/timelapse_update.py "\$@" ;;
-    config)    exec \${EDITOR:-nano} "$CONFIG" ;;
+    restore)   shift; exec python3 $PREFIX/timelapse_setup.py --restore-only \\
+                          --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
+    # The one write path that does not go through the wizard's write_config(),
+    # so it takes its own backup first. Not fatal if that fails: refusing to
+    # open an editor because a copy could not be made would be worse.
+    config)
+        python3 $PREFIX/timelapse_setup.py --backup-now --output "$CONFIG" \\
+            || echo "  (continuing without a backup)"
+        exec \${EDITOR:-nano} "$CONFIG" ;;
     logs)      exec journalctl -u timelapse-capture -f ;;
     # timelapse-encode.service is listed, not just its timer: it is oneshot,
     # so a run that failed (a broken transfer, say) leaves the *service* in a
