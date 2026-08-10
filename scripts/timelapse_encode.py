@@ -523,6 +523,83 @@ def mount_problem(t, dest):
     return None
 
 
+# ----------------------------------------------------------------------------
+# Does rsync actually work against this destination?
+#
+# Lives here because this is the program that runs rsync every night, and both
+# the wizard and the pre-flight want the same answer. They ask by importing it,
+# the way they already import the encoder probe and post_webhook().
+#
+# It is a measurement, deliberately. `-a` implies --owner --group, which a CIFS
+# share often cannot set; rsync then exits 23 and the run reports a failure
+# even though the files arrived. Whether that happens depends on the server and
+# the mount options, and the pre-flight used to guess from the filesystem type
+# alone. It guessed wrong on the author's own share, warning that a working
+# configuration would fail every night.
+# ----------------------------------------------------------------------------
+
+RSYNC_CANDIDATES = (
+    ["-a", "--partial"],
+    ["-rt", "--partial"],
+    ["-a", "--no-perms", "--no-owner", "--no-group", "--partial"],
+)
+
+
+def try_rsync_args(dest, args, svcuser=None):
+    """Copy one small file to dest with `args`. (ok, detail); None if untestable.
+
+    Runs as `svcuser` when one is given and runuser exists, because that is
+    who runs it nightly, and a share can perfectly well accept root and refuse
+    the service account.
+    """
+    if not shutil.which("rsync"):
+        return None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="tl-xfer-")
+        os.chmod(tmpdir, 0o755)
+        probe = Path(tmpdir) / ".tl-transfer-probe"
+        probe.write_bytes(b"\0" * 4096)
+        if svcuser:
+            try:
+                shutil.chown(tmpdir, user=svcuser)
+                shutil.chown(probe, user=svcuser)
+            except (OSError, LookupError):
+                pass
+    except OSError:
+        return None
+
+    landed = Path(dest) / probe.name
+    try:
+        cmd = ["rsync"] + list(args) + [str(probe),
+                                        str(dest).rstrip("/") + "/"]
+        if svcuser and shutil.which("runuser"):
+            cmd = ["runuser", "-u", svcuser, "--"] + cmd
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        except Exception:                       # noqa: BLE001
+            return None
+        if r.returncode == 0:
+            return True, ""
+        detail = " ".join((r.stderr or "").split())[:200]
+        return False, f"exit {r.returncode}{': ' + detail if detail else ''}"
+    finally:
+        # The configured args may include --remove-source-files, which takes
+        # the probe with it; missing_ok covers both outcomes.
+        landed.unlink(missing_ok=True)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def probe_rsync_flags(dest, svcuser=None):
+    """First flag set that works, [] if none do, None if it could not be tested."""
+    for args in RSYNC_CANDIDATES:
+        got = try_rsync_args(dest, args, svcuser)
+        if got is None:
+            return None
+        if got[0]:
+            return args
+    return []
+
+
 def transfer(cfg, dry_run):
     """rsync the video folder to the destination. Works for both a local mount
     path and a remote user@host:/path spec."""

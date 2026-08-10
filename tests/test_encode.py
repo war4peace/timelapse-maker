@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
 import _support
 from _support import make_frame
@@ -618,6 +619,100 @@ class TestMountGuard(unittest.TestCase):
         cfg = {"paths": {"video_output": str(self.tmp)},
                "transfer": {"enabled": False}}
         self.assertIsNone(enc.transfer(cfg, dry_run=False))
+
+
+class TestRsyncProbe(unittest.TestCase):
+    """Measured, not guessed.
+
+    The pre-flight used to warn that CIFS plus `-a` meant rsync would exit 23
+    every night. `-a` does imply --owner --group, and a share often cannot set
+    them, but whether it actually fails depends on the server and the mount
+    options. On the author's own share it does not, so a working config was
+    reported as broken. A guess dressed as a finding is worse than no check.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # This suite runs on machines without rsync, where the probe correctly
+        # declines to answer. Pretend it is installed; runuser is not, so the
+        # command stays un-wrapped unless a test says otherwise.
+        p = mock.patch.object(
+            enc.shutil, "which",
+            lambda n: "/usr/bin/rsync" if n == "rsync" else None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def fake_run(self, rc, stderr=""):
+        return mock.MagicMock(return_value=mock.Mock(returncode=rc,
+                                                     stderr=stderr))
+
+    def test_success_is_reported_as_working(self):
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(0)):
+            self.assertEqual(enc.try_rsync_args(self.tmp, ["-a"]), (True, ""))
+
+    def test_a_failure_carries_the_exit_code_and_the_message(self):
+        # Exit 23 with no explanation is the thing an operator has to search
+        # for; keep rsync's own words.
+        with mock.patch.object(enc.subprocess, "run",
+                               self.fake_run(23, "rsync: chgrp failed")):
+            ok, detail = enc.try_rsync_args(self.tmp, ["-a"])
+        self.assertFalse(ok)
+        self.assertIn("exit 23", detail)
+        self.assertIn("chgrp failed", detail)
+
+    def test_the_configured_flags_are_the_ones_run(self):
+        args = ["-a", "--no-owner", "--partial", "--remove-source-files"]
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(0)) as run:
+            enc.try_rsync_args(self.tmp, args)
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[0], "rsync")
+        for a in args:
+            self.assertIn(a, cmd)
+
+    def test_it_runs_as_the_service_account_when_there_is_one(self):
+        # A share can accept root and refuse the account that runs nightly.
+        with mock.patch.object(enc.shutil, "which", lambda n: f"/usr/bin/{n}"), \
+                mock.patch.object(enc.subprocess, "run", self.fake_run(0)) as run:
+            enc.try_rsync_args(self.tmp, ["-a"], svcuser="timelapse")
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:4], ["runuser", "-u", "timelapse", "--"])
+
+    def test_no_rsync_installed_is_untestable_not_a_failure(self):
+        with mock.patch.object(enc.shutil, "which", lambda n: None):
+            self.assertIsNone(enc.try_rsync_args(self.tmp, ["-a"]))
+
+    def test_the_probe_file_is_cleaned_up_either_way(self):
+        for rc in (0, 23):
+            with mock.patch.object(enc.subprocess, "run", self.fake_run(rc)):
+                enc.try_rsync_args(self.tmp, ["-a"])
+            self.assertEqual(os.listdir(self.tmp), [], f"rc={rc}")
+
+    def test_probe_returns_the_first_flag_set_that_works(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            # Refuse -a without --no-owner, the CIFS shape.
+            bad = "-a" in cmd and "--no-owner" not in cmd
+            return mock.Mock(returncode=23 if bad else 0, stderr="chgrp")
+
+        with mock.patch.object(enc.subprocess, "run", run):
+            self.assertEqual(enc.probe_rsync_flags(self.tmp), ["-rt", "--partial"])
+
+    def test_probe_returns_empty_when_nothing_works(self):
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(23)):
+            self.assertEqual(enc.probe_rsync_flags(self.tmp), [])
+
+    def test_probe_returns_none_when_it_cannot_be_tested(self):
+        # None and [] mean different things: "unknown" and "nothing works".
+        with mock.patch.object(enc.shutil, "which", lambda n: None):
+            self.assertIsNone(enc.probe_rsync_flags(self.tmp))
+
+    def test_dash_a_is_accepted_when_the_share_accepts_it(self):
+        # The false positive that started this: -a on CIFS is not a fault.
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(0)):
+            self.assertEqual(enc.probe_rsync_flags(self.tmp), ["-a", "--partial"])
 
 
 class TestBuildSummary(unittest.TestCase):

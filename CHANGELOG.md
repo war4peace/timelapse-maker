@@ -9,6 +9,27 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+- **`timelapse transfer` no longer tells you to fix something that is already
+  right.** It ended with "Add the destination to ReadWritePaths= in
+  timelapse-encode.service by hand, or ProtectSystem=strict will fail the
+  write read-only. (Run as root to do this automatically.)" when run as root
+  against units that were already correct, which is the ordinary case since
+  the installer writes them on every upgrade. `sync_unit_readwritepaths()`
+  returned the number of units it *rewrote*, and the caller read anything
+  falsy as failure, so "nothing to do" and "could not do it" were the same
+  answer. It now reports which of six things happened and only warns on the
+  two that are actually wrong.
+- **The pre-flight measures the rsync flags instead of guessing at them.** It
+  warned that a CIFS destination with `-a` in `rsync_args` would exit 23 every
+  night. `-a` does imply `--owner --group`, and a share often cannot set them,
+  but whether it fails depends on the server and the mount options; on a real
+  share it does not, so a working configuration was reported as broken. The
+  check now copies one file with the exact flags the encoder will use, as the
+  account it runs as, and says which flags would work when they genuinely
+  fail. `probe_rsync_flags()` moved to `timelapse_encode.py`, next to the code
+  that runs rsync nightly, so the wizard and the pre-flight share one answer.
+
 ## [0.1.2] - 2026-08-10
 
 A feature release, and the first with a real upgrade path: `sudo timelapse
@@ -100,8 +121,10 @@ midnight so a day is never half one rate and half another.
   request failed) moved out of `timelapse_web.py` into the new
   `timelapse_update.py`, which the web UI imports. Two callers needed it, and
   two copies of "compare versions as tuples, not strings" is one copy too
-  many. This is the first import between this project's scripts; they are
-  installed side by side, so it resolves for either entry point.
+  many. It is the only cross-script import at module level; the others, from
+  `timelapse_setup` and `timelapse_test` into `timelapse_encode`, all sit
+  inside functions. They are installed side by side, so it resolves for either
+  entry point.
 
 ## [0.1.1] - 2026-08-09
 

@@ -42,7 +42,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
 
-# The only import between this project's scripts, and deliberately one-way.
+# The only *module-level* import between this project's scripts, and
+# deliberately one-way. Several others exist inside functions, all reaching
+# into timelapse_encode; this one is at the top because the web server needs
+# it to define a class, not to answer one call.
 # The release query is the same knowledge whether a page or a command asks it,
 # and two copies of "compare versions as tuples, not strings" is one copy too
 # many. Installed side by side in the same directory, which is sys.path[0] for

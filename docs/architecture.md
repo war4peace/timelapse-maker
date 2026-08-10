@@ -843,7 +843,8 @@ setting it there looks like a timeout and is not one.
 Two things in one file, because they are the same knowledge: the GitHub
 release query, and the `timelapse update` command.
 
-**The one import between this project's scripts**, and deliberately one-way:
+**The only module-level import between this project's scripts**, and
+deliberately one-way:
 `timelapse_web.py` imports the query half for its version panel. Everything
 else here is standalone, and this exception earns itself. Two callers need to
 know which tag is newest, and two copies of that means two places to get the
@@ -957,6 +958,30 @@ the config.
   tonight's run is encoding a day that ran on the *old* settings. Reading the
   config would measure yesterday against a cadence yesterday never ran at: a
   complete day at 5s would report 1200% coverage after a change to 60s.
+
+**Checks measure; they do not pattern-match the config.** The pre-flight used
+to warn that a CIFS destination with `-a` in `rsync_args` would exit 23 every
+night. `-a` does imply `--owner --group` and a share often cannot set them,
+but whether rsync actually fails depends on the server and the mount options.
+On a real share it does not, so a working configuration was reported as broken
+every time the operator ran the check. `try_rsync_args()` now copies one file
+with the exact flags the encoder will use, as the account it runs as, so the
+check cannot cry wolf and can name the flags that would work when it genuinely
+fails. It lives in `timelapse_encode.py` because that is the program that runs
+rsync; the wizard and the pre-flight both import it, so they cannot give
+different answers.
+
+**A falsy return must not mean four different things.**
+`sync_unit_readwritepaths()` returned the count of units it rewrote, and the
+caller treated anything falsy as failure. Running it as root against units
+that were already correct, which is the ordinary case because the installer
+writes them on every upgrade, therefore told the operator to edit the unit by
+hand as root while they were root. It returns `(status, detail)` now, with
+`changed`, `current`, `absent`, `denied`, `empty` and `failed` telling apart
+outcomes that were previously one value. The same shape as the update
+checker writing `checked` on both success and failure, and as `timelapse
+cameras` reporting an unreadable config as an absent one: **distinct outcomes
+collapsed into one falsy value.**
 
 `timelapse test` has a **Cadence** section reporting what each camera will
 produce, because the consequence of these two numbers, how long tonight's
@@ -1114,7 +1139,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 693 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 715 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1269,9 +1294,9 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ```
 install.sh                       bootstrap installer, 738 lines
 scripts/timelapse_capture.py     daemon, 646 lines
-scripts/timelapse_encode.py      batch job, 815 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 725 lines
-scripts/timelapse_setup.py       configuration wizard, 2679 lines
+scripts/timelapse_encode.py      batch job, 892 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 761 lines
+scripts/timelapse_setup.py       configuration wizard, 2691 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_web.py         read-only web UI, 2093 lines
 tests/_support.py                path setup and fakes
