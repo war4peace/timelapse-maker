@@ -557,6 +557,13 @@ A wide general view of a courtyard is fine at one frame a minute played at
 painted, wants three seconds and produces a much longer video. Both can run on
 the same host at the same time.
 
+**A change takes effect at the next midnight.** One day is one video at one
+cadence, so today keeps the cadence it started with and the new one begins at
+00:00. Nothing to remember and nothing to time: you can restart capture
+straight away, or not, and it makes no difference. The day directory records
+what it began at, so a restart, a crash or a power cut in between all leave
+today alone.
+
 **Answering with the global value removes the setting rather than storing a
 copy.** That is deliberate: a camera you have not pinned keeps following the
 defaults, so changing the global interval later still moves it. Only cameras
@@ -598,8 +605,10 @@ It **fails** a camera whose frames per day fall below `encode.min_frames`
 An interval of 15 minutes or longer would otherwise produce nothing at all,
 every night, without anything ever reporting a failure.
 
-Capture reads its camera list at startup, so this takes effect when it
-restarts, which the command offers to do.
+The recorded cadence lives in `.cadence.json` inside each day directory. It is
+a dotfile, so nothing counts it as a frame, and it goes when that day's frames
+go. Days captured before 0.1.2 have none, and both programs fall back to the
+config for those.
 
 **It restarts capture for you.** The daemon reads its camera list once, at
 startup, so an edit does nothing until it restarts; you are asked, and told the

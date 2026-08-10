@@ -62,7 +62,8 @@ def camera_timeout(cam, cfg):
 
 
 def camera_framerate(cam, cfg):
-    return int(cam.get("framerate") or cfg["encode"].get("framerate", 60))
+    return int(cam.get("framerate")
+               or cfg.get("encode", {}).get("framerate", 60))
 
 
 def dimensions(ffprobe, path):

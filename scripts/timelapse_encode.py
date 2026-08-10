@@ -321,6 +321,27 @@ def write_concat_list(frames, target):
 
 GOP_SECONDS = 2
 
+# Written by the capture daemon into each day directory: the interval and
+# frame rate that day was actually captured at. It beats the config, because
+# the config says what is in force *now* and this day may predate a change.
+# Without it, editing a camera in the afternoon would make tonight's encode
+# measure yesterday against a cadence yesterday never ran at.
+CADENCE_FILE = ".cadence.json"
+
+
+def day_cadence(day_dir):
+    """(interval, framerate) recorded for a day, or None.
+
+    None for every day captured before this existed, and for any day the
+    daemon could not annotate, so the caller falls back to the config.
+    """
+    try:
+        with open(Path(day_dir) / CADENCE_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return int(d["interval_seconds"]), int(d["framerate"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
 
 def camera_entry(cfg, name):
     """The config entry for a camera name, or {}.
@@ -362,7 +383,18 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
     ffmpeg = cfg["paths"]["ffmpeg"]
     ffprobe = cfg["paths"].get("ffprobe", "ffprobe")
     cam = camera_entry(cfg, camera)
-    fps = str(camera_framerate(cfg, cam))
+    # What this day was captured at wins over what the config says now. A
+    # cadence edit takes effect at midnight, so a day that began before one is
+    # still that day's cadence, and this is where that stays true.
+    recorded = day_cadence(day_dir)
+    if recorded:
+        interval, framerate = recorded
+        gop = int(cam.get("gop") or framerate * GOP_SECONDS)
+    else:
+        interval = camera_interval(cfg, cam)
+        framerate = camera_framerate(cfg, cam)
+        gop = camera_gop(cfg, cam)
+    fps = str(framerate)
     day = day_dir.name
     started = time.time()
 
@@ -370,7 +402,7 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
     # cadence this camera actually ran at, rather than the global one.
     result = {"camera": camera, "date": day, "status": "FAIL", "frames": 0,
               "bad": 0, "size": 0, "seconds": 0, "note": "",
-              "interval": camera_interval(cfg, cam), "fps": int(fps)}
+              "interval": interval, "fps": framerate}
 
     frames, bad = valid_frames(day_dir, cfg["capture"]["min_bytes"])
     result["frames"], result["bad"] = len(frames), bad
@@ -404,7 +436,7 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
         # already probed. Appending a second -g instead would leave the
         # command carrying two values for one option, which is exactly the
         # confusion the duplicated -r below has to be commented for.
-        args = next((c["args"] for c in build_candidates(enc, camera_gop(cfg, cam))
+        args = next((c["args"] for c in build_candidates(enc, gop)
                      if c["codec"] == encoder["codec"]), encoder["args"])
 
         cmd = ([ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-nostats",

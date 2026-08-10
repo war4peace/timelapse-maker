@@ -38,6 +38,14 @@ While the version is `0.x`, the configuration format may change in any release.
   and stores nothing when you answer with the global one, so a camera nobody
   has pinned still moves when the global setting changes.
 
+  **A change takes effect at the next midnight**, so one day is always one
+  video at one cadence. Each day directory records the interval and frame rate
+  it began at, in a dotfile no frame count sees, and both the daemon and the
+  encoder obey that over the config. So a restart at 14:00, a crash or a power
+  cut all leave today alone, and there is nothing to time: change it whenever
+  you like. It also keeps `Cov%` honest, since tonight's encode is of a day
+  that ran on the previous settings.
+
   Everything downstream follows: the capture thread runs on that cadence (HTTP
   and RTSP alike), the encoder uses that frame rate and derives the keyframe
   interval from it, `Cov%` in the nightly summary is measured against the

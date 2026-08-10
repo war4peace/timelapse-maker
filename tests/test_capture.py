@@ -5,6 +5,7 @@ depends on, and the DST fall-back collision handling. No network, no threads
 started - HttpCamera is constructed but never run().
 """
 
+import json
 import math
 import shutil
 import tempfile
@@ -193,6 +194,15 @@ class TestPerCameraCadence(unittest.TestCase):
             self.assertEqual(
                 cap.camera_interval({"interval_seconds": value}, self.cfg), 5)
 
+    def test_a_zero_framerate_override_falls_back_to_the_global(self):
+        self.assertEqual(cap.camera_framerate({"framerate": 0},
+                                              {"encode": {"framerate": 30}}), 30)
+
+    def test_a_config_with_no_encode_section_still_works(self):
+        # The daemon has never needed that section, and must not start
+        # requiring one just to record a day's cadence.
+        self.assertEqual(cap.camera_framerate({}, {"capture": {}}), 60)
+
     def test_the_rtsp_thread_honours_it_too(self):
         # ffmpeg gets fps=1/interval, so this is the same setting by another
         # route; leaving it global would make the two paths disagree.
@@ -200,6 +210,165 @@ class TestPerCameraCadence(unittest.TestCase):
                             "interval_seconds": 120}, self.cfg)
         self.assertEqual(c.interval, 120)
         self.assertIn("fps=1/120", c._cmd())
+
+
+class TestOneDayOneCadence(unittest.TestCase):
+    """A cadence change lands at midnight and nowhere else.
+
+    The day directory records what it was captured at, and that record beats
+    the config for as long as the day lasts. Without it, editing a camera at
+    14:00 and restarting would leave the day half at one rate and half at
+    another, and the encoder would then measure it against the wrong one.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = make_config(self.tmp)          # 5s interval, 4s timeout
+        self.cfg["encode"] = {"framerate": 60}
+        self.path = self.tmp / "config.json"
+        self.write_config(5, 60)
+
+    def write_config(self, interval, framerate):
+        """The config as it would be on disk, with Roof on its own cadence."""
+        cfg = dict(self.cfg)
+        cfg["cameras"] = [{"name": "Roof", "url": "http://192.0.2.1/s",
+                           "interval_seconds": interval,
+                           "framerate": framerate}]
+        self.path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    def camera(self):
+        return cap.HttpCamera({"name": "Roof", "url": "http://192.0.2.1/s",
+                               "interval_seconds": 5, "framerate": 60},
+                              self.cfg, str(self.path))
+
+    def day(self, name, interval=None, framerate=None):
+        d = self.tmp / "Roof" / name
+        d.mkdir(parents=True, exist_ok=True)
+        if interval:
+            cap.write_cadence(d, interval, framerate)
+        return d
+
+    # -- the marker ---------------------------------------------------------
+
+    def test_a_recorded_cadence_round_trips(self):
+        d = self.day("2026-08-11", 60, 30)
+        self.assertEqual(cap.read_cadence(d), (60, 30))
+
+    def test_an_unmarked_day_reads_as_nothing(self):
+        self.assertIsNone(cap.read_cadence(self.day("2026-08-11")))
+
+    def test_a_corrupt_marker_reads_as_nothing_rather_than_raising(self):
+        d = self.day("2026-08-11")
+        (d / cap.CADENCE_FILE).write_text("{ not json", encoding="utf-8")
+        self.assertIsNone(cap.read_cadence(d))
+
+    def test_the_marker_is_never_overwritten(self):
+        # The first writer is the one that knows what the day began at.
+        d = self.day("2026-08-11", 60, 30)
+        self.assertFalse(cap.write_cadence(d, 5, 60))
+        self.assertEqual(cap.read_cadence(d), (60, 30))
+
+    def test_an_unwritable_directory_is_not_fatal(self):
+        # Failing to annotate a day is not a reason to stop capturing it.
+        self.assertFalse(cap.write_cadence(self.tmp / "nope", 5, 60))
+
+    def test_the_marker_is_invisible_to_the_frame_glob(self):
+        # valid_frames() globs *.jpg and the usage report tests .jpg; a
+        # dotfile called .cadence.json is neither.
+        d = self.day("2026-08-11", 5, 60)
+        self.assertEqual(list(d.glob("*.jpg")), [])
+        self.assertTrue(cap.CADENCE_FILE.startswith("."))
+
+    # -- adoption -----------------------------------------------------------
+
+    def test_a_day_already_under_way_keeps_its_cadence(self):
+        # The config now says 60s, but today started at 5s. A daemon
+        # restarted at 14:00 must finish the day the way it began it.
+        self.day("2026-08-11", 5, 60)
+        self.write_config(60, 30)
+        cam = self.camera()
+        cam.begin_day("2026-08-11")
+        self.assertEqual((cam.interval, cam.framerate), (5, 60))
+
+    def test_a_day_that_has_not_begun_reads_the_config(self):
+        self.write_config(60, 30)
+        cam = self.camera()
+        self.assertTrue(cam.begin_day("2026-08-12"))
+        self.assertEqual((cam.interval, cam.framerate), (60, 30))
+
+    def test_the_timeout_is_reclamped_when_a_day_pins_a_short_interval(self):
+        self.day("2026-08-11", 3, 60)
+        cam = self.camera()
+        cam.begin_day("2026-08-11")
+        self.assertEqual(cam.timeout, 2)
+
+    def test_an_unreadable_config_leaves_the_cadence_alone(self):
+        # Somebody is mid-edit. Capture keeps running on what it has.
+        self.path.write_text("{ broken", encoding="utf-8")
+        cam = self.camera()
+        self.assertFalse(cam.begin_day("2026-08-12"))
+        self.assertEqual(cam.interval, 5)
+
+    def test_a_camera_removed_from_the_config_keeps_running(self):
+        self.path.write_text(json.dumps({"capture": self.cfg["capture"],
+                                         "cameras": []}), encoding="utf-8")
+        cam = self.camera()
+        self.assertFalse(cam.begin_day("2026-08-12"))
+        self.assertEqual(cam.interval, 5)
+
+    def test_no_config_path_at_all_is_survivable(self):
+        cam = cap.HttpCamera({"name": "Roof", "url": "http://192.0.2.1/s"},
+                             self.cfg)
+        self.assertFalse(cam.begin_day("2026-08-12"))
+
+    # -- writing it as the day is created -----------------------------------
+
+    def test_creating_a_day_directory_records_the_cadence(self):
+        cam = self.camera()
+        cam._dest_path(datetime(2026, 8, 11, 0, 0, 5))
+        self.assertEqual(cap.read_cadence(self.tmp / "Roof" / "2026-08-11"),
+                         (5, 60))
+
+    def test_housekeeping_annotates_a_directory_ffmpeg_made(self):
+        # The RTSP path never creates day directories itself: ffmpeg does,
+        # through -strftime_mkdir, so the marker has to come from elsewhere.
+        cam = self.camera()
+        today = cap.day_string(time.time())
+        (self.tmp / "Roof" / today).mkdir(parents=True)
+        cap.record_cadences([cam])
+        self.assertEqual(cap.read_cadence(self.tmp / "Roof" / today), (5, 60))
+
+    def test_housekeeping_never_creates_a_directory(self):
+        # A camera offline all day would otherwise leave an empty one behind
+        # every night, which the encoder finds, reports as a SKIP, and never
+        # cleans up.
+        cap.record_cadences([self.camera()])
+        self.assertFalse((self.tmp / "Roof").exists())
+
+    # -- the boundary itself ------------------------------------------------
+
+    def test_seconds_to_midnight_is_the_time_left_in_the_day(self):
+        self.assertEqual(
+            cap.seconds_to_midnight(datetime(2026, 8, 11, 23, 59, 30)), 30)
+        self.assertEqual(
+            cap.seconds_to_midnight(datetime(2026, 8, 11, 0, 0, 0)), 86400)
+
+    def test_seconds_to_midnight_never_returns_zero(self):
+        # It becomes ffmpeg's -t; zero would exit immediately and spin.
+        self.assertGreaterEqual(
+            cap.seconds_to_midnight(datetime(2026, 8, 11, 23, 59, 59, 999999)),
+            1.0)
+
+    def test_the_rtsp_command_stops_at_the_boundary(self):
+        # ffmpeg carries fps=1/interval on its command line, so adopting a
+        # new cadence means launching a new process, and midnight is the only
+        # moment that may happen.
+        cam = cap.RtspCamera({"name": "R", "url": "rtsp://192.0.2.1/s"},
+                             self.cfg, str(self.path))
+        cmd = cam._cmd()
+        self.assertIn("-t", cmd)
+        self.assertGreater(int(cmd[cmd.index("-t") + 1]), 0)
 
 
 class TestScheduleMath(unittest.TestCase):

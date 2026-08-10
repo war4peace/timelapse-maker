@@ -863,6 +863,8 @@ def edit_camera_cadence(cfg, cam):
     """
     g_int = int(cfg.get("capture", {}).get("interval_seconds", 5))
     g_fps = int(cfg.get("encode", {}).get("framerate", 60))
+    before_interval = camera_interval(cfg, cam)
+    before_fps = camera_framerate(cfg, cam)
     print()
     note(f"This camera can run on its own cadence. The defaults are one frame "
          f"every {g_int}s, played at {g_fps}fps.")
@@ -884,6 +886,12 @@ def edit_camera_cadence(cfg, cam):
     note(f"{per_day:,} frames/day -> {video_length(per_day, fps)} of video "
          f"at {fps}fps"
          + ("" if camera_overrides(cam) else ", following the defaults"))
+    if (interval, fps) != (before_interval, before_fps):
+        # One day is one video at one cadence. Saying so here is the whole
+        # reason it is safe to restart capture straight after this: today
+        # keeps the cadence it began with either way.
+        note("This takes effect at midnight. Today keeps the cadence it "
+             "started with, so a day is never half one rate and half another.")
 
     min_frames = int(cfg.get("encode", {}).get("min_frames", 100))
     if per_day < min_frames:

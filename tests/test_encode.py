@@ -701,6 +701,96 @@ class TestPerCameraEncodeSettings(unittest.TestCase):
         self.assertEqual(enc.camera_entry(self.CFG, "Ghost"), {})
         self.assertEqual(enc.camera_framerate(self.CFG, {}), 60)
 
+    def test_a_days_recorded_cadence_beats_the_config(self):
+        # A cadence edit takes effect at midnight, so tonight's encode is of a
+        # day that ran on the *old* settings. Reading the config here would
+        # measure yesterday against a cadence yesterday never ran at.
+        import json as _json
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        tmp = _Path(_tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / enc.CADENCE_FILE).write_text(
+            _json.dumps({"interval_seconds": 5, "framerate": 60}),
+            encoding="utf-8")
+        self.assertEqual(enc.day_cadence(tmp), (5, 60))
+
+    def test_an_unmarked_day_falls_back_to_the_config(self):
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        tmp = _Path(_tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.assertIsNone(enc.day_cadence(tmp))
+
+    def test_a_corrupt_marker_falls_back_rather_than_failing_the_day(self):
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        tmp = _Path(_tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / enc.CADENCE_FILE).write_text("{ nope", encoding="utf-8")
+        self.assertIsNone(enc.day_cadence(tmp))
+
+    def test_encode_day_actually_prefers_the_recorded_cadence(self):
+        """The one that matters, and the one the isolated helper tests miss.
+
+        A cadence edit takes effect at midnight, so tonight's run encodes a day
+        that ran on the *old* settings. `day_cadence()` returning the right
+        answer is worth nothing if `encode_day()` does not ask it.
+        """
+        import json as _json
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        from unittest import mock as _mock
+        from _support import make_frame
+
+        tmp = _Path(_tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        day = tmp / "frames" / "Roof" / "2026-08-10"
+        for i in range(5):
+            make_frame(day / ("%06d.jpg" % (i * 5)))
+        (day / enc.CADENCE_FILE).write_text(
+            _json.dumps({"interval_seconds": 5, "framerate": 60}),
+            encoding="utf-8")
+
+        # The config has since been changed to the slower cadence.
+        cfg = {"capture": {"interval_seconds": 5, "min_bytes": 100},
+               "encode": {"framerate": 60, "gop": 120, "min_frames": 1,
+                          "container": "mkv"},
+               "paths": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+               "cameras": [{"name": "Roof", "interval_seconds": 60,
+                            "framerate": 30}]}
+        out = tmp / "videos"
+        out.mkdir()
+        with _mock.patch.object(enc, "probe_dimensions", return_value=(512, 512)):
+            r = enc.encode_day(cfg, {"codec": "libx264", "args": []},
+                               "Roof", day, out, dry_run=True)
+        self.assertEqual(r["fps"], 60)          # not the config's 30
+        self.assertEqual(r["interval"], 5)      # not the config's 60
+
+    def test_encode_day_falls_back_to_the_config_for_an_unmarked_day(self):
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        from unittest import mock as _mock
+        from _support import make_frame
+
+        tmp = _Path(_tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        day = tmp / "frames" / "Roof" / "2026-08-10"
+        for i in range(5):
+            make_frame(day / ("%06d.jpg" % (i * 5)))
+        cfg = {"capture": {"interval_seconds": 5, "min_bytes": 100},
+               "encode": {"framerate": 60, "gop": 120, "min_frames": 1,
+                          "container": "mkv"},
+               "paths": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+               "cameras": [{"name": "Roof", "interval_seconds": 60,
+                            "framerate": 30}]}
+        out = tmp / "videos"
+        out.mkdir()
+        with _mock.patch.object(enc, "probe_dimensions", return_value=(512, 512)):
+            r = enc.encode_day(cfg, {"codec": "libx264", "args": []},
+                               "Roof", day, out, dry_run=True)
+        self.assertEqual((r["fps"], r["interval"]), (30, 60))
+
     def test_the_arguments_are_rebuilt_for_that_gop(self):
         # The codec is probed once per run; the arguments must still carry
         # this camera's keyframe interval rather than the run's.

@@ -29,7 +29,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
@@ -128,18 +128,152 @@ def camera_timeout(cam, cfg):
     return max(1, min(int(cfg["capture"]["timeout_seconds"]), interval - 1))
 
 
+def camera_framerate(cam, cfg):
+    # .get on both levels: the daemon has never needed the `encode` section,
+    # and it must not start requiring one just to annotate a day directory.
+    return int(cam.get("framerate")
+               or cfg.get("encode", {}).get("framerate", 60))
+
+
+# ----------------------------------------------------------------------------
+# One day, one cadence
+#
+# A day directory records the interval and frame rate it was captured at, and
+# that record is what both this daemon and the encoder obey. It buys one rule
+# with no exceptions: **a change to a camera's cadence takes effect at the next
+# midnight**, whatever happens in between.
+#
+# Without it the rule leaks. Editing a camera at 14:00 and restarting capture
+# would leave the day half at one cadence and half at another, and the video is
+# then uneven with no way to tell after the fact. Worse, the encoder would
+# measure that day's coverage against the *new* interval, so a complete day at
+# one frame a minute would report 8% coverage.
+#
+# The marker is a dotfile, so valid_frames()'s "*.jpg" glob and the usage
+# report's ".jpg" test both ignore it, and it goes when the day's frames go.
+# ----------------------------------------------------------------------------
+
+CADENCE_FILE = ".cadence.json"
+
+
+def day_string(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+
+
+def seconds_to_midnight(now=None):
+    """Seconds until the next local midnight, floored at 1."""
+    now = datetime.now() if now is None else now
+    midnight = (now + timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    return max(1.0, (midnight - now).total_seconds())
+
+
+def read_cadence(day_dir):
+    """(interval, framerate) this day was started at, or None."""
+    try:
+        with open(Path(day_dir) / CADENCE_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return int(d["interval_seconds"]), int(d["framerate"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def write_cadence(day_dir, interval, framerate):
+    """Record a day's cadence, once. Never overwrites and never raises.
+
+    Never overwrites, because the first writer is the one that knows what the
+    day actually began at. Never raises, because failing to annotate a day is
+    not a reason to stop capturing it; the encoder falls back to the config.
+    """
+    path = Path(day_dir) / CADENCE_FILE
+    if path.exists():
+        return False
+    try:
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"interval_seconds": int(interval),
+                       "framerate": int(framerate)}, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        log.debug("could not record the cadence in %s: %s", day_dir, exc)
+        return False
+
+
+def config_cadence(cfg_path, name):
+    """(interval, timeout, framerate) for one camera, freshly from disk.
+
+    None when the file cannot be read or the camera is no longer in it.
+    Capture must never stop because somebody is halfway through an edit, so
+    every failure here means "keep running on what we have".
+    """
+    if not cfg_path:
+        return None                 # constructed without one; keep what we have
+    try:
+        with open(cfg_path, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    for cam in cfg.get("cameras", []):
+        if cam.get("name") == name:
+            try:
+                return (camera_interval(cam, cfg), camera_timeout(cam, cfg),
+                        camera_framerate(cam, cfg))
+            except (KeyError, TypeError, ValueError):
+                return None
+    return None
+
+
 # ----------------------------------------------------------------------------
 # HTTP snapshot cameras
 # ----------------------------------------------------------------------------
 
-class HttpCamera(threading.Thread):
+class DayCadenceMixin:
+    """Settles a camera's cadence for one day, and keeps it there.
 
-    def __init__(self, cam, cfg):
+    Both camera classes need the same rule, and it is the rule rather than the
+    fetching that is easy to get subtly wrong.
+    """
+
+    def begin_day(self, day):
+        """Adopt the cadence for `day`. True if it changed.
+
+        A day already under way wins, always: its marker says what its frames
+        were captured at, so a daemon restarted at 14:00 finishes the day the
+        way it started it. Only a day with no marker yet, which means a day
+        that has not begun, reads the config, and that is what makes an edit
+        take effect at midnight and not before.
+        """
+        before = self.interval
+        pinned = read_cadence(self.root / day)
+        if pinned:
+            self.interval, self.framerate = pinned
+            self.timeout = max(1, min(self.base_timeout, self.interval - 1))
+            source = "the day's recorded cadence"
+        else:
+            fresh = config_cadence(self.cfg_path, self.name_)
+            if fresh:
+                self.interval, self.timeout, self.framerate = fresh
+            source = "the config"
+        self.day = day
+        if before != self.interval:
+            self.log.info("%s: now one frame every %ss at %sfps, from %s",
+                          day, self.interval, self.framerate, source)
+        return before != self.interval
+
+
+class HttpCamera(DayCadenceMixin, threading.Thread):
+
+    def __init__(self, cam, cfg, cfg_path=None):
         super().__init__(name=f"cap-{cam['name']}", daemon=True)
         self.cam = cam
         self.name_ = cam["name"]
         self.url = cam["url"]
+        self.cfg_path = cfg_path
+        self.day = None
         self.interval = camera_interval(cam, cfg)
+        self.framerate = camera_framerate(cam, cfg)
+        self.base_timeout = int(cfg["capture"]["timeout_seconds"])
         self.timeout = camera_timeout(cam, cfg)
         self.min_bytes = cfg["capture"]["min_bytes"]
         self.log_every = cfg["capture"].get("log_every_n_failures", 60)
@@ -171,6 +305,10 @@ class HttpCamera(threading.Thread):
         day_dir = self.root / dt.strftime("%Y-%m-%d")
         if day_dir != self._last_dir:
             day_dir.mkdir(parents=True, exist_ok=True)
+            # The day now exists, so record what it is being captured at. This
+            # is the only place that knows the directory is new, which is
+            # exactly when the answer is not in doubt.
+            write_cadence(day_dir, self.interval, self.framerate)
             self._last_dir = day_dir
         final = day_dir / (dt.strftime("%H%M%S") + ".jpg")
         # Only collides during the DST fall-back hour, when local time repeats.
@@ -239,6 +377,7 @@ class HttpCamera(threading.Thread):
 
     def run(self):
         self.root.mkdir(parents=True, exist_ok=True)
+        self.begin_day(day_string(time.time()))
         next_t = math.ceil(time.time() / self.interval) * self.interval
         # The timeout is logged because it can differ from the configured one:
         # a camera on a shorter interval than the global has it clamped, and
@@ -255,6 +394,13 @@ class HttpCamera(threading.Thread):
                 break
 
             fire_t, next_t = next_t, next_t + self.interval
+
+            # The day boundary is the only moment a cadence change is allowed
+            # to land, so it is the only moment the config is re-read.
+            day = day_string(fire_t)
+            if day != self.day and self.begin_day(day):
+                next_t = fire_t + self.interval
+
             # If we fell behind (slow camera, suspended host), resync forward
             # rather than trying to catch up on a backlog of missed frames.
             if next_t <= time.time():
@@ -294,19 +440,24 @@ class HttpCamera(threading.Thread):
 # RTSP cameras (no HTTP snapshot endpoint)
 # ----------------------------------------------------------------------------
 
-class RtspCamera(threading.Thread):
+class RtspCamera(DayCadenceMixin, threading.Thread):
     """Supervises a persistent ffmpeg that writes one frame per interval.
 
     -strftime_mkdir 1 makes ffmpeg create the YYYY-MM-DD directory itself, so
     the on-disk layout matches the HTTP path exactly.
     """
 
-    def __init__(self, cam, cfg):
+    def __init__(self, cam, cfg, cfg_path=None):
         super().__init__(name=f"cap-{cam['name']}", daemon=True)
         self.cam = cam
         self.name_ = cam["name"]
         self.url = cam["url"]
+        self.cfg_path = cfg_path
+        self.day = None
         self.interval = camera_interval(cam, cfg)
+        self.framerate = camera_framerate(cam, cfg)
+        self.base_timeout = int(cfg["capture"]["timeout_seconds"])
+        self.timeout = camera_timeout(cam, cfg)
         self.ffmpeg = cfg["paths"]["ffmpeg"]
         self.root = Path(cfg["paths"]["frames_root"]) / self.name_
         self.quality = str(cam.get("quality", 2))
@@ -327,29 +478,51 @@ class RtspCamera(threading.Thread):
             "-f", "image2",
             "-strftime", "1",
             "-strftime_mkdir", "1",
+            # Stop at midnight so the supervisor gets a turn: this process
+            # carries fps=1/interval on its command line, so adopting a new
+            # cadence means launching a new one, and the day boundary is the
+            # only moment that is allowed to happen. ffmpeg counting stream
+            # time rather than wall clock means this can land a little either
+            # side; that costs at most one relaunch, and the day's recorded
+            # cadence is what actually pins the result.
+            "-t", str(int(seconds_to_midnight())),
             "-y", pattern,
         ]
 
     def run(self):
         self.root.mkdir(parents=True, exist_ok=True)
-        self.log.info("rtsp grabber started")
+        self.begin_day(day_string(time.time()))
+        self.log.info("rtsp grabber started (%ss interval)", self.interval)
 
         while not STOP.is_set():
             if PAUSED.is_set():
                 STOP.wait(30)
                 continue
+            # Re-read at the boundary and nowhere else, the same rule the HTTP
+            # path follows. A mid-day relaunch after a dropped connection
+            # therefore reconnects on the cadence the day started with.
+            self.begin_day(day_string(time.time()))
+            rolled = False
             try:
                 self.proc = subprocess.Popen(
                     self._cmd(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 _, err = self.proc.communicate()
                 if not STOP.is_set():
-                    self.restarts += 1
-                    msg = (err or b"").decode(errors="replace").strip()[:400]
-                    self.log.warning("ffmpeg exited (rc=%s, restart #%d): %s",
-                                     self.proc.returncode, self.restarts, msg)
+                    # rc=0 means it reached the -t deadline, which is the
+                    # planned midnight handover rather than a fault. Logging
+                    # that as a warning every night would train people to
+                    # ignore the line that matters.
+                    rolled = self.proc.returncode == 0
+                    if rolled:
+                        self.log.info("day rolled over; restarting the grabber")
+                    else:
+                        self.restarts += 1
+                        msg = (err or b"").decode(errors="replace").strip()[:400]
+                        self.log.warning("ffmpeg exited (rc=%s, restart #%d): %s",
+                                         self.proc.returncode, self.restarts, msg)
             except Exception as exc:
                 self.log.error("failed to start ffmpeg: %s", exc)
-            if not STOP.is_set():
+            if not STOP.is_set() and not rolled:
                 STOP.wait(10)           # backoff before reconnecting
 
         if self.proc and self.proc.poll() is None:
@@ -395,6 +568,26 @@ class DiskGuard(threading.Thread):
 
 # ----------------------------------------------------------------------------
 
+def record_cadences(cams):
+    """Annotate today's day directory for any camera that has one yet.
+
+    The HTTP path records the cadence as it creates the directory, but the
+    RTSP path never creates one: ffmpeg does that itself, through
+    -strftime_mkdir, at whatever moment its first frame lands. So the marker
+    is also written from here, once a minute, for a directory that already
+    exists.
+
+    It never creates a directory. A camera that is offline all day would
+    otherwise leave an empty one behind every night, which the encoder would
+    find, report as a SKIP, and never clean up.
+    """
+    today = day_string(time.time())
+    for cam in cams:
+        day_dir = cam.root / today
+        if day_dir.is_dir():
+            write_cadence(day_dir, cam.interval, cam.framerate)
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
         print(f"timelapse_capture.py {__version__}")
@@ -423,9 +616,9 @@ def main():
             continue
         method = (cam.get("method") or "http").lower()
         if method == "http":
-            threads.append(HttpCamera(cam, cfg))
+            threads.append(HttpCamera(cam, cfg, cfg_path))
         elif method == "rtsp":
-            threads.append(RtspCamera(cam, cfg))
+            threads.append(RtspCamera(cam, cfg, cfg_path))
         else:
             log.error("unknown method %r for camera %s", method, cam["name"])
 
@@ -435,9 +628,14 @@ def main():
     for t in threads:
         t.start()
 
-    log.info("running with %d camera thread(s)", len(threads) - 1)
+    cams = [t for t in threads if isinstance(t, DayCadenceMixin)]
+    log.info("running with %d camera thread(s)", len(cams))
+    ticks = 0
     while not STOP.is_set():
         STOP.wait(1)
+        ticks += 1
+        if ticks % 60 == 0:
+            record_cadences(cams)
 
     for t in threads:
         t.join(timeout=20)

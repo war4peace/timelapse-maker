@@ -91,6 +91,7 @@ This is the integration point. Treat it as an API.
 
 ```
 ${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/<HHMMSS>.jpg
+${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/.cadence.json
 ${paths.video_output}/<CameraName>.<YYYYMMDD>.<container>
 ${paths.log_dir}/{capture,encode}.log
 ```
@@ -104,6 +105,7 @@ Invariants that both sides depend on:
 | Files appear atomically | Capture writes `.<stem>.tmp` then `os.replace()`. A reader never sees a partial JPEG. `os.replace` is atomic *within a filesystem*; do not move the temp file to a different mount. |
 | Dot-prefixed files are not frames | Temp files start with `.`; `glob("*.jpg")` skips them. Don't add non-frame files to a day directory without a dot prefix. |
 | A day directory older than today is complete and owned by the encoder | Capture never writes to a past date. The encoder is free to delete it. |
+| **A day has one cadence, start to finish** | `.cadence.json` records the interval and frame rate the day began at, and both programs obey it over the config. That is what lets a cadence edit take effect at the next midnight and not before, whatever restarts happen in between. Absent for days captured before 0.1.2, so both sides fall back to the config. |
 
 Adding a camera means adding a directory. Nothing else in either program needs
 to know.
@@ -928,6 +930,34 @@ Four things follow from it that are not obvious:
 - **The disk projection sums, it does not multiply.** One camera at 60s and
   five at 5s is not six times any single figure.
 
+**A change takes effect at the next midnight, and nowhere else.** The rule is
+one sentence because a day directory enforces it: `.cadence.json` records what
+the day began at, and both the daemon and the encoder read it in preference to
+the config.
+
+- `begin_day()` is the only place either camera class adopts a cadence. A day
+  with a marker adopts the marker; a day without one, which means a day that
+  has not begun, reads the config. So a daemon restarted at 14:00 finishes the
+  day the way it started it, and there is no window in which an edit lands
+  early.
+- **The marker is written twice over, deliberately.** `_dest_path()` writes it
+  as it creates the directory, which is the moment the answer is not in doubt.
+  The RTSP path never creates directories (ffmpeg does, via
+  `-strftime_mkdir`), so `record_cadences()` also runs once a minute from
+  `main()` for any directory that exists and lacks one. It never *creates*
+  one: a camera offline all day would otherwise leave an empty directory
+  behind every night, which the encoder finds, reports as a `SKIP`, and never
+  cleans up.
+- **RTSP gets `-t seconds_to_midnight()`.** ffmpeg carries `fps=1/interval` on
+  its command line, so a new cadence means a new process, and the boundary is
+  the only moment that may happen. Its `rc=0` is the planned handover and is
+  logged at info; logging it as a warning nightly would train people to ignore
+  the line that matters.
+- **The encoder prefers the marker too.** A cadence edit at 14:00 means
+  tonight's run is encoding a day that ran on the *old* settings. Reading the
+  config would measure yesterday against a cadence yesterday never ran at: a
+  complete day at 5s would report 1200% coverage after a change to 60s.
+
 `timelapse test` has a **Cadence** section reporting what each camera will
 produce, because the consequence of these two numbers, how long tonight's
 video is, cannot be read off the config. It fails a camera whose frames/day
@@ -1084,7 +1114,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 668 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 693 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1238,10 +1268,10 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 
 ```
 install.sh                       bootstrap installer, 738 lines
-scripts/timelapse_capture.py     daemon, 448 lines
-scripts/timelapse_encode.py      batch job, 783 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 724 lines
-scripts/timelapse_setup.py       configuration wizard, 2671 lines
+scripts/timelapse_capture.py     daemon, 646 lines
+scripts/timelapse_encode.py      batch job, 815 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 725 lines
+scripts/timelapse_setup.py       configuration wizard, 2679 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_web.py         read-only web UI, 2093 lines
 tests/_support.py                path setup and fakes
