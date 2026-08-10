@@ -3,7 +3,7 @@
 > [!WARNING]
 > ## ⚠️ EXPERIMENTAL: IN DEVELOPMENT
 >
-> **Version 0.1.1.** This is early software that has run on exactly one machine.
+> **Version 0.1.2.** This is early software that has run on exactly one machine.
 > It has not been tested across different distributions, camera makes, GPUs or
 > disk layouts, and it almost certainly has rough edges nobody has hit yet.
 >
@@ -14,7 +14,8 @@
 > - Capture writes tens of thousands of files a day. Point it at a disk you
 >   are willing to fill, and run `timelapse test` first; it projects real
 >   usage from your actual cameras.
-> - There is no upgrade path between versions yet, and no security review.
+> - Upgrading is `sudo timelapse update`, which keeps your configuration.
+>   There has been no security review.
 >
 > Use it if you want to experiment or help develop it. Don't put it anywhere
 > that matters yet. **No warranty**; see [LICENSE](LICENSE).
@@ -176,7 +177,7 @@ download and the run are separate steps above precisely so you can inspect
 ```bash
 sudo bash install_timelapse.sh --unattended   # no questions, sane defaults
 sudo bash install_timelapse.sh --no-wizard    # install files only
-sudo bash install_timelapse.sh --ref v0.1.1   # pin to a tag
+sudo bash install_timelapse.sh --ref v0.1.2   # pin to a tag
 sudo bash install_timelapse.sh --uninstall    # remove; captured data is kept
 ```
 

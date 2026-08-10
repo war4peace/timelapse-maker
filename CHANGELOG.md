@@ -9,6 +9,15 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-10
+
+A feature release, and the first with a real upgrade path: `sudo timelapse
+update` replaces the three-line curl recipe. The largest change is that
+capture cadence and frame rate stop being global. Any camera can run on its
+own, so a wide courtyard view at one frame a minute and a workbench at three
+seconds can share a host, and a change to either takes effect at the next
+midnight so a day is never half one rate and half another.
+
 ### Added
 - **`sudo timelapse update`.** Asks GitHub for the newest release, shows what
   changed, and installs it after one confirmation. It keeps your
@@ -669,6 +678,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.2]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.2
 [0.1.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.1
 [0.1.0]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.0
 [0.0.9]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.0.9
