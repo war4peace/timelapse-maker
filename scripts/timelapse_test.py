@@ -34,7 +34,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 OUT = Path(os.environ.get("TIMELAPSE_TEST_DIR") or
            Path(tempfile.gettempdir()) / "timelapse-test")
@@ -141,7 +141,13 @@ def test_rtsp(cam, cfg):
         return None
     dt = time.time() - t0
     if p.returncode != 0 or not sample.exists():
-        bad(f"{name}: RTSP grab failed - {(p.stderr or '').strip()[:200]}")
+        # ffmpeg quotes the URL it was handed, and an RTSP URL carries the
+        # password in its userinfo. This runs under sudo, so unredacted it
+        # would land in root's scroll-back and in whatever the operator pastes
+        # into a bug report.
+        from timelapse_encode import redact
+        bad(f"{name}: RTSP grab failed - "
+            f"{redact((p.stderr or '').strip())[:200]}")
         return None
     size = sample.stat().st_size
     dims = dimensions(cfg["paths"].get("ffprobe", "ffprobe"), sample)
@@ -574,29 +580,65 @@ def test_transfer(cfg):
     else:
         ok(f"backed by a mount at {mp}")
 
-    # rsync -a implies -o -g, which CIFS cannot honour; it exits 23 and the
-    # nightly run reports a transfer failure even though the files arrived.
-    args = t.get("rsync_args", [])
-    fstype = _fstype(mp)
-    if fstype in ("cifs", "smb3", "nfs", "nfs4") and any(
-            a == "-a" or (a.startswith("-") and not a.startswith("--")
-                          and "a" in a) for a in args):
-        warn(f"destination is {fstype} and rsync_args uses -a")
-        info("-a implies --owner --group, which this filesystem cannot set;")
-        info("rsync will exit 23 every night. Use -rt instead, or add")
-        info("--no-owner --no-group --no-perms.")
+    check_rsync_args(cfg, dest)
 
 
-def _fstype(mountpoint):
-    """Filesystem type of a mount point, or '' if it cannot be determined."""
+def check_rsync_args(cfg, dest):
+    """Copy one file with the configured flags and see what rsync says.
+
+    This used to be a guess: if the filesystem was CIFS and the flags included
+    -a, it warned that rsync would exit 23 every night. -a does imply --owner
+    --group, and a share often cannot set them, but whether it actually fails
+    depends on the server and the mount options. On the author's own share it
+    does not, so a working configuration was reported as broken nightly.
+
+    A guess dressed as a finding is worse than no check. This measures the
+    exact command the encoder will run, so it cannot cry wolf, and when it
+    does fail it can say which flags would have worked instead.
+    """
+    args = list(cfg.get("transfer", {}).get("rsync_args", []))
+    if not args:
+        info("no rsync_args configured; the encoder's defaults apply")
+        return
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import probe_rsync_flags, try_rsync_args
+
+    # As the account that runs the encode, because a share can accept root and
+    # refuse the service user. Falls back to whoever is running this.
+    svcuser = service_account()
+    got = try_rsync_args(dest, args, svcuser)
+    if got is None:
+        info("could not test the rsync flags (rsync missing, or no temp space)")
+        return
+    if got[0]:
+        who = f" as {svcuser}" if svcuser else ""
+        ok(f"rsync {' '.join(args)} works here{who}")
+        return
+
+    bad(f"rsync {' '.join(args)} fails against {dest}: {got[1]}")
+    working = probe_rsync_flags(dest, svcuser)
+    if working:
+        info(f"these work: {' '.join(working)}")
+        info("Fix it with:  sudo timelapse transfer")
+    elif working == []:
+        info("no flag combination worked; check the share permissions for")
+        info(f"{svcuser or 'this account'}.")
+
+
+def service_account():
+    """The user the encode service runs as, or None if it cannot be told.
+
+    Read from the unit rather than assumed, because --prefix and a hand-edited
+    unit both move it, and probing as the wrong user proves nothing.
+    """
+    unit = Path("/etc/systemd/system/timelapse-encode.service")
     try:
-        for line in Path("/proc/mounts").read_text().splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[1] == str(mountpoint):
-                return parts[2]
+        for line in unit.read_text(encoding="utf-8").splitlines():
+            if line.startswith("User="):
+                return line.split("=", 1)[1].strip() or None
     except OSError:
         pass
-    return ""
+    return None
 
 
 WEBHOOK_MARKER = ".webhook-verified"

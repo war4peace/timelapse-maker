@@ -305,6 +305,19 @@ swallowed, catching `Exception` deliberately: a socket timeout is not a
 `URLError`, and notification is never load-bearing, least of all in the
 critical-failure handler, where an exception would mask the original error.
 
+**`build_summary()`** writes the table inside that embed, and **the embed is
+narrower than a message**. Roughly 50 columns survive; past that Discord wraps,
+which put the last field on a second line underneath the first row and made the
+summary unreadable. Two rules keep it inside that: the column widths come from
+the content rather than being fixed (a fixed 8 could not hold `1h 02m 03s`,
+so one slow encode knocked every column after it out of line), and **the date
+is a heading, not a column**. A run normally encodes a single day, so a Date
+column spent ten characters repeating one value on every row; a catch-up run
+after an outage emits one block per day, oldest first, in a single code fence.
+Seven cameras come out at 39 columns. The worst case that can still be
+constructed, a 12-character name with `FAIL`, a one-second cadence and an
+encode over an hour, is 50.
+
 ### 4.3 `timelapse_test.py`
 
 Pre-flight checker, run manually. Never run by systemd. Not imported by the
@@ -454,7 +467,8 @@ install never means reinstalling or re-answering everything:
    offers to move the directory instead. Disabling being just as destructive as
    removing is the non-obvious half, and is why `x` warns as loudly as `r`.
 
-`redact_url()` masks `password=` in the listing. Not theatre: `ask_secret()`
+`redact_url()` masks credentials in the listing (§4.9 has the rule and why it
+now lives in one place). Not theatre: `ask_secret()`
 exists to keep credentials out of scroll-back, and printing the camera table
 would hand them straight back. The listing elides the *middle* of a long URL
 rather than the tail, because Reolink-style URLs are identical for their first
@@ -788,9 +802,32 @@ load or a click. Nothing polls and nothing is collected in the background.
   four pages at two window sizes: 240px of drift before, 1px after, the
   remainder being sub-pixel rounding when centring inside containers of
   different widths.
-- **These two pages drop the 54rem reading column.** That width suits prose and
-  tables and is wrong for raw command output, whose line length journald and
-  systemctl decide, not us. `_render()` adds `pane-page` to `<body>` for them
+- **`/status` answers the question in four words; the detail is folded away.**
+  It was `systemctl status` verbatim, which is a page per unit: the invocation
+  ID, the cgroup, the PID, the task count and the same `Documentation=` URL
+  once for each of the four units, to say whether capture is running.
+  `unit_states()` asks `systemctl show` for the eight properties the table
+  needs and `describe_unit()` turns each into one word, and the raw output
+  keeps its place inside a `<details>` because a bug report wants exactly
+  that. Three things this must keep getting right, all verified against real
+  systemd rather than reasoned about:
+  - **`show`, not `status`.** The human output is not a contract, exits 0 even
+    for a unit that is not installed, and names its own fields.
+  - **What "not running" means depends on the unit.** The nightly encode is a
+    oneshot and is inactive for 23 hours 22 minutes of every day; calling that
+    "Stopped", as the daemon rule would, invents a fault on a healthy system
+    every time anybody looks. The third field of `STATUS_UNITS` carries this.
+    Two neighbours of the same trap: a `RemainAfterExit` oneshot reports
+    `active (exited)` long after it finished, and must not read "Running"; and
+    `activating/auto-restart` is a crash loop, not a service caught mid-boot,
+    so it is red and says so.
+  - **Rows are matched by `Id`, never by position.** A block that does not come
+    back would otherwise shift every later unit onto the wrong row.
+  The one state that looks healthy and is not gets called out: enabled=no
+  while running means it will not come back after a reboot.
+- **The logs page drops the 54rem reading column.** That width suits prose and
+  tables and is wrong for raw command output, whose line length journald
+  decides, not us. `_render()` adds `pane-page` to `<body>` for it
   and `_report(pane=True)` marks the output `<section>`; the page is then a
   flex column of viewport height, so the `<pre>` is bounded and scrolls inside
   its own frame on both axes. Before this the pane grew to its content and put
@@ -829,7 +866,12 @@ load or a click. Nothing polls and nothing is collected in the background.
 
 **Security posture.** Binds `127.0.0.1` by default and warns when it does not;
 `http.server` is not hardened and there is no TLS here. It never serves
-`config.json` and never renders a camera URL; those hold credentials. Routing
+`config.json` and never renders a camera URL; those hold credentials. **It also
+never renders command output unredacted**, which is a separate promise and was
+learned the hard way: not rendering a URL is worthless when the journal it
+displays is full of them (see §4.9). `run_command()` redacts at the source, so
+a new page that shows command output cannot reintroduce the leak by omission.
+Routing
 is an explicit allow-list; anything unrecognised is 404 with no filesystem
 lookup. `server_version`/`sys_version` are overridden so the interpreter
 version is not advertised.
@@ -843,7 +885,8 @@ setting it there looks like a timeout and is not one.
 Two things in one file, because they are the same knowledge: the GitHub
 release query, and the `timelapse update` command.
 
-**The one import between this project's scripts**, and deliberately one-way:
+**The only module-level import between this project's scripts**, and
+deliberately one-way:
 `timelapse_web.py` imports the query half for its version panel. Everything
 else here is standalone, and this exception earns itself. Two callers need to
 know which tag is newest, and two copies of that means two places to get the
@@ -958,11 +1001,85 @@ the config.
   config would measure yesterday against a cadence yesterday never ran at: a
   complete day at 5s would report 1200% coverage after a change to 60s.
 
+**Checks measure; they do not pattern-match the config.** The pre-flight used
+to warn that a CIFS destination with `-a` in `rsync_args` would exit 23 every
+night. `-a` does imply `--owner --group` and a share often cannot set them,
+but whether rsync actually fails depends on the server and the mount options.
+On a real share it does not, so a working configuration was reported as broken
+every time the operator ran the check. `try_rsync_args()` now copies one file
+with the exact flags the encoder will use, as the account it runs as, so the
+check cannot cry wolf and can name the flags that would work when it genuinely
+fails. It lives in `timelapse_encode.py` because that is the program that runs
+rsync; the wizard and the pre-flight both import it, so they cannot give
+different answers.
+
+**A falsy return must not mean four different things.**
+`sync_unit_readwritepaths()` returned the count of units it rewrote, and the
+caller treated anything falsy as failure. Running it as root against units
+that were already correct, which is the ordinary case because the installer
+writes them on every upgrade, therefore told the operator to edit the unit by
+hand as root while they were root. It returns `(status, detail)` now, with
+`changed`, `current`, `absent`, `denied`, `empty` and `failed` telling apart
+outcomes that were previously one value. The same shape as the update
+checker writing `checked` on both success and failure, and as `timelapse
+cameras` reporting an unreadable config as an absent one: **distinct outcomes
+collapsed into one falsy value.**
+
 `timelapse test` has a **Cadence** section reporting what each camera will
 produce, because the consequence of these two numbers, how long tonight's
 video is, cannot be read off the config. It fails a camera whose frames/day
 falls below `encode.min_frames`: the encoder `SKIP`s that, so the camera would
 produce nothing at all, every night, without ever failing.
+
+### 4.9 Credential redaction
+
+Reported 2026-08-11, from a real deployment's web UI, and the most serious
+defect this project has shipped:
+
+```
+WARNING [Doorbell] grab failed (#1): 502 Server Error: Bad Gateway for url:
+http://192.168.2.208/cgi-bin/api.cgi?cmd=Snap&...&user=admin&password=<real>
+```
+
+The call site is `log.warning("grab failed (#%d): %s", n, err)`. **It never
+mentions a URL.** `requests` puts the URL in the exception's text, so the
+password went to journald, to `capture.log`, and from there onto a web page.
+
+That is the whole design argument. No rule about how to write log calls could
+have prevented it, because the credential arrives inside an object formatted
+by a library, so the guarantee has to sit where every record passes:
+
+- **`RedactingFormatter`, not a filter and not a call per site.** A formatter
+  runs last, which also covers tracebacks and `log.exception()`; a filter that
+  rewrote `record.msg` would let `exc_info` through untouched.
+- **`route_exceptions_through_logging()`.** Found while verifying the above on
+  real systemd: a camera thread that dies prints its traceback through
+  `threading.excepthook`, straight to stderr, meeting no formatter at all.
+  `sys.excepthook` is the same hole for the main thread. Both now log.
+- **`run_command()` redacts in `timelapse_web.py`**, at the source rather than
+  in each renderer. Fixing the daemon does nothing for the entries already in
+  the journal, and those are what the page displays.
+
+Four shapes are masked, being the four ways a secret reaches text here: query
+string (`password=`, and seven other spellings), URL userinfo
+(`rtsp://user:pass@host`, which is how ffmpeg quotes back the URL it was
+given), and the Discord webhook token, which is not a locator but the
+authority to post. `\b` on the key stops `bypass=` being read as `pass=`; over-
+redaction is otherwise the safe direction, since masking a non-secret costs a
+debugging session and the reverse costs a password.
+
+The rule lives in `timelapse_encode.py` and is **duplicated verbatim** in
+`timelapse_capture.py`, for the same reason `load_config()` is: no daemon
+should fail to start because a sibling changed. A test asserts the two are
+character-identical, because a security rule that exists twice will drift, and
+the copy that drifts is the one nobody is looking at. `redact_url()` in the
+wizard is now a thin wrapper over the same function; its own local rule knew
+only about `password=`, so every camera the wizard's RTSP path added was listed
+with its password in full.
+
+**A fix here does not clean up after itself.** The journal and `capture.log`
+keep what they already have, so the release notes tell operators to rotate the
+camera password and say how to purge both.
 
 ---
 
@@ -1114,7 +1231,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 693 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 765 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1268,12 +1385,12 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 
 ```
 install.sh                       bootstrap installer, 738 lines
-scripts/timelapse_capture.py     daemon, 646 lines
-scripts/timelapse_encode.py      batch job, 815 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 725 lines
-scripts/timelapse_setup.py       configuration wizard, 2679 lines
+scripts/timelapse_capture.py     daemon, 742 lines
+scripts/timelapse_encode.py      batch job, 988 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 767 lines
+scripts/timelapse_setup.py       configuration wizard, 2702 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2093 lines
+scripts/timelapse_web.py         read-only web UI, 2262 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

@@ -114,12 +114,12 @@ timelapse version
 ```
 
 ```
-  capture  0.1.2
-  encode   0.1.2
-  test     0.1.2
-  setup    0.1.2
-  update   0.1.2
-  web      0.1.2
+  capture  0.1.3
+  encode   0.1.3
+  test     0.1.3
+  setup    0.1.3
+  update   0.1.3
+  web      0.1.3
 ```
 
 If the daemon predates the installed files it says so explicitly, which is the
@@ -699,6 +699,33 @@ Backups carry the config's `0640`, because they hold the same camera
 passwords. They are owned by `root` rather than `root:timelapse`: the service
 has no reason to read one.
 
+### Where camera passwords can turn up, and one place they used to
+
+The config, its backups and (for a Reolink-style camera) the URL itself are
+the places a password lives by design. All are `0640 root:timelapse`.
+
+**Versions before 0.1.3 also wrote it to the log.** A failed snapshot logged
+the error `requests` raised, and that error quotes the URL it was fetching,
+credentials and all. One 502 from a camera put the password in journald, in
+`capture.log`, and on the web UI's log page. If you have ever run an earlier
+version, assume it is exposed:
+
+```bash
+sudo timelapse update                              # stop new leaks first
+sudo timelapse cameras                             # then change the password
+sudo rm -f /var/lib/timelapse/logs/capture.log*
+sudo journalctl --rotate && sudo journalctl --vacuum-time=1s
+```
+
+That last pair throws away the whole journal, not only these lines; journald
+has no way to delete selected entries. Who could have read them: anyone in the
+`systemd-journal` or `adm` groups, and anyone who could reach the web UI,
+which is worth checking if you moved `web.bind` off `127.0.0.1`.
+
+From 0.1.3 the daemons mask credentials in everything they log, and the web UI
+masks them in anything it displays, including the entries written before the
+fix.
+
 ---
 
 ## 11. The web UI
@@ -725,8 +752,11 @@ It gives you five things:
 
 - **Where your videos actually are**: see the warning below, this is the
   question people get wrong.
-- **Service status and recent log**, on request. Same output as `timelapse
-  status` and `journalctl`, without an SSH session.
+- **Service status and recent log**, on request, without an SSH session. The
+  status page is four rows saying whether each part is working and what to do
+  if it is not, rather than the page of systemd internals `timelapse status`
+  prints; the full output is still there under *Everything systemd knows*,
+  which is what to paste into a bug report.
 - **An index of finished videos**, browsable by camera, by day and by folder.
 - **Playback in your own player.** Each video has a *Play* link that hands VLC
   (or mpv, or whatever opens `.m3u`) a playlist pointing back at the server,

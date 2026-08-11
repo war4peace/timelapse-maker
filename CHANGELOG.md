@@ -7,7 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
-## [Unreleased]
+## [0.1.3] - 2026-08-11
+
+A security release. Camera passwords were reaching the log, and from there the
+web UI's log page; if you have run any earlier version, rotate the camera
+password after upgrading, because this fix cannot unwrite what is already in
+your journal. The rest is what the first days of 0.1.2 on a real deployment
+turned up: two checks that reported healthy systems as broken, and four places
+where the UI said less than it should have.
+
+### Security
+- **Camera passwords no longer reach the log, and the web UI no longer shows
+  the ones already in it.** A failed snapshot logged the exception `requests`
+  raised, and that exception's text carries the URL it was fetching. For a
+  Reolink-style camera the URL *is* the credential, so a single 502 wrote the
+  password to journald and to `capture.log`, and the web UI's log page then
+  served it to anyone who could reach the page.
+
+  Four shapes are masked now: `password=` and seven other spellings in a query
+  string, `rtsp://user:pass@host` userinfo (ffmpeg quotes the URL back at you
+  in its own errors), and Discord webhook tokens. The masking is a logging
+  *formatter*, not a rule about how to write log calls: the leak came from a
+  call that never mentioned a URL, so nothing at the call site could have
+  known. Uncaught exceptions from a camera thread, which bypass logging
+  entirely and print to stderr, were a second route and now go to the log too.
+  The web UI redacts command output at the source, which is what covers the
+  entries already in your journal.
+
+  **If you ran any earlier version, treat the camera password as exposed.**
+  Upgrading stops new leaks; it cannot unwrite the old ones. After upgrading:
+
+  ```
+  sudo timelapse update
+  sudo timelapse cameras            # set a new password on each camera
+  sudo rm -f /var/lib/timelapse/logs/capture.log*
+  sudo journalctl --rotate && sudo journalctl --vacuum-time=1s
+  ```
+
+  The `journalctl` pair discards the whole journal, not just these lines;
+  there is no way to delete selected entries. Anyone in `systemd-journal` or
+  `adm` could read them, and so could anyone who could reach the web UI, which
+  matters most if you moved `web.bind` off `127.0.0.1`.
+
+### Changed
+- **The web UI's Service status page says whether it works, in four words.**
+  It was `systemctl status` verbatim: an invocation ID, a cgroup path, a PID,
+  a task count and the same documentation URL four times over, to answer a
+  question that fits on one line. It is now a row per service, in plain words,
+  with what to do about it when something is wrong. The full output is one
+  click away under *Everything systemd knows*, because when something *is*
+  wrong that is what a bug report needs. Each row says what "not running"
+  means for that unit: the nightly encode is a oneshot that sits inactive for
+  23 hours 22 minutes a day, and reporting that as "Stopped" would invent a
+  fault on a healthy system every time anybody looked. A crash loop reads as
+  one, and a service that is running but not enabled says it will not come
+  back after a reboot.
+- **The page header dropped the word "web"** from `timelapse-maker web 0.1.2`.
+  There is no way to be reading that page other than through the web UI.
+- **The version panel renders both numbers the same way.** Installed was a
+  `<code>` and Latest was not, so a two-row list showed one version number in
+  two different fonts, which reads as a rendering fault. Colour still marks
+  out an available update, which is the only difference that means anything
+  there.
+
+### Fixed
+- **`timelapse transfer` no longer tells you to fix something that is already
+  right.** It ended with "Add the destination to ReadWritePaths= in
+  timelapse-encode.service by hand, or ProtectSystem=strict will fail the
+  write read-only. (Run as root to do this automatically.)" when run as root
+  against units that were already correct, which is the ordinary case since
+  the installer writes them on every upgrade. `sync_unit_readwritepaths()`
+  returned the number of units it *rewrote*, and the caller read anything
+  falsy as failure, so "nothing to do" and "could not do it" were the same
+  answer. It now reports which of six things happened and only warns on the
+  two that are actually wrong.
+- **The pre-flight measures the rsync flags instead of guessing at them.** It
+  warned that a CIFS destination with `-a` in `rsync_args` would exit 23 every
+  night. `-a` does imply `--owner --group`, and a share often cannot set them,
+  but whether it fails depends on the server and the mount options; on a real
+  share it does not, so a working configuration was reported as broken. The
+  check now copies one file with the exact flags the encoder will use, as the
+  account it runs as, and says which flags would work when they genuinely
+  fail. `probe_rsync_flags()` moved to `timelapse_encode.py`, next to the code
+  that runs rsync nightly, so the wizard and the pre-flight share one answer.
+- **The nightly Discord table no longer wraps.** Discord renders an embed's
+  description in a column narrower than an ordinary message, and the table was
+  a fixed 62 wide, so its last field folded onto a second line underneath the
+  first and the summary read as broken. The date moved out of the column set
+  and became a heading, since a run almost always encodes one day and the
+  column spent ten characters repeating one value; a catch-up run after an
+  outage gets a block per day instead. The remaining widths are measured from
+  the content, which also fixes an encode over an hour knocking every column
+  after it out of line: `1h 02m 03s` never fitted the fixed 8. The same seven
+  cameras now come out at 39 columns rather than 62.
 
 ## [0.1.2] - 2026-08-10
 
@@ -100,8 +192,10 @@ midnight so a day is never half one rate and half another.
   request failed) moved out of `timelapse_web.py` into the new
   `timelapse_update.py`, which the web UI imports. Two callers needed it, and
   two copies of "compare versions as tuples, not strings" is one copy too
-  many. This is the first import between this project's scripts; they are
-  installed side by side, so it resolves for either entry point.
+  many. It is the only cross-script import at module level; the others, from
+  `timelapse_setup` and `timelapse_test` into `timelapse_encode`, all sit
+  inside functions. They are installed side by side, so it resolves for either
+  entry point.
 
 ## [0.1.1] - 2026-08-09
 
@@ -678,6 +772,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.3]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.3
 [0.1.2]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.2
 [0.1.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.1
 [0.1.0]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.0

@@ -630,6 +630,14 @@ class TestCameraManagement(unittest.TestCase):
         self.assertIn("channel=0", red)
         self.assertNotIn("p%40ss", red)
 
+    def test_redaction_covers_the_rtsp_shape_too(self):
+        # The wizard's own RTSP path produces exactly this form, and the local
+        # rule only knew about `password=`, so every RTSP camera it added was
+        # listed with its password in full.
+        red = setup.redact_url("rtsp://admin:hunter2@192.0.2.7:554/Preview_01")
+        self.assertNotIn("hunter2", red)
+        self.assertIn("192.0.2.7:554/Preview_01", red)
+
 
 class TestResolveCamera(unittest.TestCase):
     """`timelapse cameras -e:2` and `-e:Doorbell` reach the same camera.
@@ -1372,11 +1380,21 @@ class TestBindProbe(unittest.TestCase):
     def test_the_probe_leaves_the_port_free(self):
         # It binds without listening and closes immediately; if it leaked the
         # socket, the service it just approved could not start.
-        setup.check_bind("127.0.0.1", 8787)
+        #
+        # The port is borrowed from the kernel rather than hardcoded. A fixed
+        # 8787 failed here with WinError 10013 the day Hyper-V's dynamic
+        # exclusion range happened to cover it, which is a fault in the test,
+        # not in the probe.
+        borrow = socket.socket()
+        borrow.bind(("127.0.0.1", 0))
+        port = borrow.getsockname()[1]
+        borrow.close()
+
+        setup.check_bind("127.0.0.1", port)
         again = socket.socket()
         again.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.addCleanup(again.close)
-        again.bind(("127.0.0.1", 8787))     # raises if the probe held on
+        again.bind(("127.0.0.1", port))     # raises if the probe held on
 
     def test_lan_address_is_never_loopback(self):
         # It may legitimately be "" on a host with no default route; what it
@@ -1804,6 +1822,105 @@ class TestCadenceListing(unittest.TestCase):
                           "url": "http://h/api?user=admin&password=hunter2"}])
         self.assertNotIn("hunter2", out)
         self.assertIn("***", out)
+
+
+class TestSyncReadWritePaths(unittest.TestCase):
+    """"Nothing to do" and "could not do it" must not share a return value.
+
+    This returned a bare bool counting the units it rewrote, and the caller
+    read anything falsy as failure. So running it as root against units that
+    were already correct - the ordinary case, since the installer writes them
+    on every upgrade - told the operator to edit the unit by hand as root,
+    while they were root. Reported from a real 0.1.2 install.
+    """
+
+    CFG = {"paths": {"frames_root": "/var/lib/timelapse/frames",
+                     "video_output": "/var/lib/timelapse/videos",
+                     "log_dir": "/var/lib/timelapse/logs"},
+           "transfer": {"enabled": True, "destination": "/mnt/cctv/TL/"}}
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.want = " ".join(setup.writable_paths(self.CFG))
+
+    def unit(self, name="timelapse-encode.service", rwp=None):
+        p = self.tmp / name
+        body = "[Service]\n"
+        if rwp is not None:
+            body += f"ReadWritePaths={rwp}\n"
+        p.write_text(body + "ProtectSystem=strict\n", encoding="utf-8")
+        return p
+
+    def sync(self, root=True):
+        with mock.patch.object(setup, "is_root", lambda: root), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return setup.sync_unit_readwritepaths(self.CFG, unitdir=str(self.tmp))
+
+    def report(self, status, detail=""):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            setup.report_readwritepaths(status, detail)
+        return buf.getvalue()
+
+    def test_a_stale_unit_is_rewritten(self):
+        u = self.unit(rwp="/var/lib/timelapse/frames")
+        status, detail = self.sync()
+        self.assertEqual(status, "changed")
+        self.assertIn(f"ReadWritePaths={self.want}", u.read_text(encoding="utf-8"))
+
+    def test_a_correct_unit_reports_current_not_failure(self):
+        self.unit(rwp=self.want)
+        self.assertEqual(self.sync()[0], "current")
+
+    def test_a_correct_unit_is_not_rewritten(self):
+        u = self.unit(rwp=self.want)
+        before = u.read_text(encoding="utf-8")
+        self.sync()
+        self.assertEqual(u.read_text(encoding="utf-8"), before)
+
+    def test_no_units_installed_is_absent_not_failure(self):
+        self.assertEqual(self.sync()[0], "absent")
+
+    def test_not_root_is_denied(self):
+        self.unit(rwp="/wrong")
+        self.assertEqual(self.sync(root=False)[0], "denied")
+
+    def test_an_unwritable_unit_is_a_real_failure(self):
+        self.unit(rwp="/wrong")
+        with mock.patch.object(Path, "write_text",
+                               side_effect=OSError("read-only")):
+            status, detail = self.sync()
+        self.assertEqual(status, "failed")
+        self.assertIn("read-only", detail)
+
+    def test_the_transfer_destination_is_included(self):
+        self.assertIn("/mnt/cctv/TL", self.want)
+
+    # -- what the operator is told ------------------------------------------
+
+    def test_current_says_nothing_is_wrong(self):
+        out = self.report("current", self.want)
+        self.assertNotIn("by hand", out)
+        self.assertIn("nothing to do", out.lower())
+
+    def test_changed_is_silent_because_it_already_narrated(self):
+        self.assertEqual(self.report("changed", self.want), "")
+
+    def test_denied_is_the_only_one_that_mentions_sudo(self):
+        self.assertIn("sudo", self.report("denied", ""))
+        for status in ("current", "changed", "absent", "failed"):
+            self.assertNotIn("sudo", self.report(status, "x"), status)
+
+    def test_failed_still_tells_you_to_fix_it_by_hand(self):
+        out = self.report("failed", "encode.service: read-only")
+        self.assertIn("by hand", out)
+        self.assertIn("read-only", out)
+
+    def test_absent_does_not_sound_like_a_problem(self):
+        out = self.report("absent", "")
+        self.assertNotIn("by hand", out)
+        self.assertIn("nothing to", out.lower())
 
 
 class TestConfigBackups(unittest.TestCase):

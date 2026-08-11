@@ -32,10 +32,72 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+# ----------------------------------------------------------------------------
+# Credential redaction
+#
+# The canonical copy, here because this is the module the wizard and the
+# pre-flight already reach into, and because two versions of a rule like this
+# would eventually disagree. timelapse_capture.py carries a duplicate: it is a
+# daemon and deliberately imports nothing from its siblings, so a test asserts
+# the two patterns are identical rather than trusting anyone to keep them so.
+#
+# Reported from the real deployment 2026-08-11: a camera returned 502, requests
+# raised, and the exception text carries the URL it was fetching. That URL is
+# the Reolink shape, credentials in the query string, so the password went to
+# journald and then onto the web UI's log page in full. The call site said
+# nothing about a URL, which is the point below.
+# ----------------------------------------------------------------------------
+
+MASK = "***"
+
+CRED_PATTERNS = (
+    # Query-string credentials: the Reolink shape, ?user=admin&password=hunter2.
+    # \b so "bypass=" is not read as "pass=". The value ends at the next
+    # parameter or at whitespace, since a URL in a log line is followed by
+    # prose more often than not.
+    (re.compile(r"\b((?:password|passwd|pwd|pass|secret|token|auth|apikey|"
+                r"api[-_]?key)=)[^&\s\"'<>]*", re.I), r"\1" + MASK),
+    # URL userinfo: the RTSP shape, rtsp://user:hunter2@host. ffmpeg prints the
+    # URL it was given in its own error output, so this arrives second-hand.
+    (re.compile(r"(//[^/\s:@]{1,64}:)[^/\s@]*(@)"), r"\1" + MASK + r"\2"),
+    # A Discord webhook URL is not a locator, it is the authority to post. It
+    # reaches the log through urllib's exception text on a failed notification.
+    (re.compile(r"(/api/webhooks/\d+/)[\w-]+", re.I), r"\1" + MASK),
+)
+
+
+def redact(text):
+    """Mask anything in `text` that would be a credential in a log or on a page.
+
+    Deliberately over-eager: masking a value that turns out not to be secret
+    costs somebody a debugging session, and the other way round costs them a
+    password.
+    """
+    text = str(text)
+    for pattern, replacement in CRED_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class RedactingFormatter(logging.Formatter):
+    """A formatter, not a filter, and not a call at each log site.
+
+    The leak this exists for came from `log.warning("grab failed: %s", err)`,
+    a call that never mentions a URL: the credential was inside an exception
+    raised three libraries away. Nothing at the call site can be trusted to
+    know what it is about to print, so the guarantee has to sit at the last
+    point every record passes through. Formatting last also covers tracebacks
+    and `log.exception()`, which a filter on the record's message would not.
+    """
+
+    def format(self, record):
+        return redact(super().format(record))
 
 
 # ----------------------------------------------------------------------------
@@ -43,8 +105,8 @@ DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # ----------------------------------------------------------------------------
 
 def setup_logging(log_dir):
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
-                            "%Y-%m-%d %H:%M:%S")
+    fmt = RedactingFormatter("%(asctime)s %(levelname)-7s %(message)s",
+                             "%Y-%m-%d %H:%M:%S")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     sh = logging.StreamHandler(sys.stdout)
@@ -523,6 +585,83 @@ def mount_problem(t, dest):
     return None
 
 
+# ----------------------------------------------------------------------------
+# Does rsync actually work against this destination?
+#
+# Lives here because this is the program that runs rsync every night, and both
+# the wizard and the pre-flight want the same answer. They ask by importing it,
+# the way they already import the encoder probe and post_webhook().
+#
+# It is a measurement, deliberately. `-a` implies --owner --group, which a CIFS
+# share often cannot set; rsync then exits 23 and the run reports a failure
+# even though the files arrived. Whether that happens depends on the server and
+# the mount options, and the pre-flight used to guess from the filesystem type
+# alone. It guessed wrong on the author's own share, warning that a working
+# configuration would fail every night.
+# ----------------------------------------------------------------------------
+
+RSYNC_CANDIDATES = (
+    ["-a", "--partial"],
+    ["-rt", "--partial"],
+    ["-a", "--no-perms", "--no-owner", "--no-group", "--partial"],
+)
+
+
+def try_rsync_args(dest, args, svcuser=None):
+    """Copy one small file to dest with `args`. (ok, detail); None if untestable.
+
+    Runs as `svcuser` when one is given and runuser exists, because that is
+    who runs it nightly, and a share can perfectly well accept root and refuse
+    the service account.
+    """
+    if not shutil.which("rsync"):
+        return None
+    try:
+        tmpdir = tempfile.mkdtemp(prefix="tl-xfer-")
+        os.chmod(tmpdir, 0o755)
+        probe = Path(tmpdir) / ".tl-transfer-probe"
+        probe.write_bytes(b"\0" * 4096)
+        if svcuser:
+            try:
+                shutil.chown(tmpdir, user=svcuser)
+                shutil.chown(probe, user=svcuser)
+            except (OSError, LookupError):
+                pass
+    except OSError:
+        return None
+
+    landed = Path(dest) / probe.name
+    try:
+        cmd = ["rsync"] + list(args) + [str(probe),
+                                        str(dest).rstrip("/") + "/"]
+        if svcuser and shutil.which("runuser"):
+            cmd = ["runuser", "-u", svcuser, "--"] + cmd
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        except Exception:                       # noqa: BLE001
+            return None
+        if r.returncode == 0:
+            return True, ""
+        detail = " ".join((r.stderr or "").split())[:200]
+        return False, f"exit {r.returncode}{': ' + detail if detail else ''}"
+    finally:
+        # The configured args may include --remove-source-files, which takes
+        # the probe with it; missing_ok covers both outcomes.
+        landed.unlink(missing_ok=True)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def probe_rsync_flags(dest, svcuser=None):
+    """First flag set that works, [] if none do, None if it could not be tested."""
+    for args in RSYNC_CANDIDATES:
+        got = try_rsync_args(dest, args, svcuser)
+        if got is None:
+            return None
+        if got[0]:
+            return args
+    return []
+
+
 def transfer(cfg, dry_run):
     """rsync the video folder to the destination. Works for both a local mount
     path and a remote user@host:/path spec."""
@@ -617,22 +756,56 @@ def send_discord(cfg, title, description, color, fields):
         log.warning("Discord notification failed: %s", exc)
 
 
+NAME_COL = 12
+SUMMARY_HEADS = ("Camera", "St", "Frames", "Cov%", "Size", "Time")
+SUMMARY_ALIGN = ("<", "<", ">", ">", ">", ">")
+
+
+def pad_row(values, widths):
+    """One line of the table. Trailing blanks trimmed; they only cost width."""
+    return " ".join(
+        v.ljust(w) if a == "<" else v.rjust(w)
+        for v, a, w in zip(values, SUMMARY_ALIGN, widths)).rstrip()
+
+
 def build_summary(results, interval):
-    fmt = "{:<12} {:<10} {:<5} {:>7} {:>5} {:>9} {:>8}"
-    rows = [fmt.format("Camera", "Date", "St", "Frames", "Cov%", "Size", "Time"),
-            "-" * 62]
-    for r in results:
-        # Against the cadence this camera ran at. Using the global interval
-        # made a camera at one frame a minute read as 8% coverage every night,
-        # which is a full day of frames reported as a near-total outage.
-        expected = int(86400 / (r.get("interval") or interval))
-        cov = f"{100.0 * r['frames'] / expected:.0f}" if r["frames"] else "-"
-        rows.append(fmt.format(
-            r["camera"][:12], r["date"], r["status"],
-            r["frames"] or "-", cov,
-            human_size(r["size"]) if r["size"] else "-",
-            human_duration(r["seconds"])))
-    return "```\n" + "\n".join(rows) + "\n```"
+    """The nightly table, as a Discord code block.
+
+    Discord renders an embed's description in a column narrower than an
+    ordinary message and wraps whatever overflows, so a fixed 62-column table
+    put its last field on a second line underneath the first. Two things keep
+    it narrow: the widths come from the content, and the date is a heading
+    rather than a column repeating one value on every row. A run normally
+    encodes a single day; catch-up runs after an outage get a block each.
+    """
+    if not results:
+        return "Nothing to report."
+    blocks = []
+    for date in sorted({r["date"] for r in results}):
+        rows = []
+        for r in results:
+            if r["date"] != date:
+                continue
+            # Against the cadence this camera ran at. Using the global interval
+            # made a camera at one frame a minute read as 8% coverage every
+            # night, which is a full day of frames reported as a near-outage.
+            expected = int(86400 / (r.get("interval") or interval))
+            rows.append((
+                str(r["camera"])[:NAME_COL],
+                r["status"],
+                str(r["frames"] or "-"),
+                f"{100.0 * r['frames'] / expected:.0f}" if r["frames"] else "-",
+                human_size(r["size"]) if r["size"] else "-",
+                human_duration(r["seconds"])))
+        widths = [max([len(h)] + [len(row[i]) for row in rows])
+                  for i, h in enumerate(SUMMARY_HEADS)]
+        # Not len(header): the row builder strips trailing blanks, so a short
+        # value in the last column would shorten the rule under it.
+        rule = "-" * (sum(widths) + len(widths) - 1)
+        blocks.append("\n".join(
+            [date, pad_row(SUMMARY_HEADS, widths), rule]
+            + [pad_row(row, widths) for row in rows]))
+    return "```\n" + "\n\n".join(blocks) + "\n```"
 
 
 # ----------------------------------------------------------------------------

@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from unittest import mock
 
 import _support
 from _support import make_frame
@@ -620,6 +621,100 @@ class TestMountGuard(unittest.TestCase):
         self.assertIsNone(enc.transfer(cfg, dry_run=False))
 
 
+class TestRsyncProbe(unittest.TestCase):
+    """Measured, not guessed.
+
+    The pre-flight used to warn that CIFS plus `-a` meant rsync would exit 23
+    every night. `-a` does imply --owner --group, and a share often cannot set
+    them, but whether it actually fails depends on the server and the mount
+    options. On the author's own share it does not, so a working config was
+    reported as broken. A guess dressed as a finding is worse than no check.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # This suite runs on machines without rsync, where the probe correctly
+        # declines to answer. Pretend it is installed; runuser is not, so the
+        # command stays un-wrapped unless a test says otherwise.
+        p = mock.patch.object(
+            enc.shutil, "which",
+            lambda n: "/usr/bin/rsync" if n == "rsync" else None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def fake_run(self, rc, stderr=""):
+        return mock.MagicMock(return_value=mock.Mock(returncode=rc,
+                                                     stderr=stderr))
+
+    def test_success_is_reported_as_working(self):
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(0)):
+            self.assertEqual(enc.try_rsync_args(self.tmp, ["-a"]), (True, ""))
+
+    def test_a_failure_carries_the_exit_code_and_the_message(self):
+        # Exit 23 with no explanation is the thing an operator has to search
+        # for; keep rsync's own words.
+        with mock.patch.object(enc.subprocess, "run",
+                               self.fake_run(23, "rsync: chgrp failed")):
+            ok, detail = enc.try_rsync_args(self.tmp, ["-a"])
+        self.assertFalse(ok)
+        self.assertIn("exit 23", detail)
+        self.assertIn("chgrp failed", detail)
+
+    def test_the_configured_flags_are_the_ones_run(self):
+        args = ["-a", "--no-owner", "--partial", "--remove-source-files"]
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(0)) as run:
+            enc.try_rsync_args(self.tmp, args)
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[0], "rsync")
+        for a in args:
+            self.assertIn(a, cmd)
+
+    def test_it_runs_as_the_service_account_when_there_is_one(self):
+        # A share can accept root and refuse the account that runs nightly.
+        with mock.patch.object(enc.shutil, "which", lambda n: f"/usr/bin/{n}"), \
+                mock.patch.object(enc.subprocess, "run", self.fake_run(0)) as run:
+            enc.try_rsync_args(self.tmp, ["-a"], svcuser="timelapse")
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:4], ["runuser", "-u", "timelapse", "--"])
+
+    def test_no_rsync_installed_is_untestable_not_a_failure(self):
+        with mock.patch.object(enc.shutil, "which", lambda n: None):
+            self.assertIsNone(enc.try_rsync_args(self.tmp, ["-a"]))
+
+    def test_the_probe_file_is_cleaned_up_either_way(self):
+        for rc in (0, 23):
+            with mock.patch.object(enc.subprocess, "run", self.fake_run(rc)):
+                enc.try_rsync_args(self.tmp, ["-a"])
+            self.assertEqual(os.listdir(self.tmp), [], f"rc={rc}")
+
+    def test_probe_returns_the_first_flag_set_that_works(self):
+        calls = []
+
+        def run(cmd, **kw):
+            calls.append(cmd)
+            # Refuse -a without --no-owner, the CIFS shape.
+            bad = "-a" in cmd and "--no-owner" not in cmd
+            return mock.Mock(returncode=23 if bad else 0, stderr="chgrp")
+
+        with mock.patch.object(enc.subprocess, "run", run):
+            self.assertEqual(enc.probe_rsync_flags(self.tmp), ["-rt", "--partial"])
+
+    def test_probe_returns_empty_when_nothing_works(self):
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(23)):
+            self.assertEqual(enc.probe_rsync_flags(self.tmp), [])
+
+    def test_probe_returns_none_when_it_cannot_be_tested(self):
+        # None and [] mean different things: "unknown" and "nothing works".
+        with mock.patch.object(enc.shutil, "which", lambda n: None):
+            self.assertIsNone(enc.probe_rsync_flags(self.tmp))
+
+    def test_dash_a_is_accepted_when_the_share_accepts_it(self):
+        # The false positive that started this: -a on CIFS is not a fault.
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(0)):
+            self.assertEqual(enc.probe_rsync_flags(self.tmp), ["-a", "--partial"])
+
+
 class TestBuildSummary(unittest.TestCase):
 
     def row(self, **kw):
@@ -659,6 +754,60 @@ class TestBuildSummary(unittest.TestCase):
         row = self.row()
         row.pop("interval", None)
         self.assertIn("100", enc.build_summary([row], 5))
+
+    # -- width ------------------------------------------------------------
+    # Reported from the real deployment: Discord renders an embed's
+    # description in a column narrower than an ordinary message, and the
+    # fixed 62-column table wrapped its last field onto a second line
+    # underneath the first. About 50 columns survive; 48 leaves a margin for
+    # a narrower client.
+    BUDGET = 48
+
+    def widest(self, out):
+        return max(len(line) for line in out.splitlines())
+
+    def test_a_full_house_fits_the_discord_embed(self):
+        rows = [self.row(camera=n) for n in
+                ("Court180", "Doorbell", "Garage", "Gate", "Roof",
+                 "Street4K", "Workshop")]
+        self.assertLessEqual(self.widest(enc.build_summary(rows, 5)),
+                             self.BUDGET)
+
+    def test_even_the_widest_plausible_row_fits(self):
+        # Every column at its maximum at once: a name at the 12-char cap, the
+        # longest status, a one-second cadence, three-digit megabytes and an
+        # encode over an hour, which is the form human_duration writes widest.
+        row = self.row(camera="BackCourtyardWest", status="FAIL", frames=86400,
+                       size=int(1023.9 * 1024 ** 2), seconds=3723, interval=1)
+        self.assertLessEqual(self.widest(enc.build_summary([row], 5)), 52)
+
+    def test_the_date_is_a_heading_not_a_column(self):
+        rows = [self.row(camera="Roof"), self.row(camera="Gate")]
+        out = enc.build_summary(rows, 5)
+        self.assertEqual(out.count("2026-08-04"), 1)
+
+    def test_each_date_gets_its_own_block_in_one_code_fence(self):
+        # A catch-up run after an outage encodes several days at once.
+        rows = [self.row(date="2026-08-04"), self.row(date="2026-08-03")]
+        out = enc.build_summary(rows, 5)
+        self.assertEqual(out.count("2026-08-03"), 1)
+        self.assertEqual(out.count("2026-08-04"), 1)
+        self.assertEqual(out.count("```"), 2)
+        # Oldest first, the order the days were captured in.
+        self.assertLess(out.index("2026-08-03"), out.index("2026-08-04"))
+
+    def test_columns_size_to_their_content(self):
+        # The old Time column was 8 wide and "1h 02m 03s" is 10, so a slow
+        # encode pushed every column after it out of line.
+        out = enc.build_summary([self.row(camera="Roof", seconds=3723)], 5)
+        self.assertIn("1h 02m 03s", out)
+        lines = out.splitlines()
+        head = next(ln for ln in lines if ln.startswith("Camera"))
+        body = next(ln for ln in lines if ln.startswith("Roof"))
+        self.assertEqual(len(head), len(body))
+
+    def test_no_results_is_not_an_empty_code_block(self):
+        self.assertEqual(enc.build_summary([], 5), "Nothing to report.")
 
 
 class TestPerCameraEncodeSettings(unittest.TestCase):
@@ -797,6 +946,80 @@ class TestPerCameraEncodeSettings(unittest.TestCase):
         args = enc.build_candidates({"gop": 120}, gop=60)[0]["args"]
         self.assertIn("60", args)
         self.assertNotIn("120", args)
+
+
+class TestRedact(unittest.TestCase):
+    """The canonical rule. Every camera password in this project reaches a log
+    or a page through one of these four shapes."""
+
+    S = "Sup3rS3cret!"
+
+    def test_a_query_string_password(self):
+        out = enc.redact(f"http://cam/api.cgi?cmd=Snap&user=admin&password={self.S}")
+        self.assertNotIn(self.S, out)
+        self.assertIn("password=***", out)
+
+    def test_the_rest_of_the_url_survives(self):
+        # A redacted line still has to be worth keeping: the host and the
+        # endpoint are what makes a capture failure diagnosable.
+        out = enc.redact(f"http://192.0.2.7/cgi-bin/api.cgi?cmd=Snap&channel=0"
+                         f"&user=admin&password={self.S}")
+        for keep in ("192.0.2.7", "cgi-bin/api.cgi", "cmd=Snap", "channel=0",
+                     "user=admin"):
+            self.assertIn(keep, out)
+
+    def test_every_spelling_of_the_key(self):
+        for key in ("password", "passwd", "pwd", "pass", "secret", "token",
+                    "auth", "apikey", "api_key", "api-key", "PASSWORD",
+                    "Password"):
+            with self.subTest(key=key):
+                out = enc.redact(f"http://h/a?{key}={self.S}&x=1")
+                self.assertNotIn(self.S, out)
+                self.assertIn("x=1", out)
+
+    def test_a_key_that_merely_ends_in_pass_is_left_alone(self):
+        # \b in the pattern. Over-redaction is the safe direction, but not so
+        # far that ordinary parameters vanish.
+        self.assertEqual(enc.redact("http://h/a?bypass=no&compass=n"),
+                         "http://h/a?bypass=no&compass=n")
+
+    def test_url_userinfo_the_rtsp_shape(self):
+        out = enc.redact(f"rtsp://admin:{self.S}@192.0.2.7:554/Preview_01_main")
+        self.assertNotIn(self.S, out)
+        self.assertIn("rtsp://admin:***@192.0.2.7:554/Preview_01_main", out)
+
+    def test_a_discord_webhook_token(self):
+        # Not a locator: whoever holds it can post to the channel.
+        out = enc.redact("https://discord.com/api/webhooks/123456/abcDEF-ghi_JKL")
+        self.assertNotIn("abcDEF", out)
+        self.assertIn("/api/webhooks/123456/***", out)
+
+    def test_a_url_with_no_credential_is_untouched(self):
+        for clean in ("https://github.com/war4peace/timelapse-maker",
+                      "http://192.0.2.7/cgi-bin/api.cgi?cmd=Snap&channel=0",
+                      "rsync://nas/videos"):
+            self.assertEqual(enc.redact(clean), clean)
+
+    def test_several_credentials_in_one_line(self):
+        out = enc.redact(f"tried rtsp://u:{self.S}@a/ then http://b?pwd={self.S}")
+        self.assertNotIn(self.S, out)
+        self.assertEqual(out.count("***"), 2)
+
+    def test_the_value_ends_where_the_url_does(self):
+        # A log line is prose with a URL in it, not a URL. Stopping only at &
+        # swallowed the rest of the sentence, which hid the error message.
+        out = enc.redact(f"http://h/a?password={self.S} (attempt 2)")
+        self.assertIn("(attempt 2)", out)
+        self.assertNotIn(self.S, out)
+
+    def test_redacting_twice_changes_nothing(self):
+        once = enc.redact(f"http://h/a?password={self.S}")
+        self.assertEqual(enc.redact(once), once)
+
+    def test_it_takes_anything_printable_not_just_strings(self):
+        # Log arguments are frequently exception objects.
+        exc = RuntimeError(f"failed: http://h/a?password={self.S}")
+        self.assertNotIn(self.S, enc.redact(exc))
 
 
 if __name__ == "__main__":

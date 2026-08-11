@@ -42,7 +42,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
 
-# The only import between this project's scripts, and deliberately one-way.
+# The only *module-level* import between this project's scripts, and
+# deliberately one-way. Several others exist inside functions, all reaching
+# into timelapse_encode; this one is at the top because the web server needs
+# it to define a class, not to answer one call.
 # The release query is the same knowledge whether a page or a command asks it,
 # and two copies of "compare versions as tuples, not strings" is one copy too
 # many. Installed side by side in the same directory, which is sys.path[0] for
@@ -53,7 +56,14 @@ from timelapse_update import (                            # noqa: E402
     version_text,
 )
 
-__version__ = "0.1.2"
+# Also at module level, and for a harder reason: this page renders the
+# journal, which on any host that ran a version before 0.1.3 contains camera
+# passwords in full. A lazy import inside the renderer could fail at request
+# time and quietly leave the page unredacted; failing at startup is the
+# behaviour a security filter should have.
+from timelapse_encode import redact                       # noqa: E402
+
+__version__ = "0.1.3"
 
 log = logging.getLogger("web")
 
@@ -797,8 +807,24 @@ def human_size(n):
 
 COMMAND_TIMEOUT = 10
 
-STATUS_UNITS = ("timelapse-capture.service", "timelapse-encode.timer",
-                "timelapse-encode.service", "timelapse-web.service")
+# Unit, the words a reader wants, and what "not running" means for it. That
+# last field is the point of the whole table: a oneshot sitting inactive is
+# what healthy looks like between nightly runs, while a daemon sitting
+# inactive is the fault somebody opened this page to find.
+STATUS_UNITS = (
+    ("timelapse-capture.service", "Capture", "daemon"),
+    ("timelapse-encode.timer", "Nightly encode", "timer"),
+    ("timelapse-encode.service", "Last encode run", "oneshot"),
+    ("timelapse-web.service", "Web interface", "daemon"),
+)
+
+# Everything the table needs and nothing else. `systemctl status` prints the
+# invocation ID, the cgroup, the PID and the Docs= line once per unit, which
+# is four repetitions of a URL and a page of detail nobody reads to find out
+# whether capture is running.
+STATUS_PROPS = ("Id", "LoadState", "ActiveState", "SubState", "UnitFileState",
+                "ActiveEnterTimestamp", "InactiveEnterTimestamp", "Result",
+                "NextElapseUSecRealtime")
 
 # Request values pick a key; the *value* is what reaches the command line. No
 # string from a request is ever interpolated into an argv, so there is no
@@ -1039,7 +1065,11 @@ def run_command(argv):
 
     # stderr matters as much as stdout: journalctl explains itself there.
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    return out, ""
+    # Redacted here rather than at each renderer, so that adding a page that
+    # shows command output cannot reintroduce the leak by omission. Every
+    # journal this service can read predates the fix by some amount, and the
+    # entries already in it keep the password until the journal ages out.
+    return redact(out), ""
 
 
 def status_report():
@@ -1049,10 +1079,107 @@ def status_report():
     excerpt needs journal access, so without it the output looks mysteriously
     truncated; the logs page asks for logs explicitly instead.
     """
-    argv = ["systemctl", "status", "--no-pager", "--lines=0"] + list(STATUS_UNITS)
+    argv = (["systemctl", "status", "--no-pager", "--lines=0"]
+            + [name for name, _, _ in STATUS_UNITS])
     out, problem = run_command(argv)
     return {"command": " ".join(argv), "output": out, "problem": problem,
             "hint": ""}
+
+
+def describe_unit(label, kind, props, name):
+    """One row of the services table: (label, class, state, detail).
+
+    Everything here is a translation, not a judgement: each branch reports one
+    systemd state in the words an operator would use for it.
+    """
+    if not props:
+        return (label, "bad", "Unknown", f"systemd reported nothing for {name}")
+
+    load = props.get("LoadState", "")
+    active = props.get("ActiveState", "")
+    sub = props.get("SubState", "")
+
+    if load == "not-found":
+        return (label, "bad", "Not installed",
+                "no unit file here; re-run the installer")
+    if load == "masked":
+        return (label, "bad", "Masked", f"sudo systemctl unmask {name}")
+
+    if active == "failed":
+        return (label, "bad", "Failed",
+                f"{props.get('Result') or 'failed'}. The Recent log tab has "
+                f"the reason.")
+    if active in ("activating", "reloading"):
+        if sub == "auto-restart":
+            # Restart=always plus something that will not stay up. systemd
+            # calls this "activating" forever; reporting it in calm grey as
+            # "Starting" would be the wrong answer to "is it working".
+            return (label, "bad", "Restarting",
+                    "it keeps exiting. The Recent log tab has the reason.")
+        return (label, "", "Starting", "")
+    if active == "deactivating":
+        return (label, "", "Stopping", "")
+
+    if active == "active":
+        if kind == "oneshot" and sub == "exited":
+            # RemainAfterExit leaves a finished job "active". Nothing is
+            # running, so saying "Running" would be a plain untruth.
+            when = props.get("ActiveEnterTimestamp", "")
+            return (label, "", "Finished", f"ran at {when}" if when else "")
+        if kind == "timer":
+            nxt = props.get("NextElapseUSecRealtime", "")
+            return (label, "ok", "Scheduled",
+                    f"next run {nxt}" if nxt else "")
+        detail = ""
+        since = props.get("ActiveEnterTimestamp", "")
+        if since:
+            detail = f"since {since}"
+        if props.get("UnitFileState") == "disabled":
+            # Running now, gone after the next reboot. The one state that
+            # looks entirely healthy and is not.
+            detail = (detail + "; " if detail else "") + \
+                "not enabled, so it will not start again after a reboot"
+        return (label, "ok", "Running", detail)
+
+    if kind == "oneshot":
+        when = props.get("InactiveEnterTimestamp", "")
+        return (label, "", "Idle",
+                f"last finished {when}" if when else "has not run yet")
+    return (label, "bad", "Stopped", f"start it with: sudo systemctl start {name}")
+
+
+def unit_states():
+    """A plain-language row per unit. Returns (rows, problem).
+
+    `systemctl show` rather than `systemctl status`: it is the machine-readable
+    half of the pair, it asks for exactly the fields the table needs, and it
+    exits 0 even for a unit that is not installed. The human output is not a
+    contract; parsing it would mean tracking whatever systemd prints this year.
+    """
+    argv = (["systemctl", "show", "--no-pager"]
+            + [f"--property={p}" for p in STATUS_PROPS]
+            + [name for name, _, _ in STATUS_UNITS])
+    out, problem = run_command(argv)
+    if problem:
+        return [], problem
+
+    # One block per unit, blank-line separated, in the order asked for. Keyed
+    # by Id rather than by position anyway: a missing block would otherwise
+    # shift every later unit onto the wrong row.
+    props = {}
+    for block in out.split("\n\n"):
+        found = {}
+        for line in block.splitlines():
+            key, sep, value = line.partition("=")
+            # run_command folds stderr in with stdout, and a diagnostic line
+            # is not a property however much it may contain an "=".
+            if sep and key.isidentifier():
+                found[key] = value
+        if found.get("Id"):
+            props[found["Id"]] = found
+
+    return ([describe_unit(label, kind, props.get(name), name)
+             for name, label, kind in STATUS_UNITS], "")
 
 
 def journal_report(unit_key, lines_key):
@@ -1152,6 +1279,8 @@ LAYOUT = """<!doctype html>
         vertical-align: top; }}
   td.num {{ text-align: right; font-variant-numeric: tabular-nums;
             white-space: nowrap; }}
+  td.dim {{ opacity: .6; font-size: .85em; }}
+  summary {{ cursor: pointer; font-size: .85rem; opacity: .6; }}
   .wrap {{ overflow-x: auto; }}
   .path {{ font-family: ui-monospace, monospace; font-size: .8rem;
            user-select: all; overflow-wrap: anywhere; opacity: .8; }}
@@ -1174,7 +1303,7 @@ LAYOUT = """<!doctype html>
 <body class="{body_class}">
 <header>
   <h1>timelapse-maker</h1>
-  <span class="ver">web {version}</span>
+  <span class="ver">{version}</span>
 </header>
 <nav>
   <a href="/" class="{on_home}">Overview</a>
@@ -1310,8 +1439,7 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/library":
             self._send(200, self._render("library", self._library(args)))
         elif route == "/status":
-            self._send(200, self._render(
-                "status", self._report(status_report(), pane=True)))
+            self._send(200, self._render("status", self._status()))
         elif route == "/logs":
             self._send(200, self._render("logs", self._logs(args)))
         elif route == "/scan":
@@ -1359,8 +1487,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # Pages whose body is one pane of raw command output, which wants the whole
-    # window rather than the reading column the rest of the UI uses.
-    PANE_PAGES = ("status", "logs")
+    # window rather than the reading column the rest of the UI uses. The status
+    # page left this list when it stopped being raw output.
+    PANE_PAGES = ("logs",)
 
     def _render(self, page, content):
         return LAYOUT.format(
@@ -1394,8 +1523,12 @@ class Handler(BaseHTTPRequestHandler):
     def _update_panel(self, with_script=True):
         """The version section, wrapped so the poller can replace it."""
         u = self.server.updates.snapshot()
+        # Both values plain, like every other <dd> on the page. They were a
+        # <code> and a bare string, which put two fonts side by side in one
+        # two-row list and read as a rendering fault. Colour carries the only
+        # difference that means anything here.
         body = [f'<h2>Version</h2><dl><dt>Installed</dt>'
-                f'<dd><code>{escape(u["current"])}</code></dd>']
+                f'<dd>{escape(u["current"])}</dd>']
 
         if not u["enabled"]:
             body.append('<dt>Update check</dt><dd>off</dd></dl>'
@@ -1404,8 +1537,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._wrap_update("".join(body), busy=False)
 
         if u["available"]:
-            body.append(f'<dt>Latest</dt><dd class="ok"><strong>'
-                        f'{escape(u["tag"] or u["latest"])}</strong></dd></dl>')
+            body.append(f'<dt>Latest</dt><dd class="ok">'
+                        f'<strong>{escape(u["tag"] or u["latest"])}</strong>'
+                        f'</dd></dl>')
         elif u["known"] and u["latest"]:
             body.append(f'<dt>Latest</dt><dd>{escape(u["tag"] or u["latest"])}'
                         f'</dd></dl>')
@@ -1918,6 +2052,41 @@ class Handler(BaseHTTPRequestHandler):
                            f'</td></tr>')
         out.append("</table></div>")
         return "".join(out)
+
+    def _status(self):
+        """Four rows saying whether it works, and the raw output folded away.
+
+        This page used to be `systemctl status` verbatim: a page of invocation
+        IDs, cgroup paths, PIDs and the same Docs= URL four times over, to
+        answer a question that fits in four words. The detail is still one
+        click away, because when something is wrong that is exactly what a
+        bug report needs.
+        """
+        rows, problem = unit_states()
+        parts = ["<section><h2>Services</h2>"]
+        if problem:
+            parts.append(f'<p class="note">{escape(problem)}</p></section>')
+            return "".join(parts)
+
+        parts.append("<table><tr><th>Service</th><th>State</th>"
+                     "<th>Detail</th></tr>")
+        for label, cls, state, detail in rows:
+            mark = f' class="{cls}"' if cls else ""
+            parts.append(f'<tr><td>{escape(label)}</td>'
+                         f'<td{mark}>{escape(state)}</td>'
+                         f'<td class="dim">{escape(detail)}</td></tr>')
+        parts.append("</table></section>")
+
+        rep = status_report()
+        if not rep["problem"]:
+            parts.append(
+                f'<section><details>'
+                f'<summary>Everything systemd knows</summary>'
+                f'<p class="cmd" style="margin-top:.6rem">'
+                f'<code>{escape(rep["command"])}</code></p>'
+                f'<pre>{escape(rep["output"]) or "(no output)"}</pre>'
+                f'</details></section>')
+        return "".join(parts)
 
     def _logs(self, args):
         unit = (args.get("unit") or [DEFAULT_LOG_UNIT])[0]

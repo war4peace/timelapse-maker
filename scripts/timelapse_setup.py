@@ -26,7 +26,7 @@ import time
 from datetime import date
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -647,7 +647,6 @@ def add_one_camera(cfg, n):
 # ----------------------------------------------------------------------------
 
 DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CRED_IN_URL_RE = re.compile(r"((?:password|passwd|pwd|pass)=)[^&]*", re.I)
 
 
 def sanitise_name(raw, fallback):
@@ -656,12 +655,20 @@ def sanitise_name(raw, fallback):
 
 
 def redact_url(url):
-    """Mask credentials carried in the query string (the Reolink shape).
+    """Mask credentials in a URL, or in any text that might contain one.
 
     ask_secret() exists to keep passwords out of scroll-back; printing the
     camera list would hand them straight back otherwise.
+
+    The rule itself lives in timelapse_encode, which is where the wizard, the
+    pre-flight and the web UI all read it from. This function is the name the
+    wizard has always called it by, kept so that there is one rule rather than
+    one per caller: the local copy handled `password=` and not the RTSP
+    `rtsp://user:pass@host` shape, and every camera added by the wizard's own
+    RTSP path uses that shape.
     """
-    return CRED_IN_URL_RE.sub(r"\1***", url)
+    from timelapse_encode import redact
+    return redact(url)
 
 
 def camera_frames_dir(cfg, name):
@@ -1293,7 +1300,11 @@ def test_camera_rtsp(cam, cfg):
             fail("RTSP grab timed out after 45s.")
             return False
         if p.returncode != 0 or not out.exists():
-            fail(f"RTSP grab failed: {(p.stderr or '').strip()[:160]}")
+            # ffmpeg quotes the URL it was handed, password and all. The
+            # wizard asks for that password with ask_secret() precisely to
+            # keep it out of the scroll-back; printing ffmpeg's complaint
+            # verbatim would hand it straight back.
+            fail(f"RTSP grab failed: {redact_url((p.stderr or '').strip())[:160]}")
             return False
         good(f"RTSP frame captured ({out.stat().st_size/1024:.0f} KB)")
         return True
@@ -1338,50 +1349,15 @@ def mount_fstype(path):
 
 
 def probe_rsync_flags(dest, svcuser=None):
-    """Which rsync flags this destination actually accepts, or None if untested.
+    """Which rsync flags this destination accepts. See timelapse_encode.
 
-    On a CIFS share, `-a` implies --owner --group, which the share often cannot
-    set; rsync then exits 23 and every nightly run reports a transfer failure
-    even though the files arrived. Whether it happens depends on the server and
-    mount options, so measure instead of guessing.
+    Imported rather than defined here because the pre-flight needs the same
+    answer, and both already reach into the encoder for the things it owns.
+    rsync is the encoder's business: it is the program that runs it nightly.
     """
-    if not shutil.which("rsync"):
-        return None
-    import tempfile
-    candidates = (["-a", "--partial"],
-                  ["-rt", "--partial"],
-                  ["-a", "--no-perms", "--no-owner", "--no-group", "--partial"])
-    try:
-        tmpdir = tempfile.mkdtemp(prefix="tl-xfer-")
-        os.chmod(tmpdir, 0o755)
-        probe = Path(tmpdir) / ".tl-transfer-probe"
-        probe.write_bytes(b"\0" * 4096)
-        if svcuser:
-            try:
-                shutil.chown(tmpdir, user=svcuser)
-                shutil.chown(probe, user=svcuser)
-            except (OSError, LookupError):
-                pass
-    except OSError:
-        return None
-
-    landed = Path(dest) / probe.name
-    try:
-        for args in candidates:
-            cmd = ["rsync"] + args + [str(probe), str(dest).rstrip("/") + "/"]
-            if svcuser and shutil.which("runuser"):
-                cmd = ["runuser", "-u", svcuser, "--"] + cmd
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-            except Exception:
-                return None
-            landed.unlink(missing_ok=True)
-            if r.returncode == 0:
-                return args
-        return []
-    finally:
-        landed.unlink(missing_ok=True)
-        shutil.rmtree(tmpdir, ignore_errors=True)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import probe_rsync_flags as probe
+    return probe(dest, svcuser)
 
 
 def is_root():
@@ -1581,20 +1557,38 @@ def sync_unit_readwritepaths(cfg, unitdir="/etc/systemd/system"):
     transfer` also changes where the encoder writes. Without this the unit
     still lists only the old paths and ProtectSystem=strict fails the write
     read-only - which looks nothing like a configuration mistake.
+
+    Returns (status, detail). The status matters more than it looks: this used
+    to return a bare bool, counting the units it *rewrote*, and the caller read
+    anything falsy as failure. So an operator who ran it as root against units
+    that were already correct - the ordinary case, since install.sh writes them
+    on every upgrade - was told to go and edit the unit by hand, as root, while
+    being root. "Nothing to do" and "could not do it" are different answers and
+    must not share a return value.
+
+        changed   the units were rewritten
+        current   they already said the right thing
+        absent    no units are installed here
+        denied    not running as root
+        empty     the config yields no writable paths
+        failed    a unit exists but could not be written
     """
     if not is_root():
-        return False
+        return "denied", "needs root to edit the unit files"
     paths = " ".join(writable_paths(cfg))
     if not paths:
-        return False
-    touched = []
+        return "empty", "the config names no writable paths"
+
+    touched, failed, seen = [], [], 0
     for name in ("timelapse-capture.service", "timelapse-encode.service"):
         unit = Path(unitdir) / name
         if not unit.exists():
             continue
+        seen += 1
         try:
             lines = unit.read_text(encoding="utf-8").splitlines(keepends=True)
-        except OSError:
+        except OSError as exc:
+            failed.append(f"{name}: {exc}")
             continue
         out, changed = [], False
         for line in lines:
@@ -1604,23 +1598,56 @@ def sync_unit_readwritepaths(cfg, unitdir="/etc/systemd/system"):
                 out.append(new)
             else:
                 out.append(line)
-        if changed:
-            try:
-                unit.write_text("".join(out), encoding="utf-8")
-                touched.append(name)
-            except OSError:
-                pass
-    if touched:
-        good(f"Updated ReadWritePaths in {', '.join(touched)}")
-        note(f"  {paths}")
+        if not changed:
+            continue
         try:
-            subprocess.run(["systemctl", "daemon-reload"],
-                           capture_output=True, timeout=30)
-        except Exception:
-            pass
-        note("Restart the encoder timer for it to take effect:")
-        note("  systemctl restart timelapse-encode.timer")
-    return bool(touched)
+            unit.write_text("".join(out), encoding="utf-8")
+            touched.append(name)
+        except OSError as exc:
+            failed.append(f"{name}: {exc}")
+
+    if failed:
+        return "failed", "; ".join(failed)
+    if not seen:
+        return "absent", f"no timelapse units in {unitdir}"
+    if not touched:
+        return "current", paths
+
+    good(f"Updated ReadWritePaths in {', '.join(touched)}")
+    note(f"  {paths}")
+    try:
+        subprocess.run(["systemctl", "daemon-reload"],
+                       capture_output=True, timeout=30)
+    except Exception:
+        pass
+    note("Restart the encoder timer for it to take effect:")
+    note("  systemctl restart timelapse-encode.timer")
+    return "changed", paths
+
+
+def report_readwritepaths(status, detail):
+    """Say what happened, and only sound the alarm when something is wrong.
+
+    "changed" has already narrated itself. Every other outcome is either fine
+    or actionable, and they need telling apart: the whole point of the split.
+    """
+    if status == "changed":
+        return
+    if status == "current":
+        good("ReadWritePaths already covers the destination; nothing to do.")
+        note(f"  {detail}")
+        return
+    if status == "absent":
+        note("No systemd units are installed here, so there is nothing to")
+        note("update. They get these paths when the installer runs.")
+        return
+    warn("Add the destination to ReadWritePaths= in "
+         "timelapse-encode.service by hand,")
+    warn("or ProtectSystem=strict will fail the write read-only.")
+    if status == "denied":
+        note("Re-run this with sudo to do it automatically.")
+    elif detail:
+        note(f"  {detail}")
 
 
 def persist_cifs_mount(unc, mountpoint, opts, vers):
@@ -2629,11 +2656,7 @@ def main():
             note(f"require_mountpoint {t.get('require_mountpoint', False)}")
             if str(t.get("destination", "")).startswith("/"):
                 print()
-                if not sync_unit_readwritepaths(cfg):
-                    warn("Add the destination to ReadWritePaths= in "
-                         "timelapse-encode.service by hand,")
-                    warn("or ProtectSystem=strict will fail the write "
-                         "read-only. (Run as root to do this automatically.)")
+                report_readwritepaths(*sync_unit_readwritepaths(cfg))
         print()
         return 0
 
