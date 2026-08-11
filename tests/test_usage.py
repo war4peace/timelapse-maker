@@ -13,6 +13,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import _support
@@ -160,6 +161,55 @@ class TestUsageReport(unittest.TestCase):
         out = self.run_report([self.cam("Gate")])
         for ln in out.splitlines():
             self.assertEqual(ln, ln.rstrip(), f"trailing space: {ln!r}")
+
+
+class TestRsyncFlagCheckOutput(unittest.TestCase):
+    """What the operator actually reads. The unit tests below this cover the
+    probe's return values; this covers the four lines it prints, which is
+    where the false alarm was seen."""
+
+    CFG = {"transfer": {"rsync_args": ["-a", "--partial",
+                                       "--remove-source-files"]}}
+
+    def run_check(self, result, detail, working=None):
+        import timelapse_encode as enc
+        buf = io.StringIO()
+        with mock.patch.object(enc, "try_rsync_args",
+                               return_value=(result, detail)), \
+                mock.patch.object(enc, "probe_rsync_flags",
+                                  return_value=working), \
+                mock.patch.object(tt, "service_account",
+                                  return_value="timelapse"), \
+                contextlib.redirect_stdout(buf):
+            tt.check_rsync_args(self.CFG, "/mnt/cctv/TL/")
+        return buf.getvalue()
+
+    def test_untestable_is_not_reported_as_a_failure(self):
+        # The reported output, verbatim:
+        #   FAIL  rsync ... fails against /mnt/cctv/TL/: exit 1: runuser: may
+        #         not be used by non-root users
+        #   ....  no flag combination worked; check the share permissions
+        out = self.run_check(None, "only root can run the probe as timelapse; "
+                                   "try: sudo timelapse test")
+        self.assertNotIn("FAIL", out)
+        self.assertNotIn("fails against", out)
+        self.assertNotIn("share permissions", out)
+        self.assertIn("not checked", out)
+        self.assertIn("sudo timelapse test", out)
+
+    def test_a_real_failure_still_reads_as_one(self):
+        # The check has to keep working when it genuinely can run.
+        out = self.run_check(False, "exit 23: rsync: chgrp failed",
+                             working=["-rt", "--partial"])
+        self.assertIn("FAIL", out)
+        self.assertIn("exit 23", out)
+        self.assertIn("-rt --partial", out)
+        self.assertIn("sudo timelapse transfer", out)
+
+    def test_success_names_the_account_it_proved_it_for(self):
+        out = self.run_check(True, "")
+        self.assertIn("PASS", out)
+        self.assertIn("as timelapse", out)
 
 
 if __name__ == "__main__":

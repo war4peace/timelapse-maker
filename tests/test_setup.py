@@ -2153,5 +2153,97 @@ class TestWriteConfig(unittest.TestCase):
         self.assertEqual([p.name for p in self.tmp.iterdir()], ["config.json"])
 
 
+class TestRedactedDump(unittest.TestCase):
+    """`timelapse config --redacted`: the config, minus the credentials.
+
+    It exists because "here is my config, why won't camera 3 connect" is a
+    thing people do, and doing it by hand puts the guarantee in the least
+    reliable place there is.
+    """
+
+    S = "Sup3rS3cret!"
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = Path(self.dir.name) / "config.json"
+
+    def write(self, cfg):
+        self.path.write_text(json.dumps(cfg), encoding="utf-8")
+
+    def dump(self):
+        """(exit code, stdout, stderr)."""
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = setup.print_redacted_config(str(self.path))
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_stdout_is_json_and_holds_no_password(self):
+        # The contract is both halves at once: parseable, and safe.
+        self.write({"cameras": [{"name": "Gate", "password": self.S}]})
+        rc, out, _ = self.dump()
+        self.assertEqual(rc, 0)
+        self.assertNotIn(self.S, out)
+        self.assertEqual(json.loads(out)["cameras"][0]["password"], "***")
+
+    def test_prose_goes_to_stderr_so_a_redirect_stays_parseable(self):
+        # `timelapse config --redacted > report.json` must produce a file that
+        # still parses; the person at the terminal must still be warned.
+        self.write({"cameras": []})
+        _, out, err = self.dump()
+        json.loads(out)                        # would raise if prose leaked in
+        self.assertTrue(err.strip())
+
+    def test_the_dump_carries_its_own_notice(self):
+        # Inside the JSON, not beside it: what gets pasted into an issue is
+        # the blob, never the warning that was printed next to it.
+        self.write({"cameras": []})
+        _, out, _ = self.dump()
+        notice = json.loads(out)["_redacted"]
+        self.assertIn("NOT masked", notice)
+
+    def test_the_notice_is_first_so_it_is_read(self):
+        self.write({"cameras": [], "paths": {}})
+        _, out, _ = self.dump()
+        self.assertEqual(next(iter(json.loads(out))), "_redacted")
+
+    def test_it_changes_nothing_on_disk(self):
+        # A read-only command run by somebody already having a bad day.
+        cfg = {"cameras": [{"name": "Gate", "password": self.S}]}
+        self.write(cfg)
+        before = self.path.read_bytes()
+        self.dump()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual([p.name for p in Path(self.dir.name).iterdir()],
+                         ["config.json"])
+
+    def test_a_missing_config_fails_without_printing_a_dump(self):
+        rc, out, _ = self.dump()
+        self.assertEqual(rc, 1)
+        self.assertEqual(out.strip().count("{"), 0)
+
+    def test_an_unreadable_config_does_not_print_half_of_one(self):
+        self.path.write_text("{ not json", encoding="utf-8")
+        rc, out, _ = self.dump()
+        self.assertEqual(rc, 1)
+        self.assertNotIn("_redacted", out)
+
+    def test_the_flag_reaches_it_without_ever_touching_a_terminal(self):
+        # Handled before init_tty() deliberately. This is a filter, and a
+        # filter that can prompt is one that hangs inside a pipe.
+        self.write({"cameras": [{"name": "Gate", "password": self.S}]})
+        argv = ["timelapse_setup.py", "--redacted", "--output", str(self.path)]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(setup, "init_tty",
+                                  side_effect=AssertionError("it prompted")), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = setup.main()
+        self.assertEqual(rc, 0)
+        self.assertNotIn(self.S, out.getvalue())
+        json.loads(out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

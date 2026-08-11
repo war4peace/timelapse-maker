@@ -32,7 +32,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -98,6 +98,47 @@ class RedactingFormatter(logging.Formatter):
 
     def format(self, record):
         return redact(super().format(record))
+
+
+# A config holds its secrets in two shapes, and each pass below misses the
+# other one. `{"password": "hunter2"}` has no `=` in it, so the text rule walks
+# straight past it; a Reolink `url` carries the credential inside a query
+# string, so a rule that only knew field names walks past that. Hence both,
+# over the whole tree.
+#
+# Matched against key names. Deliberately loose: an unrecognised key gets its
+# value printed, so the cost of a missing name is a leak while the cost of a
+# spurious match is a question on a bug report.
+SECRET_KEY_RE = re.compile(
+    r"pass(word|wd)?$|^pwd$|secret|token|credential|api[-_]?key", re.I)
+
+
+def redact_config(node):
+    """A copy of a parsed config with the credentials taken out.
+
+    Structure is preserved exactly, because the whole use for this is handing
+    it to somebody else to read: a dump that dropped keys would have people
+    diagnosing a config that is not the one on the disk.
+
+    Note what this does *not* remove. Camera hostnames, the transfer
+    destination and the Discord webhook's numeric id all survive, because they
+    are what a fault report is about, and `usernames` survive because the text
+    rule has always kept `user=` while masking `password=`. Whoever runs this
+    is told as much, rather than being left to assume it covered more.
+    """
+    if isinstance(node, dict):
+        return {
+            # An empty value stays empty: "" for a password is not a secret,
+            # it is the answer to "did you actually set one?".
+            k: (MASK if (SECRET_KEY_RE.search(str(k)) and v)
+                else redact_config(v))
+            for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [redact_config(v) for v in node]
+    if isinstance(node, str):
+        return redact(node)
+    return node
 
 
 # ----------------------------------------------------------------------------
@@ -607,15 +648,58 @@ RSYNC_CANDIDATES = (
 )
 
 
-def try_rsync_args(dest, args, svcuser=None):
-    """Copy one small file to dest with `args`. (ok, detail); None if untestable.
+def whoami():
+    """The current account's name, or "" where that cannot be told."""
+    try:
+        import pwd
+        return pwd.getpwuid(os.geteuid()).pw_name
+    except Exception:                           # noqa: BLE001
+        return ""
 
-    Runs as `svcuser` when one is given and runuser exists, because that is
-    who runs it nightly, and a share can perfectly well accept root and refuse
-    the service account.
+
+def probe_as(svcuser):
+    """How to run the probe as `svcuser`: (argv_prefix, why_not).
+
+    A prefix of [] with no reason means "run it directly, that is already the
+    right account". A reason means the probe cannot be run as that account at
+    all, which is a fact about *this checker* and must never be reported as a
+    fact about the share.
+
+    Reported from a real 0.1.3 install, during `sudo timelapse update`. The
+    installer deliberately runs the pre-flight as the service account
+    (`as_service_user`, which is `runuser -u timelapse --`) so that permission
+    problems surface then rather than at 00:05 tonight. This probe then called
+    `runuser` *again* from inside that unprivileged process: a nested runuser,
+    which answers "may not be used by non-root users". That was read as rsync's
+    verdict on the share, and the operator was told to go and fix permissions
+    that were already correct.
+
+    The first branch is what that case needs. Being the service account
+    already, there is nothing to switch to and the probe is authoritative.
     """
+    if not svcuser or whoami() == svcuser:
+        return [], ""
+    if getattr(os, "geteuid", lambda: 0)() != 0:
+        return None, (f"only root can run the probe as {svcuser}; "
+                      f"try: sudo timelapse test")
+    if not shutil.which("runuser"):
+        return None, f"runuser is not installed, so it cannot test as {svcuser}"
+    return ["runuser", "-u", svcuser, "--"], ""
+
+
+def try_rsync_args(dest, args, svcuser=None):
+    """Copy one small file to dest with `args`, as the account that runs it.
+
+    Returns (ok, detail). `ok` is None for "could not be tested", with the
+    reason in detail, and that is deliberately not False: a share that refuses
+    the copy and a checker that could not attempt it need opposite responses
+    from whoever is reading.
+    """
+    prefix, why_not = probe_as(svcuser)
+    if prefix is None:
+        return None, why_not
     if not shutil.which("rsync"):
-        return None
+        return None, "rsync is not installed here"
     try:
         tmpdir = tempfile.mkdtemp(prefix="tl-xfer-")
         os.chmod(tmpdir, 0o755)
@@ -627,19 +711,17 @@ def try_rsync_args(dest, args, svcuser=None):
                 shutil.chown(probe, user=svcuser)
             except (OSError, LookupError):
                 pass
-    except OSError:
-        return None
+    except OSError as exc:
+        return None, f"no usable temp space for the probe file: {exc}"
 
     landed = Path(dest) / probe.name
     try:
-        cmd = ["rsync"] + list(args) + [str(probe),
-                                        str(dest).rstrip("/") + "/"]
-        if svcuser and shutil.which("runuser"):
-            cmd = ["runuser", "-u", svcuser, "--"] + cmd
+        cmd = list(prefix) + ["rsync"] + list(args) + [
+            str(probe), str(dest).rstrip("/") + "/"]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        except Exception:                       # noqa: BLE001
-            return None
+        except Exception as exc:                # noqa: BLE001
+            return None, f"could not run rsync: {exc}"
         if r.returncode == 0:
             return True, ""
         detail = " ".join((r.stderr or "").split())[:200]
@@ -654,10 +736,10 @@ def try_rsync_args(dest, args, svcuser=None):
 def probe_rsync_flags(dest, svcuser=None):
     """First flag set that works, [] if none do, None if it could not be tested."""
     for args in RSYNC_CANDIDATES:
-        got = try_rsync_args(dest, args, svcuser)
-        if got is None:
+        ok, _ = try_rsync_args(dest, args, svcuser)
+        if ok is None:
             return None
-        if got[0]:
+        if ok:
             return args
     return []
 

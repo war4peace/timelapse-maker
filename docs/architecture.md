@@ -742,22 +742,31 @@ connection this service makes, and should stay the only one.
 - **`parse_version` compares tuples, never strings.** `0.0.10` sorts below
   `0.0.9` lexically, and `0.10.0` below `0.9.0`. A two-digit component is
   not a hypothetical for a project on its tenth release.
-- **The notes come from the changelog** when the tag has no release body,
-  fetched only when there is actually an update to describe, so the ordinary
-  case is one request. `plain_notes()` strips heading markers because the text
-  lands in a `<div>`, not a markdown renderer.
-- **The 4,000-character cap degrades, rather than truncating.** v0.1.0's own
-  release body was 4,020 characters, and a plain slice cut it three characters
-  into a sentence with nothing recording that it had: the page read as though
-  this program had lost the rest. `clip_notes()` cuts on the last line break
-  instead (word break, then a blunt cut, for notes written as one paragraph),
-  and returns whether anything was dropped, so the panel can say so and link
-  to the release. The half-limit floor stops a body whose only newline is near
-  the start being trimmed to almost nothing. A cache written before the flag
-  existed is repaired on load by inferring it from the length: without that,
-  the fix would not reach an install already carrying clipped notes until its
-  next check, which is up to a day. **Never cap rendered text without
-  reporting the cap and offering the whole thing somewhere.**
+- **The web panel links to the release; it does not reproduce it.** A release
+  body is markdown, and this page is not a markdown renderer, so `##` headings
+  and backticked commands appeared verbatim and read as this program having
+  failed to format something. Reported 2026-08-11. The alternatives were a
+  markdown renderer (a dependency, or a parser to maintain, for a paragraph
+  nobody reads twice) or a link to the page that already renders it properly.
+  Consequences worth keeping: the panel needs no `notes` in its cache, and the
+  changelog fetch that used to fill it when a tag had no Release body is gone,
+  so the service's one outbound request is now *always* one.
+- **A link that leaves the UI opens in a new tab.** Every other link on these
+  pages navigates within this server, so replacing the page somebody is
+  reading with github.com is the odd one out. `external()` is the only place
+  that emits `target="_blank"`, and it always pairs it with
+  `rel="noopener noreferrer"`.
+- **The 4,000-character cap still exists for the terminal.** `timelapse
+  update` prints the notes before asking to install, where plain text is the
+  native format. v0.1.0's own release body was 4,020 characters, and a plain
+  slice cut it three characters into a sentence with nothing recording that it
+  had, so it read as this program losing the rest. `clip_notes()` cuts on the
+  last line break instead (word break, then a blunt cut, for notes written as
+  one paragraph) and returns whether anything was dropped, so the CLI can say
+  so and name where the rest is. The half-limit floor stops a body whose only
+  newline is near the start being trimmed to almost nothing. **Never cap
+  rendered text without reporting the cap and offering the whole thing
+  somewhere.**
 - **An explicit User-Agent is mandatory.** GitHub rejects a request without
   one, exactly as Cloudflare does for the Discord webhook. Two vendors, one
   trap; see `post_webhook()`.
@@ -788,8 +797,14 @@ connection this service makes, and should stay the only one.
   tells an operator nothing actionable. The original text is kept on the end,
   because that is the part worth searching for.
 
-**Status and logs** (`/status`, `/logs`) shell out, on request only: a page
-load or a click. Nothing polls and nothing is collected in the background.
+**Service state and logs** shell out only when a human asks for a page. The
+services table is one `systemctl show` at the foot of the overview; `/status`
+and `/logs` are one command each. Nothing polls and nothing is collected in
+the background, and the endpoints a machine might hit in a loop (`/healthz`,
+and the `/scan` and `/update` fragments the page's own scripts poll) run no
+commands at all. That last property is the one to preserve: the overview
+itself stopped being free when the services table moved onto it, which is the
+deliberate price of dropping a tab.
 
 - **The title and tabs are centred on the window, not on the content.** They
   are the fixed furniture of every page and the pages are not all the same
@@ -802,15 +817,21 @@ load or a click. Nothing polls and nothing is collected in the background.
   four pages at two window sizes: 240px of drift before, 1px after, the
   remainder being sub-pixel rounding when centring inside containers of
   different widths.
-- **`/status` answers the question in four words; the detail is folded away.**
-  It was `systemctl status` verbatim, which is a page per unit: the invocation
-  ID, the cgroup, the PID, the task count and the same `Documentation=` URL
-  once for each of the four units, to say whether capture is running.
-  `unit_states()` asks `systemctl show` for the eight properties the table
-  needs and `describe_unit()` turns each into one word, and the raw output
-  keeps its place inside a `<details>` because a bug report wants exactly
-  that. Three things this must keep getting right, all verified against real
-  systemd rather than reasoned about:
+- **The services table answers the question in one word, at the foot of the
+  overview.** It was a tab holding `systemctl status` verbatim, which is a
+  page per unit: the invocation ID, the cgroup, the PID, the task count and
+  the same `Documentation=` URL once for each of the four units, to say
+  whether capture is running. `unit_states()` asks `systemctl show` for the
+  nine properties the table needs and `describe_unit()` turns each into one
+  word. Once that was four rows it no longer justified a quarter of the
+  navigation, so it moved onto the overview and the UI went to three tabs.
+  `/status` survives as a page rather than a tab, holding the full output: a
+  bug report wants exactly that, and an old bookmark should land somewhere
+  useful. It is deliberately *not* inlined into a `<details>` on the overview,
+  which would cost a second subprocess and a screen of markup on every view of
+  the landing page to serve something rarely opened. Three things this must
+  keep getting right, all verified against real systemd rather than reasoned
+  about:
   - **`show`, not `status`.** The human output is not a contract, exits 0 even
     for a unit that is not installed, and names its own fields.
   - **What "not running" means depends on the unit.** The nightly encode is a
@@ -821,6 +842,13 @@ load or a click. Nothing polls and nothing is collected in the background.
     `active (exited)` long after it finished, and must not read "Running"; and
     `activating/auto-restart` is a crash loop, not a service caught mid-boot,
     so it is red and says so.
+  - **An inactive oneshot with a timestamp is a success, and says so in
+    green.** A finished run and one that has never happened are both
+    `inactive`; the timestamp is the only thing that tells them apart. "Idle"
+    was true of both and useful about neither, when the question that row
+    exists to answer is whether last night's encode worked. A failed run does
+    not reach here (systemd leaves it `failed`), but the green line is
+    conditioned on `Result` anyway rather than on the timestamp alone.
   - **Rows are matched by `Id`, never by position.** A block that does not come
     back would otherwise shift every later unit onto the wrong row.
   The one state that looks healthy and is not gets called out: enabled=no
@@ -900,6 +928,8 @@ Upgrading is re-running the installer, so that is what this does:
 
 1. Ask which release is newest, and compare as tuples.
 2. Show the notes, clipped on a line boundary (§4.5) rather than mid-sentence.
+   This is the one place that renders them: a terminal is where markdown as
+   plain text is the native format, and the web panel links to GitHub instead.
 3. Confirm, unless `--yes`.
 4. Download `install.sh` **for that tag**, not for `main`. An installer newer
    than the tree it unpacks can expect files that tree does not contain.
@@ -1013,6 +1043,25 @@ fails. It lives in `timelapse_encode.py` because that is the program that runs
 rsync; the wizard and the pre-flight both import it, so they cannot give
 different answers.
 
+**Measuring introduces its own way to be wrong: the measurement can fail.**
+The probe runs as the service account, which means `runuser`, which needs
+root. But `install.sh` already runs the pre-flight through `as_service_user`,
+precisely so that permission problems surface at install time rather than at
+00:05, so the probe was calling `runuser` a *second* time from inside an
+unprivileged process. The nested refusal came back as `FAIL ... exit 1:
+runuser: may not be used by non-root users`, followed by "check the share
+permissions". The share was fine.
+
+`try_rsync_args()` returns `(None, reason)` for "could not be tested", which
+is not `(False, detail)` for "tested, and it fails", and `probe_as()` settles
+how to reach the account before running anything: already it (run directly),
+root with `runuser` (wrap it), or neither (decline, and name the command that
+would work). The first branch is both the reported case and the best one,
+since running *as* that account is what makes the answer authoritative; the
+third also covers a host with no `runuser`, where the probe used to run
+unwrapped and report a result for the wrong account. **A checker's own
+limitations are never a finding about the thing being checked.**
+
 **A falsy return must not mean four different things.**
 `sync_unit_readwritepaths()` returned the count of units it rewrote, and the
 caller treated anything falsy as failure. Running it as root against units
@@ -1080,6 +1129,44 @@ with its password in full.
 **A fix here does not clean up after itself.** The journal and `capture.log`
 keep what they already have, so the release notes tell operators to rotate the
 camera password and say how to purge both.
+
+#### The config itself: `timelapse config --redacted`
+
+The other way a password leaves this host is that somebody sends it
+deliberately, attached to a question. `redact_config()` walks a parsed config
+and returns a masked copy, which is what that command prints.
+
+**Both passes are load-bearing, and each alone leaks.** `redact()` over the
+serialised text misses `"password": "hunter2"`, which has no `=` in it;
+matching key names misses the Reolink `url`, which carries the credential in a
+query string. So the walk masks by key name *and* runs the text rule over
+every string value. Two revert-checks pin this: field-matching alone fails
+four tests, text alone fails three.
+
+What survives is as deliberate as what does not. Hostnames, usernames, paths,
+the transfer destination and the webhook's numeric id are kept, because a dump
+that masked those would be safe and useless. The operator is told so
+explicitly, and the notice travels *inside* the JSON under `_redacted`, a key
+the schema already reserves for documentation: the moment this matters is the
+moment the text is pasted into an issue, and prose printed beside the blob is
+precisely the part that does not travel with it. JSON on stdout, prose on
+stderr, so a redirect still yields a file that parses.
+
+#### `timelapse config` and what an editor leaves behind
+
+`/etc/timelapse` is 0750 root:timelapse, so a stray file *inside* it is
+already shielded from other users. Measured rather than assumed, on vim: the
+backup `config.json~` inherits the original's 0640 root:timelapse, in the
+directory or in a `backupdir` elsewhere, so it is the same exposure as the
+config rather than a new one. `umask 0077` is set before the editor anyway,
+for editors that create from the umask instead.
+
+The real defect was elsewhere. An editor that saves by rename leaves a brand
+new file carrying root's umask, so **the config loses its group and the
+daemons can no longer read it**, which surfaces at the next restart and looks
+nothing like an editing mistake. The wrapper therefore no longer `exec`s the
+editor: it restores 0640 root:timelapse afterwards and exits with the editor's
+status.
 
 ---
 
@@ -1231,7 +1318,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 765 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 793 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1384,13 +1471,13 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 738 lines
+install.sh                       bootstrap installer, 761 lines
 scripts/timelapse_capture.py     daemon, 742 lines
-scripts/timelapse_encode.py      batch job, 988 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 767 lines
-scripts/timelapse_setup.py       configuration wizard, 2702 lines
+scripts/timelapse_encode.py      batch job, 1070 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 773 lines
+scripts/timelapse_setup.py       configuration wizard, 2743 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2262 lines
+scripts/timelapse_web.py         read-only web UI, 2269 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

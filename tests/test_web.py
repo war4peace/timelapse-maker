@@ -468,16 +468,37 @@ class TestUnitStates(unittest.TestCase):
         self.assertEqual(row[1:3], ("ok", "Running"))
         self.assertIn("since Mon 2026-08-10", row[3])
 
-    def test_an_idle_oneshot_is_not_reported_as_a_fault(self):
-        # The nightly encode is inactive for 23 hours and 22 minutes out of
-        # every day. Calling that "Stopped", as the daemon rule would, invents
-        # a fault on a healthy system every time anybody looks.
+    def test_a_finished_oneshot_reads_as_a_success(self):
+        # The nightly encode is inactive for 23 hours 22 minutes of every day,
+        # so "Stopped" (the daemon rule) would invent a fault on a healthy
+        # system. "Idle" fixed that but answered the wrong question: this row
+        # is here to say whether last night's encode worked.
         row = self.rows(self.show(self.daemon(
             "timelapse-encode.service", ActiveState="inactive",
             InactiveEnterTimestamp="Mon 2026-08-11 00:42:11 EEST",
             Result="success")))["Last encode run"]
-        self.assertEqual(row[1:3], ("", "Idle"))
+        self.assertEqual(row[1:3], ("ok", "Successful"))
         self.assertIn("last finished Mon 2026-08-11", row[3])
+
+    def test_a_oneshot_that_has_never_run_says_that_instead(self):
+        # No timestamp, so there is no run to call successful. Saying so beats
+        # a green "Successful" about something that has not happened.
+        row = self.rows(self.show(self.daemon(
+            "timelapse-encode.service", ActiveState="inactive",
+            Result="success")))["Last encode run"]
+        self.assertEqual(row[1:3], ("", "Not yet run"))
+        self.assertIn("timer has not fired", row[3])
+
+    def test_a_bad_result_is_not_dressed_up_as_success(self):
+        # systemd normally leaves a failed oneshot ActiveState=failed, which
+        # is caught earlier. Belt and braces: the green line must depend on
+        # the result, not merely on there being a timestamp.
+        row = self.rows(self.show(self.daemon(
+            "timelapse-encode.service", ActiveState="inactive",
+            InactiveEnterTimestamp="Mon 2026-08-11 00:42:11 EEST",
+            Result="exit-code")))["Last encode run"]
+        self.assertEqual(row[1:3], ("bad", "Failed"))
+        self.assertIn("exit-code", row[3])
 
     def test_a_stopped_daemon_is_a_fault_and_says_how_to_fix_it(self):
         row = self.rows(self.show(self.daemon(
@@ -579,44 +600,68 @@ class TestStatusRoutes(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn("Active: active (running)", body)
 
-    def both(self, show_text, raw=RAW_STATUS):
-        """run_command answers `show` and `status` differently, as it does in
-        life: the page makes one call for the table and one for the detail."""
-        def fake(argv):
-            return ((show_text, "") if "show" in argv else (raw, ""))
-        with mock.patch.object(web, "run_command", side_effect=fake):
-            return request("/status", self.config)[2]
+    SHOW = "\n".join(["Id=timelapse-capture.service", "LoadState=loaded",
+                      "ActiveState=active", "UnitFileState=enabled"])
 
-    def test_the_page_leads_with_four_words_not_a_page_of_systemd(self):
-        show = "\n".join(["Id=timelapse-capture.service", "LoadState=loaded",
-                          "ActiveState=active", "UnitFileState=enabled"])
-        body = self.both(show)
-        table = body.split("<details", 1)[0]
-        self.assertIn("Capture", table)
-        self.assertIn("Running", table)
-        # The reader wanted to know whether it works. None of this told them.
+    def overview(self, show_text=None):
+        with mock.patch.object(web, "run_command",
+                               return_value=(show_text or self.SHOW, "")):
+            return request("/", self.config)[2]
+
+    def test_the_services_table_lives_on_the_overview(self):
+        # Four rows did not justify a quarter of the navigation, and "is it
+        # running" belongs beside "where are my videos".
+        body = self.overview()
+        self.assertIn("Services", body)
+        self.assertIn("Capture", body)
+        self.assertIn("Running", body)
+
+    def test_the_overview_says_nothing_a_reader_did_not_ask_for(self):
+        body = self.overview()
         for noise in ("Invocation:", "Main PID:", "CGroup:", "Docs:"):
-            self.assertNotIn(noise, table, noise)
+            self.assertNotIn(noise, body, noise)
+
+    def test_the_overview_shells_out_exactly_once(self):
+        # It is the landing page. Rendering the full `systemctl status` into a
+        # collapsed <details> here would cost a second subprocess and a screen
+        # of markup on every view, to serve something rarely opened.
+        with mock.patch.object(web, "run_command",
+                               return_value=(self.SHOW, "")) as run:
+            request("/", self.config)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("show", run.call_args[0][0])
 
     def test_the_raw_output_is_still_there_one_click_away(self):
-        # Folded, not deleted: when something is wrong this is what a bug
-        # report needs, and re-running systemctl over ssh to get it is worse.
-        body = self.both("Id=timelapse-capture.service\nActiveState=active")
-        self.assertIn("<details", body)
-        detail = body.split("<details", 1)[1]
+        # When something is wrong this is what a bug report needs, and
+        # re-running systemctl over ssh to get it is worse than a link.
+        body = self.overview()
+        self.assertIn('href="/status"', body)
+        with mock.patch.object(web, "run_command",
+                               return_value=(RAW_STATUS, "")):
+            _, _, detail = request("/status", self.config)
         self.assertIn("Invocation:", detail)
         self.assertIn("Main PID:", detail)
         self.assertIn("systemctl status", detail)
 
-    def test_a_systemctl_that_will_not_run_is_reported_once(self):
-        # And the second call is not made at all: it would fail identically.
+    def test_the_detail_page_is_reachable_but_not_a_tab(self):
+        # An old bookmark has to land somewhere useful; the navigation is
+        # three tabs, and this is a page under the overview, not a fourth.
+        with mock.patch.object(web, "run_command",
+                               return_value=(RAW_STATUS, "")):
+            status, _, body = request("/status", self.config)
+        self.assertEqual(status, 200)
+        nav = body.split("<nav>", 1)[1].split("</nav>", 1)[0]
+        self.assertEqual(nav.count("<a "), 3)
+        self.assertNotIn("Service status", nav)
+        self.assertIn('href="/"', body)          # a way back
+
+    def test_a_systemctl_that_will_not_run_is_reported_not_hidden(self):
         with mock.patch.object(
                 web, "run_command",
                 return_value=("", "systemctl is not installed.")) as run:
-            _, _, body = request("/status", self.config)
+            _, _, body = request("/", self.config)
         self.assertEqual(run.call_count, 1)
         self.assertIn("not installed", body)
-        self.assertNotIn("<details", body)
 
     def test_logs_page_defaults_to_capture(self):
         with mock.patch.object(web, "run_command",
@@ -656,12 +701,18 @@ class TestStatusRoutes(unittest.TestCase):
             _, _, body = request("/status", self.config)
         self.assertIn("not installed here", body)
 
-    def test_nothing_runs_unless_that_page_is_asked_for(self):
-        # Status is on request only: the overview must not shell out.
+    def test_the_cheap_endpoints_still_shell_out_for_nothing(self):
+        """The overview did not used to run anything; folding the services
+        table into it means one `systemctl show` per view, which is the
+        deliberate cost of losing a tab. Everything a machine might hit in a
+        loop must stay free of it: /healthz is a liveness probe, and /scan and
+        /update are polled once a second by the page's own scripts."""
         with mock.patch.object(web, "run_command") as run:
-            request("/", self.config)
-            request("/healthz", self.config)
+            for path in ("/healthz", "/update"):
+                request(path, self.config)
         run.assert_not_called()
+        # /scan is the third of those and needs an index to answer at all, so
+        # it is exercised in TestScanProgress; it reads an in-memory dict.
 
     def test_output_pages_ask_for_the_whole_window(self):
         # A journal line is as wide as journald decided, so the 54rem reading
@@ -1880,7 +1931,7 @@ class TestUpdateChecker(unittest.TestCase):
         self.assertTrue(s["available"])
         self.assertEqual(s["latest"], "0.1.0")
         self.assertEqual(s["tag"], "v0.1.0")
-        self.assertEqual(s["notes"], "notes")
+        self.assertEqual(s["url"], "u")
 
     def test_the_same_version_is_not_an_update(self):
         c = self.make()
@@ -2067,78 +2118,58 @@ class TestUpdateChecker(unittest.TestCase):
         self.assertEqual(s["failures"], 0)
         self.assertTrue(s["known"])
 
-    def test_long_notes_are_clipped_and_the_clip_is_recorded(self):
-        c = self.make()
-        with mock.patch.object(web, "latest_release",
-                               return_value=((0, 1, 0), "v0.1.0", "u",
-                                             "- a line\n" * 2000)):
-            c._check()
-        s = c.snapshot()
-        self.assertTrue(s["clipped"])
-        self.assertLessEqual(len(s["notes"]), web.NOTES_LIMIT)
-        self.assertTrue(s["notes"].endswith("- a line"))   # whole lines only
-
-    def test_short_notes_are_not_flagged_as_clipped(self):
-        c = self.make()
-        with mock.patch.object(web, "latest_release",
-                               return_value=((0, 1, 0), "v0.1.0", "u", "- one")):
-            c._check()
-        s = c.snapshot()
-        self.assertFalse(s["clipped"])
-        self.assertEqual(s["notes"], "- one")
-
-    def test_a_cache_from_before_the_flag_infers_it_from_the_length(self):
-        """0.1.0 and 0.1.1 sliced at exactly NOTES_LIMIT and recorded nothing.
-        Without inferring it, an install carrying such a cache shows the
-        half-sentence with no way to reach the rest until it next checks."""
-        Path(self.tmp, "update.json").write_text(json.dumps({
-            "checked": time.time(), "tag": "v0.1.0", "latest": "0.1.0",
-            "url": "u", "notes": "x" * web.NOTES_LIMIT, "error": ""}),
-            encoding="utf-8")
-        self.assertTrue(self.make().snapshot()["clipped"])
-
-    def test_a_short_cache_from_before_the_flag_is_not_flagged(self):
-        Path(self.tmp, "update.json").write_text(json.dumps({
-            "checked": time.time(), "tag": "v0.1.0", "latest": "0.1.0",
-            "url": "u", "notes": "- short", "error": ""}), encoding="utf-8")
-        self.assertFalse(self.make().snapshot()["clipped"])
-
     def test_a_corrupt_cache_is_ignored_not_fatal(self):
         Path(self.tmp, "update.json").write_text("{ this is not json",
                                                  encoding="utf-8")
         self.assertEqual(self.make().snapshot()["latest"], "")
 
-    def test_notes_come_from_the_changelog_when_there_is_no_release(self):
-        # The tags fallback yields no body, and that is the normal case for
-        # this repo, so "what's new" has to come from somewhere.
-        c = self.make()
-        text = "## [0.1.0] - 2026-08-09\n- a real change\n\n## [0.0.9]\n- old\n"
-        with mock.patch.object(web, "latest_release",
-                               return_value=((0, 1, 0), "v0.1.0", "u", "")), \
-                mock.patch.object(web, "fetch_text", return_value=text):
-            c._check()
-        self.assertIn("a real change", c.snapshot()["notes"])
-        self.assertNotIn("old", c.snapshot()["notes"])
+    def test_the_release_body_is_neither_stored_nor_fetched_twice(self):
+        """The panel links to the release instead of reproducing it, so there
+        is nothing here to store and nothing to make a second request for.
 
-    def test_a_changelog_failure_still_leaves_the_update_known(self):
+        The changelog fetch existed only to fill "what is new" when a tag had
+        no Release behind it. Keeping it would mean this service reaching out
+        twice to render a link it already has."""
         c = self.make()
         with mock.patch.object(web, "latest_release",
-                               return_value=((0, 1, 0), "v0.1.0", "u", "")), \
-                mock.patch.object(web, "fetch_text", side_effect=OSError("x")):
+                               return_value=((0, 1, 0), "v0.1.0", "u", "")):
             c._check()
         s = c.snapshot()
         self.assertTrue(s["available"])
-        self.assertEqual(s["notes"], "")
-        self.assertEqual(s["error"], "")
+        self.assertNotIn("notes", s)
+        self.assertNotIn("clipped", s)
 
-    def test_no_changelog_fetch_when_up_to_date(self):
-        # One request in the common case, which is what keeps this cheap.
+    def test_the_next_successful_check_rewrites_the_file_without_them(self):
+        # An old cache keeps its `notes` key until something rewrites the
+        # file. Nothing reads it, so it is harmless, but the state file should
+        # not carry a dead field for ever either.
+        path = Path(self.tmp, "update.json")
+        path.write_text(json.dumps({
+            "checked": time.time(), "tag": "v0.1.3", "latest": "0.1.3",
+            "url": "u", "notes": "## Fixed", "clipped": True, "error": ""}),
+            encoding="utf-8")
         c = self.make()
         with mock.patch.object(web, "latest_release",
-                               return_value=((0, 0, 9), "v0.0.9", "u", "")), \
-                mock.patch.object(web, "fetch_text") as text:
+                               return_value=((0, 1, 4), "v0.1.4", "u2", "")):
             c._check()
-        text.assert_not_called()
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("notes", saved)
+        self.assertNotIn("clipped", saved)
+        self.assertEqual(saved["tag"], "v0.1.4")
+
+    def test_a_cache_written_by_an_older_build_still_loads(self):
+        # 0.1.0 to 0.1.3 stored `notes` and `clipped`. Those keys are simply
+        # not copied out now; everything else in the file still is.
+        ok_at = time.time() - 60
+        Path(self.tmp, "update.json").write_text(json.dumps({
+            "checked": ok_at, "attempted": ok_at, "failures": 0,
+            "tag": "v0.1.3", "latest": "0.1.3", "url": "u",
+            "notes": "- a change", "clipped": True, "error": ""}),
+            encoding="utf-8")
+        s = self.make().snapshot()
+        self.assertEqual(s["tag"], "v0.1.3")
+        self.assertTrue(s["known"])
+        self.assertNotIn("notes", s)
 
 
 class TestUpdatePanel(unittest.TestCase):
@@ -2189,45 +2220,49 @@ class TestUpdatePanel(unittest.TestCase):
         self.assertIn("sudo timelapse update", body)
         self.assertIn("https://example/rel", body)
 
-    def test_clipped_notes_say_so_and_link_to_the_rest(self):
-        # A cap that silently eats the end of somebody's release notes reads
-        # as this program losing them, and leaves no way to go and read them.
-        body = self.get(self.checker(
-            checked=time.time(), tag="v0.1.0", latest="0.1.0",
-            url="https://example/rel", notes="- a change", clipped=True))
-        self.assertIn("shortened", body)
-        self.assertIn("https://example/rel", body)
+    # -- the release notes are GitHub's job ---------------------------------
+    # This panel used to reproduce the release body. It is markdown, and this
+    # is not a markdown renderer, so `## Camera passwords` and backticked
+    # commands appeared as-is and read as a formatting failure by this
+    # program. Reported from the real deployment 2026-08-11. GitHub renders it
+    # properly one click away, which makes the link the honest version.
 
-    def test_unclipped_notes_do_not_claim_anything_is_missing(self):
+    def test_the_panel_does_not_reproduce_the_release_body(self):
         body = self.get(self.checker(
             checked=time.time(), tag="v0.1.0", latest="0.1.0",
-            notes="- a change", clipped=False))
-        self.assertIn("What is new", body)
+            url="https://example/rel"))
+        self.assertNotIn("What is new", body)
         self.assertNotIn("shortened", body)
 
-    def test_a_clip_with_no_release_url_still_offers_somewhere_to_go(self):
+    def test_it_links_to_the_release_instead(self):
         body = self.get(self.checker(
-            checked=time.time(), tag="v0.1.0", latest="0.1.0", url="",
-            notes="- a change", clipped=True))
+            checked=time.time(), tag="v0.1.0", latest="0.1.0",
+            url="https://example/rel"))
+        self.assertIn("https://example/rel", body)
+        self.assertIn("Read what changed", body)
+
+    def test_a_link_that_leaves_the_ui_opens_in_its_own_tab(self):
+        # Replacing the page somebody is reading with GitHub is the wrong
+        # move; every other link here navigates inside this server.
+        body = self.get(self.checker(
+            checked=time.time(), tag="v0.1.0", latest="0.1.0",
+            url="https://example/rel"))
+        for link in re.findall(r'<a [^>]*href="https://[^"]*"[^>]*>', body):
+            self.assertIn('target="_blank"', link)
+            # Without noopener the opened page can reach back through
+            # window.opener; it costs nothing and is not optional.
+            self.assertIn("noopener", link)
+
+    def test_internal_links_stay_in_the_tab(self):
+        body = self.get(self.checker(checked=time.time(), tag="v0.0.9",
+                                     latest="0.0.9"))
+        for link in re.findall(r'<a [^>]*href="/[^"]*"[^>]*>', body):
+            self.assertNotIn("target=", link)
+
+    def test_a_release_with_no_url_still_offers_somewhere_to_go(self):
+        body = self.get(self.checker(
+            checked=time.time(), tag="v0.1.0", latest="0.1.0", url=""))
         self.assertIn(web.RELEASES_URL, body)
-
-    def test_release_notes_are_shown_and_escaped(self):
-        body = self.get(self.checker(
-            checked=time.time(), tag="v0.1.0", latest="0.1.0",
-            notes="- fixed <script>alert(1)</script>"))
-        self.assertIn("What is new", body)
-        self.assertNotIn("<script>alert", body)
-        self.assertIn("&lt;script&gt;", body)
-
-    def test_changelog_heading_markers_are_stripped(self):
-        # The notes go into a <div>, not a markdown renderer, so a literal
-        # "### Fixed" reads as a mistake rather than as formatting.
-        body = self.get(self.checker(
-            checked=time.time(), tag="v0.1.0", latest="0.1.0",
-            notes="### Fixed\n- a thing"))
-        self.assertIn("Fixed", body)
-        self.assertNotIn("### Fixed", body)
-        self.assertIn("- a thing", body)
 
     def test_up_to_date_says_so_without_commands(self):
         body = self.get(self.checker(checked=time.time(), tag="v0.0.9",

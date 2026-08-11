@@ -7,6 +7,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.1.4] - 2026-08-11
+
+### Added
+- **`timelapse config --redacted` prints the configuration with the
+  credentials taken out**, for pasting into a bug report. "Here is my config,
+  why will camera 3 not connect" is a thing people do, and that file holds
+  every camera password; asking them to redact it by hand puts the guarantee
+  in the least reliable place available, and the shape of the secret is not
+  obvious anyway, because a Reolink URL *is* the credential.
+
+  A config hides its secrets in two shapes and each pass misses the other, so
+  it does both: `"password": "x"` has no `=` in it for the text rule to find,
+  and a Reolink `url` buries the credential in a query string where a rule
+  that knew only field names never looks. Masked: passwords under any key
+  name, credentials inside HTTP and RTSP URLs, and the Discord webhook token.
+  Kept: hostnames, usernames, paths, the transfer destination and the
+  webhook's numeric id, because those are what a fault report is about.
+
+  What was masked travels *inside* the dump as a `_redacted` key, since the
+  moment it matters is the moment somebody pastes the text into an issue, and
+  a warning printed beside the JSON is exactly the part that does not get
+  pasted. JSON goes to stdout and the prose to stderr, so
+  `timelapse config --redacted > report.json` still produces a file that
+  parses.
+
+### Changed
+- **Service status folded into the Overview, so the web UI has three tabs.**
+  Once that page was four rows rather than a screen of `systemctl status`
+  output, it no longer justified a quarter of the navigation, and "is it
+  running" belongs next to "where are my videos". *Technical data* links to
+  the full output, which stays a page of its own so that an old
+  bookmark still lands somewhere useful, and so that the Overview shells out
+  once per view rather than twice.
+- **"Last encode run" says Successful, in green, rather than Idle.** A
+  finished oneshot and one that has never run are both `inactive`; the
+  timestamp is the only thing separating them, so a row that already knew the
+  encode finished at 00:42 was reporting it in the same words and the same
+  colour as a machine that has never encoded anything. It now reads
+  *Successful* with the time, *Not yet run* when there is no timestamp, and
+  *Failed* if systemd recorded a bad result.
+- **The web UI links to the release notes instead of printing them.** The
+  "What is new" panel showed the release body as plain text, so its markdown
+  arrived intact: `## Camera passwords were being written to the log`,
+  backticked commands, and fenced blocks, which reads as this program having
+  failed to format something rather than as formatting. Rendering markdown
+  properly would mean either a dependency or a parser to maintain, for a
+  paragraph nobody reads twice; GitHub already renders it one click away. The
+  panel now carries that link, and **it opens in a new tab** rather than
+  replacing the page you were on. `sudo timelapse update` still prints the
+  notes in the terminal, where plain text is the native format.
+
+  Two consequences worth having: the update cache no longer stores the release
+  body, and the changelog fetch that used to fill the panel when a tag had no
+  Release behind it is gone, so the web UI's single outbound request is now
+  always a single request rather than usually one.
+
+### Fixed
+- **`timelapse config` no longer lets an editor leave the config unreadable by
+  the daemons.** Editors that save by writing a new file and renaming it over
+  the old one (vim with `backupcopy=no`, and every `sed -i`-style tool) leave
+  root's umask on the result. The mode widening to 0644 is unwanted, but
+  losing the `timelapse` group is worse: the services then cannot read their
+  own configuration and nothing says so until the next restart. The command
+  now re-asserts 0640 root:timelapse after the editor exits, which is why it
+  no longer `exec`s it. The editor's exit status is still the command's.
+
+  It also sets `umask 0077` first, so an editor that creates its backup or
+  swap file from the umask rather than from the original's mode creates it
+  private. Measured, and worth stating precisely: vim copies the *original's*
+  mode onto its backup, so `config.json~` comes out 0640 root:timelapse
+  whether or not the umask is set, in `/etc/timelapse` or in a `backupdir`
+  elsewhere. That is the same exposure as the config itself rather than a new
+  one, so this is defence against editors that behave differently, not a fix
+  for an exploitable hole in vim.
+
+- **The pre-flight during `sudo timelapse update` no longer reports a working
+  share as broken.** It ended with:
+
+  ```
+  FAIL  rsync -a --partial --remove-source-files fails against /mnt/cctv/TL/:
+        exit 1: runuser: may not be used by non-root users
+  ....  no flag combination worked; check the share permissions for timelapse.
+  ```
+
+  Nothing was wrong with the share. The installer runs the pre-flight *as the
+  service account* on purpose, so that permission problems surface then rather
+  than at 00:05 tonight; the rsync probe then ran `runuser` a second time from
+  inside that unprivileged process, and the nested "may not be used by
+  non-root users" was printed as rsync's verdict.
+
+  `probe_as()` now works out how to reach that account before running
+  anything: already it (run directly, which is both the reported case and the
+  authoritative one), root with `runuser` (wrap), or neither (decline, and
+  name the command that would work). `try_rsync_args()` returns `None` for
+  "could not be tested" separately from `False` for "tested, and it does not
+  work", with the reason attached. That also fixes a host with no `runuser`
+  installed, where the probe previously ran unwrapped and reported a result
+  for the wrong account entirely.
+
+  Fourth instance of one shape in this project, after the update checker
+  writing `checked` on a failed poll and `sync_unit_readwritepaths()` returning
+  a count: **"could not check" collapsed into "checked, and it is broken"**.
+
 ## [0.1.3] - 2026-08-11
 
 A security release. Camera passwords were reaching the log, and from there the
@@ -645,8 +748,6 @@ Bugs from the first real install on someone else's hardware.
 - `timelapse_test.py` reports the reason each encoder was unavailable, and
   distinguishes a 403 from a 404 on the webhook check.
 
-## [Unreleased]
-
 ### Added
 - `transfer.require_mountpoint`: refuses to transfer when the destination is
   not on a mounted filesystem. An unmounted CIFS/NFS mountpoint is an ordinary
@@ -772,6 +873,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.4]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.4
 [0.1.3]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.3
 [0.1.2]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.2
 [0.1.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.1

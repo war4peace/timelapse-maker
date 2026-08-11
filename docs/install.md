@@ -114,12 +114,12 @@ timelapse version
 ```
 
 ```
-  capture  0.1.3
-  encode   0.1.3
-  test     0.1.3
-  setup    0.1.3
-  update   0.1.3
-  web      0.1.3
+  capture  0.1.4
+  encode   0.1.4
+  test     0.1.4
+  setup    0.1.4
+  update   0.1.4
+  web      0.1.4
 ```
 
 If the daemon predates the installed files it says so explicitly, which is the
@@ -406,7 +406,8 @@ of it; nothing needs a reinstall.
 | `timelapse web` | Turn the read-only web UI on or off and set its address, port and library path. §11. |
 | `timelapse web-serve` | Run the web UI in the foreground for a look at its log. The service normally does this. |
 | `timelapse setup` | The full wizard again: storage, capture settings, cameras, transfer, Discord. Overwrites the whole config, so prefer `cameras` or `transfer` for a single change. |
-| `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover, such as the encoder's container and quality. A backup is taken first. You are then responsible for restarting capture yourself. |
+| `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover, such as the encoder's container and quality. A backup is taken first, and the file's `0640 root:timelapse` is restored afterwards whatever your editor did to it. You are then responsible for restarting capture yourself. |
+| `timelapse config --redacted` | Prints the config with the passwords masked, for pasting into a bug report. Opens no editor and changes nothing. See below. |
 | `timelapse restore` | Put back an earlier config. One is kept before every change, five deep. §10. |
 | `timelapse encode` | Runs the nightly encode immediately instead of waiting for 00:05. Useful to clear a backlog. |
 | `timelapse version` | The installed version of each script, and a warning if the running daemon predates them. |
@@ -440,6 +441,33 @@ camera list once, at startup. `timelapse cameras` handles that for you; after a
 hand-edit with `timelapse config`, run `sudo systemctl restart
 timelapse-capture`. The encoder re-reads the config on every run, so it never
 needs this.
+
+### Asking for help without posting your passwords
+
+`config.json` holds a password for every camera, and for the Reolink-style
+cameras the password is *inside the URL*, which is easy to miss when pasting.
+Never post the file as it is.
+
+```bash
+sudo timelapse config --redacted
+```
+
+It prints the whole configuration with the credentials replaced by `***`:
+passwords under any key, credentials embedded in HTTP and RTSP URLs, and the
+Discord webhook token. Everything a fault report actually needs is kept, which
+is the deliberate part: camera addresses, usernames, the authentication mode,
+your paths, the transfer destination and the webhook's numeric id all remain,
+so read it through before posting it anywhere public if any of those are
+sensitive on your network. The dump says as much in a `_redacted` field at the
+top, so the warning travels with the text.
+
+It writes nothing, takes no backup and opens no editor. To keep it in a file:
+
+```bash
+sudo timelapse config --redacted > report.json
+```
+
+The JSON goes to stdout and the advice to stderr, so that file still parses.
 
 ### Checking disk usage
 
@@ -726,6 +754,14 @@ From 0.1.3 the daemons mask credentials in everything they log, and the web UI
 masks them in anything it displays, including the entries written before the
 fix.
 
+**Two more places worth knowing about.** Sending the config to somebody is the
+one route no daemon can guard, so use `timelapse config --redacted` for that;
+see §8. And your editor may keep a copy of its own: vim writes `config.json~`
+next to the file, or into wherever `backupdir` points, carrying the same
+`0640 root:timelapse`. That is no worse than the config itself, but it is an
+extra copy that nothing rotates, so it can still be holding a password you
+have since changed. `sudo ls -la /etc/timelapse` shows anything left there.
+
 ---
 
 ## 11. The web UI
@@ -752,26 +788,27 @@ It gives you five things:
 
 - **Where your videos actually are**: see the warning below, this is the
   question people get wrong.
-- **Service status and recent log**, on request, without an SSH session. The
-  status page is four rows saying whether each part is working and what to do
-  if it is not, rather than the page of systemd internals `timelapse status`
-  prints; the full output is still there under *Everything systemd knows*,
-  which is what to paste into a bug report.
+- **Service status and recent log**, without an SSH session. Service status is
+  four rows at the foot of the Overview, saying whether each part is working
+  and what to do if it is not, rather than the page of systemd internals
+  `timelapse status` prints. *Technical data* links to the full output, which
+  is what to paste into a bug report.
 - **An index of finished videos**, browsable by camera, by day and by folder.
 - **Playback in your own player.** Each video has a *Play* link that hands VLC
   (or mpv, or whatever opens `.m3u`) a playlist pointing back at the server,
   plus a *Download* link. There is also **one playlist per day**: open it and
   your player queues that day's videos from every camera in turn.
-- **Whether there is a new version**, with what changed and the command to
-  upgrade. See below; you can turn it off.
+- **Whether there is a new version**, with the command to upgrade and a link
+  to the release notes. See below; you can turn it off.
 
 ### The update check, and the only packet this UI sends
 
-The Overview page tells you which version you are running and whether a newer
-one has been tagged, along with its release notes and the command to upgrade
-(`sudo timelapse update`). Release notes longer than 4,000 characters are cut
-at a line boundary, and the page says so and links to the full text rather
-than stopping mid-sentence.
+The Overview page tells you which version you are running, whether a newer one
+has been tagged, and the command to upgrade (`sudo timelapse update`). What
+changed is a link to the release on GitHub, which opens in a new tab: release
+notes are markdown, this page is not a markdown renderer, and GitHub already
+renders them properly. `sudo timelapse update` prints them in the terminal
+before asking to install, where plain text is the right format anyway.
 
 It asks `api.github.com` **at most once a day**, and only while somebody has
 the page open, so a service nobody looks at never contacts anything. The

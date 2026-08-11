@@ -51,8 +51,7 @@ from urllib.parse import parse_qs, quote, unquote
 # many. Installed side by side in the same directory, which is sys.path[0] for
 # either entry point; the tests put scripts/ on the path for the same reason.
 from timelapse_update import (                            # noqa: E402
-    CHANGELOG_URL, NOTES_LIMIT, RELEASES_URL, changelog_section, clip_notes,
-    fetch_json, fetch_text, friendly_error, latest_release, parse_version,
+    RELEASES_URL, fetch_json, friendly_error, latest_release, parse_version,
     version_text,
 )
 
@@ -63,7 +62,7 @@ from timelapse_update import (                            # noqa: E402
 # behaviour a security filter should have.
 from timelapse_encode import redact                       # noqa: E402
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 log = logging.getLogger("web")
 
@@ -867,15 +866,16 @@ UPDATE_RETRY_MAX = UPDATE_INTERVAL
 UPDATE_COMMANDS = "sudo timelapse update"
 
 
-def plain_notes(text):
-    """Changelog markdown, de-fanged for a <div> that is not a renderer.
+def external(url, label):
+    """A link that leaves this UI, and says so by opening in its own tab.
 
-    Only the heading markers, which is the part that looks like a mistake
-    rather than like formatting. Bullets and backticks read fine as they are,
-    and half-rendering markdown is worse than not rendering it.
+    Every other link here navigates within the server; this one hands the
+    reader to GitHub. Replacing the page they were reading with it is the
+    wrong move, and `noopener` is not optional on a target=_blank link: it
+    stops the opened page reaching back through window.opener.
     """
-    out = [re.sub(r"^#+\s*", "", line) for line in (text or "").splitlines()]
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    return (f'<a href="{escape(url)}" target="_blank" '
+            f'rel="noopener noreferrer">{escape(label)}</a>')
 
 
 class UpdateChecker:
@@ -902,9 +902,12 @@ class UpdateChecker:
         # which are different things and used to be conflated. Recording a
         # failure as a check both gated the retry for a day and made the page
         # claim it had checked when it had not.
+        # No `notes` here any more. The panel links to the release rather than
+        # reproducing it, so caching the body would be storing something
+        # nothing reads. A cache written by an older build simply has a key
+        # this no longer copies out of it.
         self.state = {"checked": 0.0, "attempted": 0.0, "failures": 0,
-                      "tag": "", "latest": "", "url": "", "notes": "",
-                      "clipped": False, "error": ""}
+                      "tag": "", "latest": "", "url": "", "error": ""}
         self._load()
 
     def _load(self):
@@ -935,13 +938,6 @@ class UpdateChecker:
             self.state["failures"] = 1
             self.state["attempted"] = saved.get("checked", 0.0)
             self.state["checked"] = 0.0
-        # Notes cached by 0.1.0 or 0.1.1 were sliced at exactly NOTES_LIMIT
-        # with nothing recording that anything was lost, so a body that landed
-        # on the boundary is one that was cut. The page would otherwise show
-        # yesterday's half-sentence with no hint that the rest exists, for up
-        # to a day, which is the whole complaint this change answers.
-        if "clipped" not in saved and len(saved.get("notes") or "") >= NOTES_LIMIT:
-            self.state["clipped"] = True
 
     def _save(self):
         if not self.path:
@@ -999,23 +995,16 @@ class UpdateChecker:
 
     def _check(self):
         try:
-            ver, tag, url, notes = latest_release()
-            if not notes and self.current and ver > self.current:
-                # No Release behind the tag, so the changelog is where the
-                # "what's new" lives. Fetched only when there is an update, so
-                # the usual case is a single request.
-                try:
-                    text = fetch_text(CHANGELOG_URL, 256 * 1024)
-                    notes = changelog_section(text, version_text(ver))
-                except Exception as exc:          # noqa: BLE001
-                    log.debug("Changelog fetch failed: %s", exc)
-            notes, clipped = clip_notes(notes)
+            # One request, always. This used to fetch the changelog as well
+            # when a tag had no Release behind it, to fill the "what is new"
+            # panel; with that panel gone the second request has nothing to
+            # fill, and the service's single outbound connection stays single.
+            ver, tag, url, _ = latest_release()
             now = time.time()
             with self._lock:
                 self.state.update(checked=now, attempted=now, failures=0,
                                   tag=tag, latest=version_text(ver),
-                                  url=url, notes=notes, clipped=clipped,
-                                  error="")
+                                  url=url, error="")
         except Exception as exc:                  # noqa: BLE001
             # Every failure here is somebody else's outage. Record it, keep
             # the last good answer, and never let it reach the page as a 500.
@@ -1142,9 +1131,19 @@ def describe_unit(label, kind, props, name):
         return (label, "ok", "Running", detail)
 
     if kind == "oneshot":
+        # A finished oneshot is inactive, exactly as one that has never run
+        # is, and the timestamp is what tells them apart. "Idle" was true of
+        # both and useful about neither: the question this row answers is
+        # whether last night's encode worked, so say so, in green. A run that
+        # failed does not reach here; systemd leaves it ActiveState=failed.
         when = props.get("InactiveEnterTimestamp", "")
-        return (label, "", "Idle",
-                f"last finished {when}" if when else "has not run yet")
+        if not when:
+            return (label, "", "Not yet run",
+                    "the timer has not fired since this was installed")
+        result = props.get("Result", "success")
+        if result and result != "success":
+            return (label, "bad", "Failed", f"{result}, at {when}")
+        return (label, "ok", "Successful", f"last finished {when}")
     return (label, "bad", "Stopped", f"start it with: sudo systemctl start {name}")
 
 
@@ -1291,8 +1290,6 @@ LAYOUT = """<!doctype html>
                    padding-top: 0; }}
   .scan {{ font-size: .85rem; opacity: .7; margin: 0 0 1rem; }}
   .new {{ background: rgba(26,127,55,.14); }}
-  .notes {{ max-height: 22rem; overflow: auto; white-space: pre-wrap;
-            font-size: .85rem; margin: .6rem 0 0; }}
   .quiet {{ font-size: .8rem; opacity: .55; margin: .6rem 0 0; }}
   form.inline {{ display: inline; }}
   button {{ font: inherit; font-size: .85rem; padding: .25rem .8rem;
@@ -1308,7 +1305,6 @@ LAYOUT = """<!doctype html>
 <nav>
   <a href="/" class="{on_home}">Overview</a>
   <a href="/library" class="{on_library}">Library</a>
-  <a href="/status" class="{on_status}">Service status</a>
   <a href="/logs" class="{on_logs}">Recent log</a>
 </nav>
 {content}
@@ -1384,6 +1380,8 @@ OVERVIEW = """<section>
 </section>
 
 {update}
+
+{services}
 """
 
 
@@ -1439,7 +1437,13 @@ class Handler(BaseHTTPRequestHandler):
         elif route == "/library":
             self._send(200, self._render("library", self._library(args)))
         elif route == "/status":
-            self._send(200, self._render("status", self._status()))
+            # No longer a tab: the four-row summary lives at the foot of the
+            # overview. This is the full `systemctl status` behind it, kept as
+            # a page of its own so the overview shells out once rather than
+            # twice and carries one table rather than a screen of output that
+            # is almost never opened. Old bookmarks still land somewhere
+            # useful, which is the other reason not to fold it away entirely.
+            self._send(200, self._render("home", self._status_detail()))
         elif route == "/logs":
             self._send(200, self._render("logs", self._logs(args)))
         elif route == "/scan":
@@ -1497,7 +1501,6 @@ class Handler(BaseHTTPRequestHandler):
             body_class="pane-page" if page in self.PANE_PAGES else "",
             on_home="on" if page == "home" else "",
             on_library="on" if page == "library" else "",
-            on_status="on" if page == "status" else "",
             on_logs="on" if page == "logs" else "",
             content=content,
         )
@@ -1518,6 +1521,7 @@ class Handler(BaseHTTPRequestHandler):
             lib_state="yes" if lib["usable"] else "no",
             lib_note=note,
             update=self._update_panel(),
+            services=self._services(),
         )
 
     def _update_panel(self, with_script=True):
@@ -1549,28 +1553,23 @@ class Handler(BaseHTTPRequestHandler):
         if u["busy"]:
             body.append('<p class="scan">Checking GitHub&hellip;</p>')
         elif u["available"]:
+            # The release notes themselves are not rendered here, deliberately.
+            # They are markdown, this is not a markdown renderer, and showing
+            # the source with its `##` and backticks intact read as this
+            # program having failed to format something. GitHub renders them
+            # properly, one click away, so the honest version of this panel is
+            # the link.
             body.append(
                 f'<p class="note new"><strong>An update is available.</strong> '
                 f'You have {escape(u["current"])}; '
-                f'<a href="{escape(u["url"])}">{escape(u["tag"])}</a> is out.'
-                f'</p>'
+                f'{external(u["url"] or RELEASES_URL, u["tag"] or u["latest"])}'
+                f' is out.</p>'
                 f'<p class="cmd">Upgrading re-runs the installer, which keeps '
                 f'your config, your frames and your videos.'
-                f'</p><pre>{escape(UPDATE_COMMANDS)}</pre>')
-            if u["notes"]:
-                # The tag is in the line above; repeating it in an h2 would
-                # only show it uppercased, since that is what h2 does here.
-                body.append(f'<h2 style="margin-top:1rem">What is new</h2>'
-                            f'<div class="notes">'
-                            f'{escape(plain_notes(u["notes"]))}</div>')
-                if u["clipped"]:
-                    # Say it, and link past it. A cap that silently eats the
-                    # end of somebody's release notes reads as this program
-                    # losing them, and leaves no way to go and read the rest.
-                    body.append(
-                        f'<p class="quiet">These notes were shortened to fit. '
-                        f'<a href="{escape(u["url"] or RELEASES_URL)}">Read '
-                        f'the full notes for {escape(u["tag"])}</a>.</p>')
+                f'</p><pre>{escape(UPDATE_COMMANDS)}</pre>'
+                f'<p class="quiet">'
+                f'{external(u["url"] or RELEASES_URL, "Read what changed on GitHub")}'
+                f'</p>')
         elif u["known"] and not u["error"]:
             body.append('<p class="scan">Up to date.</p>')
 
@@ -2053,14 +2052,19 @@ class Handler(BaseHTTPRequestHandler):
         out.append("</table></div>")
         return "".join(out)
 
-    def _status(self):
-        """Four rows saying whether it works, and the raw output folded away.
+    def _services(self):
+        """Four rows saying whether it works, for the foot of the overview.
 
-        This page used to be `systemctl status` verbatim: a page of invocation
-        IDs, cgroup paths, PIDs and the same Docs= URL four times over, to
-        answer a question that fits in four words. The detail is still one
-        click away, because when something is wrong that is exactly what a
-        bug report needs.
+        It was a tab of its own, and before that a tab holding `systemctl
+        status` verbatim. Once it became four rows there was not enough of it
+        to justify a quarter of the navigation, and "is it running" belongs
+        next to "where are my videos" anyway.
+
+        One `systemctl show` per page load, and no more: the full output is a
+        click away at /status rather than inline in a <details>, because
+        rendering it here would cost a second subprocess and a screen of
+        markup on every view of the landing page to serve something that is
+        almost never opened.
         """
         rows, problem = unit_states()
         parts = ["<section><h2>Services</h2>"]
@@ -2075,18 +2079,21 @@ class Handler(BaseHTTPRequestHandler):
             parts.append(f'<tr><td>{escape(label)}</td>'
                          f'<td{mark}>{escape(state)}</td>'
                          f'<td class="dim">{escape(detail)}</td></tr>')
-        parts.append("</table></section>")
-
-        rep = status_report()
-        if not rep["problem"]:
-            parts.append(
-                f'<section><details>'
-                f'<summary>Everything systemd knows</summary>'
-                f'<p class="cmd" style="margin-top:.6rem">'
-                f'<code>{escape(rep["command"])}</code></p>'
-                f'<pre>{escape(rep["output"]) or "(no output)"}</pre>'
-                f'</details></section>')
+        parts.append('</table><p class="quiet">'
+                     '<a href="/status">Technical data</a></p>'
+                     '</section>')
         return "".join(parts)
+
+    def _status_detail(self):
+        """`systemctl status` in full, for when something is actually wrong.
+
+        Not a tab any more, and not inline on the overview either, but still a
+        page: this is what a bug report wants pasted into it, and re-running
+        systemctl over ssh to get it is worse than a link.
+        """
+        rep = status_report()
+        return ('<p class="sub"><a href="/">&larr; Overview</a></p>'
+                + self._report(rep))
 
     def _logs(self, args):
         unit = (args.get("unit") or [DEFAULT_LOG_UNIT])[0]
