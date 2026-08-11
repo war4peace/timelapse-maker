@@ -762,16 +762,17 @@ It gives you five things:
   (or mpv, or whatever opens `.m3u`) a playlist pointing back at the server,
   plus a *Download* link. There is also **one playlist per day**: open it and
   your player queues that day's videos from every camera in turn.
-- **Whether there is a new version**, with what changed and the command to
-  upgrade. See below; you can turn it off.
+- **Whether there is a new version**, with the command to upgrade and a link
+  to the release notes. See below; you can turn it off.
 
 ### The update check, and the only packet this UI sends
 
-The Overview page tells you which version you are running and whether a newer
-one has been tagged, along with its release notes and the command to upgrade
-(`sudo timelapse update`). Release notes longer than 4,000 characters are cut
-at a line boundary, and the page says so and links to the full text rather
-than stopping mid-sentence.
+The Overview page tells you which version you are running, whether a newer one
+has been tagged, and the command to upgrade (`sudo timelapse update`). What
+changed is a link to the release on GitHub, which opens in a new tab: release
+notes are markdown, this page is not a markdown renderer, and GitHub already
+renders them properly. `sudo timelapse update` prints them in the terminal
+before asking to install, where plain text is the right format anyway.
 
 It asks `api.github.com` **at most once a day**, and only while somebody has
 the page open, so a service nobody looks at never contacts anything. The

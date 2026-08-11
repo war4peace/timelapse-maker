@@ -51,8 +51,7 @@ from urllib.parse import parse_qs, quote, unquote
 # many. Installed side by side in the same directory, which is sys.path[0] for
 # either entry point; the tests put scripts/ on the path for the same reason.
 from timelapse_update import (                            # noqa: E402
-    CHANGELOG_URL, NOTES_LIMIT, RELEASES_URL, changelog_section, clip_notes,
-    fetch_json, fetch_text, friendly_error, latest_release, parse_version,
+    RELEASES_URL, fetch_json, friendly_error, latest_release, parse_version,
     version_text,
 )
 
@@ -867,15 +866,16 @@ UPDATE_RETRY_MAX = UPDATE_INTERVAL
 UPDATE_COMMANDS = "sudo timelapse update"
 
 
-def plain_notes(text):
-    """Changelog markdown, de-fanged for a <div> that is not a renderer.
+def external(url, label):
+    """A link that leaves this UI, and says so by opening in its own tab.
 
-    Only the heading markers, which is the part that looks like a mistake
-    rather than like formatting. Bullets and backticks read fine as they are,
-    and half-rendering markdown is worse than not rendering it.
+    Every other link here navigates within the server; this one hands the
+    reader to GitHub. Replacing the page they were reading with it is the
+    wrong move, and `noopener` is not optional on a target=_blank link: it
+    stops the opened page reaching back through window.opener.
     """
-    out = [re.sub(r"^#+\s*", "", line) for line in (text or "").splitlines()]
-    return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
+    return (f'<a href="{escape(url)}" target="_blank" '
+            f'rel="noopener noreferrer">{escape(label)}</a>')
 
 
 class UpdateChecker:
@@ -902,9 +902,12 @@ class UpdateChecker:
         # which are different things and used to be conflated. Recording a
         # failure as a check both gated the retry for a day and made the page
         # claim it had checked when it had not.
+        # No `notes` here any more. The panel links to the release rather than
+        # reproducing it, so caching the body would be storing something
+        # nothing reads. A cache written by an older build simply has a key
+        # this no longer copies out of it.
         self.state = {"checked": 0.0, "attempted": 0.0, "failures": 0,
-                      "tag": "", "latest": "", "url": "", "notes": "",
-                      "clipped": False, "error": ""}
+                      "tag": "", "latest": "", "url": "", "error": ""}
         self._load()
 
     def _load(self):
@@ -935,13 +938,6 @@ class UpdateChecker:
             self.state["failures"] = 1
             self.state["attempted"] = saved.get("checked", 0.0)
             self.state["checked"] = 0.0
-        # Notes cached by 0.1.0 or 0.1.1 were sliced at exactly NOTES_LIMIT
-        # with nothing recording that anything was lost, so a body that landed
-        # on the boundary is one that was cut. The page would otherwise show
-        # yesterday's half-sentence with no hint that the rest exists, for up
-        # to a day, which is the whole complaint this change answers.
-        if "clipped" not in saved and len(saved.get("notes") or "") >= NOTES_LIMIT:
-            self.state["clipped"] = True
 
     def _save(self):
         if not self.path:
@@ -999,23 +995,16 @@ class UpdateChecker:
 
     def _check(self):
         try:
-            ver, tag, url, notes = latest_release()
-            if not notes and self.current and ver > self.current:
-                # No Release behind the tag, so the changelog is where the
-                # "what's new" lives. Fetched only when there is an update, so
-                # the usual case is a single request.
-                try:
-                    text = fetch_text(CHANGELOG_URL, 256 * 1024)
-                    notes = changelog_section(text, version_text(ver))
-                except Exception as exc:          # noqa: BLE001
-                    log.debug("Changelog fetch failed: %s", exc)
-            notes, clipped = clip_notes(notes)
+            # One request, always. This used to fetch the changelog as well
+            # when a tag had no Release behind it, to fill the "what is new"
+            # panel; with that panel gone the second request has nothing to
+            # fill, and the service's single outbound connection stays single.
+            ver, tag, url, _ = latest_release()
             now = time.time()
             with self._lock:
                 self.state.update(checked=now, attempted=now, failures=0,
                                   tag=tag, latest=version_text(ver),
-                                  url=url, notes=notes, clipped=clipped,
-                                  error="")
+                                  url=url, error="")
         except Exception as exc:                  # noqa: BLE001
             # Every failure here is somebody else's outage. Record it, keep
             # the last good answer, and never let it reach the page as a 500.
@@ -1291,8 +1280,6 @@ LAYOUT = """<!doctype html>
                    padding-top: 0; }}
   .scan {{ font-size: .85rem; opacity: .7; margin: 0 0 1rem; }}
   .new {{ background: rgba(26,127,55,.14); }}
-  .notes {{ max-height: 22rem; overflow: auto; white-space: pre-wrap;
-            font-size: .85rem; margin: .6rem 0 0; }}
   .quiet {{ font-size: .8rem; opacity: .55; margin: .6rem 0 0; }}
   form.inline {{ display: inline; }}
   button {{ font: inherit; font-size: .85rem; padding: .25rem .8rem;
@@ -1549,28 +1536,23 @@ class Handler(BaseHTTPRequestHandler):
         if u["busy"]:
             body.append('<p class="scan">Checking GitHub&hellip;</p>')
         elif u["available"]:
+            # The release notes themselves are not rendered here, deliberately.
+            # They are markdown, this is not a markdown renderer, and showing
+            # the source with its `##` and backticks intact read as this
+            # program having failed to format something. GitHub renders them
+            # properly, one click away, so the honest version of this panel is
+            # the link.
             body.append(
                 f'<p class="note new"><strong>An update is available.</strong> '
                 f'You have {escape(u["current"])}; '
-                f'<a href="{escape(u["url"])}">{escape(u["tag"])}</a> is out.'
-                f'</p>'
+                f'{external(u["url"] or RELEASES_URL, u["tag"] or u["latest"])}'
+                f' is out.</p>'
                 f'<p class="cmd">Upgrading re-runs the installer, which keeps '
                 f'your config, your frames and your videos.'
-                f'</p><pre>{escape(UPDATE_COMMANDS)}</pre>')
-            if u["notes"]:
-                # The tag is in the line above; repeating it in an h2 would
-                # only show it uppercased, since that is what h2 does here.
-                body.append(f'<h2 style="margin-top:1rem">What is new</h2>'
-                            f'<div class="notes">'
-                            f'{escape(plain_notes(u["notes"]))}</div>')
-                if u["clipped"]:
-                    # Say it, and link past it. A cap that silently eats the
-                    # end of somebody's release notes reads as this program
-                    # losing them, and leaves no way to go and read the rest.
-                    body.append(
-                        f'<p class="quiet">These notes were shortened to fit. '
-                        f'<a href="{escape(u["url"] or RELEASES_URL)}">Read '
-                        f'the full notes for {escape(u["tag"])}</a>.</p>')
+                f'</p><pre>{escape(UPDATE_COMMANDS)}</pre>'
+                f'<p class="quiet">'
+                f'{external(u["url"] or RELEASES_URL, "Read what changed on GitHub")}'
+                f'</p>')
         elif u["known"] and not u["error"]:
             body.append('<p class="scan">Up to date.</p>')
 

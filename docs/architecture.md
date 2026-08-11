@@ -742,22 +742,31 @@ connection this service makes, and should stay the only one.
 - **`parse_version` compares tuples, never strings.** `0.0.10` sorts below
   `0.0.9` lexically, and `0.10.0` below `0.9.0`. A two-digit component is
   not a hypothetical for a project on its tenth release.
-- **The notes come from the changelog** when the tag has no release body,
-  fetched only when there is actually an update to describe, so the ordinary
-  case is one request. `plain_notes()` strips heading markers because the text
-  lands in a `<div>`, not a markdown renderer.
-- **The 4,000-character cap degrades, rather than truncating.** v0.1.0's own
-  release body was 4,020 characters, and a plain slice cut it three characters
-  into a sentence with nothing recording that it had: the page read as though
-  this program had lost the rest. `clip_notes()` cuts on the last line break
-  instead (word break, then a blunt cut, for notes written as one paragraph),
-  and returns whether anything was dropped, so the panel can say so and link
-  to the release. The half-limit floor stops a body whose only newline is near
-  the start being trimmed to almost nothing. A cache written before the flag
-  existed is repaired on load by inferring it from the length: without that,
-  the fix would not reach an install already carrying clipped notes until its
-  next check, which is up to a day. **Never cap rendered text without
-  reporting the cap and offering the whole thing somewhere.**
+- **The web panel links to the release; it does not reproduce it.** A release
+  body is markdown, and this page is not a markdown renderer, so `##` headings
+  and backticked commands appeared verbatim and read as this program having
+  failed to format something. Reported 2026-08-11. The alternatives were a
+  markdown renderer (a dependency, or a parser to maintain, for a paragraph
+  nobody reads twice) or a link to the page that already renders it properly.
+  Consequences worth keeping: the panel needs no `notes` in its cache, and the
+  changelog fetch that used to fill it when a tag had no Release body is gone,
+  so the service's one outbound request is now *always* one.
+- **A link that leaves the UI opens in a new tab.** Every other link on these
+  pages navigates within this server, so replacing the page somebody is
+  reading with github.com is the odd one out. `external()` is the only place
+  that emits `target="_blank"`, and it always pairs it with
+  `rel="noopener noreferrer"`.
+- **The 4,000-character cap still exists for the terminal.** `timelapse
+  update` prints the notes before asking to install, where plain text is the
+  native format. v0.1.0's own release body was 4,020 characters, and a plain
+  slice cut it three characters into a sentence with nothing recording that it
+  had, so it read as this program losing the rest. `clip_notes()` cuts on the
+  last line break instead (word break, then a blunt cut, for notes written as
+  one paragraph) and returns whether anything was dropped, so the CLI can say
+  so and name where the rest is. The half-limit floor stops a body whose only
+  newline is near the start being trimmed to almost nothing. **Never cap
+  rendered text without reporting the cap and offering the whole thing
+  somewhere.**
 - **An explicit User-Agent is mandatory.** GitHub rejects a request without
   one, exactly as Cloudflare does for the Discord webhook. Two vendors, one
   trap; see `post_webhook()`.
@@ -900,6 +909,8 @@ Upgrading is re-running the installer, so that is what this does:
 
 1. Ask which release is newest, and compare as tuples.
 2. Show the notes, clipped on a line boundary (§4.5) rather than mid-sentence.
+   This is the one place that renders them: a terminal is where markdown as
+   plain text is the native format, and the web panel links to GitHub instead.
 3. Confirm, unless `--yes`.
 4. Download `install.sh` **for that tag**, not for `main`. An installer newer
    than the tree it unpacks can expect files that tree does not contain.
@@ -1250,7 +1261,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 772 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 768 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1409,7 +1420,7 @@ scripts/timelapse_encode.py      batch job, 1022 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 772 lines
 scripts/timelapse_setup.py       configuration wizard, 2702 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2262 lines
+scripts/timelapse_web.py         read-only web UI, 2244 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

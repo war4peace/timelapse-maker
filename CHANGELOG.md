@@ -9,6 +9,23 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Changed
+- **The web UI links to the release notes instead of printing them.** The
+  "What is new" panel showed the release body as plain text, so its markdown
+  arrived intact: `## Camera passwords were being written to the log`,
+  backticked commands, and fenced blocks, which reads as this program having
+  failed to format something rather than as formatting. Rendering markdown
+  properly would mean either a dependency or a parser to maintain, for a
+  paragraph nobody reads twice; GitHub already renders it one click away. The
+  panel now carries that link, and **it opens in a new tab** rather than
+  replacing the page you were on. `sudo timelapse update` still prints the
+  notes in the terminal, where plain text is the native format.
+
+  Two consequences worth having: the update cache no longer stores the release
+  body, and the changelog fetch that used to fill the panel when a tag had no
+  Release behind it is gone, so the web UI's single outbound request is now
+  always a single request rather than usually one.
+
 ### Fixed
 - **The pre-flight during `sudo timelapse update` no longer reports a working
   share as broken.** It ended with:
