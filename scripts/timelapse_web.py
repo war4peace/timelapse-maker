@@ -2080,7 +2080,7 @@ class Handler(BaseHTTPRequestHandler):
                          f'<td{mark}>{escape(state)}</td>'
                          f'<td class="dim">{escape(detail)}</td></tr>')
         parts.append('</table><p class="quiet">'
-                     '<a href="/status">Everything systemd knows</a></p>'
+                     '<a href="/status">Technical data</a></p>'
                      '</section>')
         return "".join(parts)
 

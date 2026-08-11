@@ -13,8 +13,8 @@ While the version is `0.x`, the configuration format may change in any release.
 - **Service status folded into the Overview, so the web UI has three tabs.**
   Once that page was four rows rather than a screen of `systemctl status`
   output, it no longer justified a quarter of the navigation, and "is it
-  running" belongs next to "where are my videos". *Everything systemd knows*
-  links to the full output, which stays a page of its own so that an old
+  running" belongs next to "where are my videos". *Technical data* links to
+  the full output, which stays a page of its own so that an old
   bookmark still lands somewhere useful, and so that the Overview shells out
   once per view rather than twice.
 - **"Last encode run" says Successful, in green, rather than Idle.** A
