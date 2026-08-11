@@ -694,22 +694,56 @@ def send_discord(cfg, title, description, color, fields):
         log.warning("Discord notification failed: %s", exc)
 
 
+NAME_COL = 12
+SUMMARY_HEADS = ("Camera", "St", "Frames", "Cov%", "Size", "Time")
+SUMMARY_ALIGN = ("<", "<", ">", ">", ">", ">")
+
+
+def pad_row(values, widths):
+    """One line of the table. Trailing blanks trimmed; they only cost width."""
+    return " ".join(
+        v.ljust(w) if a == "<" else v.rjust(w)
+        for v, a, w in zip(values, SUMMARY_ALIGN, widths)).rstrip()
+
+
 def build_summary(results, interval):
-    fmt = "{:<12} {:<10} {:<5} {:>7} {:>5} {:>9} {:>8}"
-    rows = [fmt.format("Camera", "Date", "St", "Frames", "Cov%", "Size", "Time"),
-            "-" * 62]
-    for r in results:
-        # Against the cadence this camera ran at. Using the global interval
-        # made a camera at one frame a minute read as 8% coverage every night,
-        # which is a full day of frames reported as a near-total outage.
-        expected = int(86400 / (r.get("interval") or interval))
-        cov = f"{100.0 * r['frames'] / expected:.0f}" if r["frames"] else "-"
-        rows.append(fmt.format(
-            r["camera"][:12], r["date"], r["status"],
-            r["frames"] or "-", cov,
-            human_size(r["size"]) if r["size"] else "-",
-            human_duration(r["seconds"])))
-    return "```\n" + "\n".join(rows) + "\n```"
+    """The nightly table, as a Discord code block.
+
+    Discord renders an embed's description in a column narrower than an
+    ordinary message and wraps whatever overflows, so a fixed 62-column table
+    put its last field on a second line underneath the first. Two things keep
+    it narrow: the widths come from the content, and the date is a heading
+    rather than a column repeating one value on every row. A run normally
+    encodes a single day; catch-up runs after an outage get a block each.
+    """
+    if not results:
+        return "Nothing to report."
+    blocks = []
+    for date in sorted({r["date"] for r in results}):
+        rows = []
+        for r in results:
+            if r["date"] != date:
+                continue
+            # Against the cadence this camera ran at. Using the global interval
+            # made a camera at one frame a minute read as 8% coverage every
+            # night, which is a full day of frames reported as a near-outage.
+            expected = int(86400 / (r.get("interval") or interval))
+            rows.append((
+                str(r["camera"])[:NAME_COL],
+                r["status"],
+                str(r["frames"] or "-"),
+                f"{100.0 * r['frames'] / expected:.0f}" if r["frames"] else "-",
+                human_size(r["size"]) if r["size"] else "-",
+                human_duration(r["seconds"])))
+        widths = [max([len(h)] + [len(row[i]) for row in rows])
+                  for i, h in enumerate(SUMMARY_HEADS)]
+        # Not len(header): the row builder strips trailing blanks, so a short
+        # value in the last column would shorten the rule under it.
+        rule = "-" * (sum(widths) + len(widths) - 1)
+        blocks.append("\n".join(
+            [date, pad_row(SUMMARY_HEADS, widths), rule]
+            + [pad_row(row, widths) for row in rows]))
+    return "```\n" + "\n\n".join(blocks) + "\n```"
 
 
 # ----------------------------------------------------------------------------

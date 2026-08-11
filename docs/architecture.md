@@ -305,6 +305,19 @@ swallowed, catching `Exception` deliberately: a socket timeout is not a
 `URLError`, and notification is never load-bearing, least of all in the
 critical-failure handler, where an exception would mask the original error.
 
+**`build_summary()`** writes the table inside that embed, and **the embed is
+narrower than a message**. Roughly 50 columns survive; past that Discord wraps,
+which put the last field on a second line underneath the first row and made the
+summary unreadable. Two rules keep it inside that: the column widths come from
+the content rather than being fixed (a fixed 8 could not hold `1h 02m 03s`,
+so one slow encode knocked every column after it out of line), and **the date
+is a heading, not a column**. A run normally encodes a single day, so a Date
+column spent ten characters repeating one value on every row; a catch-up run
+after an outage emits one block per day, oldest first, in a single code fence.
+Seven cameras come out at 39 columns. The worst case that can still be
+constructed, a 12-character name with `FAIL`, a one-second cadence and an
+encode over an hour, is 50.
+
 ### 4.3 `timelapse_test.py`
 
 Pre-flight checker, run manually. Never run by systemd. Not imported by the
@@ -1139,7 +1152,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 715 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 721 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1294,11 +1307,11 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ```
 install.sh                       bootstrap installer, 738 lines
 scripts/timelapse_capture.py     daemon, 646 lines
-scripts/timelapse_encode.py      batch job, 892 lines
+scripts/timelapse_encode.py      batch job, 926 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 761 lines
 scripts/timelapse_setup.py       configuration wizard, 2691 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2093 lines
+scripts/timelapse_web.py         read-only web UI, 2096 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

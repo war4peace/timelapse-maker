@@ -755,6 +755,60 @@ class TestBuildSummary(unittest.TestCase):
         row.pop("interval", None)
         self.assertIn("100", enc.build_summary([row], 5))
 
+    # -- width ------------------------------------------------------------
+    # Reported from the real deployment: Discord renders an embed's
+    # description in a column narrower than an ordinary message, and the
+    # fixed 62-column table wrapped its last field onto a second line
+    # underneath the first. About 50 columns survive; 48 leaves a margin for
+    # a narrower client.
+    BUDGET = 48
+
+    def widest(self, out):
+        return max(len(line) for line in out.splitlines())
+
+    def test_a_full_house_fits_the_discord_embed(self):
+        rows = [self.row(camera=n) for n in
+                ("Court180", "Doorbell", "Garage", "Gate", "Roof",
+                 "Street4K", "Workshop")]
+        self.assertLessEqual(self.widest(enc.build_summary(rows, 5)),
+                             self.BUDGET)
+
+    def test_even_the_widest_plausible_row_fits(self):
+        # Every column at its maximum at once: a name at the 12-char cap, the
+        # longest status, a one-second cadence, three-digit megabytes and an
+        # encode over an hour, which is the form human_duration writes widest.
+        row = self.row(camera="BackCourtyardWest", status="FAIL", frames=86400,
+                       size=int(1023.9 * 1024 ** 2), seconds=3723, interval=1)
+        self.assertLessEqual(self.widest(enc.build_summary([row], 5)), 52)
+
+    def test_the_date_is_a_heading_not_a_column(self):
+        rows = [self.row(camera="Roof"), self.row(camera="Gate")]
+        out = enc.build_summary(rows, 5)
+        self.assertEqual(out.count("2026-08-04"), 1)
+
+    def test_each_date_gets_its_own_block_in_one_code_fence(self):
+        # A catch-up run after an outage encodes several days at once.
+        rows = [self.row(date="2026-08-04"), self.row(date="2026-08-03")]
+        out = enc.build_summary(rows, 5)
+        self.assertEqual(out.count("2026-08-03"), 1)
+        self.assertEqual(out.count("2026-08-04"), 1)
+        self.assertEqual(out.count("```"), 2)
+        # Oldest first, the order the days were captured in.
+        self.assertLess(out.index("2026-08-03"), out.index("2026-08-04"))
+
+    def test_columns_size_to_their_content(self):
+        # The old Time column was 8 wide and "1h 02m 03s" is 10, so a slow
+        # encode pushed every column after it out of line.
+        out = enc.build_summary([self.row(camera="Roof", seconds=3723)], 5)
+        self.assertIn("1h 02m 03s", out)
+        lines = out.splitlines()
+        head = next(ln for ln in lines if ln.startswith("Camera"))
+        body = next(ln for ln in lines if ln.startswith("Roof"))
+        self.assertEqual(len(head), len(body))
+
+    def test_no_results_is_not_an_empty_code_block(self):
+        self.assertEqual(enc.build_summary([], 5), "Nothing to report.")
+
 
 class TestPerCameraEncodeSettings(unittest.TestCase):
 

@@ -29,6 +29,16 @@ While the version is `0.x`, the configuration format may change in any release.
   account it runs as, and says which flags would work when they genuinely
   fail. `probe_rsync_flags()` moved to `timelapse_encode.py`, next to the code
   that runs rsync nightly, so the wizard and the pre-flight share one answer.
+- **The nightly Discord table no longer wraps.** Discord renders an embed's
+  description in a column narrower than an ordinary message, and the table was
+  a fixed 62 wide, so its last field folded onto a second line underneath the
+  first and the summary read as broken. The date moved out of the column set
+  and became a heading, since a run almost always encodes one day and the
+  column spent ten characters repeating one value; a catch-up run after an
+  outage gets a block per day instead. The remaining widths are measured from
+  the content, which also fixes an encode over an hour knocking every column
+  after it out of line: `1h 02m 03s` never fitted the fixed 8. The same seven
+  cameras now come out at 39 columns rather than 62.
 
 ## [0.1.2] - 2026-08-10
 
