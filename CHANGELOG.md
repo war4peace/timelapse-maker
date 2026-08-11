@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [Unreleased]
+
+### Fixed
+- **The pre-flight during `sudo timelapse update` no longer reports a working
+  share as broken.** It ended with:
+
+  ```
+  FAIL  rsync -a --partial --remove-source-files fails against /mnt/cctv/TL/:
+        exit 1: runuser: may not be used by non-root users
+  ....  no flag combination worked; check the share permissions for timelapse.
+  ```
+
+  Nothing was wrong with the share. The installer runs the pre-flight *as the
+  service account* on purpose, so that permission problems surface then rather
+  than at 00:05 tonight; the rsync probe then ran `runuser` a second time from
+  inside that unprivileged process, and the nested "may not be used by
+  non-root users" was printed as rsync's verdict.
+
+  `probe_as()` now works out how to reach that account before running
+  anything: already it (run directly, which is both the reported case and the
+  authoritative one), root with `runuser` (wrap), or neither (decline, and
+  name the command that would work). `try_rsync_args()` returns `None` for
+  "could not be tested" separately from `False` for "tested, and it does not
+  work", with the reason attached. That also fixes a host with no `runuser`
+  installed, where the probe previously ran unwrapped and reported a result
+  for the wrong account entirely.
+
+  Fourth instance of one shape in this project, after the update checker
+  writing `checked` on a failed poll and `sync_unit_readwritepaths()` returning
+  a count: **"could not check" collapsed into "checked, and it is broken"**.
+
 ## [0.1.3] - 2026-08-11
 
 A security release. Camera passwords were reaching the log, and from there the

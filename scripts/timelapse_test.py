@@ -606,16 +606,22 @@ def check_rsync_args(cfg, dest):
     # As the account that runs the encode, because a share can accept root and
     # refuse the service user. Falls back to whoever is running this.
     svcuser = service_account()
-    got = try_rsync_args(dest, args, svcuser)
-    if got is None:
-        info("could not test the rsync flags (rsync missing, or no temp space)")
+    result, detail = try_rsync_args(dest, args, svcuser)
+
+    if result is None:
+        # Not a finding about the share. Reported from a real 0.1.3 install:
+        # the installer runs this pre-flight as the service account, the probe
+        # ran runuser again from inside it, and the nested "may not be used by
+        # non-root users" was printed as rsync's verdict, sending the operator
+        # to check share permissions that were perfectly correct.
+        info(f"rsync flags not checked: {detail}")
         return
-    if got[0]:
+    if result:
         who = f" as {svcuser}" if svcuser else ""
         ok(f"rsync {' '.join(args)} works here{who}")
         return
 
-    bad(f"rsync {' '.join(args)} fails against {dest}: {got[1]}")
+    bad(f"rsync {' '.join(args)} fails against {dest}: {detail}")
     working = probe_rsync_flags(dest, svcuser)
     if working:
         info(f"these work: {' '.join(working)}")

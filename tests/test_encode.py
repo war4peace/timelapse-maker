@@ -680,7 +680,77 @@ class TestRsyncProbe(unittest.TestCase):
 
     def test_no_rsync_installed_is_untestable_not_a_failure(self):
         with mock.patch.object(enc.shutil, "which", lambda n: None):
-            self.assertIsNone(enc.try_rsync_args(self.tmp, ["-a"]))
+            ok, detail = enc.try_rsync_args(self.tmp, ["-a"])
+        self.assertIsNone(ok)
+        self.assertIn("rsync is not installed", detail)
+
+    # -- who the probe runs as --------------------------------------------
+    # Reported from a real 0.1.3 install, during `sudo timelapse update`:
+    #
+    #   FAIL  rsync -a --partial --remove-source-files fails against
+    #         /mnt/cctv/TL/: exit 1: runuser: may not be used by non-root users
+    #   ....  no flag combination worked; check the share permissions for
+    #   ....  timelapse.
+    #
+    # Nothing was wrong with the share. install.sh runs the pre-flight through
+    # `as_service_user`, so it was already `runuser -u timelapse`; the probe
+    # then ran runuser a second time from inside that unprivileged process,
+    # and the nested refusal was read as rsync's answer. Fourth instance of
+    # one shape here: "could not check" collapsed into "checked, and broken".
+    #
+    # test_already_being_the_service_account_needs_no_runuser is the one that
+    # covers the reported case; the rest cover the neighbours.
+
+    def as_user(self, name, root):
+        """Pretend to be `name`, with or without root."""
+        return (mock.patch.object(enc, "whoami", lambda: name),
+                mock.patch.object(enc.os, "geteuid", lambda: 0 if root else 1000,
+                                  create=True))
+
+    def test_without_root_it_declines_instead_of_blaming_the_share(self):
+        me, euid = self.as_user("eduard", root=False)
+        with me, euid, mock.patch.object(enc.subprocess, "run") as run:
+            ok, detail = enc.try_rsync_args(self.tmp, ["-a"], svcuser="timelapse")
+        self.assertIsNone(ok, "not a verdict on the share")
+        self.assertIsNot(ok, False)
+        self.assertIn("root", detail)
+        self.assertIn("sudo timelapse test", detail)
+        run.assert_not_called()
+
+    def test_already_being_the_service_account_needs_no_runuser(self):
+        # The reported case, and the important one: install.sh runs the
+        # pre-flight as `runuser -u timelapse`, so this probe is already the
+        # account it wants to test as. Wrapping it in a second runuser from an
+        # unprivileged process is what produced the false FAIL, and the answer
+        # is not to decline but to measure, since running as that account is
+        # exactly what makes the result authoritative.
+        me, euid = self.as_user("timelapse", root=False)
+        with me, euid, mock.patch.object(enc.shutil, "which",
+                                         lambda n: "/usr/bin/rsync"
+                                         if n == "rsync" else None), \
+                mock.patch.object(enc.subprocess, "run", self.fake_run(0)) as run:
+            ok, _ = enc.try_rsync_args(self.tmp, ["-a"], svcuser="timelapse")
+        self.assertTrue(ok)
+        self.assertEqual(run.call_args[0][0][0], "rsync")
+
+    def test_no_runuser_on_the_host_is_untestable_too(self):
+        me, euid = self.as_user("root", root=True)
+        with me, euid, mock.patch.object(
+                enc.shutil, "which",
+                lambda n: "/usr/bin/rsync" if n == "rsync" else None), \
+                mock.patch.object(enc.subprocess, "run") as run:
+            ok, detail = enc.try_rsync_args(self.tmp, ["-a"], svcuser="timelapse")
+        self.assertIsNone(ok)
+        self.assertIn("runuser", detail)
+        run.assert_not_called()
+
+    def test_the_flag_search_does_not_report_untestable_as_nothing_works(self):
+        # [] means "tried them all, none worked" and sends the reader to the
+        # share's permissions. None means "never got to try", which must not
+        # send them anywhere.
+        me, euid = self.as_user("eduard", root=False)
+        with me, euid:
+            self.assertIsNone(enc.probe_rsync_flags(self.tmp, "timelapse"))
 
     def test_the_probe_file_is_cleaned_up_either_way(self):
         for rc in (0, 23):

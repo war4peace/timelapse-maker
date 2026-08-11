@@ -1013,6 +1013,25 @@ fails. It lives in `timelapse_encode.py` because that is the program that runs
 rsync; the wizard and the pre-flight both import it, so they cannot give
 different answers.
 
+**Measuring introduces its own way to be wrong: the measurement can fail.**
+The probe runs as the service account, which means `runuser`, which needs
+root. But `install.sh` already runs the pre-flight through `as_service_user`,
+precisely so that permission problems surface at install time rather than at
+00:05, so the probe was calling `runuser` a *second* time from inside an
+unprivileged process. The nested refusal came back as `FAIL ... exit 1:
+runuser: may not be used by non-root users`, followed by "check the share
+permissions". The share was fine.
+
+`try_rsync_args()` returns `(None, reason)` for "could not be tested", which
+is not `(False, detail)` for "tested, and it fails", and `probe_as()` settles
+how to reach the account before running anything: already it (run directly),
+root with `runuser` (wrap it), or neither (decline, and name the command that
+would work). The first branch is both the reported case and the best one,
+since running *as* that account is what makes the answer authoritative; the
+third also covers a host with no `runuser`, where the probe used to run
+unwrapped and report a result for the wrong account. **A checker's own
+limitations are never a finding about the thing being checked.**
+
 **A falsy return must not mean four different things.**
 `sync_unit_readwritepaths()` returned the count of units it rewrote, and the
 caller treated anything falsy as failure. Running it as root against units
@@ -1231,7 +1250,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 765 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 772 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1386,8 +1405,8 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ```
 install.sh                       bootstrap installer, 738 lines
 scripts/timelapse_capture.py     daemon, 742 lines
-scripts/timelapse_encode.py      batch job, 988 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 767 lines
+scripts/timelapse_encode.py      batch job, 1022 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 772 lines
 scripts/timelapse_setup.py       configuration wizard, 2702 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_web.py         read-only web UI, 2262 lines
