@@ -797,8 +797,14 @@ connection this service makes, and should stay the only one.
   tells an operator nothing actionable. The original text is kept on the end,
   because that is the part worth searching for.
 
-**Status and logs** (`/status`, `/logs`) shell out, on request only: a page
-load or a click. Nothing polls and nothing is collected in the background.
+**Service state and logs** shell out only when a human asks for a page. The
+services table is one `systemctl show` at the foot of the overview; `/status`
+and `/logs` are one command each. Nothing polls and nothing is collected in
+the background, and the endpoints a machine might hit in a loop (`/healthz`,
+and the `/scan` and `/update` fragments the page's own scripts poll) run no
+commands at all. That last property is the one to preserve: the overview
+itself stopped being free when the services table moved onto it, which is the
+deliberate price of dropping a tab.
 
 - **The title and tabs are centred on the window, not on the content.** They
   are the fixed furniture of every page and the pages are not all the same
@@ -811,15 +817,21 @@ load or a click. Nothing polls and nothing is collected in the background.
   four pages at two window sizes: 240px of drift before, 1px after, the
   remainder being sub-pixel rounding when centring inside containers of
   different widths.
-- **`/status` answers the question in four words; the detail is folded away.**
-  It was `systemctl status` verbatim, which is a page per unit: the invocation
-  ID, the cgroup, the PID, the task count and the same `Documentation=` URL
-  once for each of the four units, to say whether capture is running.
-  `unit_states()` asks `systemctl show` for the eight properties the table
-  needs and `describe_unit()` turns each into one word, and the raw output
-  keeps its place inside a `<details>` because a bug report wants exactly
-  that. Three things this must keep getting right, all verified against real
-  systemd rather than reasoned about:
+- **The services table answers the question in one word, at the foot of the
+  overview.** It was a tab holding `systemctl status` verbatim, which is a
+  page per unit: the invocation ID, the cgroup, the PID, the task count and
+  the same `Documentation=` URL once for each of the four units, to say
+  whether capture is running. `unit_states()` asks `systemctl show` for the
+  nine properties the table needs and `describe_unit()` turns each into one
+  word. Once that was four rows it no longer justified a quarter of the
+  navigation, so it moved onto the overview and the UI went to three tabs.
+  `/status` survives as a page rather than a tab, holding the full output: a
+  bug report wants exactly that, and an old bookmark should land somewhere
+  useful. It is deliberately *not* inlined into a `<details>` on the overview,
+  which would cost a second subprocess and a screen of markup on every view of
+  the landing page to serve something rarely opened. Three things this must
+  keep getting right, all verified against real systemd rather than reasoned
+  about:
   - **`show`, not `status`.** The human output is not a contract, exits 0 even
     for a unit that is not installed, and names its own fields.
   - **What "not running" means depends on the unit.** The nightly encode is a
@@ -830,6 +842,13 @@ load or a click. Nothing polls and nothing is collected in the background.
     `active (exited)` long after it finished, and must not read "Running"; and
     `activating/auto-restart` is a crash loop, not a service caught mid-boot,
     so it is red and says so.
+  - **An inactive oneshot with a timestamp is a success, and says so in
+    green.** A finished run and one that has never happened are both
+    `inactive`; the timestamp is the only thing that tells them apart. "Idle"
+    was true of both and useful about neither, when the question that row
+    exists to answer is whether last night's encode worked. A failed run does
+    not reach here (systemd leaves it `failed`), but the green line is
+    conditioned on `Result` anyway rather than on the timestamp alone.
   - **Rows are matched by `Id`, never by position.** A block that does not come
     back would otherwise shift every later unit onto the wrong row.
   The one state that looks healthy and is not gets called out: enabled=no
@@ -1261,7 +1280,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 768 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 773 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1420,7 +1439,7 @@ scripts/timelapse_encode.py      batch job, 1022 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 772 lines
 scripts/timelapse_setup.py       configuration wizard, 2702 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2244 lines
+scripts/timelapse_web.py         read-only web UI, 2269 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

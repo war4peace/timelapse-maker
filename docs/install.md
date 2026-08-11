@@ -752,11 +752,11 @@ It gives you five things:
 
 - **Where your videos actually are**: see the warning below, this is the
   question people get wrong.
-- **Service status and recent log**, on request, without an SSH session. The
-  status page is four rows saying whether each part is working and what to do
-  if it is not, rather than the page of systemd internals `timelapse status`
-  prints; the full output is still there under *Everything systemd knows*,
-  which is what to paste into a bug report.
+- **Service status and recent log**, without an SSH session. Service status is
+  four rows at the foot of the Overview, saying whether each part is working
+  and what to do if it is not, rather than the page of systemd internals
+  `timelapse status` prints. *Everything systemd knows* links to the full
+  output, which is what to paste into a bug report.
 - **An index of finished videos**, browsable by camera, by day and by folder.
 - **Playback in your own player.** Each video has a *Play* link that hands VLC
   (or mpv, or whatever opens `.m3u`) a playlist pointing back at the server,

@@ -10,6 +10,20 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Changed
+- **Service status folded into the Overview, so the web UI has three tabs.**
+  Once that page was four rows rather than a screen of `systemctl status`
+  output, it no longer justified a quarter of the navigation, and "is it
+  running" belongs next to "where are my videos". *Everything systemd knows*
+  links to the full output, which stays a page of its own so that an old
+  bookmark still lands somewhere useful, and so that the Overview shells out
+  once per view rather than twice.
+- **"Last encode run" says Successful, in green, rather than Idle.** A
+  finished oneshot and one that has never run are both `inactive`; the
+  timestamp is the only thing separating them, so a row that already knew the
+  encode finished at 00:42 was reporting it in the same words and the same
+  colour as a machine that has never encoded anything. It now reads
+  *Successful* with the time, *Not yet run* when there is no timestamp, and
+  *Failed* if systemd recorded a bad result.
 - **The web UI links to the release notes instead of printing them.** The
   "What is new" panel showed the release body as plain text, so its markdown
   arrived intact: `## Camera passwords were being written to the log`,
