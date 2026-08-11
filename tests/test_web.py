@@ -302,6 +302,59 @@ class TestRunCommand(unittest.TestCase):
         self.assertIn("did not answer", problem)
 
 
+class TestCommandOutputIsRedacted(unittest.TestCase):
+    """The leak was found *on this page*. Every journal this service can read
+    was written by some version of the daemon, and on any host that ran one
+    before 0.1.3 it holds camera passwords in full until it ages out. Fixing
+    the daemon does nothing for those entries; this is what covers them."""
+
+    SECRET = "Sup3rS3cret!"
+
+    LEAKED = ("Aug 09 01:59:55 host python3[1414708]: 2026-08-09 01:59:55 "
+              "WARNING [Doorbell] grab failed (#1): 502 Server Error: Bad "
+              "Gateway for url: http://192.168.2.208/cgi-bin/api.cgi?"
+              "cmd=Snap&channel=0&rs=tl&user=admin&password=" + SECRET)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        Path(self.tmp, "videos").mkdir()
+        self.config = cfg(self.tmp, transfer={"enabled": False})
+
+    def test_run_command_redacts_before_anything_can_render_it(self):
+        # At the source rather than in each renderer, so that adding a page
+        # which shows command output cannot reintroduce this by omission.
+        with mock.patch.object(web.subprocess, "run") as run:
+            run.return_value = mock.Mock(stdout=self.LEAKED, stderr="")
+            out, problem = web.run_command(["journalctl"])
+        self.assertEqual(problem, "")
+        self.assertNotIn(self.SECRET, out)
+        self.assertIn("password=***", out)
+        self.assertIn("[Doorbell] grab failed", out)
+
+    def leaky_journal(self):
+        """Patch at the subprocess boundary, not at run_command.
+
+        Mocking run_command would step over the very code being tested and
+        pass against a page that served the password in full, which is what
+        the first draft of these two did.
+        """
+        return mock.patch.object(
+            web.subprocess, "run",
+            return_value=mock.Mock(stdout=self.LEAKED, stderr=""))
+
+    def test_the_log_page_does_not_serve_the_password(self):
+        with self.leaky_journal():
+            _, _, body = request("/logs", self.config)
+        self.assertNotIn(self.SECRET, body)
+        self.assertIn("password=***", body)
+
+    def test_the_status_page_does_not_serve_the_password(self):
+        with self.leaky_journal():
+            _, _, body = request("/status", self.config)
+        self.assertNotIn(self.SECRET, body)
+
+
 class TestReports(unittest.TestCase):
 
     def test_status_suppresses_the_journal_excerpt(self):

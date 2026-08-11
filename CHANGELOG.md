@@ -9,6 +9,39 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Security
+- **Camera passwords no longer reach the log, and the web UI no longer shows
+  the ones already in it.** A failed snapshot logged the exception `requests`
+  raised, and that exception's text carries the URL it was fetching. For a
+  Reolink-style camera the URL *is* the credential, so a single 502 wrote the
+  password to journald and to `capture.log`, and the web UI's log page then
+  served it to anyone who could reach the page.
+
+  Four shapes are masked now: `password=` and seven other spellings in a query
+  string, `rtsp://user:pass@host` userinfo (ffmpeg quotes the URL back at you
+  in its own errors), and Discord webhook tokens. The masking is a logging
+  *formatter*, not a rule about how to write log calls: the leak came from a
+  call that never mentioned a URL, so nothing at the call site could have
+  known. Uncaught exceptions from a camera thread, which bypass logging
+  entirely and print to stderr, were a second route and now go to the log too.
+  The web UI redacts command output at the source, which is what covers the
+  entries already in your journal.
+
+  **If you ran any earlier version, treat the camera password as exposed.**
+  Upgrading stops new leaks; it cannot unwrite the old ones. After upgrading:
+
+  ```
+  sudo timelapse update
+  sudo timelapse cameras            # set a new password on each camera
+  sudo rm -f /var/lib/timelapse/logs/capture.log*
+  sudo journalctl --rotate && sudo journalctl --vacuum-time=1s
+  ```
+
+  The `journalctl` pair discards the whole journal, not just these lines;
+  there is no way to delete selected entries. Anyone in `systemd-journal` or
+  `adm` could read them, and so could anyone who could reach the web UI, which
+  matters most if you moved `web.bind` off `127.0.0.1`.
+
 ### Changed
 - **The web UI's Service status page says whether it works, in four words.**
   It was `systemctl status` verbatim: an invocation ID, a cgroup path, a PID,

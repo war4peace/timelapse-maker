@@ -39,12 +39,74 @@ DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 # ----------------------------------------------------------------------------
+# Credential redaction
+#
+# The canonical copy, here because this is the module the wizard and the
+# pre-flight already reach into, and because two versions of a rule like this
+# would eventually disagree. timelapse_capture.py carries a duplicate: it is a
+# daemon and deliberately imports nothing from its siblings, so a test asserts
+# the two patterns are identical rather than trusting anyone to keep them so.
+#
+# Reported from the real deployment 2026-08-11: a camera returned 502, requests
+# raised, and the exception text carries the URL it was fetching. That URL is
+# the Reolink shape, credentials in the query string, so the password went to
+# journald and then onto the web UI's log page in full. The call site said
+# nothing about a URL, which is the point below.
+# ----------------------------------------------------------------------------
+
+MASK = "***"
+
+CRED_PATTERNS = (
+    # Query-string credentials: the Reolink shape, ?user=admin&password=hunter2.
+    # \b so "bypass=" is not read as "pass=". The value ends at the next
+    # parameter or at whitespace, since a URL in a log line is followed by
+    # prose more often than not.
+    (re.compile(r"\b((?:password|passwd|pwd|pass|secret|token|auth|apikey|"
+                r"api[-_]?key)=)[^&\s\"'<>]*", re.I), r"\1" + MASK),
+    # URL userinfo: the RTSP shape, rtsp://user:hunter2@host. ffmpeg prints the
+    # URL it was given in its own error output, so this arrives second-hand.
+    (re.compile(r"(//[^/\s:@]{1,64}:)[^/\s@]*(@)"), r"\1" + MASK + r"\2"),
+    # A Discord webhook URL is not a locator, it is the authority to post. It
+    # reaches the log through urllib's exception text on a failed notification.
+    (re.compile(r"(/api/webhooks/\d+/)[\w-]+", re.I), r"\1" + MASK),
+)
+
+
+def redact(text):
+    """Mask anything in `text` that would be a credential in a log or on a page.
+
+    Deliberately over-eager: masking a value that turns out not to be secret
+    costs somebody a debugging session, and the other way round costs them a
+    password.
+    """
+    text = str(text)
+    for pattern, replacement in CRED_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class RedactingFormatter(logging.Formatter):
+    """A formatter, not a filter, and not a call at each log site.
+
+    The leak this exists for came from `log.warning("grab failed: %s", err)`,
+    a call that never mentions a URL: the credential was inside an exception
+    raised three libraries away. Nothing at the call site can be trusted to
+    know what it is about to print, so the guarantee has to sit at the last
+    point every record passes through. Formatting last also covers tracebacks
+    and `log.exception()`, which a filter on the record's message would not.
+    """
+
+    def format(self, record):
+        return redact(super().format(record))
+
+
+# ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
 
 def setup_logging(log_dir):
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(message)s",
-                            "%Y-%m-%d %H:%M:%S")
+    fmt = RedactingFormatter("%(asctime)s %(levelname)-7s %(message)s",
+                             "%Y-%m-%d %H:%M:%S")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     sh = logging.StreamHandler(sys.stdout)

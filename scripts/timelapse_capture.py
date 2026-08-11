@@ -23,6 +23,7 @@ import logging
 import logging.handlers
 import math
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -82,9 +83,71 @@ def load_config(path):
         sys.exit(f"Cannot read {path}: {exc}")
 
 
+# ----------------------------------------------------------------------------
+# Credential redaction
+#
+# Duplicated from timelapse_encode.py for the same reason load_config() is: no
+# daemon should be able to fail to start because a sibling changed. A test
+# asserts the two copies are character-identical, because a security rule that
+# exists twice will otherwise drift, and the copy that drifts is the one nobody
+# is looking at.
+#
+# This daemon is where the leak was found. Both of its failure paths carry a
+# URL it never chose to print: requests puts the URL in the exception text, and
+# ffmpeg prints the RTSP URL it was handed in its own stderr, which the RTSP
+# grabber logs verbatim.
+# ----------------------------------------------------------------------------
+
+MASK = "***"
+
+CRED_PATTERNS = (
+    # Query-string credentials: the Reolink shape, ?user=admin&password=hunter2.
+    # \b so "bypass=" is not read as "pass=". The value ends at the next
+    # parameter or at whitespace, since a URL in a log line is followed by
+    # prose more often than not.
+    (re.compile(r"\b((?:password|passwd|pwd|pass|secret|token|auth|apikey|"
+                r"api[-_]?key)=)[^&\s\"'<>]*", re.I), r"\1" + MASK),
+    # URL userinfo: the RTSP shape, rtsp://user:hunter2@host. ffmpeg prints the
+    # URL it was given in its own error output, so this arrives second-hand.
+    (re.compile(r"(//[^/\s:@]{1,64}:)[^/\s@]*(@)"), r"\1" + MASK + r"\2"),
+    # A Discord webhook URL is not a locator, it is the authority to post. It
+    # reaches the log through urllib's exception text on a failed notification.
+    (re.compile(r"(/api/webhooks/\d+/)[\w-]+", re.I), r"\1" + MASK),
+)
+
+
+def redact(text):
+    """Mask anything in `text` that would be a credential in a log or on a page.
+
+    Deliberately over-eager: masking a value that turns out not to be secret
+    costs somebody a debugging session, and the other way round costs them a
+    password.
+    """
+    text = str(text)
+    for pattern, replacement in CRED_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+
+class RedactingFormatter(logging.Formatter):
+    """A formatter, not a filter, and not a call at each log site.
+
+    The leak this exists for came from `log.warning("grab failed: %s", err)`,
+    a call that never mentions a URL: the credential was inside an exception
+    raised three libraries away. Nothing at the call site can be trusted to
+    know what it is about to print, so the guarantee has to sit at the last
+    point every record passes through. Formatting last also covers tracebacks
+    and `log.exception()`, which a filter on the record's message would not.
+    """
+
+    def format(self, record):
+        return redact(super().format(record))
+
+
 def setup_logging(log_dir):
-    fmt = logging.Formatter("%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
-                            "%Y-%m-%d %H:%M:%S")
+    fmt = RedactingFormatter(
+        "%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+        "%Y-%m-%d %H:%M:%S")
     root = logging.getLogger()
     root.setLevel(logging.INFO)
 
@@ -98,6 +161,39 @@ def setup_logging(log_dir):
             Path(log_dir) / "capture.log", maxBytes=8 * 1024 * 1024, backupCount=3)
         fileh.setFormatter(fmt)
         root.addHandler(fileh)
+
+    route_exceptions_through_logging()
+
+
+def route_exceptions_through_logging():
+    """Send uncaught exceptions to the log rather than to bare stderr.
+
+    Found while verifying the redaction on real systemd: a camera thread that
+    dies prints its traceback through `threading.excepthook`, which writes
+    straight to stderr and never passes the formatter above. The exception
+    text is exactly the thing that carries a URL, so that path was still a
+    leak. It is also the path that logs a thread's death at no priority at
+    all, which journald then shows as an error anyway, unlabelled.
+    """
+    def thread_hook(args):
+        if args.exc_type is SystemExit:
+            return
+        name = args.thread.name if args.thread else "?"
+        log.error("thread %s died", name,
+                  exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    inherited = sys.excepthook
+
+    def main_hook(exc_type, exc, tb):
+        # Ctrl-C and a clean exit are not faults, and the default hook prints
+        # them the way anyone running this by hand expects.
+        if issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            inherited(exc_type, exc, tb)
+            return
+        log.critical("unhandled exception", exc_info=(exc_type, exc, tb))
+
+    threading.excepthook = thread_hook
+    sys.excepthook = main_hook
 
 
 # ----------------------------------------------------------------------------

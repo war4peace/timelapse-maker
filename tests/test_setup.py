@@ -630,6 +630,14 @@ class TestCameraManagement(unittest.TestCase):
         self.assertIn("channel=0", red)
         self.assertNotIn("p%40ss", red)
 
+    def test_redaction_covers_the_rtsp_shape_too(self):
+        # The wizard's own RTSP path produces exactly this form, and the local
+        # rule only knew about `password=`, so every RTSP camera it added was
+        # listed with its password in full.
+        red = setup.redact_url("rtsp://admin:hunter2@192.0.2.7:554/Preview_01")
+        self.assertNotIn("hunter2", red)
+        self.assertIn("192.0.2.7:554/Preview_01", red)
+
 
 class TestResolveCamera(unittest.TestCase):
     """`timelapse cameras -e:2` and `-e:Doorbell` reach the same camera.

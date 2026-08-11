@@ -948,5 +948,79 @@ class TestPerCameraEncodeSettings(unittest.TestCase):
         self.assertNotIn("120", args)
 
 
+class TestRedact(unittest.TestCase):
+    """The canonical rule. Every camera password in this project reaches a log
+    or a page through one of these four shapes."""
+
+    S = "Sup3rS3cret!"
+
+    def test_a_query_string_password(self):
+        out = enc.redact(f"http://cam/api.cgi?cmd=Snap&user=admin&password={self.S}")
+        self.assertNotIn(self.S, out)
+        self.assertIn("password=***", out)
+
+    def test_the_rest_of_the_url_survives(self):
+        # A redacted line still has to be worth keeping: the host and the
+        # endpoint are what makes a capture failure diagnosable.
+        out = enc.redact(f"http://192.0.2.7/cgi-bin/api.cgi?cmd=Snap&channel=0"
+                         f"&user=admin&password={self.S}")
+        for keep in ("192.0.2.7", "cgi-bin/api.cgi", "cmd=Snap", "channel=0",
+                     "user=admin"):
+            self.assertIn(keep, out)
+
+    def test_every_spelling_of_the_key(self):
+        for key in ("password", "passwd", "pwd", "pass", "secret", "token",
+                    "auth", "apikey", "api_key", "api-key", "PASSWORD",
+                    "Password"):
+            with self.subTest(key=key):
+                out = enc.redact(f"http://h/a?{key}={self.S}&x=1")
+                self.assertNotIn(self.S, out)
+                self.assertIn("x=1", out)
+
+    def test_a_key_that_merely_ends_in_pass_is_left_alone(self):
+        # \b in the pattern. Over-redaction is the safe direction, but not so
+        # far that ordinary parameters vanish.
+        self.assertEqual(enc.redact("http://h/a?bypass=no&compass=n"),
+                         "http://h/a?bypass=no&compass=n")
+
+    def test_url_userinfo_the_rtsp_shape(self):
+        out = enc.redact(f"rtsp://admin:{self.S}@192.0.2.7:554/Preview_01_main")
+        self.assertNotIn(self.S, out)
+        self.assertIn("rtsp://admin:***@192.0.2.7:554/Preview_01_main", out)
+
+    def test_a_discord_webhook_token(self):
+        # Not a locator: whoever holds it can post to the channel.
+        out = enc.redact("https://discord.com/api/webhooks/123456/abcDEF-ghi_JKL")
+        self.assertNotIn("abcDEF", out)
+        self.assertIn("/api/webhooks/123456/***", out)
+
+    def test_a_url_with_no_credential_is_untouched(self):
+        for clean in ("https://github.com/war4peace/timelapse-maker",
+                      "http://192.0.2.7/cgi-bin/api.cgi?cmd=Snap&channel=0",
+                      "rsync://nas/videos"):
+            self.assertEqual(enc.redact(clean), clean)
+
+    def test_several_credentials_in_one_line(self):
+        out = enc.redact(f"tried rtsp://u:{self.S}@a/ then http://b?pwd={self.S}")
+        self.assertNotIn(self.S, out)
+        self.assertEqual(out.count("***"), 2)
+
+    def test_the_value_ends_where_the_url_does(self):
+        # A log line is prose with a URL in it, not a URL. Stopping only at &
+        # swallowed the rest of the sentence, which hid the error message.
+        out = enc.redact(f"http://h/a?password={self.S} (attempt 2)")
+        self.assertIn("(attempt 2)", out)
+        self.assertNotIn(self.S, out)
+
+    def test_redacting_twice_changes_nothing(self):
+        once = enc.redact(f"http://h/a?password={self.S}")
+        self.assertEqual(enc.redact(once), once)
+
+    def test_it_takes_anything_printable_not_just_strings(self):
+        # Log arguments are frequently exception objects.
+        exc = RuntimeError(f"failed: http://h/a?password={self.S}")
+        self.assertNotIn(self.S, enc.redact(exc))
+
+
 if __name__ == "__main__":
     unittest.main()

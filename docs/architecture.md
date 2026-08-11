@@ -467,7 +467,8 @@ install never means reinstalling or re-answering everything:
    offers to move the directory instead. Disabling being just as destructive as
    removing is the non-obvious half, and is why `x` warns as loudly as `r`.
 
-`redact_url()` masks `password=` in the listing. Not theatre: `ask_secret()`
+`redact_url()` masks credentials in the listing (§4.9 has the rule and why it
+now lives in one place). Not theatre: `ask_secret()`
 exists to keep credentials out of scroll-back, and printing the camera table
 would hand them straight back. The listing elides the *middle* of a long URL
 rather than the tail, because Reolink-style URLs are identical for their first
@@ -865,7 +866,12 @@ load or a click. Nothing polls and nothing is collected in the background.
 
 **Security posture.** Binds `127.0.0.1` by default and warns when it does not;
 `http.server` is not hardened and there is no TLS here. It never serves
-`config.json` and never renders a camera URL; those hold credentials. Routing
+`config.json` and never renders a camera URL; those hold credentials. **It also
+never renders command output unredacted**, which is a separate promise and was
+learned the hard way: not rendering a URL is worthless when the journal it
+displays is full of them (see §4.9). `run_command()` redacts at the source, so
+a new page that shows command output cannot reintroduce the leak by omission.
+Routing
 is an explicit allow-list; anything unrecognised is 404 with no filesystem
 lookup. `server_version`/`sys_version` are overridden so the interpreter
 version is not advertised.
@@ -1025,6 +1031,56 @@ video is, cannot be read off the config. It fails a camera whose frames/day
 falls below `encode.min_frames`: the encoder `SKIP`s that, so the camera would
 produce nothing at all, every night, without ever failing.
 
+### 4.9 Credential redaction
+
+Reported 2026-08-11, from a real deployment's web UI, and the most serious
+defect this project has shipped:
+
+```
+WARNING [Doorbell] grab failed (#1): 502 Server Error: Bad Gateway for url:
+http://192.168.2.208/cgi-bin/api.cgi?cmd=Snap&...&user=admin&password=<real>
+```
+
+The call site is `log.warning("grab failed (#%d): %s", n, err)`. **It never
+mentions a URL.** `requests` puts the URL in the exception's text, so the
+password went to journald, to `capture.log`, and from there onto a web page.
+
+That is the whole design argument. No rule about how to write log calls could
+have prevented it, because the credential arrives inside an object formatted
+by a library, so the guarantee has to sit where every record passes:
+
+- **`RedactingFormatter`, not a filter and not a call per site.** A formatter
+  runs last, which also covers tracebacks and `log.exception()`; a filter that
+  rewrote `record.msg` would let `exc_info` through untouched.
+- **`route_exceptions_through_logging()`.** Found while verifying the above on
+  real systemd: a camera thread that dies prints its traceback through
+  `threading.excepthook`, straight to stderr, meeting no formatter at all.
+  `sys.excepthook` is the same hole for the main thread. Both now log.
+- **`run_command()` redacts in `timelapse_web.py`**, at the source rather than
+  in each renderer. Fixing the daemon does nothing for the entries already in
+  the journal, and those are what the page displays.
+
+Four shapes are masked, being the four ways a secret reaches text here: query
+string (`password=`, and seven other spellings), URL userinfo
+(`rtsp://user:pass@host`, which is how ffmpeg quotes back the URL it was
+given), and the Discord webhook token, which is not a locator but the
+authority to post. `\b` on the key stops `bypass=` being read as `pass=`; over-
+redaction is otherwise the safe direction, since masking a non-secret costs a
+debugging session and the reverse costs a password.
+
+The rule lives in `timelapse_encode.py` and is **duplicated verbatim** in
+`timelapse_capture.py`, for the same reason `load_config()` is: no daemon
+should fail to start because a sibling changed. A test asserts the two are
+character-identical, because a security rule that exists twice will drift, and
+the copy that drifts is the one nobody is looking at. `redact_url()` in the
+wizard is now a thin wrapper over the same function; its own local rule knew
+only about `password=`, so every camera the wizard's RTSP path added was listed
+with its password in full.
+
+**A fix here does not clean up after itself.** The journal and `capture.log`
+keep what they already have, so the release notes tell operators to rotate the
+camera password and say how to purge both.
+
 ---
 
 ## 5. Configuration reference
@@ -1175,7 +1231,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 742 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 765 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1329,12 +1385,12 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 
 ```
 install.sh                       bootstrap installer, 738 lines
-scripts/timelapse_capture.py     daemon, 646 lines
-scripts/timelapse_encode.py      batch job, 926 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 761 lines
-scripts/timelapse_setup.py       configuration wizard, 2691 lines
+scripts/timelapse_capture.py     daemon, 742 lines
+scripts/timelapse_encode.py      batch job, 988 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 767 lines
+scripts/timelapse_setup.py       configuration wizard, 2702 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2251 lines
+scripts/timelapse_web.py         read-only web UI, 2262 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

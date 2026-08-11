@@ -141,7 +141,13 @@ def test_rtsp(cam, cfg):
         return None
     dt = time.time() - t0
     if p.returncode != 0 or not sample.exists():
-        bad(f"{name}: RTSP grab failed - {(p.stderr or '').strip()[:200]}")
+        # ffmpeg quotes the URL it was handed, and an RTSP URL carries the
+        # password in its userinfo. This runs under sudo, so unredacted it
+        # would land in root's scroll-back and in whatever the operator pastes
+        # into a bug report.
+        from timelapse_encode import redact
+        bad(f"{name}: RTSP grab failed - "
+            f"{redact((p.stderr or '').strip())[:200]}")
         return None
     size = sample.stat().st_size
     dims = dimensions(cfg["paths"].get("ffprobe", "ffprobe"), sample)

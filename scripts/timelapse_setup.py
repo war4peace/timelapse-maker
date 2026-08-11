@@ -647,7 +647,6 @@ def add_one_camera(cfg, n):
 # ----------------------------------------------------------------------------
 
 DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-CRED_IN_URL_RE = re.compile(r"((?:password|passwd|pwd|pass)=)[^&]*", re.I)
 
 
 def sanitise_name(raw, fallback):
@@ -656,12 +655,20 @@ def sanitise_name(raw, fallback):
 
 
 def redact_url(url):
-    """Mask credentials carried in the query string (the Reolink shape).
+    """Mask credentials in a URL, or in any text that might contain one.
 
     ask_secret() exists to keep passwords out of scroll-back; printing the
     camera list would hand them straight back otherwise.
+
+    The rule itself lives in timelapse_encode, which is where the wizard, the
+    pre-flight and the web UI all read it from. This function is the name the
+    wizard has always called it by, kept so that there is one rule rather than
+    one per caller: the local copy handled `password=` and not the RTSP
+    `rtsp://user:pass@host` shape, and every camera added by the wizard's own
+    RTSP path uses that shape.
     """
-    return CRED_IN_URL_RE.sub(r"\1***", url)
+    from timelapse_encode import redact
+    return redact(url)
 
 
 def camera_frames_dir(cfg, name):
@@ -1293,7 +1300,11 @@ def test_camera_rtsp(cam, cfg):
             fail("RTSP grab timed out after 45s.")
             return False
         if p.returncode != 0 or not out.exists():
-            fail(f"RTSP grab failed: {(p.stderr or '').strip()[:160]}")
+            # ffmpeg quotes the URL it was handed, password and all. The
+            # wizard asks for that password with ask_secret() precisely to
+            # keep it out of the scroll-back; printing ffmpeg's complaint
+            # verbatim would hand it straight back.
+            fail(f"RTSP grab failed: {redact_url((p.stderr or '').strip())[:160]}")
             return False
         good(f"RTSP frame captured ({out.stat().st_size/1024:.0f} KB)")
         return True

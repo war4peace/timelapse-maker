@@ -56,6 +56,13 @@ from timelapse_update import (                            # noqa: E402
     version_text,
 )
 
+# Also at module level, and for a harder reason: this page renders the
+# journal, which on any host that ran a version before 0.1.3 contains camera
+# passwords in full. A lazy import inside the renderer could fail at request
+# time and quietly leave the page unredacted; failing at startup is the
+# behaviour a security filter should have.
+from timelapse_encode import redact                       # noqa: E402
+
 __version__ = "0.1.2"
 
 log = logging.getLogger("web")
@@ -1058,7 +1065,11 @@ def run_command(argv):
 
     # stderr matters as much as stdout: journalctl explains itself there.
     out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    return out, ""
+    # Redacted here rather than at each renderer, so that adding a page that
+    # shows command output cannot reintroduce the leak by omission. Every
+    # journal this service can read predates the fix by some amount, and the
+    # entries already in it keep the password until the journal ages out.
+    return redact(out), ""
 
 
 def status_report():

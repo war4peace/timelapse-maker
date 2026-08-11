@@ -699,6 +699,33 @@ Backups carry the config's `0640`, because they hold the same camera
 passwords. They are owned by `root` rather than `root:timelapse`: the service
 has no reason to read one.
 
+### Where camera passwords can turn up, and one place they used to
+
+The config, its backups and (for a Reolink-style camera) the URL itself are
+the places a password lives by design. All are `0640 root:timelapse`.
+
+**Versions before 0.1.3 also wrote it to the log.** A failed snapshot logged
+the error `requests` raised, and that error quotes the URL it was fetching,
+credentials and all. One 502 from a camera put the password in journald, in
+`capture.log`, and on the web UI's log page. If you have ever run an earlier
+version, assume it is exposed:
+
+```bash
+sudo timelapse update                              # stop new leaks first
+sudo timelapse cameras                             # then change the password
+sudo rm -f /var/lib/timelapse/logs/capture.log*
+sudo journalctl --rotate && sudo journalctl --vacuum-time=1s
+```
+
+That last pair throws away the whole journal, not only these lines; journald
+has no way to delete selected entries. Who could have read them: anyone in the
+`systemd-journal` or `adm` groups, and anyone who could reach the web UI,
+which is worth checking if you moved `web.bind` off `127.0.0.1`.
+
+From 0.1.3 the daemons mask credentials in everything they log, and the web UI
+masks them in anything it displays, including the entries written before the
+fix.
+
 ---
 
 ## 11. The web UI

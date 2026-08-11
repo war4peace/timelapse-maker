@@ -5,10 +5,14 @@ depends on, and the DST fall-back collision handling. No network, no threads
 started - HttpCamera is constructed but never run().
 """
 
+import io
 import json
+import logging
 import math
 import shutil
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime
@@ -551,6 +555,159 @@ class TestDiskGuard(unittest.TestCase):
         cfg["capture"]["min_free_gb"] = 10
         guard = cap.DiskGuard(cfg)
         self.assertGreater(guard.min_free * 1.1, guard.min_free)
+
+
+class TestCredentialsNeverReachTheLog(unittest.TestCase):
+    """Reported from the real deployment 2026-08-11, from the web UI's log
+    page:
+
+        WARNING [Doorbell] grab failed (#1): 502 Server Error: Bad Gateway
+        for url: http://.../api.cgi?cmd=Snap&...&user=admin&password=hunter2
+
+    The call site is `log.warning("grab failed (#%d): %s", n, err)`. It never
+    mentions a URL: requests puts it in the exception text. That is why the
+    guarantee is a formatter and not a rule about how to write log calls.
+    """
+
+    SECRET = "Sup3rS3cret!"
+
+    def logged(self, call):
+        """Run `call` against a logger wired exactly as the daemon wires its
+        own, and return what would have been written."""
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(cap.RedactingFormatter("%(message)s"))
+        logger = logging.getLogger("redaction-test")
+        logger.handlers = [handler]
+        logger.propagate = False
+        logger.setLevel(logging.DEBUG)
+        call(logger)
+        return stream.getvalue()
+
+    def test_the_reported_line(self):
+        err = ("502 Server Error: Bad Gateway for url: "
+               "http://192.168.2.208/cgi-bin/api.cgi?cmd=Snap&channel=0"
+               f"&rs=tl&user=admin&password={self.SECRET}")
+        out = self.logged(lambda log: log.warning("grab failed (#%d): %s",
+                                                  1, err))
+        self.assertNotIn(self.SECRET, out)
+        self.assertIn("password=***", out)
+        # Still a usable log line: the camera, the status and the endpoint
+        # are what makes it worth keeping.
+        self.assertIn("502 Server Error", out)
+        self.assertIn("192.168.2.208", out)
+        self.assertIn("user=admin", out)
+
+    def test_ffmpeg_stderr_from_the_rtsp_path(self):
+        # The other half of the same bug. ffmpeg quotes the URL it was handed,
+        # and an RTSP URL carries the password in its userinfo.
+        msg = (f"rtsp://admin:{self.SECRET}@192.168.2.208:554/h264Preview_01 "
+               f"Server returned 401 Unauthorized")
+        out = self.logged(lambda log: log.warning(
+            "ffmpeg exited (rc=%s, restart #%d): %s", 1, 2, msg))
+        self.assertNotIn(self.SECRET, out)
+        self.assertIn("rtsp://admin:***@192.168.2.208", out)
+
+    def test_a_traceback_is_redacted_too(self):
+        # log.exception() formats exc_info in the formatter, so a filter on
+        # the record's message would let this one straight through.
+        def call(log):
+            try:
+                raise RuntimeError(f"connecting to http://h/a?password="
+                                   f"{self.SECRET}")
+            except RuntimeError:
+                log.exception("grab failed")
+        out = self.logged(call)
+        self.assertIn("Traceback", out)
+        self.assertNotIn(self.SECRET, out)
+
+    def test_a_message_with_no_credential_is_left_alone(self):
+        out = self.logged(lambda log: log.info(
+            "capture started (5s interval, 4s timeout)"))
+        self.assertIn("capture started (5s interval, 4s timeout)", out)
+
+    def wired_by(self, setup_logging):
+        """The formatters `setup_logging` actually installs on the root logger.
+
+        Found by reverting: with every test above using RedactingFormatter
+        directly, putting a plain logging.Formatter back into setup_logging
+        broke nothing at all. The class being correct is worth nothing if the
+        daemon does not use it.
+        """
+        root = logging.getLogger()
+        saved, level = root.handlers[:], root.level
+        root.handlers = []
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                setup_logging(td)
+                self.assertTrue(root.handlers)
+                kinds = [type(h.formatter) for h in root.handlers]
+                # Before leaving the directory: the rotating file handler
+                # holds capture.log open, and Windows will not delete it.
+                for h in root.handlers:
+                    h.close()
+                root.handlers = []
+                return kinds
+        finally:
+            for h in root.handlers:
+                h.close()
+            root.handlers, root.level = saved, level
+
+    def test_the_daemon_installs_the_redacting_formatter(self):
+        # Both handlers: journald sees stdout, and capture.log is a file on
+        # disk that outlives the journal's retention.
+        kinds = self.wired_by(cap.setup_logging)
+        self.assertEqual(len(kinds), 2)
+        for kind in kinds:
+            self.assertIs(kind, cap.RedactingFormatter)
+
+    def test_the_encoder_installs_it_too(self):
+        import timelapse_encode as enc
+        kinds = self.wired_by(enc.setup_logging)
+        self.assertEqual(len(kinds), 2)
+        for kind in kinds:
+            self.assertIs(kind, enc.RedactingFormatter)
+
+    def test_a_dying_thread_does_not_print_around_the_formatter(self):
+        """Found on real systemd, not in a test: threading's own excepthook
+        writes a dead thread's traceback straight to stderr, meeting no
+        formatter on the way. An exception carrying a URL leaked in full."""
+        saved_thread, saved_sys = threading.excepthook, sys.excepthook
+        self.addCleanup(setattr, threading, "excepthook", saved_thread)
+        self.addCleanup(setattr, sys, "excepthook", saved_sys)
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        handler.setFormatter(cap.RedactingFormatter("%(message)s"))
+        saved_handlers = cap.log.handlers[:]
+        cap.log.handlers = [handler]
+        cap.log.propagate = False
+        self.addCleanup(setattr, cap.log, "handlers", saved_handlers)
+
+        cap.route_exceptions_through_logging()
+
+        def die():
+            raise RuntimeError(f"http://cam/a?password={self.SECRET}")
+
+        thread = threading.Thread(target=die, name="cap-Doorbell")
+        thread.start()
+        thread.join()
+
+        out = stream.getvalue()
+        self.assertIn("cap-Doorbell", out)
+        self.assertIn("Traceback", out)
+        self.assertNotIn(self.SECRET, out)
+
+    def test_the_daemons_copy_of_the_rule_has_not_drifted(self):
+        """The rule exists twice: this daemon imports nothing from its
+        siblings, for the same reason load_config() is duplicated. A security
+        rule that exists twice will drift, and the copy that drifts is the one
+        nobody is looking at, so pin them together here."""
+        import timelapse_encode as enc
+        self.assertEqual(cap.MASK, enc.MASK)
+        self.assertEqual(
+            [(p.pattern, p.flags, r) for p, r in cap.CRED_PATTERNS],
+            [(p.pattern, p.flags, r) for p, r in enc.CRED_PATTERNS])
 
 
 if __name__ == "__main__":
