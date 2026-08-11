@@ -1130,6 +1130,44 @@ with its password in full.
 keep what they already have, so the release notes tell operators to rotate the
 camera password and say how to purge both.
 
+#### The config itself: `timelapse config --redacted`
+
+The other way a password leaves this host is that somebody sends it
+deliberately, attached to a question. `redact_config()` walks a parsed config
+and returns a masked copy, which is what that command prints.
+
+**Both passes are load-bearing, and each alone leaks.** `redact()` over the
+serialised text misses `"password": "hunter2"`, which has no `=` in it;
+matching key names misses the Reolink `url`, which carries the credential in a
+query string. So the walk masks by key name *and* runs the text rule over
+every string value. Two revert-checks pin this: field-matching alone fails
+four tests, text alone fails three.
+
+What survives is as deliberate as what does not. Hostnames, usernames, paths,
+the transfer destination and the webhook's numeric id are kept, because a dump
+that masked those would be safe and useless. The operator is told so
+explicitly, and the notice travels *inside* the JSON under `_redacted`, a key
+the schema already reserves for documentation: the moment this matters is the
+moment the text is pasted into an issue, and prose printed beside the blob is
+precisely the part that does not travel with it. JSON on stdout, prose on
+stderr, so a redirect still yields a file that parses.
+
+#### `timelapse config` and what an editor leaves behind
+
+`/etc/timelapse` is 0750 root:timelapse, so a stray file *inside* it is
+already shielded from other users. Measured rather than assumed, on vim: the
+backup `config.json~` inherits the original's 0640 root:timelapse, in the
+directory or in a `backupdir` elsewhere, so it is the same exposure as the
+config rather than a new one. `umask 0077` is set before the editor anyway,
+for editors that create from the umask instead.
+
+The real defect was elsewhere. An editor that saves by rename leaves a brand
+new file carrying root's umask, so **the config loses its group and the
+daemons can no longer read it**, which surfaces at the next restart and looks
+nothing like an editing mistake. The wrapper therefore no longer `exec`s the
+editor: it restores 0640 root:timelapse afterwards and exits with the editor's
+status.
+
 ---
 
 ## 5. Configuration reference
@@ -1280,7 +1318,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 773 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 793 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1433,11 +1471,11 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 738 lines
+install.sh                       bootstrap installer, 761 lines
 scripts/timelapse_capture.py     daemon, 742 lines
-scripts/timelapse_encode.py      batch job, 1022 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 772 lines
-scripts/timelapse_setup.py       configuration wizard, 2702 lines
+scripts/timelapse_encode.py      batch job, 1070 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 773 lines
+scripts/timelapse_setup.py       configuration wizard, 2743 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_web.py         read-only web UI, 2269 lines
 tests/_support.py                path setup and fakes

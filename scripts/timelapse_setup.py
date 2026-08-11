@@ -2285,6 +2285,39 @@ def write_config(cfg, out_path, owner=None):
             pass
 
 
+def print_redacted_config(path):
+    """The config with its credentials taken out, for pasting into bug reports.
+
+    The whole reason this exists: "here is my config, why won't camera 3
+    connect" is a thing people do, and every camera password is in that file.
+    Asking them to redact by hand puts the guarantee in the least reliable
+    place available, and the shape of the secret is not obvious anyway, since
+    a Reolink URL *is* the credential.
+
+    What is masked travels *inside* the dump, as a `_` key, which the schema
+    already reserves for documentation. The moment this matters is the moment
+    somebody pastes the text into an issue, and a warning printed next to it is
+    exactly the part that does not get pasted.
+
+    JSON on stdout, prose on stderr, so `> report.json` gets a file that still
+    parses while the person at the terminal is still told to check it.
+    """
+    from timelapse_encode import MASK, redact_config
+    cfg = load_existing_config(path)
+    if cfg is None:
+        return 1
+    safe = {"_redacted": (
+        f"Camera passwords and the Discord webhook token are replaced with "
+        f"'{MASK}'. Hostnames, usernames, paths and the transfer destination "
+        f"are NOT masked: they are usually what a fault report is about.")}
+    safe.update(redact_config(cfg))
+    print(json.dumps(safe, indent=2))
+    print("\n  Read this through before posting it anywhere public. The "
+          "addresses,\n  usernames and paths are still in there, because a "
+          "fault report needs them.\n", file=sys.stderr)
+    return 0
+
+
 def load_json(path):
     """Parsed JSON, or None. For inspecting files we are not about to trust."""
     try:
@@ -2537,6 +2570,9 @@ def main():
                     help="restore a previous config from the backups")
     ap.add_argument("--backup-now", action="store_true",
                     help="take a config backup and print its path, then stop")
+    ap.add_argument("--redacted", action="store_true",
+                    help="print the config with its credentials masked, for "
+                         "pasting into a bug report")
     # Camera shortcuts. The documented spelling is -e:2 / -e:Doorbell, which
     # reaches argparse as the value ":2" because a short option swallows
     # whatever is attached to it; strip_colon puts it back. -e 2, -e2 and
@@ -2580,6 +2616,11 @@ def main():
     if args.backup_now:
         made = backup_config(args.output)
         return 0 if made else 1
+
+    # Before init_tty(): this is a filter, not a wizard. It must work under a
+    # pipe, and it must never prompt.
+    if args.redacted:
+        return print_redacted_config(args.output)
 
     # Machine-readable mode used by install.sh to template the systemd units.
     if args.print_paths:

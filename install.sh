@@ -284,6 +284,8 @@ CONFIGURING
                        do not cover, such as the encoder's container and
                        quality. A backup is taken first. You restart capture
                        yourself after.
+                         --redacted   print the config with the passwords
+                                      masked, to paste into a bug report
   restore      [sudo]  Put back an earlier config. One is kept automatically
                        before every change, five deep, and the listing says
                        when each was taken and what is in it. Restoring backs
@@ -368,9 +370,30 @@ case "\${1:-}" in
     # so it takes its own backup first. Not fatal if that fails: refusing to
     # open an editor because a copy could not be made would be worse.
     config)
+        shift
+        # A dump for a bug report is not an edit: no backup, no editor, and it
+        # stays pipeable, so it goes before any of that.
+        if [ "\${1:-}" = "--redacted" ]; then
+            exec python3 $PREFIX/timelapse_setup.py --redacted --output "$CONFIG"
+        fi
         python3 $PREFIX/timelapse_setup.py --backup-now --output "$CONFIG" \\
             || echo "  (continuing without a backup)"
-        exec \${EDITOR:-nano} "$CONFIG" ;;
+        # An editor writes more than the file you named it: a backup copy, a
+        # swap file, an undo file. $CONFDIR is 0750 so anything landing *here*
+        # is already shielded, but 'set backupdir' and 'set directory' send
+        # them somewhere else entirely, and each one is a copy of your camera
+        # passwords. 0600 whatever this creates, wherever it creates it.
+        umask 0077
+        \${EDITOR:-nano} "$CONFIG"
+        rc=\$?
+        # Not exec'd, because of these two lines. An editor that saves by
+        # writing a new file and renaming it over the old one leaves root's
+        # umask on the result: 0644 is unwanted, but losing the group is worse,
+        # because the daemons then cannot read their own config and nothing
+        # says so until the next restart.
+        chgrp $SVCUSER "$CONFIG" 2>/dev/null || true
+        chmod 0640 "$CONFIG" 2>/dev/null || true
+        exit \$rc ;;
     logs)      exec journalctl -u timelapse-capture -f ;;
     # timelapse-encode.service is listed, not just its timer: it is oneshot,
     # so a run that failed (a broken transfer, say) leaves the *service* in a

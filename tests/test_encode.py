@@ -1092,5 +1092,116 @@ class TestRedact(unittest.TestCase):
         self.assertNotIn(self.S, enc.redact(exc))
 
 
+class TestRedactConfig(unittest.TestCase):
+    """The same rule applied to a parsed config rather than to a log line.
+
+    Two shapes of secret live in this file and each pass misses the other:
+    `"password": "x"` has no `=` for the text rule, and a Reolink `url` hides
+    the credential inside a query string where a field rule never looks.
+    """
+
+    S = "Sup3rS3cret!"
+
+    def config(self):
+        return {
+            "paths": {"frames_root": "/srv/tl/frames"},
+            "discord": {
+                "enabled": True,
+                "webhook_url": "https://discord.com/api/webhooks/123456/abcDEF",
+            },
+            "transfer": {"destination": "nasuser@nas:/mnt/user/tl/",
+                         "rsync_args": ["-rt", "--partial"]},
+            "cameras": [
+                {"name": "Driveway", "auth": "digest", "username": "admin",
+                 "password": self.S,
+                 "url": "http://192.0.2.10/cgi-bin/snapshot.cgi?channel=1"},
+                {"name": "Doorbell", "auth": "none",
+                 "url": f"http://192.0.2.11/cgi-bin/api.cgi?cmd=Snap"
+                        f"&user=admin&password={self.S}"},
+                {"name": "Hallway", "method": "rtsp",
+                 "url": f"rtsp://admin:{self.S}@192.0.2.14:554/stream1"},
+            ],
+        }
+
+    def dumped(self):
+        return json.dumps(enc.redact_config(self.config()))
+
+    def test_the_secret_appears_nowhere_at_all(self):
+        # The test that actually matters: one assertion over the whole tree,
+        # so a credential in a shape nobody thought of still fails this.
+        self.assertNotIn(self.S, self.dumped())
+
+    def test_a_password_field(self):
+        out = enc.redact_config(self.config())
+        self.assertEqual(out["cameras"][0]["password"], enc.MASK)
+
+    def test_a_password_inside_a_url(self):
+        out = enc.redact_config(self.config())
+        self.assertIn("password=***", out["cameras"][1]["url"])
+
+    def test_a_password_inside_an_rtsp_url(self):
+        out = enc.redact_config(self.config())
+        self.assertEqual(out["cameras"][2]["url"],
+                         "rtsp://admin:***@192.0.2.14:554/stream1")
+
+    def test_the_discord_token_goes_and_the_id_stays(self):
+        out = enc.redact_config(self.config())
+        self.assertEqual(out["discord"]["webhook_url"],
+                         "https://discord.com/api/webhooks/123456/***")
+
+    def test_what_a_fault_report_needs_survives(self):
+        # A dump that masked the addresses and the paths would be safe and
+        # useless. These are the fields somebody answering the report reads.
+        dump = self.dumped()
+        for keep in ("192.0.2.10", "192.0.2.11", "Driveway", "Hallway",
+                     "admin", "digest", "/srv/tl/frames",
+                     "nasuser@nas:/mnt/user/tl/", "--partial"):
+            with self.subTest(keep=keep):
+                self.assertIn(keep, dump)
+
+    def test_the_structure_is_preserved_exactly(self):
+        cfg = self.config()
+        out = enc.redact_config(cfg)
+        self.assertEqual(sorted(out), sorted(cfg))
+        self.assertEqual(len(out["cameras"]), 3)
+        self.assertEqual([c["name"] for c in out["cameras"]],
+                         ["Driveway", "Doorbell", "Hallway"])
+        self.assertEqual(out["transfer"]["rsync_args"], ["-rt", "--partial"])
+
+    def test_the_original_is_not_touched(self):
+        # It is handed a live config in-process. Masking in place would edit
+        # the thing the caller is about to write back to disk.
+        cfg = self.config()
+        enc.redact_config(cfg)
+        self.assertEqual(cfg["cameras"][0]["password"], self.S)
+
+    def test_an_empty_password_stays_empty(self):
+        # "" is not a secret, it is the answer to "did you set one?", which is
+        # exactly what a report about a 401 needs to show.
+        out = enc.redact_config({"cameras": [{"password": "", "username": ""}]})
+        self.assertEqual(out["cameras"][0]["password"], "")
+
+    def test_a_key_nobody_planned_for(self):
+        # The schema may grow one, and a hand-edited config may already have.
+        out = enc.redact_config({"x": {"api_key": "k", "AuthToken": "t",
+                                       "db_credentials": "c", "passwd": "p"}})
+        self.assertEqual(set(out["x"].values()), {enc.MASK})
+
+    def test_ordinary_keys_are_not_masked_by_a_loose_match(self):
+        # Over-redaction is the safe direction, but a dump where half the
+        # settings read *** is one nobody can act on.
+        out = enc.redact_config({"encode": {"framerate": 60, "container": "mkv",
+                                            "av1_preset": "p6"},
+                                 "capture": {"retry_within_tick": True}})
+        self.assertEqual(out, {"encode": {"framerate": 60, "container": "mkv",
+                                          "av1_preset": "p6"},
+                               "capture": {"retry_within_tick": True}})
+
+    def test_non_strings_come_through_as_themselves(self):
+        # It must still be JSON-serialisable afterwards, with the types intact.
+        out = enc.redact_config({"a": 1, "b": True, "c": None, "d": 1.5})
+        self.assertEqual(out, {"a": 1, "b": True, "c": None, "d": 1.5})
+
+
 if __name__ == "__main__":
     unittest.main()

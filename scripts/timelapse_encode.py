@@ -100,6 +100,47 @@ class RedactingFormatter(logging.Formatter):
         return redact(super().format(record))
 
 
+# A config holds its secrets in two shapes, and each pass below misses the
+# other one. `{"password": "hunter2"}` has no `=` in it, so the text rule walks
+# straight past it; a Reolink `url` carries the credential inside a query
+# string, so a rule that only knew field names walks past that. Hence both,
+# over the whole tree.
+#
+# Matched against key names. Deliberately loose: an unrecognised key gets its
+# value printed, so the cost of a missing name is a leak while the cost of a
+# spurious match is a question on a bug report.
+SECRET_KEY_RE = re.compile(
+    r"pass(word|wd)?$|^pwd$|secret|token|credential|api[-_]?key", re.I)
+
+
+def redact_config(node):
+    """A copy of a parsed config with the credentials taken out.
+
+    Structure is preserved exactly, because the whole use for this is handing
+    it to somebody else to read: a dump that dropped keys would have people
+    diagnosing a config that is not the one on the disk.
+
+    Note what this does *not* remove. Camera hostnames, the transfer
+    destination and the Discord webhook's numeric id all survive, because they
+    are what a fault report is about, and `usernames` survive because the text
+    rule has always kept `user=` while masking `password=`. Whoever runs this
+    is told as much, rather than being left to assume it covered more.
+    """
+    if isinstance(node, dict):
+        return {
+            # An empty value stays empty: "" for a password is not a secret,
+            # it is the answer to "did you actually set one?".
+            k: (MASK if (SECRET_KEY_RE.search(str(k)) and v)
+                else redact_config(v))
+            for k, v in node.items()
+        }
+    if isinstance(node, list):
+        return [redact_config(v) for v in node]
+    if isinstance(node, str):
+        return redact(node)
+    return node
+
+
 # ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
