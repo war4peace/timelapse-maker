@@ -363,6 +363,154 @@ class TestReports(unittest.TestCase):
         self.assertIn("not installed", rep["problem"])
 
 
+RAW_STATUS = """\
+● timelapse-capture.service - Timelapse capture daemon
+     Loaded: loaded (/etc/systemd/system/timelapse-capture.service; enabled)
+     Active: active (running) since Mon 2026-08-10 22:00:01 EEST; 14h ago
+       Docs: https://github.com/war4peace/timelapse-maker
+ Invocation: 2b1f4c9e7a3d4f0b8c6e1a2d3f4b5c6d
+   Main PID: 1234 (python3)
+      Tasks: 9 (limit: 38000)
+     CGroup: /system.slice/timelapse-capture.service
+"""
+
+
+class TestUnitStates(unittest.TestCase):
+    """`systemctl status` spends a page per unit answering a question that
+    fits in one word. These cover the translation into that word."""
+
+    def show(self, *units):
+        """systemctl show's real shape: one block per unit, blank-line
+        separated, properties in whatever order systemd feels like."""
+        return "\n\n".join(
+            "\n".join(f"{k}={v}" for k, v in u.items()) for u in units)
+
+    def daemon(self, unit="timelapse-capture.service", **over):
+        props = {"Id": unit, "LoadState": "loaded", "ActiveState": "active",
+                 "UnitFileState": "enabled",
+                 "ActiveEnterTimestamp": "Mon 2026-08-10 22:00:01 EEST"}
+        props.update(over)
+        return props
+
+    def rows(self, text):
+        with mock.patch.object(web, "run_command", return_value=(text, "")):
+            rows, problem = web.unit_states()
+        self.assertEqual(problem, "")
+        return {r[0]: r for r in rows}
+
+    def test_it_asks_show_for_named_properties_not_status(self):
+        # `systemctl status` is a human report and not a contract; `show`
+        # names its fields and keeps them.
+        with mock.patch.object(web, "run_command",
+                               return_value=("", "")) as run:
+            web.unit_states()
+        argv = run.call_args[0][0]
+        self.assertIn("show", argv)
+        self.assertNotIn("status", argv)
+        for prop in web.STATUS_PROPS:
+            self.assertIn(f"--property={prop}", argv)
+
+    def test_a_running_daemon_says_running_and_since_when(self):
+        row = self.rows(self.show(self.daemon()))["Capture"]
+        self.assertEqual(row[1:3], ("ok", "Running"))
+        self.assertIn("since Mon 2026-08-10", row[3])
+
+    def test_an_idle_oneshot_is_not_reported_as_a_fault(self):
+        # The nightly encode is inactive for 23 hours and 22 minutes out of
+        # every day. Calling that "Stopped", as the daemon rule would, invents
+        # a fault on a healthy system every time anybody looks.
+        row = self.rows(self.show(self.daemon(
+            "timelapse-encode.service", ActiveState="inactive",
+            InactiveEnterTimestamp="Mon 2026-08-11 00:42:11 EEST",
+            Result="success")))["Last encode run"]
+        self.assertEqual(row[1:3], ("", "Idle"))
+        self.assertIn("last finished Mon 2026-08-11", row[3])
+
+    def test_a_stopped_daemon_is_a_fault_and_says_how_to_fix_it(self):
+        row = self.rows(self.show(self.daemon(
+            ActiveState="inactive")))["Capture"]
+        self.assertEqual(row[1:3], ("bad", "Stopped"))
+        self.assertIn("systemctl start timelapse-capture.service", row[3])
+
+    def test_an_active_timer_shows_its_next_run(self):
+        row = self.rows(self.show(self.daemon(
+            "timelapse-encode.timer",
+            NextElapseUSecRealtime="Wed 2026-08-12 00:05:00 EEST",
+        )))["Nightly encode"]
+        self.assertEqual(row[1:3], ("ok", "Scheduled"))
+        self.assertIn("next run Wed 2026-08-12 00:05:00", row[3])
+
+    def test_a_unit_that_is_not_installed_says_so(self):
+        row = self.rows(self.show(self.daemon(
+            LoadState="not-found", ActiveState="inactive")))["Capture"]
+        self.assertEqual(row[1], "bad")
+        self.assertIn("installer", row[3])
+
+    def test_a_failed_unit_carries_the_reason_and_points_at_the_log(self):
+        row = self.rows(self.show(self.daemon(
+            ActiveState="failed", Result="exit-code")))["Capture"]
+        self.assertEqual(row[1:3], ("bad", "Failed"))
+        self.assertIn("exit-code", row[3])
+        self.assertIn("log", row[3].lower())
+
+    def test_running_but_disabled_says_it_will_not_survive_a_reboot(self):
+        # The one state that looks entirely healthy and is not.
+        row = self.rows(self.show(self.daemon(
+            UnitFileState="disabled")))["Capture"]
+        self.assertEqual(row[1:3], ("ok", "Running"))
+        self.assertIn("reboot", row[3])
+
+    def test_a_crash_loop_is_a_fault_not_a_start(self):
+        # Restart=always plus something that will not stay up sits in
+        # "activating/auto-restart" indefinitely. Reported as a calm
+        # "Starting" it looks like a service caught mid-boot, forever.
+        row = self.rows(self.show(self.daemon(
+            ActiveState="activating", SubState="auto-restart")))["Capture"]
+        self.assertEqual(row[1:3], ("bad", "Restarting"))
+        self.assertIn("log", row[3].lower())
+
+    def test_a_finished_oneshot_is_not_called_running(self):
+        # Verified against real systemd: a RemainAfterExit oneshot reports
+        # active/exited long after it stopped doing anything. Our encode unit
+        # does not set it, but the row must not lie if one ever does.
+        row = self.rows(self.show(self.daemon(
+            "timelapse-encode.service", SubState="exited",
+            ActiveEnterTimestamp="Tue 2026-08-11 00:05:12 EEST",
+        )))["Last encode run"]
+        self.assertEqual(row[2], "Finished")
+        self.assertIn("ran at Tue 2026-08-11", row[3])
+
+    def test_a_running_oneshot_is_called_running(self):
+        row = self.rows(self.show(self.daemon(
+            "timelapse-encode.service", SubState="running")))["Last encode run"]
+        self.assertEqual(row[1:3], ("ok", "Running"))
+
+    def test_rows_are_matched_by_id_not_by_position(self):
+        # A block that does not come back must not shift every later unit onto
+        # the wrong row, which is what reading them in order would do.
+        rows = self.rows(self.show(
+            self.daemon("timelapse-web.service"),
+            self.daemon("timelapse-encode.timer",
+                        NextElapseUSecRealtime="Wed 2026-08-12 00:05 EEST")))
+        self.assertEqual(rows["Web interface"][2], "Running")
+        self.assertEqual(rows["Nightly encode"][2], "Scheduled")
+        self.assertEqual(rows["Capture"][2], "Unknown")
+
+    def test_a_diagnostic_line_is_not_mistaken_for_a_property(self):
+        # run_command folds stderr in with stdout, and systemctl's warnings
+        # contain "=" often enough.
+        text = (self.show(self.daemon())
+                + "\nWarning: unit file changed, run daemon-reload=maybe")
+        self.assertEqual(self.rows(text)["Capture"][2], "Running")
+
+    def test_a_missing_systemctl_is_a_problem_not_an_empty_table(self):
+        with mock.patch.object(web, "run_command",
+                               return_value=("", "systemctl is not installed.")):
+            rows, problem = web.unit_states()
+        self.assertEqual(rows, [])
+        self.assertIn("not installed", problem)
+
+
 class TestStatusRoutes(unittest.TestCase):
 
     def setUp(self):
@@ -377,6 +525,45 @@ class TestStatusRoutes(unittest.TestCase):
             status, _, body = request("/status", self.config)
         self.assertEqual(status, 200)
         self.assertIn("Active: active (running)", body)
+
+    def both(self, show_text, raw=RAW_STATUS):
+        """run_command answers `show` and `status` differently, as it does in
+        life: the page makes one call for the table and one for the detail."""
+        def fake(argv):
+            return ((show_text, "") if "show" in argv else (raw, ""))
+        with mock.patch.object(web, "run_command", side_effect=fake):
+            return request("/status", self.config)[2]
+
+    def test_the_page_leads_with_four_words_not_a_page_of_systemd(self):
+        show = "\n".join(["Id=timelapse-capture.service", "LoadState=loaded",
+                          "ActiveState=active", "UnitFileState=enabled"])
+        body = self.both(show)
+        table = body.split("<details", 1)[0]
+        self.assertIn("Capture", table)
+        self.assertIn("Running", table)
+        # The reader wanted to know whether it works. None of this told them.
+        for noise in ("Invocation:", "Main PID:", "CGroup:", "Docs:"):
+            self.assertNotIn(noise, table, noise)
+
+    def test_the_raw_output_is_still_there_one_click_away(self):
+        # Folded, not deleted: when something is wrong this is what a bug
+        # report needs, and re-running systemctl over ssh to get it is worse.
+        body = self.both("Id=timelapse-capture.service\nActiveState=active")
+        self.assertIn("<details", body)
+        detail = body.split("<details", 1)[1]
+        self.assertIn("Invocation:", detail)
+        self.assertIn("Main PID:", detail)
+        self.assertIn("systemctl status", detail)
+
+    def test_a_systemctl_that_will_not_run_is_reported_once(self):
+        # And the second call is not made at all: it would fail identically.
+        with mock.patch.object(
+                web, "run_command",
+                return_value=("", "systemctl is not installed.")) as run:
+            _, _, body = request("/status", self.config)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("not installed", body)
+        self.assertNotIn("<details", body)
 
     def test_logs_page_defaults_to_capture(self):
         with mock.patch.object(web, "run_command",
@@ -428,13 +615,20 @@ class TestStatusRoutes(unittest.TestCase):
         # column that suits prose and tables is the wrong frame for it. The
         # stylesheet keys off these two classes; without them the pane went
         # back to a fixed width with its scrollbar far below the fold.
-        for path in ("/status", "/logs"):
-            with self.subTest(path=path):
-                with mock.patch.object(web, "run_command",
-                                       return_value=("a line", "")):
-                    _, _, body = request(path, self.config)
-                self.assertIn('<body class="pane-page">', body)
-                self.assertIn('<section class="pane">', body)
+        with mock.patch.object(web, "run_command",
+                               return_value=("a line", "")):
+            _, _, body = request("/logs", self.config)
+        self.assertIn('<body class="pane-page">', body)
+        self.assertIn('<section class="pane">', body)
+
+    def test_the_status_page_is_prose_width_not_output_width(self):
+        # It stopped being raw output, so it stopped wanting the raw-output
+        # layout. Left in PANE_PAGES it would have stretched a four-row table
+        # across the window and pinned it to the viewport height.
+        with mock.patch.object(web, "run_command", return_value=("", "")):
+            _, _, body = request("/status", self.config)
+        self.assertIn('<body class="">', body)
+        self.assertNotIn('<section class="pane">', body)
 
     def test_the_tabs_are_centred_independently_of_the_page_width(self):
         """Reported: the tabs jumped ~240px between the overview and the log
@@ -449,6 +643,15 @@ class TestStatusRoutes(unittest.TestCase):
         self.assertIn("justify-content: center", nav)
         head = css.split("header {", 1)[1].split("}", 1)[0]
         self.assertIn("justify-content: center", head)
+
+    def test_the_header_names_the_project_and_its_version_only(self):
+        _, _, body = request("/", self.config)
+        header = body.split("<header>", 1)[1].split("</header>", 1)[0]
+        self.assertIn("timelapse-maker", header)
+        self.assertIn(web.__version__, header)
+        # It read "web 0.1.2", which said nothing: there is no way to be
+        # looking at this page other than through the web interface.
+        self.assertNotIn("web", header)
 
     def test_every_page_carries_the_same_nav(self):
         # Whatever the layout does, the controls themselves must not differ
@@ -475,8 +678,8 @@ class TestStatusRoutes(unittest.TestCase):
         # The pane fills the viewport height. Applying that to a one-line
         # error would render an almost empty box the height of the screen.
         with mock.patch.object(web, "run_command",
-                               return_value=("", "systemctl is not installed.")):
-            _, _, body = request("/status", self.config)
+                               return_value=("", "journalctl is not installed.")):
+            _, _, body = request("/logs", self.config)
         self.assertIn("not installed", body)
         self.assertNotIn('<section class="pane">', body)
         # The page itself still gets the full width; only the box is normal.
@@ -1904,6 +2107,26 @@ class TestUpdatePanel(unittest.TestCase):
 
     def get(self, checker):
         return request("/", self.config, updates=checker)[2]
+
+    def version_list(self, body):
+        return body.split("<h2>Version</h2>", 1)[1].split("</dl>", 1)[0]
+
+    def test_installed_and_latest_are_rendered_the_same_way(self):
+        # Reported: one was a <code> and the other a bare string, so a
+        # two-row list showed a version number in two different fonts and
+        # read as a rendering fault. Colour is the only difference that
+        # carries meaning here.
+        dl = self.version_list(self.get(self.checker(
+            checked=time.time(), tag="v0.0.9", latest="0.0.9")))
+        self.assertNotIn("<code>", dl)
+        self.assertIn("<dd>0.0.9</dd>", dl)
+
+    def test_an_update_is_still_marked_out_by_colour(self):
+        dl = self.version_list(self.get(self.checker(
+            checked=time.time(), tag="v0.1.0", latest="0.1.0",
+            url="https://example/rel")))
+        self.assertNotIn("<code>", dl)
+        self.assertIn('class="ok"', dl)
 
     def test_an_available_update_shows_the_tag_and_the_command(self):
         body = self.get(self.checker(checked=time.time(), tag="v0.1.0",

@@ -801,9 +801,32 @@ load or a click. Nothing polls and nothing is collected in the background.
   four pages at two window sizes: 240px of drift before, 1px after, the
   remainder being sub-pixel rounding when centring inside containers of
   different widths.
-- **These two pages drop the 54rem reading column.** That width suits prose and
-  tables and is wrong for raw command output, whose line length journald and
-  systemctl decide, not us. `_render()` adds `pane-page` to `<body>` for them
+- **`/status` answers the question in four words; the detail is folded away.**
+  It was `systemctl status` verbatim, which is a page per unit: the invocation
+  ID, the cgroup, the PID, the task count and the same `Documentation=` URL
+  once for each of the four units, to say whether capture is running.
+  `unit_states()` asks `systemctl show` for the eight properties the table
+  needs and `describe_unit()` turns each into one word, and the raw output
+  keeps its place inside a `<details>` because a bug report wants exactly
+  that. Three things this must keep getting right, all verified against real
+  systemd rather than reasoned about:
+  - **`show`, not `status`.** The human output is not a contract, exits 0 even
+    for a unit that is not installed, and names its own fields.
+  - **What "not running" means depends on the unit.** The nightly encode is a
+    oneshot and is inactive for 23 hours 22 minutes of every day; calling that
+    "Stopped", as the daemon rule would, invents a fault on a healthy system
+    every time anybody looks. The third field of `STATUS_UNITS` carries this.
+    Two neighbours of the same trap: a `RemainAfterExit` oneshot reports
+    `active (exited)` long after it finished, and must not read "Running"; and
+    `activating/auto-restart` is a crash loop, not a service caught mid-boot,
+    so it is red and says so.
+  - **Rows are matched by `Id`, never by position.** A block that does not come
+    back would otherwise shift every later unit onto the wrong row.
+  The one state that looks healthy and is not gets called out: enabled=no
+  while running means it will not come back after a reboot.
+- **The logs page drops the 54rem reading column.** That width suits prose and
+  tables and is wrong for raw command output, whose line length journald
+  decides, not us. `_render()` adds `pane-page` to `<body>` for it
   and `_report(pane=True)` marks the output `<section>`; the page is then a
   flex column of viewport height, so the `<pre>` is bounded and scrolls inside
   its own frame on both axes. Before this the pane grew to its content and put
@@ -1152,7 +1175,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 721 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 742 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1311,7 +1334,7 @@ scripts/timelapse_encode.py      batch job, 926 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 761 lines
 scripts/timelapse_setup.py       configuration wizard, 2691 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2096 lines
+scripts/timelapse_web.py         read-only web UI, 2251 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

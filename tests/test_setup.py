@@ -1372,11 +1372,21 @@ class TestBindProbe(unittest.TestCase):
     def test_the_probe_leaves_the_port_free(self):
         # It binds without listening and closes immediately; if it leaked the
         # socket, the service it just approved could not start.
-        setup.check_bind("127.0.0.1", 8787)
+        #
+        # The port is borrowed from the kernel rather than hardcoded. A fixed
+        # 8787 failed here with WinError 10013 the day Hyper-V's dynamic
+        # exclusion range happened to cover it, which is a fault in the test,
+        # not in the probe.
+        borrow = socket.socket()
+        borrow.bind(("127.0.0.1", 0))
+        port = borrow.getsockname()[1]
+        borrow.close()
+
+        setup.check_bind("127.0.0.1", port)
         again = socket.socket()
         again.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.addCleanup(again.close)
-        again.bind(("127.0.0.1", 8787))     # raises if the probe held on
+        again.bind(("127.0.0.1", port))     # raises if the probe held on
 
     def test_lan_address_is_never_loopback(self):
         # It may legitimately be "" on a host with no default route; what it

@@ -9,6 +9,27 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Changed
+- **The web UI's Service status page says whether it works, in four words.**
+  It was `systemctl status` verbatim: an invocation ID, a cgroup path, a PID,
+  a task count and the same documentation URL four times over, to answer a
+  question that fits on one line. It is now a row per service, in plain words,
+  with what to do about it when something is wrong. The full output is one
+  click away under *Everything systemd knows*, because when something *is*
+  wrong that is what a bug report needs. Each row says what "not running"
+  means for that unit: the nightly encode is a oneshot that sits inactive for
+  23 hours 22 minutes a day, and reporting that as "Stopped" would invent a
+  fault on a healthy system every time anybody looked. A crash loop reads as
+  one, and a service that is running but not enabled says it will not come
+  back after a reboot.
+- **The page header dropped the word "web"** from `timelapse-maker web 0.1.2`.
+  There is no way to be reading that page other than through the web UI.
+- **The version panel renders both numbers the same way.** Installed was a
+  `<code>` and Latest was not, so a two-row list showed one version number in
+  two different fonts, which reads as a rendering fault. Colour still marks
+  out an available update, which is the only difference that means anything
+  there.
+
 ### Fixed
 - **`timelapse transfer` no longer tells you to fix something that is already
   right.** It ended with "Add the destination to ReadWritePaths= in
