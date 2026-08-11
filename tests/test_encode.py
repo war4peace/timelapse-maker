@@ -672,7 +672,14 @@ class TestRsyncProbe(unittest.TestCase):
 
     def test_it_runs_as_the_service_account_when_there_is_one(self):
         # A share can accept root and refuse the account that runs nightly.
-        with mock.patch.object(enc.shutil, "which", lambda n: f"/usr/bin/{n}"), \
+        #
+        # Says who it is, rather than inheriting it. Wrapping in runuser is now
+        # conditional on being root, and `getattr(os, "geteuid", lambda: 0)`
+        # reports 0 on Windows, which has no such call: this passed here and
+        # failed on every CI leg, because a runner is not root either.
+        me, euid = self.as_user("root", root=True)
+        with me, euid, \
+                mock.patch.object(enc.shutil, "which", lambda n: f"/usr/bin/{n}"), \
                 mock.patch.object(enc.subprocess, "run", self.fake_run(0)) as run:
             enc.try_rsync_args(self.tmp, ["-a"], svcuser="timelapse")
         cmd = run.call_args[0][0]
