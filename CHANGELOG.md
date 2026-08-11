@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
-## [Unreleased]
+## [0.1.3] - 2026-08-11
+
+A security release. Camera passwords were reaching the log, and from there the
+web UI's log page; if you have run any earlier version, rotate the camera
+password after upgrading, because this fix cannot unwrite what is already in
+your journal. The rest is what the first days of 0.1.2 on a real deployment
+turned up: two checks that reported healthy systems as broken, and four places
+where the UI said less than it should have.
 
 ### Security
 - **Camera passwords no longer reach the log, and the web UI no longer shows
@@ -765,6 +772,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.3]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.3
 [0.1.2]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.2
 [0.1.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.1
 [0.1.0]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.0
