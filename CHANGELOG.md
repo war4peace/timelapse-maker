@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
-## [Unreleased]
+## [0.1.4] - 2026-08-11
 
 ### Added
 - **`timelapse config --redacted` prints the configuration with the
@@ -31,25 +31,6 @@ While the version is `0.x`, the configuration format may change in any release.
   pasted. JSON goes to stdout and the prose to stderr, so
   `timelapse config --redacted > report.json` still produces a file that
   parses.
-
-### Fixed
-- **`timelapse config` no longer lets an editor leave the config unreadable by
-  the daemons.** Editors that save by writing a new file and renaming it over
-  the old one (vim with `backupcopy=no`, and every `sed -i`-style tool) leave
-  root's umask on the result. The mode widening to 0644 is unwanted, but
-  losing the `timelapse` group is worse: the services then cannot read their
-  own configuration and nothing says so until the next restart. The command
-  now re-asserts 0640 root:timelapse after the editor exits, which is why it
-  no longer `exec`s it. The editor's exit status is still the command's.
-
-  It also sets `umask 0077` first, so an editor that creates its backup or
-  swap file from the umask rather than from the original's mode creates it
-  private. Measured, and worth stating precisely: vim copies the *original's*
-  mode onto its backup, so `config.json~` comes out 0640 root:timelapse
-  whether or not the umask is set, in `/etc/timelapse` or in a `backupdir`
-  elsewhere. That is the same exposure as the config itself rather than a new
-  one, so this is defence against editors that behave differently, not a fix
-  for an exploitable hole in vim.
 
 ### Changed
 - **Service status folded into the Overview, so the web UI has three tabs.**
@@ -83,6 +64,24 @@ While the version is `0.x`, the configuration format may change in any release.
   always a single request rather than usually one.
 
 ### Fixed
+- **`timelapse config` no longer lets an editor leave the config unreadable by
+  the daemons.** Editors that save by writing a new file and renaming it over
+  the old one (vim with `backupcopy=no`, and every `sed -i`-style tool) leave
+  root's umask on the result. The mode widening to 0644 is unwanted, but
+  losing the `timelapse` group is worse: the services then cannot read their
+  own configuration and nothing says so until the next restart. The command
+  now re-asserts 0640 root:timelapse after the editor exits, which is why it
+  no longer `exec`s it. The editor's exit status is still the command's.
+
+  It also sets `umask 0077` first, so an editor that creates its backup or
+  swap file from the umask rather than from the original's mode creates it
+  private. Measured, and worth stating precisely: vim copies the *original's*
+  mode onto its backup, so `config.json~` comes out 0640 root:timelapse
+  whether or not the umask is set, in `/etc/timelapse` or in a `backupdir`
+  elsewhere. That is the same exposure as the config itself rather than a new
+  one, so this is defence against editors that behave differently, not a fix
+  for an exploitable hole in vim.
+
 - **The pre-flight during `sudo timelapse update` no longer reports a working
   share as broken.** It ended with:
 
@@ -749,8 +748,6 @@ Bugs from the first real install on someone else's hardware.
 - `timelapse_test.py` reports the reason each encoder was unavailable, and
   distinguishes a 403 from a 404 on the webhook check.
 
-## [Unreleased]
-
 ### Added
 - `transfer.require_mountpoint`: refuses to transfer when the destination is
   not on a mounted filesystem. An unmounted CIFS/NFS mountpoint is an ordinary
@@ -876,6 +873,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.4]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.4
 [0.1.3]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.3
 [0.1.2]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.2
 [0.1.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.1

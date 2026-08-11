@@ -62,7 +62,7 @@ from timelapse_update import (                            # noqa: E402
 # behaviour a security filter should have.
 from timelapse_encode import redact                       # noqa: E402
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 
 log = logging.getLogger("web")
 

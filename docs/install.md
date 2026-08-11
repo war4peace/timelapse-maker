@@ -114,12 +114,12 @@ timelapse version
 ```
 
 ```
-  capture  0.1.3
-  encode   0.1.3
-  test     0.1.3
-  setup    0.1.3
-  update   0.1.3
-  web      0.1.3
+  capture  0.1.4
+  encode   0.1.4
+  test     0.1.4
+  setup    0.1.4
+  update   0.1.4
+  web      0.1.4
 ```
 
 If the daemon predates the installed files it says so explicitly, which is the
