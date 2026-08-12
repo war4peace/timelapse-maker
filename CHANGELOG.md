@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [Unreleased]
+
+### Fixed
+- **A day whose frames are kept is no longer encoded again every night.**
+  Nothing in the project recorded that a day had been encoded: deleting the
+  frames *was* the record, and it works, which is why this went unnoticed for
+  five releases. Set `encode.delete_frames_on_success: false` and that record
+  disappears with it, so every night the encoder found the same days still
+  sitting there and re-encoded the newest `max_backlog_days` of them from
+  scratch, then re-transferred the results. On a seven-camera install that is
+  forty-nine camera-days of GPU work nightly to produce videos that already
+  existed, and nothing in the log said "again".
+
+  A successful encode now writes a small `.encoded.json` into the day
+  directory, naming the video, the frame count, the encoder and the time, in
+  the manner of the existing `.cadence.json`. Days carrying one are skipped and
+  counted, and the count is reported rather than left silent, because a run
+  that legitimately does nothing should not look like a broken one.
+
+  **Nothing changes if you use the defaults**: frames are deleted on success,
+  so the marker is written and removed a second later. The marker cannot be
+  inferred from the video file instead, which is the obvious alternative:
+  `transfer()` *moves* the video to the NAS, so by morning the output
+  directory is normally empty and every day would look unencoded again.
+
+### Added
+- `timelapse encode --force` re-encodes days that are already marked. `--date`
+  keeps overriding the marker on its own, so re-doing a single day by hand
+  needs no new flag.
+
 ## [0.1.5] - 2026-08-12
 
 ### Added

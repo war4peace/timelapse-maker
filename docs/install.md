@@ -519,11 +519,19 @@ It stats every frame file, so on a busy install expect a few seconds.
 
 ```
 timelapse_encode.py [config] [--date YYYY-MM-DD] [--dry-run]
-                             [--keep-frames] [--no-transfer]
+                             [--keep-frames] [--no-transfer] [--force]
 ```
 
 Exit codes: `0` all good, `1` partial failure, `2` critical. Pass these through
 the wrapper too: `timelapse encode --date 2026-08-01 --keep-frames`.
+
+**A day is encoded once.** On success the encoder drops a small
+`.encoded.json` into the day's frame directory, and skips any day that carries
+one. You will only ever notice this if you keep your frames
+(`encode.delete_frames_on_success: false`); when they are deleted, which is
+the default, the marker goes with them. Two ways to encode a day again:
+`--date 2026-08-01`, which ignores the marker for that one day, or `--force`,
+which ignores it for the whole backlog. Deleting the marker file works too.
 
 ## 9. Adding, editing and removing cameras
 

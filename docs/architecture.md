@@ -92,6 +92,7 @@ This is the integration point. Treat it as an API.
 ```
 ${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/<HHMMSS>.jpg
 ${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/.cadence.json
+${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/.encoded.json
 ${paths.video_output}/<CameraName>.<YYYYMMDD>.<container>
 ${paths.log_dir}/{capture,encode}.log
 ```
@@ -106,6 +107,7 @@ Invariants that both sides depend on:
 | Dot-prefixed files are not frames | Temp files start with `.`; `glob("*.jpg")` skips them. Don't add non-frame files to a day directory without a dot prefix. |
 | A day directory older than today is complete and owned by the encoder | Capture never writes to a past date. The encoder is free to delete it. |
 | **A day has one cadence, start to finish** | `.cadence.json` records the interval and frame rate the day began at, and both programs obey it over the config. That is what lets a cadence edit take effect at the next midnight and not before, whatever restarts happen in between. Absent for days captured before 0.1.2, so both sides fall back to the config. |
+| **A day is encoded once** | `.encoded.json` records what was produced and when. Until 0.1.6, deleting the frames *was* that record, so `delete_frames_on_success: false` meant the newest `max_backlog_days` were re-encoded from scratch every night. The marker is what makes keeping frames a supportable configuration. It cannot be inferred from the video instead: `transfer()` moves that to the NAS. |
 
 Adding a camera means adding a directory. Nothing else in either program needs
 to know.
@@ -233,11 +235,23 @@ Pipeline, in `main()`:
    earlier version guessed from the codec name and told an RTX 4060 owner their
    GPU was too old for AV1.
 2. `find_pending()` → every date directory across all enabled cameras whose name
-   sorts `< today`, oldest first, capped to the newest `max_backlog_days`
-   distinct dates.
-3. `encode_day()` per job, sequentially.
+   sorts `< today` **and carries no `.encoded.json`**, oldest first, capped to
+   the newest `max_backlog_days` distinct dates. It returns `(jobs, done)`;
+   `done` counts the camera-days already encoded, which the log reports so a
+   run that legitimately does nothing cannot be mistaken for a broken one.
+   The marker check happens *before* the cap, or a week of finished days would
+   push the one day that still needs encoding out of the window. `--date`
+   overrides a marker (re-encoding one day by hand has to stay possible) and
+   `--force` overrides it for the whole backlog.
+3. `encode_day()` per job, sequentially. On `OK`, and only on `OK`, after the
+   output file is closed and size-checked, `mark_encoded()` writes
+   `.encoded.json`. It never raises: a marker that could not be written costs
+   a re-encode next night, which is the behaviour the project had for five
+   releases, and that is not worth failing a good run over.
 4. `rmtree` the day directory on `OK` (unless `--keep-frames` or config says
-   otherwise).
+   otherwise). The marker is written even when this is about to delete it,
+   because `rmtree` runs with `ignore_errors=True`: a deletion that quietly
+   failed would otherwise leave an unmarked directory to encode again.
 5. `transfer()` → rsync.
 6. `send_discord()` → embed with a monospace summary table plus fields.
 7. Exit `0` all-good, `1` partial failure, `2` critical.
@@ -1300,8 +1314,8 @@ take an optional path as their first positional argument. See
 | `av1_preset` / `av1_cq` | `p6` / 26 | p1 fastest … p7 slowest. Lower cq = higher quality. |
 | `hevc_cq`, `x264_crf` | 24, 20 | Fallback encoders only. |
 | `min_frames` | 100 | Below this, `SKIP` rather than produce a 2-second video. |
-| `delete_frames_on_success` | true | |
-| `max_backlog_days` | 7 | Bounds a catch-up run after long downtime. |
+| `delete_frames_on_success` | true | Off keeps the day directory. Safe since 0.1.6: `.encoded.json` is what stops the day being encoded again. There is still no age-based sweeper, so kept frames are kept forever. |
+| `max_backlog_days` | 7 | Bounds a catch-up run after long downtime. A count of the newest distinct dates *still pending*, not an age cutoff: downtime produces fewer date directories, never more, so it cannot strand a day. |
 
 ### `transfer`
 | Key | Notes |
@@ -1382,7 +1396,10 @@ remediation only.
 
 **Frame retention beyond encode**: set `delete_frames_on_success: false` and add
 a separate age-based sweeper. Do not add retention logic to `encode_day()`; keep
-"encode" and "delete" separable.
+"encode" and "delete" separable. Since 0.1.6 the first half of that is real: a
+kept day carries `.encoded.json` and is not encoded again, so a sweeper only
+has to decide *when* to delete, never *whether* the work was done. It must
+delete the marker with the day rather than leaving it behind.
 
 **Parallel encoding**: currently sequential and deliberately so. NVENC session
 limits on consumer GeForce cards are low, and the real bottleneck is CPU JPEG
@@ -1416,7 +1433,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 936 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 964 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1450,6 +1467,13 @@ corrupt ones, named as real captures), runs `timelapse_encode.py` over it, and
 asserts what has actually broken before: bad frames rejected, exact output
 duration, `color_range=tv`, `color_space=bt709`, `pix_fmt=yuv420p`, frames
 deleted afterwards. Needs ffmpeg but no GPU; it falls back to libx264.
+
+It then runs a **second night with `delete_frames_on_success` off**, because
+that is the configuration the encode-once marker exists for and the one a
+regression would hide in: the day is encoded, the frames stay, the marker
+appears, a re-run encodes nothing and says why, the video's mtime and size are
+untouched, and `--force` encodes it again. The unit tests can assert about the
+marker; only this can assert that a real run leaves the video alone.
 
 **The suite was mutation-checked** when written: 18 deliberate breakages
 introduced one at a time, 16 caught. The two misses were tests passing for the
@@ -1652,7 +1676,7 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ```
 install.sh                       bootstrap installer, 761 lines
 scripts/timelapse_capture.py     daemon, 742 lines
-scripts/timelapse_encode.py      batch job, 1078 lines
+scripts/timelapse_encode.py      batch job, 1176 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 773 lines
 scripts/timelapse_setup.py       configuration wizard, 2920 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines

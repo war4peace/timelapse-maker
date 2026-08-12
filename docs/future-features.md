@@ -22,7 +22,10 @@ item depends on explicitly, or the ordering rots.
 deleted from this file at 0.1.6 because it was finished; the CHANGELOG says
 what shipped and architecture.md §4.5 says how it works. The one part worth
 keeping was the library survey that justified the filename parser, which is
-now architecture.md §9a.
+now architecture.md §9a. The re-encode defect that briefly sat at the top of
+this list as item 0 went the same way once it was fixed: the invariant it
+established is in architecture.md §3, where the next person will actually meet
+it. Numbering is not reused, so item 1 stays item 1.
 
 Everything below is **researched against the code as of 0.1.5**, so each entry
 says where it would hook in and what is already there. None of it is designed;
@@ -30,54 +33,11 @@ these are pre-plans, and the traps are the point.
 
 ---
 
-## 0. A day with kept frames is re-encoded every night
-
-**Effort:** small. **Prerequisites:** none. **This is a defect, not a
-feature**, which is why it sits above everything else.
-
-### What happens
-
-`find_pending()` collects every date directory older than today, and
-`encode_day()` SKIPs only on too-few-frames. **Nothing anywhere asks whether a
-day has already been encoded.** Deleting the frames is what has always made
-that safe: the day directory disappears, so the next night cannot find it
-again.
-
-Set `encode.delete_frames_on_success = false` and that safety goes with it.
-The directories stay, so every night the encoder re-encodes the newest N days
-from scratch and re-transfers the results. On the deployment that is seven
-cameras times seven days of GPU work, nightly, to produce videos that already
-exist. Nothing in the log says "again", because as far as the run is concerned
-this is ordinary work.
-
-Found 2026-08-12 while researching item 1, by reading the code rather than by
-running it. It has presumably never been noticed because the default is
-`true` and nobody has had a reason to change it.
-
-### Shape
-
-A marker written into the day directory on success, in the manner of
-`.cadence.json`, naming what was produced and when. `find_pending()` skips a
-day that carries one, and `--force`, or deleting the marker, re-encodes.
-
-The tempting alternative, "skip if the output file already exists", does not
-work: `transfer()` *moves* the video to the NAS, so the output is normally
-gone by morning and every day would look unencoded again.
-
-### Traps
-
-- The marker must not make a genuinely-failed day look finished: write it only
-  on `status == "OK"`, after the file is closed.
-- `--date` must keep overriding it, or re-encoding one day by hand becomes
-  impossible.
-- Retention (item 1) must delete the marker with the day, not leave it behind.
-
----
-
 ## 1. Frame retention beyond encode
 
-**Effort:** small. **Prerequisites:** item 0, which is what makes "kept
-frames" a supportable configuration in the first place.
+**Effort:** small. **Prerequisites:** none any more. The one that mattered was
+the encode-once marker, which shipped in 0.1.6 and is what makes "kept frames"
+a supportable configuration in the first place.
 
 ### What exists
 
@@ -85,6 +45,11 @@ Frames are deleted in exactly one place: `encode_day()` removes the day
 directory after a successful encode, gated on
 `encode.delete_frames_on_success` (default true). There is no other deletion
 path anywhere in the project.
+
+Turning that off is now safe rather than merely possible: since 0.1.6 a
+successful encode leaves `.encoded.json` in the day directory and
+`find_pending()` skips any day that has one, so the frames stay and the day is
+not encoded a second time. What is still missing is the other half, below.
 
 ### What `max_backlog_days` actually does, because it is easy to misread
 
@@ -133,9 +98,12 @@ encoding" and "delete after N days" become one tangled condition.
   touched later than it represents.
 - **Never sweep a day the encoder has not finished with.** Ordering matters:
   sweep last, and skip anything in the pending list.
-- **`.cadence.json` lives in the day directory.** A sweeper that deletes the
-  marker but leaves frames would make the encoder read the config's current
-  cadence for an old day and report nonsense coverage.
+- **Two dotfiles live in the day directory, and they fail differently.** A
+  sweeper that deletes `.cadence.json` but leaves the frames would make the
+  encoder read the config's current cadence for an old day and report nonsense
+  coverage. Deleting `.encoded.json` and leaving the frames is worse: the day
+  becomes pending again and is re-encoded, which is exactly the defect 0.1.6
+  fixed. Delete the whole directory or nothing in it.
 - Deleting is the one irreversible thing this project would do to captured
   data. It deserves the same treatment as the transfer's mountpoint guard: a
   refusal when the situation looks wrong, not a best-effort delete.

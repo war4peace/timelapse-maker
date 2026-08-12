@@ -7,13 +7,14 @@ each to a 60 fps AV1 video, deletes the frames on success, sends a Discord
 summary, then rsyncs the videos to the configured destination (moving them,
 not copying) - a NAS share, another host, or any local path.
 
-"Completed" means any date directory strictly older than today, so a missed
-run (host down, crash) is picked up automatically on the next pass rather
-than silently leaving frames behind.
+"Completed" means any date directory strictly older than today that does not
+already carry an .encoded.json marker, so a missed run (host down, crash) is
+picked up automatically on the next pass rather than silently leaving frames
+behind, and a day whose frames were kept is not encoded a second time.
 
 Usage:
     timelapse_encode.py [config.json] [--date YYYY-MM-DD] [--dry-run]
-                        [--keep-frames] [--no-transfer]
+                        [--keep-frames] [--no-transfer] [--force]
 """
 
 import argparse
@@ -454,6 +455,69 @@ def day_cadence(day_dir):
         return None
 
 
+# Written into a day directory once its video exists. Until 0.1.6 nothing
+# recorded that a day had been encoded: deleting the frames *was* the record,
+# and it still is whenever `delete_frames_on_success` is left at its default,
+# because the directory goes away and the next run cannot find it.
+#
+# Turn that off and the record goes with it. The directory stays, so the same
+# day is found again the next night, and every night after, and re-encoded
+# from scratch over a video that already exists.
+#
+# It cannot be inferred from the output file instead: transfer() *moves* the
+# video to the NAS, so by morning video_output is normally empty and every day
+# would look unencoded again.
+ENCODED_FILE = ".encoded.json"
+
+
+def day_encoded(day_dir):
+    """What a day's marker says was produced, or None if it has none.
+
+    None for a marker that is unreadable or malformed as well as for one that
+    is absent. Unreadable has to mean "encode it again": the wasteful answer
+    costs one night of GPU time and is self-correcting, where trusting a
+    damaged marker loses the day silently and permanently.
+    """
+    try:
+        with open(Path(day_dir) / ENCODED_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) and d.get("video") else None
+    except (OSError, ValueError):
+        return None
+
+
+def mark_encoded(day_dir, out_file, result, encoder_name):
+    """Record that this day has been encoded. Never raises.
+
+    Never raises for the same reason write_cadence() does not: a marker that
+    could not be written costs a re-encode next night, which is exactly the
+    behaviour this project had before markers existed, and that is not worth
+    turning a successful run into a failed one over.
+
+    This says the day was *encoded*, not that it was delivered. A transfer
+    that failed leaves the video in video_output and the next run ships it;
+    re-encoding it would not have helped that.
+    """
+    day_dir = Path(day_dir)
+    path = day_dir / ENCODED_FILE
+    try:
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"encoded_at": datetime.now().replace(
+                           microsecond=0).isoformat(),
+                       "video": out_file.name,
+                       "frames": result["frames"],
+                       "size": result["size"],
+                       "encoder": encoder_name,
+                       "version": __version__}, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        log.warning("  %s: could not mark the day encoded (%s); it will be "
+                    "encoded again next run", day_dir.name, exc)
+        return False
+
+
 def camera_entry(cfg, name):
     """The config entry for a camera name, or {}.
 
@@ -579,6 +643,14 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
         result["status"] = "OK"
         if bad:
             result["note"] = f"{bad} bad frame(s) skipped"
+
+        # After the file is closed and checked, and only on OK, so a day that
+        # failed can never look finished. Written even when the frames are
+        # about to be deleted (the usual case, where it is redundant and gone
+        # a second later), because the caller's rmtree runs with
+        # ignore_errors=True: a deletion that quietly failed would otherwise
+        # leave an unmarked directory to be encoded all over again.
+        mark_encoded(day_dir, out_file, result, encoder["name"])
 
     except Exception as exc:
         result["note"] = str(exc)[:300]
@@ -925,10 +997,22 @@ def load_config(path):
         sys.exit(f"Cannot read {path}: {exc}")
 
 
-def find_pending(frames_root, cameras, only_date, max_backlog):
-    """Every date dir older than today, oldest first, capped at max_backlog."""
+def find_pending(frames_root, cameras, only_date, max_backlog, force=False):
+    """(jobs, done): date dirs older than today that still need encoding.
+
+    Oldest first, capped at max_backlog, which is a count of the newest
+    distinct dates still pending rather than an age cutoff.
+
+    `done` counts the camera-days left out because they already carry a marker.
+    They are dropped *before* the cap, so a pile of finished days cannot push a
+    pending one out of the window; that is the whole point of applying the two
+    in this order.
+
+    An explicit --date overrides a marker, because re-encoding one day by hand
+    has to stay possible; --force overrides it for the whole backlog.
+    """
     today = date.today().isoformat()
-    jobs = []
+    jobs, done = [], 0
     for cam in cameras:
         cam_dir = frames_root / cam
         if not cam_dir.is_dir():
@@ -940,11 +1024,14 @@ def find_pending(frames_root, cameras, only_date, max_backlog):
                 if d.name == only_date:
                     jobs.append((cam, d))
             elif d.name < today:
-                jobs.append((cam, d))
+                if not force and day_encoded(d):
+                    done += 1
+                else:
+                    jobs.append((cam, d))
     if not only_date and max_backlog:
         keep = sorted({d.name for _, d in jobs})[-max_backlog:]
         jobs = [(c, d) for c, d in jobs if d.name in keep]
-    return sorted(jobs, key=lambda j: (j[1].name, j[0]))
+    return sorted(jobs, key=lambda j: (j[1].name, j[0])), done
 
 
 def main():
@@ -955,6 +1042,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep-frames", action="store_true")
     ap.add_argument("--no-transfer", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="re-encode days that are already marked encoded")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -979,8 +1068,12 @@ def main():
                                "(tried av1_nvenc, hevc_nvenc, libx264)")
         log.info("Selected: %s", encoder["name"])
 
-        jobs = find_pending(frames_root, cameras, args.date,
-                            cfg["encode"].get("max_backlog_days", 7))
+        jobs, done = find_pending(frames_root, cameras, args.date,
+                                  cfg["encode"].get("max_backlog_days", 7),
+                                  args.force)
+        if done:
+            log.info("Skipping %d day(s) already encoded; --force re-does them.",
+                     done)
         if not jobs:
             log.info("Nothing to process.")
             # Still ship the backlog. A transfer that failed last night leaves
@@ -997,10 +1090,15 @@ def main():
                                ("OK - %d file(s) moved" % xfer["moved"])
                                if xfer["ok"] else "FAILED - " + xfer["detail"]))
             good = xfer is None or xfer["ok"]
+            # "None found" and "all of them are already done" look identical
+            # from here and are very different things to read at breakfast,
+            # so say which one it was.
             send_discord(cfg,
                          "Timelapse - nothing to do" if good
                          else "⚠️ Timelapse - transfer failed",
-                         "No completed day folders were found.",
+                         (f"{done} completed day folder(s) were already "
+                          f"encoded; nothing new." if done else
+                          "No completed day folders were found."),
                          0x95A5A6 if good else 0xF1C40F, fields)
             return 0 if good else 1
 

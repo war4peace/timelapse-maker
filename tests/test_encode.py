@@ -3,6 +3,7 @@
 The end-to-end encode is covered separately by tests/smoke_test.py.
 """
 
+import inspect
 import json
 import logging
 import os
@@ -162,28 +163,39 @@ class TestFindPending(unittest.TestCase):
         p.mkdir(parents=True, exist_ok=True)
         return d
 
+    def mark(self, camera, offset, video="Cam.mkv"):
+        """Mark a day encoded, the way a successful run leaves it."""
+        d = (self.today + timedelta(days=offset)).isoformat()
+        (self.root / camera / d / enc.ENCODED_FILE).write_text(
+            json.dumps({"video": video}), encoding="utf-8")
+        return d
+
+    def pending(self, *a, **kw):
+        """The job list only; the skipped count is asserted where it matters."""
+        return enc.find_pending(*a, **kw)[0]
+
     def test_todays_directory_is_left_alone(self):
         # Capture is still writing to it.
         self.day("Cam", 0)
-        self.assertEqual(enc.find_pending(self.root, ["Cam"], None, 7), [])
+        self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
 
     def test_finds_completed_days(self):
         self.day("Cam", -1)
         self.day("Cam", -2)
-        jobs = enc.find_pending(self.root, ["Cam"], None, 7)
+        jobs = self.pending(self.root, ["Cam"], None, 7)
         self.assertEqual(len(jobs), 2)
 
     def test_returns_oldest_first(self):
         self.day("Cam", -1)
         self.day("Cam", -3)
         self.day("Cam", -2)
-        names = [d.name for _, d in enc.find_pending(self.root, ["Cam"], None, 7)]
+        names = [d.name for _, d in self.pending(self.root, ["Cam"], None, 7)]
         self.assertEqual(names, sorted(names))
 
     def test_backlog_cap_keeps_the_newest_dates(self):
         for off in range(-10, 0):
             self.day("Cam", off)
-        jobs = enc.find_pending(self.root, ["Cam"], None, 3)
+        jobs = self.pending(self.root, ["Cam"], None, 3)
         names = [d.name for _, d in jobs]
         expected = [(self.today + timedelta(days=o)).isoformat()
                     for o in (-3, -2, -1)]
@@ -195,40 +207,199 @@ class TestFindPending(unittest.TestCase):
         for cam in ("A", "B"):
             self.day(cam, -1)
             self.day(cam, -2)
-        self.assertEqual(len(enc.find_pending(self.root, ["A", "B"], None, 2)), 4)
+        self.assertEqual(len(self.pending(self.root, ["A", "B"], None, 2)), 4)
 
     def test_only_date_selects_exactly_one(self):
         target = self.day("Cam", -2)
         self.day("Cam", -1)
-        jobs = enc.find_pending(self.root, ["Cam"], target, 7)
+        jobs = self.pending(self.root, ["Cam"], target, 7)
         self.assertEqual([d.name for _, d in jobs], [target])
 
     def test_only_date_ignores_the_backlog_cap(self):
         target = self.day("Cam", -9)
         for off in range(-8, 0):
             self.day("Cam", off)
-        jobs = enc.find_pending(self.root, ["Cam"], target, 3)
+        jobs = self.pending(self.root, ["Cam"], target, 3)
         self.assertEqual([d.name for _, d in jobs], [target])
 
     def test_only_date_may_be_today(self):
         # --date is an explicit override, so it can encode a day still in use.
         target = self.day("Cam", 0)
-        jobs = enc.find_pending(self.root, ["Cam"], target, 7)
+        jobs = self.pending(self.root, ["Cam"], target, 7)
         self.assertEqual([d.name for _, d in jobs], [target])
 
     def test_non_date_directories_are_skipped(self):
         (self.root / "Cam").mkdir(parents=True)
         (self.root / "Cam" / "scratch").mkdir()
         (self.root / "Cam" / "2026-8-4").mkdir()
-        self.assertEqual(enc.find_pending(self.root, ["Cam"], None, 7), [])
+        self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
 
     def test_unconfigured_cameras_are_not_touched(self):
         self.day("Ghost", -1)
-        self.assertEqual(enc.find_pending(self.root, ["Cam"], None, 7), [])
+        self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
 
     def test_missing_camera_directory_is_not_an_error(self):
         self.root.mkdir(parents=True)
-        self.assertEqual(enc.find_pending(self.root, ["Cam"], None, 7), [])
+        self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
+
+
+class TestFindPendingSkipsEncoded(unittest.TestCase):
+    """The whole point of the marker: kept frames are not encoded twice.
+
+    Before 0.1.6 nothing recorded that a day had been encoded, so with
+    `delete_frames_on_success` off the encoder re-encoded the newest N days
+    from scratch every single night, and re-transferred the results.
+    """
+
+    setUp = TestFindPending.setUp
+    tearDown = TestFindPending.tearDown
+    day = TestFindPending.day
+    mark = TestFindPending.mark
+    pending = TestFindPending.pending
+
+    def test_a_marked_day_is_not_offered_again(self):
+        self.day("Cam", -1)
+        self.mark("Cam", -1)
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7)
+        self.assertEqual(jobs, [])
+        self.assertEqual(done, 1)
+
+    def test_an_unmarked_day_beside_a_marked_one_still_runs(self):
+        self.day("Cam", -1)
+        self.day("Cam", -2)
+        self.mark("Cam", -2)
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7)
+        self.assertEqual([d.name for _, d in jobs],
+                         [(self.today + timedelta(days=-1)).isoformat()])
+        self.assertEqual(done, 1)
+
+    def test_the_marker_is_per_camera_not_per_date(self):
+        # Two cameras share a date; marking one must not excuse the other.
+        for cam in ("A", "B"):
+            self.day(cam, -1)
+        self.mark("A", -1)
+        jobs, done = enc.find_pending(self.root, ["A", "B"], None, 7)
+        self.assertEqual([c for c, _ in jobs], ["B"])
+        self.assertEqual(done, 1)
+
+    def test_force_re_encodes_a_marked_day(self):
+        self.day("Cam", -1)
+        self.mark("Cam", -1)
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7, force=True)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(done, 0)
+
+    def test_only_date_overrides_the_marker(self):
+        # Re-encoding one day by hand has to stay possible without --force.
+        target = self.day("Cam", -2)
+        self.mark("Cam", -2)
+        jobs, _ = enc.find_pending(self.root, ["Cam"], target, 7)
+        self.assertEqual([d.name for _, d in jobs], [target])
+
+    def test_marked_days_do_not_consume_the_backlog_window(self):
+        # Dropped before the cap, or a week of finished days would push the
+        # one day that still needs encoding straight out of the window.
+        for off in range(-10, 0):
+            self.day("Cam", off)
+            if off != -10:
+                self.mark("Cam", off)
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 3)
+        self.assertEqual([d.name for _, d in jobs],
+                         [(self.today + timedelta(days=-10)).isoformat()])
+        self.assertEqual(done, 9)
+
+    def test_a_damaged_marker_means_encode_it_again(self):
+        self.day("Cam", -1)
+        (self.root / "Cam" / (self.today + timedelta(days=-1)).isoformat()
+         / enc.ENCODED_FILE).write_text("{ truncated", encoding="utf-8")
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(done, 0)
+
+    def test_a_cadence_marker_is_not_an_encoded_marker(self):
+        # Two dotfiles in the same directory, and only one of them means done.
+        self.day("Cam", -1)
+        (self.root / "Cam" / (self.today + timedelta(days=-1)).isoformat()
+         / enc.CADENCE_FILE).write_text(
+            json.dumps({"interval_seconds": 5, "framerate": 60}),
+            encoding="utf-8")
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(done, 0)
+
+
+class TestEncodedMarker(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.day = self.tmp / "2026-08-11"
+        self.day.mkdir()
+        self.result = {"frames": 10896, "size": 612345678}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_it_is_hidden_like_the_cadence_marker(self):
+        # Both live in a directory otherwise full of frames; neither should
+        # show up in a casual listing, and neither is a *.jpg.
+        self.assertTrue(enc.ENCODED_FILE.startswith("."))
+        self.assertNotEqual(enc.ENCODED_FILE, enc.CADENCE_FILE)
+
+    def test_round_trip(self):
+        enc.mark_encoded(self.day, Path("/out/Cam.20260811.mkv"),
+                         self.result, "av1_nvenc (NVIDIA AV1)")
+        got = enc.day_encoded(self.day)
+        self.assertEqual(got["video"], "Cam.20260811.mkv")
+        self.assertEqual(got["frames"], 10896)
+        self.assertEqual(got["size"], 612345678)
+        self.assertEqual(got["encoder"], "av1_nvenc (NVIDIA AV1)")
+        self.assertEqual(got["version"], enc.__version__)
+
+    def test_it_records_when(self):
+        enc.mark_encoded(self.day, Path("Cam.mkv"), self.result, "libx264")
+        stamp = enc.day_encoded(self.day)["encoded_at"]
+        self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+
+    def test_no_marker_reads_as_none(self):
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_a_missing_directory_reads_as_none(self):
+        self.assertIsNone(enc.day_encoded(self.tmp / "nope"))
+
+    def test_malformed_json_reads_as_none(self):
+        (self.day / enc.ENCODED_FILE).write_text("{ nope", encoding="utf-8")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_json_that_is_not_an_object_reads_as_none(self):
+        (self.day / enc.ENCODED_FILE).write_text("[1, 2]", encoding="utf-8")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_a_marker_naming_no_video_reads_as_none(self):
+        # An empty {} is what a half-written or hand-made file looks like, and
+        # it is not evidence that anything was produced.
+        (self.day / enc.ENCODED_FILE).write_text("{}", encoding="utf-8")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_it_overwrites_an_earlier_marker(self):
+        # --force re-encodes; the marker must then describe the new video, not
+        # keep pointing at the one that was just replaced.
+        enc.mark_encoded(self.day, Path("old.mkv"), self.result, "libx264")
+        enc.mark_encoded(self.day, Path("new.mkv"), self.result, "av1_nvenc")
+        self.assertEqual(enc.day_encoded(self.day)["video"], "new.mkv")
+
+    def test_it_leaves_no_temporary_file_behind(self):
+        enc.mark_encoded(self.day, Path("Cam.mkv"), self.result, "libx264")
+        self.assertEqual([p.name for p in self.day.iterdir()],
+                         [enc.ENCODED_FILE])
+
+    def test_an_unwritable_directory_is_not_an_error(self):
+        # Failing to annotate a day costs a re-encode next run, which is what
+        # the project did for five releases. It is not worth failing over.
+        missing = self.tmp / "gone" / "2026-08-11"
+        with self.assertLogs("encode", level="WARNING") as cm:
+            self.assertFalse(
+                enc.mark_encoded(missing, Path("Cam.mkv"), self.result, "x"))
+        self.assertIn("encoded again", "\n".join(cm.output))
 
 
 class TestEncoderCandidates(unittest.TestCase):
@@ -1023,6 +1194,102 @@ class TestPerCameraEncodeSettings(unittest.TestCase):
         args = enc.build_candidates({"gop": 120}, gop=60)[0]["args"]
         self.assertIn("60", args)
         self.assertNotIn("120", args)
+
+
+class TestEncodeDayMarksTheDay(unittest.TestCase):
+    """`day_encoded()` answering correctly is worth nothing if nothing writes.
+
+    Same reasoning as the cadence test above: the helpers are cheap to test in
+    isolation and that is exactly why the wiring is the part that breaks.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.day = self.tmp / "frames" / "Roof" / "2026-08-10"
+        for i in range(5):
+            make_frame(self.day / ("%06d.jpg" % (i * 5)))
+        self.out = self.tmp / "videos"
+        self.out.mkdir()
+        self.cfg = {"capture": {"interval_seconds": 5, "min_bytes": 100},
+                    "encode": {"framerate": 60, "gop": 120, "min_frames": 1,
+                               "container": "mkv"},
+                    "paths": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+                    "cameras": [{"name": "Roof"}]}
+
+    def run_day(self, rc=0, produce=True, dry_run=False):
+        """encode_day() with ffmpeg replaced by something that writes a file."""
+        def fake_run(cmd, **kw):
+            if produce:
+                Path(cmd[-1]).write_bytes(b"\0" * 4096)
+            return mock.Mock(returncode=rc, stdout="", stderr="boom")
+
+        with mock.patch.object(enc, "probe_dimensions", return_value=(512, 512)), \
+                mock.patch.object(enc.subprocess, "run", side_effect=fake_run):
+            return enc.encode_day(self.cfg, {"codec": "libx264", "args": [],
+                                             "name": "libx264 (CPU)"},
+                                  "Roof", self.day, self.out, dry_run)
+
+    def test_a_successful_day_is_marked(self):
+        r = self.run_day()
+        self.assertEqual(r["status"], "OK")
+        marker = enc.day_encoded(self.day)
+        self.assertIsNotNone(marker)
+        self.assertEqual(marker["video"], "Roof.20260810.mkv")
+        self.assertEqual(marker["frames"], 5)
+        self.assertEqual(marker["encoder"], "libx264 (CPU)")
+
+    def test_a_marked_day_is_the_one_find_pending_then_skips(self):
+        # The round trip through both halves, because each half passing its
+        # own test proves nothing about the pair.
+        self.run_day()
+        jobs, done = enc.find_pending(self.tmp / "frames", ["Roof"],
+                                      None, 7, force=False)
+        self.assertEqual(jobs, [])
+        self.assertEqual(done, 1)
+
+    def test_a_failed_encode_is_not_marked(self):
+        r = self.run_day(rc=1, produce=False)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_an_output_that_never_appeared_is_not_marked(self):
+        # ffmpeg exiting 0 having written nothing usable is a failure too, and
+        # marking it would strand the day permanently.
+        r = self.run_day(rc=0, produce=False)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_a_skipped_day_is_not_marked(self):
+        self.cfg["encode"]["min_frames"] = 100
+        r = self.run_day()
+        self.assertEqual(r["status"], "SKIP")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_a_dry_run_is_not_marked(self):
+        # --dry-run must be able to answer "what would run tonight" twice.
+        r = self.run_day(dry_run=True)
+        self.assertEqual(r["status"], "DRY")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_the_marker_is_not_mistaken_for_a_frame(self):
+        self.run_day()
+        good, bad = enc.valid_frames(self.day, 100)
+        self.assertEqual((len(good), bad), (5, 0))
+
+
+class TestForceIsWiredUp(unittest.TestCase):
+    """main() is not unit-testable here, and this is the part that rots."""
+
+    def test_main_passes_force_through_to_find_pending(self):
+        source = inspect.getsource(enc.main)
+        self.assertIn("--force", source)
+        self.assertIn("args.force", source)
+
+    def test_main_reports_what_it_skipped(self):
+        # A run that quietly does nothing because every day is marked looks
+        # identical to a broken one from the log.
+        self.assertIn("already encoded", inspect.getsource(enc.main))
 
 
 class TestRedact(unittest.TestCase):

@@ -141,6 +141,60 @@ def main():
           ffprobe_field(out, "stream=pix_fmt") == "yuv420p")
     check("frames deleted after success", not day_dir.exists())
 
+    return second_night(tmp, cfg, cfg_path, videos)
+
+
+def second_night(tmp, cfg, cfg_path, videos):
+    """The defect fixed in 0.1.6: with frames kept, does it encode twice?
+
+    Deleting the frames used to be the only thing stopping a second encode, so
+    this is the configuration where a regression would hide. Worth the extra
+    ffmpeg run: the unit tests can only assert about the marker, not about
+    whether a real run leaves the video alone.
+    """
+    frames_root = Path(cfg["paths"]["frames_root"])
+    day = (date.today() - timedelta(days=2)).isoformat()
+    day_dir = frames_root / "TestCam" / day
+
+    print("\nSecond night, with delete_frames_on_success off...")
+    build_frames(day_dir)
+    cfg["encode"]["delete_frames_on_success"] = False
+    cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+    def run():
+        p = subprocess.run([sys.executable, str(ENCODE), str(cfg_path)],
+                           capture_output=True, text=True, timeout=900)
+        return p
+
+    first = run()
+    out = videos / f"TestCam.{day.replace('-', '')}.mkv"
+    print("Assertions:")
+    check("kept-frames run exits 0", first.returncode == 0,
+          f"rc={first.returncode}")
+    check("video produced", out.exists(), out.name)
+    if not out.exists():
+        print(first.stdout, first.stderr)
+        return finish(tmp)
+    check("frames kept", day_dir.is_dir())
+    check("day marked encoded", (day_dir / ".encoded.json").is_file())
+
+    stamp, size = out.stat().st_mtime_ns, out.stat().st_size
+    os.utime(out, ns=(stamp - 2_000_000_000, stamp - 2_000_000_000))
+    stamp = out.stat().st_mtime_ns
+
+    second = run()
+    check("re-run exits 0", second.returncode == 0, f"rc={second.returncode}")
+    check("re-run encoded nothing", "Nothing to process" in second.stdout)
+    check("re-run said why", "already encoded" in second.stdout)
+    check("video untouched", out.stat().st_mtime_ns == stamp
+          and out.stat().st_size == size)
+
+    forced = subprocess.run(
+        [sys.executable, str(ENCODE), str(cfg_path), "--force"],
+        capture_output=True, text=True, timeout=900)
+    check("--force encodes it again", forced.returncode == 0
+          and out.stat().st_mtime_ns != stamp, f"rc={forced.returncode}")
+
     return finish(tmp)
 
 
