@@ -1188,6 +1188,59 @@ class TestRedactConfig(unittest.TestCase):
         out = enc.redact_config({"cameras": [{"password": "", "username": ""}]})
         self.assertEqual(out["cameras"][0]["password"], "")
 
+    # -- a stored hash is a secret for this purpose -------------------------
+    # The web UI's login keeps a PBKDF2 hash in the config. It is not a
+    # password, and it is not replayed to anything, but it is offline-
+    # crackable and this dump exists to be pasted into a public issue. The
+    # original rule anchored on `pass(word|wd)?$`, so `password_hash` went
+    # through untouched.
+
+    def test_a_stored_password_hash_is_masked(self):
+        out = enc.redact_config({"web": {"auth": {
+            "username": "ed",
+            "password_hash": f"pbkdf2_sha256$600000$c2FsdA$ZGVyaXZlZA{self.S}",
+        }}})
+        self.assertEqual(out["web"]["auth"]["password_hash"], enc.MASK)
+
+    def test_the_hash_appears_nowhere_in_the_dump(self):
+        # The same whole-tree assertion the passwords get: a hash in a shape
+        # nobody thought of still fails this.
+        dump = json.dumps(enc.redact_config({"web": {"auth": {
+            "password_hash": f"pbkdf2_sha256$600000$c2FsdA${self.S}"}}}))
+        self.assertNotIn(self.S, dump)
+
+    def test_the_login_username_survives(self):
+        # Same reasoning as the camera usernames: "who is it configured for"
+        # is a question a fault report has to be able to answer.
+        out = enc.redact_config({"web": {"auth": {"username": "ed",
+                                                  "password_hash": "x"}}})
+        self.assertEqual(out["web"]["auth"]["username"], "ed")
+
+    def test_an_unset_login_still_reads_as_unset(self):
+        # "" is the answer to "have you configured a login at all?", which is
+        # the first thing to ask about a UI that is letting anyone in.
+        out = enc.redact_config({"web": {"auth": {"username": "",
+                                                  "password_hash": ""}}})
+        self.assertEqual(out["web"]["auth"], {"username": "",
+                                              "password_hash": ""})
+
+    def test_the_camera_auth_scheme_is_not_swept_up_with_it(self):
+        # `auth` on a camera is "digest" or "basic", not a credential, and
+        # masking the block it names would hide the username with it.
+        out = enc.redact_config({"cameras": [{"auth": "digest",
+                                              "username": "admin"}]})
+        self.assertEqual(out["cameras"][0], {"auth": "digest",
+                                             "username": "admin"})
+
+    def test_an_ordinary_hash_field_is_left_alone(self):
+        # The rule is "a password key, however suffixed", not "anything with
+        # hash in the name". A dump where half the settings read *** is one
+        # nobody can act on.
+        out = enc.redact_config({"encode": {"frame_hash": "abc123",
+                                            "hash_algorithm": "sha256"}})
+        self.assertEqual(out["encode"], {"frame_hash": "abc123",
+                                         "hash_algorithm": "sha256"})
+
     def test_a_key_nobody_planned_for(self):
         # The schema may grow one, and a hand-edited config may already have.
         out = enc.redact_config({"x": {"api_key": "k", "AuthToken": "t",

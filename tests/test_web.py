@@ -167,17 +167,20 @@ class FakeRequest:
 
 
 class FakeServer:
-    def __init__(self, config, index=None, updates=None):
+    def __init__(self, config, index=None, updates=None, auth=None):
         self.cfg = config
         self.index = index
         # Disabled by default, and that is not incidental: an enabled checker
         # would have the overview page reaching api.github.com from the test
         # suite. Tests that want the panel populated set the state directly.
         self.updates = updates or web.UpdateChecker(None, enabled=False)
+        # Also disabled by default, so every test written before the login
+        # existed still describes a server with no login.
+        self.auth = auth or web.Auth()
 
 
 def request_bytes(path, config, index=None, method="GET", headers="",
-                  updates=None):
+                  updates=None, auth=None, body=None, client="127.0.0.1"):
     """Drive one request through the real handler; body stays bytes.
 
     Extra headers go first, and Host is only defaulted when they do not supply
@@ -186,26 +189,30 @@ def request_bytes(path, config, index=None, method="GET", headers="",
     """
     extra = headers or ""
     host = "" if "host:" in extra.lower() else "Host: nas.local\r\n"
-    raw = (f"{method} {path} HTTP/1.1\r\n{extra}{host}"
-           f"Content-Length: 0\r\nConnection: close\r\n\r\n")
-    req = FakeRequest(raw.encode())
+    payload = (body or "").encode("utf-8")
+    ctype = ("Content-Type: application/x-www-form-urlencoded\r\n"
+             if payload else "")
+    raw = (f"{method} {path} HTTP/1.1\r\n{extra}{host}{ctype}"
+           f"Content-Length: {len(payload)}\r\nConnection: close\r\n\r\n")
+    req = FakeRequest(raw.encode() + payload)
     handler = web.Handler.__new__(web.Handler)
     handler.log_message = lambda *a, **k: None
     handler.rfile = None
     # BaseHTTPRequestHandler does all its work from __init__.
-    web.Handler.__init__(handler, req, ("127.0.0.1", 5555),
-                         FakeServer(config, index, updates))
+    web.Handler.__init__(handler, req, (client, 5555),
+                         FakeServer(config, index, updates, auth))
     out = bytes(req.sent)
     head, _, body = out.partition(b"\r\n\r\n")
     head = head.decode("latin-1")
     return int(head.split()[1]), head, body
 
 
-def request(path, config, index=None, method="GET", headers="", updates=None):
+def request(path, config, index=None, method="GET", headers="", updates=None,
+            auth=None, body=None, client="127.0.0.1"):
     """As request_bytes, with the body decoded for HTML assertions."""
-    status, head, body = request_bytes(path, config, index, method, headers,
-                                       updates)
-    return status, head, body.decode("utf-8", "replace")
+    status, head, raw = request_bytes(path, config, index, method, headers,
+                                      updates, auth, body, client)
+    return status, head, raw.decode("utf-8", "replace")
 
 
 class TestRouting(unittest.TestCase):
@@ -558,6 +565,34 @@ class TestUnitStates(unittest.TestCase):
         row = self.rows(self.show(self.daemon(
             "timelapse-encode.service", SubState="running")))["Last encode run"]
         self.assertEqual(row[1:3], ("ok", "Running"))
+
+    def test_an_encode_in_progress_does_not_read_as_stuck(self):
+        # Reported from the deployment. A Type=oneshot sits in
+        # activating/start for the whole of its ExecStart, which for the
+        # nightly encode is twenty minutes and more; the daemon word for that
+        # state is "Starting", and watching it say so for a quarter of an hour
+        # reads as a job that never got going. Verified on systemd 255: the
+        # start time is in InactiveExitTimestamp and the other two timestamps
+        # are empty until it finishes.
+        row = self.rows(self.show(self.daemon(
+            "timelapse-encode.service", ActiveState="activating",
+            SubState="start", ActiveEnterTimestamp="",
+            InactiveExitTimestamp="Wed 2026-08-12 00:05:00 EEST",
+        )))["Last encode run"]
+        self.assertEqual(row[1:3], ("ok", "Running"))
+        self.assertIn("started Wed 2026-08-12 00:05:00", row[3])
+
+    def test_a_daemon_mid_start_is_still_starting(self):
+        # The oneshot rule must not swallow the state it was named for.
+        row = self.rows(self.show(self.daemon(
+            ActiveState="activating", SubState="start")))["Capture"]
+        self.assertEqual(row[1:3], ("", "Starting"))
+
+    def test_a_oneshot_crash_loop_is_still_a_fault(self):
+        row = self.rows(self.show(self.daemon(
+            "timelapse-encode.service", ActiveState="activating",
+            SubState="auto-restart")))["Last encode run"]
+        self.assertEqual(row[1:3], ("bad", "Restarting"))
 
     def test_rows_are_matched_by_id_not_by_position(self):
         # A block that does not come back must not shift every later unit onto
@@ -1950,6 +1985,58 @@ class TestUpdateChecker(unittest.TestCase):
             c._check()
         self.assertFalse(c.snapshot()["available"])
 
+    # -- a cache the installed version has overtaken ------------------------
+    # Reported from the deployment: upgraded 0.1.3 to 0.1.4 from the terminal,
+    # and the panel then read "Installed 0.1.4 / Latest 0.1.3" until the daily
+    # check came round. Upstream cannot be behind what is installed here, so
+    # the cached answer is out of date rather than a finding about GitHub.
+
+    def test_an_overtaken_cache_reports_the_installed_version(self):
+        c = self.make(current="0.1.3")
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 3), "v0.1.3", "u", "")):
+            c._check()
+        c.current, c.current_text = web.parse_version("0.1.4"), "0.1.4"
+        s = c.snapshot()
+        self.assertEqual(s["latest"], "0.1.4")
+        self.assertFalse(s["available"])
+        self.assertTrue(s["known"])
+
+    def test_an_overtaken_cache_drops_the_older_release_link(self):
+        # The tag and the URL name 0.1.3's release; kept, they would label a
+        # link "0.1.4" and land the reader on the previous release's page.
+        c = self.make(current="0.1.3")
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 3), "v0.1.3", "u", "")):
+            c._check()
+        c.current, c.current_text = web.parse_version("0.1.4"), "0.1.4"
+        s = c.snapshot()
+        self.assertEqual(s["tag"], "")
+        self.assertEqual(s["url"], "")
+
+    def test_the_cache_itself_is_not_rewritten(self):
+        # Only the rendering is clamped. The file stays a record of what
+        # GitHub actually said, so the next real check has something to
+        # correct and "Last successful check" keeps meaning what it says.
+        c = self.make(current="0.1.3")
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 3), "v0.1.3", "u", "")):
+            c._check()
+        c.current, c.current_text = web.parse_version("0.1.4"), "0.1.4"
+        c.snapshot()
+        self.assertEqual(c.state["latest"], "0.1.3")
+        self.assertEqual(c.state["tag"], "v0.1.3")
+
+    def test_a_newer_upstream_is_left_alone(self):
+        c = self.make(current="0.1.4")
+        with mock.patch.object(web, "latest_release",
+                               return_value=((0, 1, 5), "v0.1.5", "u", "")):
+            c._check()
+        s = c.snapshot()
+        self.assertEqual(s["latest"], "0.1.5")
+        self.assertEqual(s["url"], "u")
+        self.assertTrue(s["available"])
+
     def test_a_failure_does_not_count_as_a_check(self):
         """The reported bug. A momentary DNS failure during an upgrade set
         `checked`, so the daily cache gated the retry and the operator was
@@ -2212,13 +2299,45 @@ class TestUpdatePanel(unittest.TestCase):
         self.assertNotIn("<code>", dl)
         self.assertIn('class="ok"', dl)
 
-    def test_an_available_update_shows_the_tag_and_the_command(self):
+    def test_an_available_update_shows_the_version_and_the_command(self):
         body = self.get(self.checker(checked=time.time(), tag="v0.1.0",
                                      latest="0.1.0", url="https://example/rel"))
         self.assertIn("An update is available", body)
-        self.assertIn("v0.1.0", body)
+        self.assertIn("0.1.0", body)
         self.assertIn("sudo timelapse update", body)
         self.assertIn("https://example/rel", body)
+
+    # -- one shape for both version numbers ---------------------------------
+    # Reported from the deployment: "Installed 0.1.4" beside "Latest v0.1.4".
+    # The tag is what the repo wrote and the installed version is what
+    # __version__ says; side by side in one two-row list the v reads as a
+    # difference between the two values rather than as punctuation in one.
+
+    def test_the_latest_version_is_printed_without_the_tag_v(self):
+        dl = self.version_list(self.get(self.checker(
+            checked=time.time(), tag="v0.1.0", latest="0.1.0",
+            url="https://example/rel")))
+        self.assertIn("0.1.0", dl)
+        self.assertNotIn("v0.1.0", dl)
+
+    def test_the_two_versions_agree_on_shape_when_they_agree(self):
+        dl = self.version_list(self.get(self.checker(
+            checked=time.time(), tag="v0.0.9", latest="0.0.9")))
+        self.assertEqual(dl.count("<dd>0.0.9</dd>"), 2)
+
+    def test_the_update_sentence_uses_the_same_shape(self):
+        # "You have 0.1.4; v0.1.5 is out" puts both spellings in one sentence.
+        body = self.get(self.checker(checked=time.time(), tag="v0.1.0",
+                                     latest="0.1.0", url="https://example/rel"))
+        self.assertIn("You have 0.0.9; ", body)
+        self.assertNotIn("v0.1.0", body)
+
+    def test_a_cache_with_only_a_tag_falls_back_to_it(self):
+        # Belt and braces: _check writes the two together, so this is only a
+        # fallback for a cache that somehow has one without the other. Better
+        # a v than a blank where a version should be.
+        self.assertEqual(web.latest_label({"latest": "", "tag": "v0.1.0"}),
+                         "v0.1.0")
 
     # -- the release notes are GitHub's job ---------------------------------
     # This panel used to reproduce the release body. It is markdown, and this
@@ -2269,6 +2388,20 @@ class TestUpdatePanel(unittest.TestCase):
                                      latest="0.0.9"))
         self.assertIn("Up to date", body)
         self.assertNotIn("install_timelapse.sh", body)
+
+    def test_a_terminal_upgrade_does_not_leave_the_panel_contradicting_itself(self):
+        # The reported sequence: `sudo timelapse update` moves the installed
+        # version, the cache still holds yesterday's answer, and the panel
+        # reads "Installed 0.1.4 / Latest 0.1.3" for up to a day.
+        body = self.get(self.checker(current="0.1.4", checked=time.time(),
+                                     tag="v0.1.3", latest="0.1.3",
+                                     url="https://example/rel"))
+        dl = self.version_list(body)
+        self.assertEqual(dl.count("<dd>0.1.4</dd>"), 2)
+        self.assertNotIn("0.1.3", dl)
+        self.assertIn("Up to date", body)
+        # And it still says how old the answer is, which is the honest part.
+        self.assertIn("Last successful check", body)
 
     def test_disabled_says_how_to_turn_it_on(self):
         body = self.get(self.checker(enabled=False))
@@ -2348,7 +2481,7 @@ class TestUpdatePanel(unittest.TestCase):
         status, _, body = request("/update", self.config, updates=c)
         self.assertEqual(status, 200)
         self.assertIn('id="update"', body)
-        self.assertIn("v0.1.0", body)
+        self.assertIn("0.1.0", body)
         self.assertNotIn("setInterval", body)
         self.assertNotIn("<nav>", body)
 
@@ -2435,6 +2568,725 @@ class TestHandleError(unittest.TestCase):
             except BaseException:
                 self.server.handle_error(None, ("192.168.2.90", 14539))
         self.assertEqual(buf.getvalue(), "")
+
+
+def with_login(user="ed", password="hunter2", fail_delay=0):
+    """An Auth with a real credential, hashed cheaply and failing instantly.
+
+    fail_delay defaults to 0 here: a wrong password costs three real seconds
+    in the shipped code, and a dozen tests of failed logins would otherwise
+    spend half a minute proving that sleep() sleeps. The delay itself is
+    tested where it belongs, in TestFailedLoginDelay.
+    """
+    return web.Auth(user, web.hash_password(password, iters=1000),
+                    fail_delay=fail_delay)
+
+
+def cookie_header(token):
+    return f"Cookie: {web.SESSION_COOKIE}={token}\r\n"
+
+
+def set_cookie(head):
+    """The Set-Cookie value from a response, or ""."""
+    for line in head.split("\r\n"):
+        if line.lower().startswith("set-cookie:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def location(head):
+    for line in head.split("\r\n"):
+        if line.lower().startswith("location:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+class TestSafeNext(unittest.TestCase):
+    """Where the login page is allowed to send you afterwards."""
+
+    def test_a_local_path_survives(self):
+        self.assertEqual(web.safe_next("/library?camera=Garage"),
+                         "/library?camera=Garage")
+
+    def test_nothing_becomes_the_home_page(self):
+        for value in ("", None, "   "):
+            with self.subTest(value=value):
+                self.assertEqual(web.safe_next(value), "/")
+
+    def test_another_site_is_refused(self):
+        # An open redirect on a login page is the classic way to make a
+        # phishing link look like it belongs to the host it names.
+        for value in ("//evil.example/", "http://evil.example/",
+                      "https://evil.example/", "javascript:alert(1)",
+                      "\\\\evil.example\\share", "/\\evil.example"):
+            with self.subTest(value=value):
+                self.assertEqual(web.safe_next(value), "/")
+
+    def test_a_header_injection_attempt_is_refused(self):
+        # This value goes into a Location header.
+        self.assertEqual(web.safe_next("/x\r\nSet-Cookie: a=b"), "/")
+        self.assertEqual(web.safe_next("/x\nX: y"), "/")
+
+
+class TestGate(unittest.TestCase):
+    """Which routes need the session, and which cannot."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        Path(self.tmp, "videos").mkdir()
+        self.config = cfg(self.tmp, transfer={"enabled": False})
+        self.auth = with_login()
+
+    def get(self, path, headers="", method="GET"):
+        return request(path, self.config, method=method, headers=headers,
+                       auth=self.auth)
+
+    def test_without_a_login_configured_nothing_changes(self):
+        # Every existing install. The gate must be invisible until somebody
+        # asks for it.
+        status, _, body = request("/", self.config)
+        self.assertEqual(status, 200)
+        self.assertIn("Video library", body)
+
+    def test_the_pages_need_a_session(self):
+        for path, where in (("/", "/login"),
+                            ("/library", "/login?next=%2Flibrary"),
+                            ("/logs", "/login?next=%2Flogs"),
+                            ("/status", "/login?next=%2Fstatus")):
+            with self.subTest(path=path):
+                status, head, _ = self.get(path)
+                self.assertEqual(status, 303)
+                self.assertEqual(location(head), where)
+
+    def test_the_page_you_wanted_is_remembered(self):
+        _, head, _ = self.get("/library?camera=Garage")
+        self.assertEqual(location(head),
+                         "/login?next=%2Flibrary%3Fcamera%3DGarage")
+
+    def test_a_session_gets_you_in(self):
+        status, _, body = self.get("/", cookie_header(
+            self.auth.open_session()))
+        self.assertEqual(status, 200)
+        self.assertIn("Video library", body)
+
+    def test_a_stale_or_forged_cookie_does_not(self):
+        for value in ("nonsense", "", "a=b; c=d"):
+            with self.subTest(cookie=value):
+                status, _, _ = self.get("/", f"Cookie: {value}\r\n")
+                self.assertEqual(status, 303)
+
+    def test_a_malformed_cookie_header_is_not_an_error(self):
+        # Some other application's cookie on the same host, badly formed.
+        status, _, _ = self.get("/", "Cookie: =broken;;;\r\n")
+        self.assertEqual(status, 303)
+
+    def test_a_cookie_split_over_several_headers_still_works(self):
+        # A proxy may do this, and taking only the first header would log
+        # everybody behind it out.
+        token = self.auth.open_session()
+        headers = f"Cookie: other=1\r\nCookie: {web.SESSION_COOKIE}={token}\r\n"
+        status, _, _ = self.get("/", headers)
+        self.assertEqual(status, 200)
+
+    def test_an_expired_session_does_not(self):
+        auth = web.Auth("ed", web.hash_password("hunter2", iters=1000),
+                        idle=0.05)
+        token = auth.open_session()
+        time.sleep(0.1)
+        status, _, _ = request("/", self.config, headers=cookie_header(token),
+                               auth=auth)
+        self.assertEqual(status, 303)
+
+    def test_a_logged_out_token_does_not(self):
+        token = self.auth.open_session()
+        self.auth.close_session(token)
+        status, _, _ = self.get("/", cookie_header(token))
+        self.assertEqual(status, 303)
+
+    def test_head_is_gated_too(self):
+        # do_HEAD is do_GET, so this is really a check that the gate sits
+        # before the routing rather than inside one branch of it.
+        status, head, _ = self.get("/", method="HEAD")
+        self.assertEqual(status, 303)
+        self.assertTrue(location(head).startswith("/login"))
+
+    def test_the_pollers_are_refused_not_redirected(self):
+        # A 303 here would have the poller fetch the login page and splice it
+        # into the panel it is refreshing.
+        for path in ("/scan", "/update"):
+            with self.subTest(path=path):
+                status, _, _ = self.get(path)
+                self.assertEqual(status, 401)
+
+    def test_the_actions_need_a_session(self):
+        for path in ("/rescan", "/check-update"):
+            with self.subTest(path=path):
+                status, head, _ = request(path, self.config, method="POST",
+                                          auth=self.auth)
+                self.assertEqual(status, 303)
+                self.assertEqual(location(head), "/login")
+
+    def test_healthz_stays_open(self):
+        # A monitor should not need a credential to ask whether the process
+        # is alive, and the answer says nothing about anybody's videos.
+        status, _, body = self.get("/healthz")
+        self.assertEqual(status, 200)
+        self.assertEqual(body.strip(), "ok")
+
+    def test_the_login_page_itself_is_reachable(self):
+        status, _, body = self.get("/login")
+        self.assertEqual(status, 200)
+        self.assertIn('name="password"', body)
+
+    def test_an_unknown_route_still_404s_once_you_are_in(self):
+        status, _, _ = self.get("/nope", cookie_header(
+            self.auth.open_session()))
+        self.assertEqual(status, 404)
+
+    def test_an_unknown_route_is_gated_before_it_404s(self):
+        # Otherwise the 404 itself confirms which paths exist.
+        status, _, _ = self.get("/nope")
+        self.assertEqual(status, 303)
+
+
+class TestVideoStaysOpen(IndexCase):
+    """The deliberate hole, and the reason for it.
+
+    VLC has no cookie jar, and the .m3u handoff is what the library page is
+    for. A saved playlist that stopped working at the next logout would be a
+    worse outcome than a video file that answers anyone who knows its exact
+    path, which is the trade the operator chose knowingly.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.config = cfg(self.tmp, transfer={"enabled": True,
+                                              "destination": str(self.root)})
+        self.scan()
+
+    def get(self, path, **kw):
+        return request(path, self.config, self.index, auth=with_login(), **kw)
+
+    def test_a_video_is_served_without_a_session(self):
+        status, head, _ = self.get("/video/Gate.20260707.mkv")
+        self.assertEqual(status, 200)
+        self.assertIn("Content-Type: video/x-matroska", head)
+
+    def test_a_range_request_works_without_one_too(self):
+        # Seeking in VLC, which is the whole point of leaving this open.
+        status, _, _ = self.get("/video/Gate.20260707.mkv",
+                                headers="Range: bytes=0-99\r\n")
+        self.assertEqual(status, 206)
+
+    def test_a_playlist_still_needs_a_session(self):
+        # The browser fetches this one, so it has the cookie. Keeping it
+        # gated is free, and it is what holds the camera names and the day
+        # groupings behind the login.
+        status, head, _ = self.get("/play/Gate.20260707.mkv")
+        self.assertEqual(status, 303)
+        self.assertTrue(location(head).startswith("/login"))
+
+    def test_a_day_playlist_needs_one_too(self):
+        status, _, _ = self.get("/day/2026-07-07")
+        self.assertEqual(status, 303)
+
+    def test_the_playlist_url_is_one_vlc_can_actually_fetch(self):
+        # The two halves of this decision have to agree, so this follows the
+        # playlist the way VLC would: take the URL out of it, ask for that
+        # path with no cookie, and expect the video rather than a login page.
+        auth = with_login()
+        _, _, playlist = request("/play/Gate.20260707.mkv", self.config,
+                                 self.index, auth=auth,
+                                 headers=cookie_header(auth.open_session()))
+        urls = [ln for ln in playlist.splitlines() if ln.startswith("http")]
+        self.assertEqual(len(urls), 1)
+        path = "/" + urls[0].split("/", 3)[3]
+        status, _, _ = request(path, self.config, self.index, auth=auth)
+        self.assertEqual(status, 200)
+
+
+class TestLoginForm(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        Path(self.tmp, "videos").mkdir()
+        self.config = cfg(self.tmp, transfer={"enabled": False})
+        self.auth = with_login()
+
+    def post(self, body, headers="", auth=None, client="127.0.0.1"):
+        return request("/login", self.config, method="POST", body=body,
+                       headers=headers, auth=auth or self.auth, client=client)
+
+    def test_the_right_credentials_start_a_session(self):
+        status, head, _ = self.post("username=ed&password=hunter2")
+        self.assertEqual(status, 303)
+        self.assertEqual(location(head), "/")
+        self.assertIn(f"{web.SESSION_COOKIE}=", set_cookie(head))
+        self.assertEqual(self.auth.session_count, 1)
+
+    def test_the_cookie_it_sets_actually_works(self):
+        # End to end rather than by inspection: the value it hands out must be
+        # the value the gate accepts.
+        _, head, _ = self.post("username=ed&password=hunter2")
+        token = set_cookie(head).split(";")[0].split("=", 1)[1]
+        status, _, _ = request("/", self.config, headers=cookie_header(token),
+                               auth=self.auth)
+        self.assertEqual(status, 200)
+
+    def test_the_cookie_is_httponly_and_samesite(self):
+        _, head, _ = self.post("username=ed&password=hunter2")
+        cookie = set_cookie(head)
+        self.assertIn("HttpOnly", cookie)
+        self.assertIn("SameSite=Lax", cookie)
+        self.assertIn("Path=/", cookie)
+        self.assertIn(f"Max-Age={int(web.SESSION_IDLE)}", cookie)
+
+    def test_the_cookie_is_not_marked_secure_over_plain_http(self):
+        # Marked Secure, the browser would drop it on exactly the connection
+        # this service actually serves, and the login would silently never
+        # take.
+        self.assertNotIn("Secure", set_cookie(
+            self.post("username=ed&password=hunter2")[1]))
+
+    def test_it_is_marked_secure_behind_a_tls_proxy(self):
+        _, head, _ = self.post("username=ed&password=hunter2",
+                               headers="X-Forwarded-Proto: https\r\n")
+        self.assertIn("Secure", set_cookie(head))
+
+    def test_a_wrong_password_gets_the_form_back(self):
+        status, head, body = self.post("username=ed&password=wrong")
+        self.assertEqual(status, 401)
+        self.assertEqual(set_cookie(head), "")
+        self.assertIn('name="password"', body)
+        self.assertEqual(self.auth.session_count, 0)
+
+    def test_the_error_does_not_say_which_half_was_wrong(self):
+        # Telling a guest that the username is right narrows their next
+        # attempt, and tells the household member nothing.
+        _, _, wrong_pw = self.post("username=ed&password=wrong")
+        _, _, wrong_user = self.post("username=nobody&password=hunter2")
+        self.assertIn("did not match", wrong_pw)
+        self.assertEqual(
+            re.findall(r'<p class="bad">[^<]*</p>', wrong_pw),
+            re.findall(r'<p class="bad">[^<]*</p>', wrong_user))
+
+    def test_the_attempt_is_not_echoed_back_into_the_page(self):
+        # A form that helpfully refills what you typed would put the password
+        # in the HTML, and from there into a proxy log or a screenshot.
+        _, _, body = self.post("username=ed&password=Sup3rS3cret")
+        self.assertNotIn("Sup3rS3cret", body)
+
+    def test_where_you_were_going_is_honoured(self):
+        _, head, _ = self.post(
+            "username=ed&password=hunter2&next=%2Flibrary%3Fcamera%3DGarage")
+        self.assertEqual(location(head), "/library?camera=Garage")
+
+    def test_a_hostile_next_is_not(self):
+        _, head, _ = self.post(
+            "username=ed&password=hunter2&next=https%3A%2F%2Fevil.example%2F")
+        self.assertEqual(location(head), "/")
+
+    def test_the_next_field_is_carried_through_a_failed_attempt(self):
+        _, _, body = self.post("username=ed&password=wrong&next=%2Flogs")
+        self.assertIn('value="/logs"', body)
+
+    def test_a_missing_field_is_a_failed_login_not_a_crash(self):
+        for body in ("", "username=ed", "password=hunter2", "x=y"):
+            with self.subTest(body=body):
+                status, _, _ = self.post(body)
+                self.assertIn(status, (401, 429))
+
+    def test_a_wrong_password_costs_three_seconds(self):
+        # The one place the real delay is exercised through the handler; the
+        # rest of this class uses an Auth that fails instantly.
+        real = with_login(fail_delay=web.LOGIN_DELAY)
+        with mock.patch.object(web.time, "sleep") as slept:
+            status, _, _ = self.post("username=ed&password=wrong", auth=real)
+        self.assertEqual(status, 401)
+        slept.assert_called_once_with(3.0)
+
+    def test_the_right_password_costs_nothing(self):
+        real = with_login(fail_delay=web.LOGIN_DELAY)
+        with mock.patch.object(web.time, "sleep") as slept:
+            self.post("username=ed&password=hunter2", auth=real)
+        slept.assert_not_called()
+
+    def test_guesses_are_never_capped(self):
+        # The point of the change: twenty wrong answers, and the twenty-first
+        # attempt with the right one still works. Nobody gets locked out of
+        # their own video index.
+        for _ in range(20):
+            status, _, _ = self.post("username=ed&password=wrong")
+            self.assertEqual(status, 401)
+        status, head, _ = self.post("username=ed&password=hunter2")
+        self.assertEqual(status, 303)
+        self.assertIn(f"{web.SESSION_COOKIE}=", set_cookie(head))
+
+    def test_one_client_guessing_does_not_affect_another(self):
+        for _ in range(6):
+            self.post("username=ed&password=wrong", client="192.0.2.5")
+        status, _, _ = self.post("username=ed&password=hunter2",
+                                 client="192.0.2.9")
+        self.assertEqual(status, 303)
+
+    def test_the_form_says_what_it_does_and_does_not_protect(self):
+        # This is a household lock, not a security control, and the page it
+        # is on should not imply otherwise.
+        _, _, body = request("/login", self.config, auth=self.auth)
+        text = " ".join(body.split())
+        self.assertIn("not encrypted", text)
+        self.assertIn("video files themselves stay reachable", text)
+
+    def test_the_login_page_has_no_navigation(self):
+        # Every tab on it would bounce straight back here, which reads as a
+        # broken page rather than a locked one.
+        _, _, body = request("/login", self.config, auth=self.auth)
+        self.assertNotIn("<nav>", body)
+
+    def test_with_no_login_configured_the_form_is_not_offered(self):
+        for method in ("GET", "POST"):
+            with self.subTest(method=method):
+                status, head, _ = request("/login", self.config,
+                                          method=method,
+                                          body="username=x&password=y")
+                self.assertEqual(status, 303)
+                self.assertEqual(location(head), "/")
+
+
+class TestLogout(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        Path(self.tmp, "videos").mkdir()
+        self.config = cfg(self.tmp, transfer={"enabled": False})
+        self.auth = with_login()
+
+    def test_it_clears_the_cookie(self):
+        token = self.auth.open_session()
+        _, head, _ = request("/logout", self.config,
+                             headers=cookie_header(token), auth=self.auth)
+        self.assertIn("Max-Age=0", set_cookie(head))
+        self.assertEqual(location(head), "/")
+
+    def test_it_revokes_the_token_as_well(self):
+        # A cookie copied out of the browser must stop working, which a
+        # cleared cookie alone would not achieve.
+        token = self.auth.open_session()
+        request("/logout", self.config, headers=cookie_header(token),
+                auth=self.auth)
+        self.assertFalse(self.auth.valid(token))
+
+    def test_it_leaves_the_other_browser_alone(self):
+        phone, laptop = self.auth.open_session(), self.auth.open_session()
+        request("/logout", self.config, headers=cookie_header(phone),
+                auth=self.auth)
+        self.assertTrue(self.auth.valid(laptop))
+
+    def test_logging_out_without_a_session_is_harmless(self):
+        status, _, _ = request("/logout", self.config, auth=self.auth)
+        self.assertEqual(status, 303)
+
+    def test_the_link_is_offered_while_logged_in(self):
+        _, _, body = request("/", self.config, auth=self.auth,
+                             headers=cookie_header(self.auth.open_session()))
+        self.assertIn('href="/logout"', body)
+
+    def test_no_link_when_there_is_no_login(self):
+        # A control that does nothing is worse than no control.
+        _, _, body = request("/", self.config)
+        self.assertNotIn("/logout", body)
+
+
+class TestPostBody(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        Path(self.tmp, "videos").mkdir()
+        self.config = cfg(self.tmp, transfer={"enabled": False})
+
+    def test_an_oversized_body_is_refused(self):
+        # The only body this server reads. A length the client chose is not a
+        # length to allocate on trust.
+        status, _, _ = request("/login", self.config, method="POST",
+                               body="x" * (web.FORM_LIMIT + 1),
+                               auth=with_login())
+        self.assertEqual(status, 413)
+
+    def test_a_body_at_the_limit_is_still_read(self):
+        pad = "x" * (web.FORM_LIMIT - len("username=ed&password=hunter2&p="))
+        status, _, _ = request("/login", self.config, method="POST",
+                               body=f"username=ed&password=hunter2&p={pad}",
+                               auth=with_login())
+        self.assertEqual(status, 303)
+
+    def test_the_existing_actions_still_work_with_no_body(self):
+        with mock.patch.object(web, "run_command", return_value=("", "")):
+            status, head, _ = request("/check-update", self.config,
+                                      method="POST")
+        self.assertEqual(status, 303)
+        self.assertEqual(location(head), "/")
+
+
+class TestPasswordHash(unittest.TestCase):
+    """The credential is verified here and never presented to anything, which
+    is what makes hashing correct. The camera passwords are the opposite case
+    and must stay in the clear; see redact_config."""
+
+    # Every test here uses a low iteration count deliberately. The shipped
+    # 600k is a defence against offline guessing, not a property under test,
+    # and paying 0.1s per call would make this class the slowest in the suite.
+    FAST = 1000
+
+    def test_a_password_verifies_against_its_own_hash(self):
+        h = web.hash_password("hunter2", iters=self.FAST)
+        self.assertTrue(web.verify_password(h, "hunter2"))
+
+    def test_a_wrong_password_does_not(self):
+        h = web.hash_password("hunter2", iters=self.FAST)
+        self.assertFalse(web.verify_password(h, "hunter3"))
+        self.assertFalse(web.verify_password(h, ""))
+        self.assertFalse(web.verify_password(h, "HUNTER2"))
+
+    def test_the_hash_does_not_contain_the_password(self):
+        self.assertNotIn("hunter2", web.hash_password("hunter2",
+                                                      iters=self.FAST))
+
+    def test_two_hashes_of_one_password_differ(self):
+        # Per-hash salt: two installs with the same weak password must not
+        # produce the same string, and a repeated one must not be a tell.
+        a = web.hash_password("hunter2", iters=self.FAST)
+        b = web.hash_password("hunter2", iters=self.FAST)
+        self.assertNotEqual(a, b)
+        self.assertTrue(web.verify_password(a, "hunter2"))
+        self.assertTrue(web.verify_password(b, "hunter2"))
+
+    def test_the_hash_carries_its_own_parameters(self):
+        # What lets the iteration count rise later without locking anybody
+        # out of a config written today.
+        h = web.hash_password("hunter2", iters=4242)
+        self.assertTrue(h.startswith("pbkdf2_sha256$4242$"))
+        self.assertTrue(web.verify_password(h, "hunter2"))
+
+    def test_a_unicode_password_survives_the_round_trip(self):
+        h = web.hash_password("paßwort☃", iters=self.FAST)
+        self.assertTrue(web.verify_password(h, "paßwort☃"))
+
+    def test_a_malformed_hash_is_a_no_not_a_traceback(self):
+        # This runs inside a request handler. A hand-edited config must give
+        # a failed login, not a 500 on the page you log in from.
+        for bad in ("", "x", "$$$", "pbkdf2_sha256$$$", "pbkdf2_sha256$a$b$c",
+                    "pbkdf2_sha256$1000$!!!$!!!", "bcrypt$12$abc$def",
+                    "pbkdf2_sha256$0$c2FsdA==$a2V5", None, 17, [],
+                    "pbkdf2_sha256$1000$c2FsdA==$a2V5$extra"):
+            with self.subTest(stored=bad):
+                self.assertFalse(web.verify_password(bad, "hunter2"))
+                self.assertIsNone(web.parse_password_hash(bad))
+
+    def test_a_good_hash_parses(self):
+        parsed = web.parse_password_hash(web.hash_password("x",
+                                                           iters=self.FAST))
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[0], self.FAST)
+
+
+class TestAuthConfig(unittest.TestCase):
+
+    def test_no_web_section_at_all_means_no_login(self):
+        # Every install that predates this feature. It must behave exactly as
+        # it did, which is the .get() rule doing its job.
+        self.assertFalse(web.Auth.from_config({}).enabled)
+        self.assertFalse(web.Auth.from_config({"web": {}}).enabled)
+        self.assertFalse(web.Auth.from_config({"web": None}).enabled)
+
+    def test_half_a_credential_is_not_a_login(self):
+        # A username with no hash cannot be checked against anything, so
+        # treating it as "on" would lock the page with no way in.
+        for auth in ({"username": "ed"}, {"password_hash": "x"},
+                     {"username": "", "password_hash": ""},
+                     {"username": "  ", "password_hash": "  "}):
+            with self.subTest(auth=auth):
+                self.assertFalse(
+                    web.Auth.from_config({"web": {"auth": auth}}).enabled)
+
+    def test_a_configured_pair_is_a_login(self):
+        auth = web.Auth.from_config({"web": {"auth": {
+            "username": "ed",
+            "password_hash": web.hash_password("hunter2", iters=1000)}}})
+        self.assertTrue(auth.enabled)
+        self.assertTrue(auth.check("ed", "hunter2"))
+
+    def test_an_uncheckable_hash_refuses_to_start(self):
+        # Fail closed, and loudly. Carrying on without the login would serve
+        # the pages to everyone precisely because somebody asked for the
+        # opposite, and doing it silently is how that goes unnoticed.
+        with self.assertRaises(ValueError) as caught:
+            web.Auth.from_config({"web": {"auth": {
+                "username": "ed", "password_hash": "not-a-hash"}}})
+        self.assertIn("timelapse web", str(caught.exception))
+
+    def test_a_disabled_auth_never_accepts_anything(self):
+        auth = web.Auth()
+        self.assertFalse(auth.check("", ""))
+        self.assertFalse(auth.check("ed", "hunter2"))
+
+
+class TestAuthCheck(unittest.TestCase):
+
+    def auth(self, user="ed", password="hunter2"):
+        return web.Auth(user, web.hash_password(password, iters=1000))
+
+    def test_the_right_pair_passes(self):
+        self.assertTrue(self.auth().check("ed", "hunter2"))
+
+    def test_either_half_wrong_fails(self):
+        auth = self.auth()
+        self.assertFalse(auth.check("ed", "wrong"))
+        self.assertFalse(auth.check("nobody", "hunter2"))
+        self.assertFalse(auth.check("nobody", "wrong"))
+
+    def test_the_username_is_case_sensitive_and_exact(self):
+        auth = self.auth()
+        self.assertFalse(auth.check("ED", "hunter2"))
+        self.assertFalse(auth.check("ed ", "hunter2"))
+        self.assertFalse(auth.check("", "hunter2"))
+
+    def test_none_is_treated_as_missing_not_as_a_crash(self):
+        # A form can post a field with no value, and a client can omit it.
+        auth = self.auth()
+        self.assertFalse(auth.check(None, None))
+
+
+class TestSessions(unittest.TestCase):
+
+    def auth(self, idle=web.SESSION_IDLE):
+        return web.Auth("ed", web.hash_password("hunter2", iters=1000),
+                        idle=idle)
+
+    def test_a_new_session_is_valid(self):
+        auth = self.auth()
+        self.assertTrue(auth.valid(auth.open_session()))
+
+    def test_an_unknown_token_is_not(self):
+        auth = self.auth()
+        auth.open_session()
+        self.assertFalse(auth.valid("something-else"))
+        self.assertFalse(auth.valid(""))
+        self.assertFalse(auth.valid(None))
+
+    def test_tokens_are_unguessable_and_unique(self):
+        auth = self.auth()
+        tokens = {auth.open_session() for _ in range(50)}
+        self.assertEqual(len(tokens), 50)
+        self.assertTrue(all(len(t) >= 32 for t in tokens))
+
+    def test_logout_revokes_the_token_not_just_the_cookie(self):
+        # A token copied out of the browser must stop working too, which is
+        # what makes this revocation rather than a cleared cookie.
+        auth = self.auth()
+        token = auth.open_session()
+        auth.close_session(token)
+        self.assertFalse(auth.valid(token))
+
+    def test_logging_out_twice_is_not_an_error(self):
+        auth = self.auth()
+        token = auth.open_session()
+        auth.close_session(token)
+        auth.close_session(token)
+
+    def test_one_logout_leaves_the_other_browser_alone(self):
+        auth = self.auth()
+        phone, laptop = auth.open_session(), auth.open_session()
+        auth.close_session(phone)
+        self.assertTrue(auth.valid(laptop))
+
+    def test_an_idle_session_expires(self):
+        auth = self.auth(idle=0.05)
+        token = auth.open_session()
+        time.sleep(0.1)
+        self.assertFalse(auth.valid(token))
+
+    def test_use_restarts_the_idle_clock(self):
+        auth = self.auth(idle=0.3)
+        token = auth.open_session()
+        for _ in range(4):
+            time.sleep(0.1)
+            self.assertTrue(auth.valid(token))
+
+    def test_expiry_is_measured_on_the_monotonic_clock(self):
+        # A recorder without a battery-backed clock jumps at boot when NTP
+        # lands, and an hours-long correction must not log everybody out.
+        auth = self.auth()
+        token = auth.open_session()
+        with mock.patch.object(web.time, "time",
+                               return_value=time.time() + 90 * 24 * 3600):
+            self.assertTrue(auth.valid(token))
+
+    def test_sessions_are_capped(self):
+        # They only leave on logout or expiry, so something has to bound them.
+        auth = self.auth()
+        tokens = [auth.open_session() for _ in range(web.MAX_SESSIONS + 5)]
+        self.assertLessEqual(auth.session_count, web.MAX_SESSIONS)
+        # The newest survive; the oldest are the ones dropped.
+        self.assertTrue(auth.valid(tokens[-1]))
+        self.assertFalse(auth.valid(tokens[0]))
+
+    def test_sessions_survive_concurrent_use(self):
+        # ThreadingHTTPServer: every request runs on its own thread, and the
+        # dict is shared.
+        auth = self.auth()
+        errors = []
+
+        def hammer():
+            try:
+                for _ in range(50):
+                    token = auth.open_session()
+                    auth.valid(token)
+                    auth.close_session(token)
+            except Exception as exc:            # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=hammer) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(10)
+        self.assertEqual(errors, [])
+
+
+class TestFailedLoginDelay(unittest.TestCase):
+    """A wrong password costs three seconds and nothing else.
+
+    No counter, no lockout, unlimited attempts: this gates a status page and a
+    list of video files, and an account somebody has locked themselves out of
+    is infuriating without being much of a defence.
+    """
+
+    def test_the_shipped_delay_is_three_seconds(self):
+        self.assertEqual(web.LOGIN_DELAY, 3.0)
+        self.assertEqual(web.Auth().fail_delay, 3.0)
+
+    def test_a_failure_waits_before_answering(self):
+        auth = web.Auth("ed", web.hash_password("x", iters=1000))
+        with mock.patch.object(web.time, "sleep") as slept:
+            auth.pause_after_failure()
+        slept.assert_called_once_with(3.0)
+
+    def test_the_wait_can_be_turned_off_for_tests(self):
+        with mock.patch.object(web.time, "sleep") as slept:
+            web.Auth(fail_delay=0).pause_after_failure()
+        slept.assert_not_called()
+
+    def test_there_is_no_lockout_state_to_get_stuck_in(self):
+        # Deliberately pinned: the first implementation counted strikes per
+        # address and locked out after five, which is exactly the behaviour
+        # this replaced.
+        auth = web.Auth("ed", web.hash_password("x", iters=1000))
+        for name in ("locked_for", "record_failure", "record_success"):
+            self.assertFalse(hasattr(auth, name), name)
 
 
 if __name__ == "__main__":

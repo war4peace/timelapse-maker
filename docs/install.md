@@ -114,12 +114,12 @@ timelapse version
 ```
 
 ```
-  capture  0.1.4
-  encode   0.1.4
-  test     0.1.4
-  setup    0.1.4
-  update   0.1.4
-  web      0.1.4
+  capture  0.1.5
+  encode   0.1.5
+  test     0.1.5
+  setup    0.1.5
+  update   0.1.5
+  web      0.1.5
 ```
 
 If the daemon predates the installed files it says so explicitly, which is the
@@ -403,7 +403,8 @@ of it; nothing needs a reinstall.
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and Discord. Run it after any change. |
 | `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. A menu with no options; `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` go straight to one. §9. |
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
-| `timelapse web` | Turn the read-only web UI on or off and set its address, port and library path. §11. |
+| `timelapse web` | Turn the read-only web UI on or off and set its address, port, library path and whether it asks for a login. §11. |
+| `timelapse password` | Set or change the web UI's login, and nothing else: a username, a password twice, and a restart. Never asks for the old one, because this already needs root. §11. |
 | `timelapse web-serve` | Run the web UI in the foreground for a look at its log. The service normally does this. |
 | `timelapse setup` | The full wizard again: storage, capture settings, cameras, transfer, Discord. Overwrites the whole config, so prefer `cameras` or `transfer` for a single change. |
 | `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover, such as the encoder's container and quality. A backup is taken first, and the file's `0640 root:timelapse` is restored afterwards whatever your editor did to it. You are then responsible for restarting capture yourself. |
@@ -848,14 +849,81 @@ library as unreadable: correct, and thoroughly confusing.
 
 ### It is not secured, so bind it accordingly
 
-There is **no login and no HTTPS**. The wizard suggests this host's LAN
-address, because a page you can only open on the recorder itself is not much
-use, and it says so plainly when you accept it: **anyone on that network can
-watch your cameras' footage.**
+There is **no HTTPS**, and the optional login below is a door lock rather than
+a safe. The wizard suggests this host's LAN address, because a page you can
+only open on the recorder itself is not much use, and it says so plainly when
+you accept it: **anyone on that network can watch your cameras' footage.**
 
 That is the right trade on a trusted home LAN and the wrong one anywhere else.
 Answer `127.0.0.1` to keep it to this machine. Put a reverse proxy with TLS and
 authentication in front of it for anything wider, and do not port-forward it.
+
+### The optional login
+
+`timelapse web` offers a single username and password. Leave it off and
+everything behaves as it always has. Turn it on and the Overview, the Library,
+the logs and the status pages ask for it first; a session lasts until you press
+**Log out**, and expires by itself after 30 days idle.
+
+Be clear about what this is. It keeps a household, or a guest on your wifi, out
+of your video index. It is **not** protection against anyone determined, and
+nothing here pretends otherwise:
+
+- **There is no HTTPS**, so the password crosses your network in clear. Anyone
+  able to watch the traffic can read it.
+- **The video files stay reachable without it.** A request for
+  `/video/<name>` answers anybody who knows, or guesses, the exact name. Only
+  the pages are behind the login.
+
+That second point is a deliberate trade, not an oversight. VLC is a separate
+program with no access to your browser's session, so gating the files would
+break every *Play* link, and a playlist you saved last month would stop working
+the moment you logged out. Leaving them open means a saved `.m3u` keeps playing
+for as long as the file exists.
+
+A wrong password costs three seconds and nothing else. **Attempts are never
+capped and nothing is ever locked out**: three seconds is plenty against
+somebody guessing at a keyboard, which is the threat this is for, and a locked
+account would mostly succeed at infuriating whoever mistyped their own
+password.
+
+### Turning it on and off, and changing the password
+
+```bash
+sudo timelapse password             # set or change it
+sudo timelapse password --disable   # remove it; the pages open again
+```
+
+A username, a password, twice, and done. It restarts the web UI, which logs
+everybody out.
+
+`--disable` asks nothing: it needs no password to carry out and it is undone by
+running the command again, so it works unattended and in a script. Running it
+when no login is set is not an error, it says so and stops. `--enable` exists
+and means the same as the bare command, so nobody has to discover that.
+
+`timelapse web` still offers the same on/off question as part of the wider web
+section; these are the shortcuts for when that is all you want to change.
+
+**There is no way to turn the login on or off from the web UI itself, and there
+will not be.** The service is allowed to write exactly one directory, its own
+index; `config.json` is read-only to it, enforced by systemd rather than by
+intention. A page that could edit its own authentication would need write
+access to the config, which is the property that keeps a network-facing service
+from being able to change anything at all.
+
+It never asks for the old password, and that is not an oversight. The command
+needs root to write the config at all, and root can already read every camera
+password in that same file, so the question would prove nothing while locking
+out the one person entitled to fix a forgotten login.
+
+There is also nothing to recover: the password is stored only as a PBKDF2 hash,
+so **it cannot be read back out of `config.json`**. Forgetting it is not a
+problem, it is one command.
+
+Sessions live in memory, so restarting the service for any reason (an upgrade,
+a wizard run, this command) logs everybody out. To remove the login entirely,
+run `sudo timelapse web`.
 
 The wizard also checks that the address you give actually exists on this host.
 It used to accept anything, and a wrong address is the worst kind of mistake

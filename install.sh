@@ -279,7 +279,18 @@ CONFIGURING
                        mounting an SMB/CIFS share and re-deriving the
                        ReadWritePaths= the systemd units need.
   web          [sudo]  Turn the read-only web UI on or off and set its
-                       address, port and library path. Offers to restart it.
+                       address, port and library path, including whether it
+                       asks for a login. Offers to restart it.
+  password     [sudo]  Set or change the web UI's login: a username, a
+                       password, twice, and done. It never asks for the old
+                       one - this already needs root, and root can read every
+                       camera password in that same file, so the question
+                       would prove nothing and would lock out the one person
+                       entitled to fix a forgotten password. Only a hash is
+                       stored, so there is nothing to recover. Restarts the
+                       UI, which logs everybody out.
+                         --disable    remove the login; the pages then open
+                                      to anyone who can reach them
   config       [sudo]  Open the config in \$EDITOR for anything the wizards
                        do not cover, such as the encoder's container and
                        quality. A backup is taken first. You restart capture
@@ -358,6 +369,8 @@ case "\${1:-}" in
     transfer)  shift; exec python3 $PREFIX/timelapse_setup.py --transfer-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     web)       shift; exec python3 $PREFIX/timelapse_setup.py --web-only \\
+                          --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
+    password)  shift; exec python3 $PREFIX/timelapse_setup.py --password-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     web-serve) shift; exec python3 $PREFIX/timelapse_web.py "$CONFIG" "\$@" ;;
     # No "$CONFIG": updating neither reads nor writes it, which is why
@@ -739,7 +752,7 @@ main() {
   ╚══════════════════════════════════════════════════════════╝
 BANNER
     printf '%s' "$N"
-    printf '  %sEXPERIMENTAL (v0.1.4)%s - early software, tested on one machine.\n' "$Y$B" "$N"
+    printf '  %sEXPERIMENTAL (v0.1.5)%s - early software, tested on one machine.\n' "$Y$B" "$N"
     note "Config format may change between versions. Not for production use."
 
     if [ "$DO_UNINSTALL" = "1" ]; then

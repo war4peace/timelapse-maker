@@ -3,7 +3,7 @@
 > [!WARNING]
 > ## ⚠️ EXPERIMENTAL: IN DEVELOPMENT
 >
-> **Version 0.1.4.** This is early software that has run on exactly one machine.
+> **Version 0.1.5.** This is early software that has run on exactly one machine.
 > It has not been tested across different distributions, camera makes, GPUs or
 > disk layouts, and it almost certainly has rough edges nobody has hit yet.
 >
@@ -65,7 +65,8 @@ Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 | `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord | **sudo** |
 | `timelapse cameras` | Add, edit, remove or disable a camera, set its own interval and frame rate, then restart capture. `-l` lists; `-a`, `-e:NAME`, `-x:NAME`, `-t:NAME`, `-r:NAME` skip the menu | **sudo** |
 | `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed | **sudo** |
-| `timelapse web` | Turn the read-only web UI on or off, set its address and library path | **sudo** |
+| `timelapse web` | Turn the read-only web UI on or off, set its address, library path and whether it asks for a login | **sudo** |
+| `timelapse password` | Set or change the web UI's login; `--disable` removes it. Never asks for the old one: this needs root, and root can read the config anyway | **sudo** |
 | `timelapse encode` | Run tonight's encode now | **sudo** |
 | `timelapse setup` · `config` | Full wizard · edit the JSON | **sudo** |
 | `timelapse restore` | Put back an earlier config; one is kept before every change, five deep | **sudo** |
@@ -115,8 +116,17 @@ so either can be stopped, replaced or rewritten without touching the other.
   file instead of one per camera. It reads the destination you already keep
   your timelapses in, recognising the naming conventions of whatever tool came
   before. Off by default, binds to localhost, and allowed to write exactly one
-  directory: its own index. See
+  directory: its own index. An **optional login** can be put on the pages;
+  read what it is and is not below before relying on it. See
   [docs/install.md §10](docs/install.md#10-the-web-ui).
+- **A door lock, not a safe.** The web UI's login keeps the household, or a
+  guest on your wifi, out of the status page and the video index. That is all
+  it is for, and the design says so out loud rather than implying more: there
+  is no HTTPS, so the password crosses your network in clear, and the video
+  files themselves stay reachable to anyone who knows a file's exact address.
+  That last part is deliberate, and it is what lets a saved `.m3u` keep
+  playing in VLC long after you log out. For anything facing the internet, put
+  a reverse proxy with TLS in front and do not rely on this.
 
 ## Requirements
 
@@ -196,7 +206,7 @@ After installing, a `timelapse` command wraps the common operations. Run
 `sudo`:
 
 ```
-timelapse status | logs | test | encode | config | setup | transfer | web | update | restore
+timelapse status | logs | test | encode | config | setup | transfer | web | password | update | restore
 ```
 
 Run `timelapse test` before enabling anything; it fetches one snapshot per

@@ -513,6 +513,76 @@ for nothing, which is why `sync_units()` templates the web unit separately and
 It logs only to journald: a rotating log file would be a second writable path
 for no benefit.
 
+**The optional login is a door lock, not a safe, and is built to say so.**
+`web.auth` sets one username and one password; absent or blank means the
+pages behave exactly as they did before it existed, which is what every
+upgrade gets. What it is for is keeping a household, or a guest on the wifi,
+out of the status page and the video index. The threat model was stated by
+the operator and is worth keeping in view, because a design that pretends to
+more than this would make worse trades:
+
+- **`/video/` is deliberately outside the gate.** VLC is a separate process
+  with no cookie jar, and the `.m3u` handoff is what the library page exists
+  for; gating the bytes would break every Play link, and a playlist saved a
+  month ago would stop working the moment somebody logged out. `/play/` and
+  `/day/` *are* gated, because the browser fetches those with the cookie and
+  VLC only ever fetches the `/video/` URL written inside the playlist. So the
+  camera names, the day groupings, the logs and the status stay behind the
+  login and the file bytes do not. The login page says this in as many words.
+- **The password is hashed** (PBKDF2-SHA256, 600k iterations, per-hash salt),
+  which is correct precisely because it is *verified* here and never presented
+  to anything. That is the inverse of the camera passwords, which must be
+  replayed to the camera and therefore must be kept: **you can hash what you
+  verify; you must keep what you present.** `SECRET_KEY_RE` was extended for
+  it, since the original anchored on `pass(word|wd)?$` and let
+  `password_hash` straight through `timelapse config --redacted`.
+- **Sessions live in memory only**, so `state_dir` still holds exactly what it
+  held before and the one-writable-directory rule is untouched. A restart logs
+  everybody out, which for a service that restarts on upgrades and wizard runs
+  is a fair trade and easy to explain. Logout revokes the token as well as
+  clearing the cookie, so a copy taken out of the browser stops working.
+- **The cookie is `HttpOnly`, `SameSite=Lax`, `Path=/`**, with `Secure` set
+  only behind a TLS proxy (`X-Forwarded-Proto`). Setting `Secure`
+  unconditionally would make the browser drop it on the plain HTTP this
+  service actually serves, and the login would silently never take.
+  `SameSite=Lax` is also what stops another site posting to `/rescan` with
+  this cookie attached.
+- **A denied fragment gets 401, never a redirect.** `/scan` and `/update` are
+  fetched by the pollers, which check `r.ok`; a 303 would be followed
+  transparently and the login page would be spliced into the panel being
+  refreshed.
+- **An unparseable hash refuses to start.** Fail closed: carrying on would
+  serve the pages to everyone precisely because somebody asked for the
+  opposite.
+- **A wrong password costs three seconds, and nothing is ever locked out.**
+  There is no counter and no per-client state at all. The first cut had five
+  strikes and an escalating lockout; the operator removed it, and was right
+  to: what is behind this is a status page and a list of video files, and a
+  locked account mostly infuriates whoever mistyped their own password. Three
+  seconds stops somebody guessing at a keyboard, which is the whole threat
+  model. It does not stop a script guessing in parallel, because the delay is
+  per request rather than global, and the comment on `pause_after_failure()`
+  says so rather than implying otherwise.
+- **`timelapse password` sets the login and nothing else**, because changing a
+  password is a thing people do in a hurry. It never asks for the old one: it
+  needs root to write the config, and root can already read every camera
+  password in that file, so the question would prove nothing while locking out
+  the one person entitled to fix a forgotten login. `set_web_login()` is the
+  shared half; `choose_web_login()` is that plus the on/off questions.
+  `--disable` removes it with no prompt and no confirmation, which is what
+  makes it scriptable; it is idempotent, runs with no terminal, and `--enable`
+  exists as a spelled-out synonym for the bare command so that nobody meets
+  "unrecognized arguments". Both are refused outside `--password-only`, for
+  the same reason the camera shortcuts are: a definite instruction that gets
+  silently ignored while the whole wizard runs instead is the wrong surprise.
+- **The web UI cannot turn its own login on or off, and must not be able to.**
+  That would need write access to `config.json`, and the one structural
+  property this service has is that it writes exactly one directory, its own
+  index. A page able to edit its own authentication is a page able to edit
+  everything, which is the trade `ReadWritePaths` exists to refuse. Asked
+  directly by the operator 2026-08-12; the answer belongs in install.md as
+  well, because "why is this not in the UI" is a fair question.
+
 **`PrivateTmp=true` hides `/tmp` and `/var/tmp` from the unit.** A library
 placed under either is invisible to the service and the page reports it as
 unreadable, which is correct but baffling. Cost an hour of a test run; worth
@@ -751,6 +821,26 @@ connection this service makes, and should stay the only one.
   Consequences worth keeping: the panel needs no `notes` in its cache, and the
   changelog fetch that used to fill it when a tag had no Release body is gone,
   so the service's one outbound request is now *always* one.
+- **Both version numbers are printed in one shape.** "Installed" comes from
+  `__version__` (`0.1.4`) and "Latest" used to come from the git tag
+  (`v0.1.4`), so a two-row list carried a `v` on one of two adjacent values
+  and the pair read as different kinds of thing rather than as the same
+  question answered twice. Reported 2026-08-12. `latest_label()` prefers the
+  normalised `latest` the cache already holds and keeps the tag only as a
+  fallback; the tag is still what the *terminal* prints, where it names a ref
+  the installer will fetch.
+- **The cache is clamped to the installed version when it is behind.** An
+  upgrade run from the terminal moves `__version__` without touching
+  `update.json`, so for up to a day the panel read "Installed 0.1.4 / Latest
+  0.1.3", which reads as this checker being wrong rather than merely old.
+  Reported 2026-08-12, from a 0.1.3 to 0.1.4 upgrade. Upstream cannot be
+  behind what is installed here (the tag is where the installer got it), so a
+  cached answer older than the running version is simply out of date. The
+  clamp lives in `snapshot()` and takes the stored `tag` and `url` with it,
+  since those name the *older* release and would otherwise label a link
+  "0.1.4" and land the reader on 0.1.3's page. The **cache itself is not
+  rewritten**: it stays the record of what GitHub said, and "Last successful
+  check" keeps saying how old that answer is, which is the honest part.
 - **A link that leaves the UI opens in a new tab.** Every other link on these
   pages navigates within this server, so replacing the page somebody is
   reading with github.com is the odd one out. `external()` is the only place
@@ -822,7 +912,7 @@ deliberate price of dropping a tab.
   page per unit: the invocation ID, the cgroup, the PID, the task count and
   the same `Documentation=` URL once for each of the four units, to say
   whether capture is running. `unit_states()` asks `systemctl show` for the
-  nine properties the table needs and `describe_unit()` turns each into one
+  ten properties the table needs and `describe_unit()` turns each into one
   word. Once that was four rows it no longer justified a quarter of the
   navigation, so it moved onto the overview and the UI went to three tabs.
   `/status` survives as a page rather than a tab, holding the full output: a
@@ -842,6 +932,13 @@ deliberate price of dropping a tab.
     `active (exited)` long after it finished, and must not read "Running"; and
     `activating/auto-restart` is a crash loop, not a service caught mid-boot,
     so it is red and says so.
+  - **A oneshot is `activating` for the whole of its run**, not for a moment
+    at the start of it: `activating/start`, with the start time in
+    `InactiveExitTimestamp` and both other timestamps empty until it finishes
+    (measured on systemd 255). The daemon word for that state is "Starting",
+    and the nightly encode holds it for twenty minutes and more, which reads
+    as a job that never got going. Reported 2026-08-12. It reads "Running",
+    with the time it began.
   - **An inactive oneshot with a timestamp is a success, and says so in
     green.** A finished run and one that has never happened are both
     `inactive`; the timestamp is the only thing that tells them apart. "Idle"
@@ -1220,8 +1317,9 @@ is read with `.get(key, default)`.
 | Key | Notes |
 |---|---|
 | `enabled` | `false` by default. The program exits 0 when false, so the unit may be enabled without the server running. |
-| `bind` | `127.0.0.1` by default. There is no authentication and no TLS; any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup. |
+| `bind` | `127.0.0.1` by default. There is no TLS, and the optional login below is a door lock rather than a safe; any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup, worded according to whether a login is configured. |
 | `port` | `8787` by default. |
+| `auth` | Optional single login: `{username, password_hash}`. Absent, or either field blank, means no login and the pages behave exactly as they did before it existed. The hash is PBKDF2-SHA256 and self-describing (`pbkdf2_sha256$iters$salt$key`), so the iteration count can rise later without locking anyone out. A username with an unparseable hash **refuses to start**, rather than serving the pages to everyone because the check could not be made. |
 | `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path, typically a remote rsync destination that is *also* mounted locally. Not `/tmp` or `/var/tmp`: `PrivateTmp=true` hides those from the unit. |
 | `state_dir` | The **only** directory the web UI may write to; holds the sqlite index. The unit's `ReadWritePaths` is scoped to exactly this, so the library, the frames and the config stay read-only to it. `install.sh` creates it: a `ReadWritePaths` naming a missing directory stops the unit dead, and the service cannot create it itself. |
 
@@ -1318,7 +1416,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 793 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 936 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1473,11 +1571,11 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 ```
 install.sh                       bootstrap installer, 761 lines
 scripts/timelapse_capture.py     daemon, 742 lines
-scripts/timelapse_encode.py      batch job, 1070 lines
+scripts/timelapse_encode.py      batch job, 1078 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 773 lines
-scripts/timelapse_setup.py       configuration wizard, 2743 lines
+scripts/timelapse_setup.py       configuration wizard, 2920 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2269 lines
+scripts/timelapse_web.py         read-only web UI, 2821 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
