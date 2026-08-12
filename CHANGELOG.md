@@ -7,6 +7,84 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.1.5] - 2026-08-12
+
+### Added
+- **An optional login for the web UI.** `timelapse web` asks for a username
+  and a password; leave it off and everything behaves exactly as it did. Turn
+  it on and the Overview, Library, logs and status pages ask for it first. The
+  session lasts until you press **Log out**, and expires by itself after 30
+  days idle.
+
+  What it is for, said plainly here because it is said plainly in the UI too:
+  keeping a household, or a guest on your wifi, out of your video index. It is
+  a lock on a door, not a safe. There is no HTTPS, so the password crosses your
+  network in clear.
+
+  **The video files stay reachable without it**, and that is deliberate. VLC is
+  a separate program with no access to your browser's session, so gating the
+  files would break every *Play* link and stop a playlist you saved last month
+  from working the moment you logged out. The pages, the camera names and the
+  day groupings are behind the login; a request for a file's exact address is
+  not.
+
+  The password is stored only as a PBKDF2-SHA256 hash (600,000 iterations,
+  per-hash salt), so it cannot be read back out of `config.json`: if you forget
+  it, see the new command below. Hashing is right here for the same reason it
+  is wrong for the camera passwords: this one is *verified*, and those have to
+  be *presented* to a camera. Sessions are held in memory only, so nothing new
+  is written to disk and a service restart logs everybody out.
+
+  A wrong password costs three seconds. **Attempts are never capped and
+  nothing is ever locked out**, because three seconds is plenty against
+  somebody guessing at a keyboard, and a locked account would mostly succeed
+  at infuriating whoever mistyped their own password.
+- **`sudo timelapse password`**: set or change the web UI's login, and nothing
+  else. A username, a password, twice, done, and the UI restarts.
+  `sudo timelapse password --disable` removes it again. That one asks nothing
+  at all, since it needs no password to carry out and is undone by running the
+  command again, so it works unattended and in a script; it is idempotent, and
+  `--enable` exists as a synonym for the bare command.
+
+  The login cannot be turned on or off from the web UI itself, deliberately.
+  That would need write access to `config.json`, and the one structural
+  property this service has is that it writes exactly one directory: its own
+  index.
+
+  It never asks for the old password. The command needs root to write the
+  config at all, and root can already read every camera password in that same
+  file, so the question would prove nothing while locking out the one person
+  entitled to fix a forgotten login. There is nothing to recover either, since
+  only the hash is stored: forgetting the password is one command, not a
+  problem.
+
+### Fixed
+- **`timelapse config --redacted` printed a stored password hash in full.**
+  The key-name rule anchored on `pass(word|wd)?$`, so `password_hash` went
+  straight through. It is offline-crackable and the entire use for that dump
+  is pasting it somewhere public. Found while designing the web UI login, so
+  no released version has ever written such a key; the rule is fixed anyway,
+  because the next one like it should not have to be found twice.
+- **The web UI printed the two version numbers in two different shapes**:
+  "Installed 0.1.4" beside "Latest v0.1.4". The `v` is the git tag's, not the
+  version's, and on two adjacent rows of one list it read as a difference
+  between the values rather than as punctuation in one of them. Both now use
+  the normalised form. The terminal still prints the tag, where it names a ref
+  the installer will fetch.
+- **After an upgrade run from the terminal the panel contradicted itself**,
+  reporting "Installed 0.1.4 / Latest 0.1.3" until the next daily check.
+  Upstream cannot be behind what is installed here, since the tag is where the
+  installer got it, so a cached answer older than the running version is out
+  of date rather than a finding about GitHub: the panel now reports the
+  version it can prove exists, and drops the stored tag and URL with it so a
+  link never labels one release and opens another. The cache file is left
+  alone, and "Last successful check" still says how old the answer is.
+- **"Last encode run" read "Starting" for the whole of the nightly encode.**
+  A `Type=oneshot` service is `activating` for as long as its `ExecStart`
+  runs, which here is twenty minutes and more, and the word for a daemon
+  caught mid-boot describes a job that never got going when it is held for
+  that long. It now reads "Running", with the time the run began.
+
 ## [0.1.4] - 2026-08-11
 
 ### Added
@@ -873,6 +951,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.5]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.5
 [0.1.4]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.4
 [0.1.3]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.3
 [0.1.2]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.2

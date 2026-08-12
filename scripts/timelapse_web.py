@@ -25,11 +25,16 @@ Run under systemd. Logs to stdout (journald).
 """
 
 import argparse
+import base64
+import binascii
 import datetime
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import signal
 import socket
 import sqlite3
@@ -38,6 +43,7 @@ import sys
 import threading
 import time
 from email.utils import formatdate
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote
@@ -62,7 +68,7 @@ from timelapse_update import (                            # noqa: E402
 # behaviour a security filter should have.
 from timelapse_encode import redact                       # noqa: E402
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 log = logging.getLogger("web")
 
@@ -822,8 +828,8 @@ STATUS_UNITS = (
 # is four repetitions of a URL and a page of detail nobody reads to find out
 # whether capture is running.
 STATUS_PROPS = ("Id", "LoadState", "ActiveState", "SubState", "UnitFileState",
-                "ActiveEnterTimestamp", "InactiveEnterTimestamp", "Result",
-                "NextElapseUSecRealtime")
+                "ActiveEnterTimestamp", "InactiveEnterTimestamp",
+                "InactiveExitTimestamp", "Result", "NextElapseUSecRealtime")
 
 # Request values pick a key; the *value* is what reaches the command line. No
 # string from a request is ever interpolated into an argv, so there is no
@@ -876,6 +882,18 @@ def external(url, label):
     """
     return (f'<a href="{escape(url)}" target="_blank" '
             f'rel="noopener noreferrer">{escape(label)}</a>')
+
+
+def latest_label(u):
+    """The version to print for "Latest", in the shape "Installed" uses.
+
+    Two names for one thing: `latest` is normalised ("0.1.5") and `tag` is
+    whatever the repo wrote ("v0.1.5"). Printing the tag put a v on one of two
+    adjacent values in the same two-row list, which reads as a difference
+    between them rather than as punctuation in one. The tag is kept only as
+    the fallback for a cache that somehow has one without the other.
+    """
+    return u["latest"] or u["tag"]
 
 
 class UpdateChecker:
@@ -959,6 +977,20 @@ class UpdateChecker:
         s["current"] = self.current_text
         latest = parse_version(s["latest"])
         s["available"] = bool(latest and self.current and latest > self.current)
+        # An upgrade run from the terminal moves the installed version without
+        # touching this cache, so for up to a day the panel said "Installed
+        # 0.1.4" beside "Latest 0.1.3", which reads as this checker being
+        # wrong rather than merely old. Upstream cannot be behind what is
+        # installed here: the tag is where the installer got it. So a cached
+        # answer older than the running version is simply out of date, and the
+        # version we can prove exists is the one running. The tag and the URL
+        # go with it, because they name the older release and would otherwise
+        # link "0.1.4" to 0.1.3's page. "Last successful check" still says how
+        # old the answer is, which is the honest part of this.
+        if latest and self.current and self.current > latest:
+            s["latest"] = self.current_text
+            s["tag"] = ""
+            s["url"] = ""
         s["known"] = bool(s["checked"])
         s["retry_at"] = self._retry_at(s)
         return s
@@ -1105,6 +1137,19 @@ def describe_unit(label, kind, props, name):
             # "Starting" would be the wrong answer to "is it working".
             return (label, "bad", "Restarting",
                     "it keeps exiting. The Recent log tab has the reason.")
+        if kind == "oneshot":
+            # A oneshot is "activating" for the whole time its ExecStart runs,
+            # which for the nightly encode is however long seven cameras take:
+            # twenty minutes on the deployment, and more on a slow disk. The
+            # daemon word for this state is "Starting", and an operator
+            # watching it sit there for a quarter of an hour reads that as
+            # stuck. It is not starting, it is doing the work. Verified on
+            # systemd 255: activating/start, with the start time in
+            # InactiveExitTimestamp and both other timestamps empty until it
+            # finishes.
+            began = props.get("InactiveExitTimestamp", "")
+            return (label, "ok", "Running",
+                    f"started {began}" if began else "in progress now")
         return (label, "", "Starting", "")
     if active == "deactivating":
         return (label, "", "Stopping", "")
@@ -1194,6 +1239,249 @@ def journal_report(unit_key, lines_key):
         hint = JOURNAL_DENIED
     return {"command": " ".join(argv), "output": out, "problem": problem,
             "hint": hint}
+
+
+# ----------------------------------------------------------------------------
+# Login
+#
+# One optional user, and deliberately modest about what it is for: it keeps a
+# household out of the pages, not an attacker off the host. There is no TLS
+# here, so the password crosses the LAN in clear; the videos themselves stay
+# reachable by path (see the gate in do_GET); and this is stated in the UI and
+# the docs rather than left for somebody to discover.
+#
+# Configured means `web.auth.username` and `web.auth.password_hash` are both
+# set. Absent or blank, every route behaves exactly as it did before this
+# existed, which is what an upgrade must keep doing.
+# ----------------------------------------------------------------------------
+
+# The credential is *verified* here, never replayed to anything, so it is
+# hashed - the exact inverse of the camera passwords, which have to be
+# presented to the camera and therefore have to be kept. PBKDF2 rather than
+# scrypt: it is always present, needs no memory tuning, and works on the 3.9
+# floor. Measured on Linux, 600k iterations is 0.09s on a workstation, so a
+# login on a recorder that is also running an NVR stays well under a second
+# while an offline guessing run pays that per attempt.
+PBKDF2_NAME = "pbkdf2_sha256"
+PBKDF2_ITERS = 600_000
+SALT_BYTES = 16
+
+SESSION_COOKIE = "tl_session"
+# The session ends at logout, which is what the operator asked for. This is
+# the backstop for the browser that is never coming back: a tab left open on a
+# machine that is then repurposed should not stay logged in forever.
+SESSION_IDLE = 30 * 24 * 3600
+# One entry per browser that has ever logged in, and they only leave on logout
+# or expiry, so a script with the right password could accumulate them. A cap
+# with the oldest dropped first keeps that bounded; nobody has 64 browsers.
+MAX_SESSIONS = 64
+
+# A wrong password costs three seconds and nothing else. Attempts are never
+# capped and nothing is ever locked: what is behind this is a status page and
+# a list of video files, and a lockout would mostly succeed at infuriating the
+# household member who mistyped, which helps nobody. Three seconds is plenty
+# against somebody guessing at a keyboard, and this does not pretend to be
+# more than that: a script guessing in parallel is barely slowed, because the
+# delay is per request rather than global.
+LOGIN_DELAY = 3.0
+
+# The only request body this server reads. A username and a password do not
+# reach four kilobytes, and a length the client chose is not a length to
+# allocate on trust.
+FORM_LIMIT = 4096
+
+
+def safe_next(where):
+    """A request-supplied path to return to after logging in, or "/".
+
+    Only a path on this server: a value starting "//" or carrying a scheme is
+    somebody else's site, and a login page that forwards to one is an open
+    redirect. Anything that is not plainly a local path becomes the home page,
+    which is a harmless place to be sent.
+    """
+    where = (where or "").strip()
+    if (not where.startswith("/") or where.startswith("//")
+            or "\\" in where or any(c < " " for c in where)):
+        return "/"
+    return where
+
+
+def hash_password(password, iters=PBKDF2_ITERS, salt=None):
+    """`pbkdf2_sha256$<iters>$<salt>$<key>`, all base64.
+
+    Self-describing on purpose: the iteration count and the salt travel with
+    the hash, so raising the count later leaves every existing config working
+    instead of locking its owner out.
+    """
+    salt = os.urandom(SALT_BYTES) if salt is None else salt
+    key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters)
+    return (f"{PBKDF2_NAME}${iters}${base64.b64encode(salt).decode()}"
+            f"${base64.b64encode(key).decode()}")
+
+
+def verify_password(stored, password):
+    """True if `password` produced `stored`. Never raises.
+
+    A malformed or hand-edited hash is a no, not a traceback: this runs inside
+    a request handler, and the alternative is a 500 on the login page.
+    """
+    parsed = parse_password_hash(stored)
+    if parsed is None:
+        return False
+    iters, salt, key = parsed
+    got = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters)
+    return hmac.compare_digest(got, key)
+
+
+def parse_password_hash(stored):
+    """(iterations, salt, key) for a hash this build can check, else None.
+
+    Asked at startup as well as at each login: a config carrying a hash
+    nobody can verify locks its owner out of their own page, and the useful
+    moment to say so is while somebody is watching the service start, not at
+    the first attempt to log in.
+    """
+    parts = str(stored).split("$")
+    if len(parts) != 4 or parts[0] != PBKDF2_NAME:
+        return None
+    try:
+        iters = int(parts[1])
+        salt = base64.b64decode(parts[2], validate=True)
+        key = base64.b64decode(parts[3], validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if iters < 1 or not salt or not key:
+        return None
+    return iters, salt, key
+
+
+class Auth:
+    """The optional single user, their sessions, and the guessing throttle.
+
+    Sessions live in memory and nowhere else. That keeps `state_dir` holding
+    exactly what it held before (the index and the update cache), so the one
+    writable directory this service has stays scoped to things it can rebuild.
+    The cost is that a restart logs everybody out, which for a service that
+    restarts on upgrades and wizard runs is a fair trade and easy to explain.
+    """
+
+    def __init__(self, username="", password_hash="", idle=SESSION_IDLE,
+                 fail_delay=LOGIN_DELAY):
+        self.username = username or ""
+        self.password_hash = password_hash or ""
+        self.idle = idle
+        # An attribute rather than the constant, so the tests can turn it off.
+        # Nine tests that each waited three real seconds would be half a minute
+        # of suite time spent proving that sleep() sleeps.
+        self.fail_delay = fail_delay
+        self._lock = threading.Lock()
+        self._sessions = {}         # token -> last seen (monotonic)
+
+    @classmethod
+    def from_config(cls, cfg):
+        """Build from `web.auth`, or a disabled instance when it is not set.
+
+        Raises ValueError for a username with a hash this build cannot check.
+        Refusing to start is the fail-closed answer: carrying on without the
+        login would serve the pages to everyone precisely because the operator
+        asked for the opposite.
+        """
+        # .get throughout: an upgrade keeps the existing config.json, and every
+        # install that predates this has no `auth` key at all.
+        auth = (cfg.get("web", {}) or {}).get("auth", {}) or {}
+        user = (auth.get("username") or "").strip()
+        stored = (auth.get("password_hash") or "").strip()
+        if not user or not stored:
+            return cls()
+        if parse_password_hash(stored) is None:
+            raise ValueError(
+                "web.auth.password_hash is not a hash this version can check. "
+                "Run `sudo timelapse password` to set the login again, or "
+                "`sudo timelapse web` to turn it off.")
+        return cls(user, stored)
+
+    @property
+    def enabled(self):
+        return bool(self.username and self.password_hash)
+
+    # -- the credential ------------------------------------------------------
+
+    def check(self, username, password):
+        """Whether these are the configured credentials.
+
+        The hash is computed even when the username is wrong. It costs a
+        tenth of a second on a request that is already failing, and it keeps
+        a wrong *username* from answering faster than a wrong password.
+        """
+        if not self.enabled:
+            return False
+        ok_pw = verify_password(self.password_hash, password or "")
+        ok_user = hmac.compare_digest((username or "").encode("utf-8"),
+                                      self.username.encode("utf-8"))
+        return ok_user and ok_pw
+
+    # -- sessions ------------------------------------------------------------
+
+    def open_session(self):
+        token = secrets.token_urlsafe(32)
+        with self._lock:
+            self._prune()
+            if len(self._sessions) >= MAX_SESSIONS:
+                oldest = min(self._sessions, key=self._sessions.get)
+                del self._sessions[oldest]
+            self._sessions[token] = time.monotonic()
+        return token
+
+    def valid(self, token):
+        """True for a live session, and touches it so the idle clock restarts.
+
+        monotonic() rather than time(): an NTP correction or a manual clock
+        change must not expire everybody, and this machine boots without a
+        battery-backed clock more often than not.
+        """
+        if not token:
+            return False
+        with self._lock:
+            self._prune()
+            if token not in self._sessions:
+                return False
+            self._sessions[token] = time.monotonic()
+            return True
+
+    def close_session(self, token):
+        """Forget a session. Logout is revocation here, not just a cleared
+        cookie: a token copied out of the browser stops working too."""
+        with self._lock:
+            self._sessions.pop(token, None)
+
+    def _prune(self):
+        cutoff = time.monotonic() - self.idle
+        for token in [t for t, seen in self._sessions.items() if seen < cutoff]:
+            del self._sessions[token]
+
+    @property
+    def session_count(self):
+        with self._lock:
+            self._prune()
+            return len(self._sessions)
+
+    # -- what a wrong password costs -----------------------------------------
+
+    def pause_after_failure(self):
+        """Wait out the delay a failed attempt earns.
+
+        No counter, no lockout, no state per client at all. Attempts are
+        unlimited: a locked account would be infuriating for the person who
+        mistyped and would still not keep out anybody serious, and what is
+        behind this is a status page and a list of video files.
+
+        The wait happens before the answer goes back, so it costs the caller
+        the three seconds rather than merely delaying our own bookkeeping. It
+        holds this request's thread while it waits, which is affordable
+        precisely because nothing here is defending against a flood.
+        """
+        if self.fail_delay > 0:
+            time.sleep(self.fail_delay)
 
 
 # ----------------------------------------------------------------------------
@@ -1295,20 +1583,62 @@ LAYOUT = """<!doctype html>
   button {{ font: inherit; font-size: .85rem; padding: .25rem .8rem;
             border-radius: 999px; border: 1px solid rgba(128,128,128,.35);
             background: transparent; color: inherit; cursor: pointer; }}
-  @media (prefers-color-scheme: dark) {{ .flag {{ color: #ff7b72; }} }}
+  /* The login form. One column, so it reads the same on a phone as on a
+     desktop, and the section keeps its own width rather than the 54rem the
+     content column would give two fields. */
+  .signin {{ max-width: 22rem; margin-inline: auto; }}
+  .signin label {{ display: block; font-size: .85rem; opacity: .6;
+                   margin: .8rem 0 .2rem; }}
+  .signin input {{ font: inherit; width: 100%; box-sizing: border-box;
+                   padding: .4rem .6rem; border-radius: 6px;
+                   border: 1px solid rgba(128,128,128,.45);
+                   background: transparent; color: inherit; }}
+  .signin button {{ margin-top: 1rem; }}
+  .bad {{ color: #b3261e; }}
+  @media (prefers-color-scheme: dark) {{
+    .flag, .bad {{ color: #ff7b72; }} }}
 </style>
 <body class="{body_class}">
 <header>
   <h1>timelapse-maker</h1>
   <span class="ver">{version}</span>
 </header>
-<nav>
+{nav}
+{content}
+"""
+
+# Split out of LAYOUT so the login page can render with the same stylesheet
+# and no navigation: every tab on it would bounce straight back here, which
+# reads as a broken page rather than as a locked one.
+NAV = """<nav>
   <a href="/" class="{on_home}">Overview</a>
   <a href="/library" class="{on_library}">Library</a>
   <a href="/logs" class="{on_logs}">Recent log</a>
-</nav>
-{content}
-"""
+  {logout}
+</nav>"""
+
+# autocomplete on both fields, so a password manager fills this the way it
+# fills any other login. The note is not decoration: somebody typing a
+# password into a page has a right to know it is not going over TLS, and that
+# the videos are reachable without it. Saying so here costs nothing and stops
+# this looking like more protection than it is.
+LOGIN_FORM = """<section class="signin">
+  <h2>Log in</h2>
+  {error}
+  <form method="post" action="/login">
+    <input type="hidden" name="next" value="{next}">
+    <label for="u">Username</label>
+    <input id="u" name="username" autocomplete="username" autofocus>
+    <label for="p">Password</label>
+    <input id="p" name="password" type="password"
+           autocomplete="current-password">
+    <button type="submit">Log in</button>
+  </form>
+  <p class="quiet">This keeps the pages to whoever knows the password. It is
+  not encrypted, so use it on a network you trust, and note that the video
+  files themselves stay reachable to anyone who knows their exact address:
+  that is what lets a saved playlist keep working in VLC.</p>
+</section>"""
 
 # Emitted only while a scan is running, and only into a full page. A rendered
 # fragment cannot poll for itself, so this replaces the banner in place until
@@ -1420,6 +1750,22 @@ class Handler(BaseHTTPRequestHandler):
         # page, which looked like the group being empty.
         args = parse_qs(query, keep_blank_values=True)
 
+        if not self._authorised(route):
+            self._deny(route, self.path)
+            return
+
+        if route == "/login":
+            # With no login configured this page is a form that can log
+            # nobody in, so the honest answer is the page they wanted.
+            if self.server.auth.enabled:
+                self._send(200, self._login_page(args))
+            else:
+                self._redirect("/")
+            return
+        if route == "/logout":
+            self._logout()
+            return
+
         # Prefix routes first: the rest of the path is a library-relative file
         # path, which may contain slashes, spaces and non-ASCII.
         if route.startswith("/video/"):
@@ -1464,15 +1810,42 @@ class Handler(BaseHTTPRequestHandler):
     do_HEAD = do_GET
 
     def do_POST(self):
-        """The two actions a read-only UI has, both about its own state:
-        rescan the index, and retry the update check.
+        """The three actions a read-only UI has, all about its own state:
+        rescan the index, retry the update check, and log in.
 
         POST rather than links so a crawler, a prefetch or a refresh cannot
-        set either going. Neither changes anything outside our own state
+        set any of them going. None changes anything outside our own state
         directory, and the update retry is the only one that leaves the host
         at all.
         """
         route = self.path.split("?", 1)[0].rstrip("/") or "/"
+
+        # Read the body here, once, whatever the route. Only /login has one,
+        # but under keep-alive an unread body is the *next* request as far as
+        # the parser is concerned, so leaving it in the buffer would turn a
+        # stray POST into a corrupted session rather than an ignored one.
+        form = self._read_form()
+        if form is None:
+            # Refused rather than parsed, so the stream is no longer at a
+            # request boundary and this connection cannot be reused.
+            self.close_connection = True
+            self._send(413, "request too large\n", "text/plain; charset=utf-8")
+            return
+
+        if not self._authorised(route):
+            # No `next` for a POST: the target is an action, not a page, and
+            # sending somebody to a GET of /rescan after logging in would land
+            # them on a 404. The home page has the button.
+            self._deny(route, "/")
+            return
+
+        if route == "/login":
+            self._login(form)
+            return
+        if route == "/logout":
+            self._logout()
+            return
+
         if route == "/rescan":
             self.server.index.start_scan("requested")
             self._redirect("/library")
@@ -1484,24 +1857,183 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, "not found\n", "text/plain; charset=utf-8")
 
-    def _redirect(self, where):
+    def _redirect(self, where, cookie=None):
         self.send_response(303)
         self.send_header("Location", where)
         self.send_header("Content-Length", "0")
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
         self.end_headers()
+
+    # -- the login gate ------------------------------------------------------
+    #
+    # What this is for, stated once: keeping a household out of the pages. It
+    # is not a defence against an attacker, and it is not sold as one. There
+    # is no TLS, so the password crosses the LAN in clear.
+    #
+    # /video/ is deliberately outside the gate. VLC is a separate process with
+    # no cookie jar, and the .m3u handoff is what the library page exists for;
+    # gating the bytes would break every Play link, and a saved playlist would
+    # stop working the moment the session ended. So the pages, the index, the
+    # status and the logs need the login; a video file still answers anyone
+    # who knows its exact path.
+
+    OPEN_PREFIXES = ("/video/",)
+    # /healthz so a monitor needs no credential; /login and /logout because
+    # they are how you get in and out.
+    OPEN_ROUTES = ("/login", "/logout", "/healthz")
+    # Fragments fetched by the pollers rather than navigated to. They must be
+    # refused, not redirected: a 303 to /login would have the poller splice a
+    # login page into the panel it is refreshing.
+    FRAGMENT_ROUTES = ("/scan", "/update")
+
+    def _authorised(self, route):
+        auth = self.server.auth
+        if not auth.enabled:
+            return True
+        if route in self.OPEN_ROUTES or route.startswith(self.OPEN_PREFIXES):
+            return True
+        return auth.valid(self._cookie_token())
+
+    def _deny(self, route, wanted):
+        if route in self.FRAGMENT_ROUTES:
+            self._send(401, "log in\n", "text/plain; charset=utf-8")
+            return
+        if not wanted or wanted == "/":
+            # Where the login sends you by default anyway. A `?next=%2F` on
+            # the address bar is noise about nothing.
+            self._redirect("/login")
+            return
+        self._redirect(f"/login?next={quote(wanted, safe='')}")
+
+    def _cookie_token(self):
+        """The session token this request carries, or "".
+
+        get_all rather than get: a proxy is allowed to split the cookies over
+        several headers, and taking only the first would drop the session for
+        anybody running behind one.
+        """
+        for raw in (self.headers.get_all("Cookie") or []):
+            try:
+                jar = SimpleCookie()
+                jar.load(raw)
+            except CookieError:
+                continue        # Junk from somebody else's cookie, not ours.
+            morsel = jar.get(SESSION_COOKIE)
+            if morsel and morsel.value:
+                return morsel.value
+        return ""
+
+    def _https(self):
+        """Whether the client's leg of this connection is TLS.
+
+        Only a reverse proxy can answer that, since this server never speaks
+        it. Same header, and the same "anything else is http", as _base_url().
+        """
+        return (self.headers.get("X-Forwarded-Proto") or "").strip().lower() \
+            == "https"
+
+    def _session_cookie(self, token, clear=False):
+        """The Set-Cookie value for starting or ending a session.
+
+        Secure is conditional and must stay so: set unconditionally, a browser
+        would drop the cookie on the plain HTTP this service actually serves,
+        and the login would silently never take. SameSite=Lax is what keeps
+        another site from posting to /rescan with this cookie attached.
+        """
+        parts = [f"{SESSION_COOKIE}={'' if clear else token}", "Path=/",
+                 "HttpOnly", "SameSite=Lax",
+                 f"Max-Age={0 if clear else int(SESSION_IDLE)}"]
+        if self._https():
+            parts.append("Secure")
+        return "; ".join(parts)
+
+    def _read_form(self):
+        """A parsed urlencoded body, {} when there is none, None when refused.
+
+        Bounded: this is the only body this server has ever read, and reading
+        a length somebody else chose is how a small service becomes a way to
+        exhaust its own memory.
+        """
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length < 0 or length > FORM_LIMIT:
+            return None
+        if not length:
+            return {}
+        raw = self.rfile.read(length)
+        return parse_qs(raw.decode("utf-8", "replace"), keep_blank_values=True)
+
+    @staticmethod
+    def _first(form, key):
+        values = (form or {}).get(key) or [""]
+        return values[0]
+
+    def _login(self, form):
+        auth = self.server.auth
+        if not auth.enabled:
+            # Nothing to log in to. Sending them to the page they wanted beats
+            # a form that cannot do anything.
+            self._redirect("/")
+            return
+
+        if not auth.check(self._first(form, "username"),
+                          self._first(form, "password")):
+            # Three seconds, every time, and then the form back. Never a
+            # lockout: see pause_after_failure().
+            auth.pause_after_failure()
+            # One message for both halves. Saying which was wrong tells an
+            # unwelcome guest which half to keep working on, and tells the
+            # legitimate user nothing they cannot work out by retrying.
+            #
+            # Nothing about the attempt is logged: the password would be the
+            # interesting part and it must never reach the journal, and the
+            # rest is a line per wrong guess in a log somebody reads for
+            # encode failures.
+            self._send(401, self._login_page(
+                {}, error="That username and password did not match.",
+                nxt=self._first(form, "next")))
+            return
+
+        token = auth.open_session()
+        self._redirect(safe_next(self._first(form, "next")),
+                       cookie=self._session_cookie(token))
+
+    def _logout(self):
+        """End the session, both halves: the cookie goes and so does the
+        token, so a copy of it taken from the browser stops working too."""
+        self.server.auth.close_session(self._cookie_token())
+        self._redirect("/", cookie=self._session_cookie("", clear=True))
+
+    def _login_page(self, args, error="", nxt=None):
+        nxt = safe_next(nxt if nxt is not None else self._first(args, "next"))
+        problem = f'<p class="bad">{escape(error)}</p>' if error else ""
+        return self._render("login", LOGIN_FORM.format(
+            error=problem, next=escape(nxt)), nav=False)
 
     # Pages whose body is one pane of raw command output, which wants the whole
     # window rather than the reading column the rest of the UI uses. The status
     # page left this list when it stopped being raw output.
     PANE_PAGES = ("logs",)
 
-    def _render(self, page, content):
-        return LAYOUT.format(
-            version=__version__,
-            body_class="pane-page" if page in self.PANE_PAGES else "",
+    def _render(self, page, content, nav=True):
+        # The logout link appears only when there is a session to end. With no
+        # login configured it would be a control that does nothing, and on the
+        # login page itself it would offer to leave somewhere nobody is.
+        logout = ('<a href="/logout">Log out</a>'
+                  if self.server.auth.enabled else "")
+        bar = NAV.format(
             on_home="on" if page == "home" else "",
             on_library="on" if page == "library" else "",
             on_logs="on" if page == "logs" else "",
+            logout=logout,
+        ) if nav else ""
+        return LAYOUT.format(
+            version=__version__,
+            body_class="pane-page" if page in self.PANE_PAGES else "",
+            nav=bar,
             content=content,
         )
 
@@ -1542,10 +2074,10 @@ class Handler(BaseHTTPRequestHandler):
 
         if u["available"]:
             body.append(f'<dt>Latest</dt><dd class="ok">'
-                        f'<strong>{escape(u["tag"] or u["latest"])}</strong>'
+                        f'<strong>{escape(latest_label(u))}</strong>'
                         f'</dd></dl>')
         elif u["known"] and u["latest"]:
-            body.append(f'<dt>Latest</dt><dd>{escape(u["tag"] or u["latest"])}'
+            body.append(f'<dt>Latest</dt><dd>{escape(latest_label(u))}'
                         f'</dd></dl>')
         else:
             body.append("</dl>")
@@ -1562,7 +2094,7 @@ class Handler(BaseHTTPRequestHandler):
             body.append(
                 f'<p class="note new"><strong>An update is available.</strong> '
                 f'You have {escape(u["current"])}; '
-                f'{external(u["url"] or RELEASES_URL, u["tag"] or u["latest"])}'
+                f'{external(u["url"] or RELEASES_URL, latest_label(u))}'
                 f' is out.</p>'
                 f'<p class="cmd">Upgrading re-runs the installer, which keeps '
                 f'your config, your frames and your videos.'
@@ -2159,13 +2691,16 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, addr, handler, cfg, index, updates=None):
+    def __init__(self, addr, handler, cfg, index, updates=None, auth=None):
         super().__init__(addr, handler)
         self.cfg = cfg
         self.index = index
         # Default to a disabled checker rather than None: every page that
         # renders the panel would otherwise need to know it might be absent.
         self.updates = updates or UpdateChecker(None, enabled=False)
+        # Same reasoning: a disabled Auth answers every question the handler
+        # asks, so no route has to know whether a login exists.
+        self.auth = auth or Auth()
 
     def handle_error(self, request, client_address):
         """A client that walks away is not an error.
@@ -2216,10 +2751,27 @@ def main():
     bind = args.bind or web.get("bind", DEFAULT_BIND)
     port = args.port or int(web.get("port", DEFAULT_PORT))
 
+    # Before the bind warning, because what that warning should say depends on
+    # the answer, and because refusing to start is the point: an unusable hash
+    # means the login cannot be checked, and carrying on regardless would open
+    # the pages to everyone exactly because somebody asked for the opposite.
+    try:
+        auth = Auth.from_config(cfg)
+    except ValueError as exc:
+        sys.exit(f"Cannot start: {exc}")
+
     if bind not in ("127.0.0.1", "::1", "localhost"):
-        log.warning("Listening on %s - this server has no authentication and "
-                    "no TLS. Put a reverse proxy in front of it for anything "
-                    "beyond a trusted LAN.", bind)
+        if auth.enabled:
+            log.warning("Listening on %s - the login keeps the pages to "
+                        "whoever knows the password, but there is no TLS, so "
+                        "it crosses the network in clear, and the video files "
+                        "answer anyone who knows their exact address.", bind)
+        else:
+            log.warning("Listening on %s - this server has no authentication "
+                        "and no TLS. Put a reverse proxy in front of it for "
+                        "anything beyond a trusted LAN.", bind)
+    if auth.enabled:
+        log.info("Login required for the pages (user %s).", auth.username)
 
     lib = resolve_library(cfg)
     log.info("Library: %s (from %s)%s",
@@ -2237,7 +2789,7 @@ def main():
                  "connections.")
 
     try:
-        httpd = Server((bind, port), Handler, cfg, index, updates)
+        httpd = Server((bind, port), Handler, cfg, index, updates, auth)
     except OSError as exc:
         # Almost always "address already in use" or a bind address that does
         # not exist on this host. Both are config errors, not crashes.

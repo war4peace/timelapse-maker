@@ -26,7 +26,7 @@ import time
 from datetime import date
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -1915,6 +1915,111 @@ def suggest_bind(current):
     return lan_address() or "0.0.0.0"
 
 
+MIN_PASSWORD = 6
+
+
+def hash_web_password(password):
+    """The one place the wizard turns a password into what gets stored.
+
+    Imported from the web UI rather than reimplemented: two copies of a
+    password format is two chances to write a config the server cannot read,
+    and the failure would appear as a locked-out operator rather than as an
+    error here.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_web import hash_password
+    return hash_password(password)
+
+
+def choose_web_login(web):
+    """The optional single login for the web UI.
+
+    Absent or blank means no login, which is what every install that predates
+    this has, so the pages keep behaving exactly as they did.
+    """
+    auth = web.get("auth") or {}
+    user = (auth.get("username") or "").strip()
+    have = bool(user and (auth.get("password_hash") or "").strip())
+
+    print()
+    note("The pages can ask for a username and password first.")
+    note("What that is for: keeping the household, or a guest on your wifi,")
+    note("out of the status page and the video index. It is a lock on a door,")
+    note("not a safe. There is no HTTPS here, so the password crosses your")
+    note("network in clear, and the video files themselves stay reachable to")
+    note("anyone who knows their exact address: that last part is deliberate,")
+    note("it is what lets a saved .m3u keep playing in VLC afterwards.")
+    if have:
+        print()
+        note(f"A login is configured, for '{user}'.")
+
+    if not ask_yes("Require a login?", have):
+        if have:
+            warn("Removing the login. The pages will open to anyone who can")
+            warn("reach the address above.")
+        # Removed rather than blanked: absent is what every config without a
+        # login looks like, and two spellings of "off" is one too many.
+        web.pop("auth", None)
+        return
+
+    if have and not ask_yes("Set a new username and password?", False):
+        return
+
+    if AUTO or _TTY is None:
+        # A backstop, and normally unreachable: both questions above default
+        # to "leave it as it is" under AUTO, so an unattended run returns
+        # before it gets here. It exists because a password cannot come from a
+        # default, so if either of those defaults ever changes, this must be
+        # what happens rather than a prompt nobody can answer.
+        warn("No terminal here, so there is nothing to type a password into.")
+        if have:
+            warn(f"Keeping the existing login for '{user}'.")
+        else:
+            warn("Leaving the web UI without a login.")
+            web.pop("auth", None)
+        return
+
+    set_web_login(web)
+
+
+def set_web_login(web):
+    """Ask for a username and password and store the hash. True if it changed.
+
+    Split out of choose_web_login() because `timelapse password` is exactly
+    this and none of the rest: somebody running that command has already
+    answered "do you want a login?" by typing it.
+    """
+    if AUTO or _TTY is None:
+        warn("No terminal here, so there is nothing to type a password into.")
+        return False
+
+    user = ((web.get("auth") or {}).get("username") or "").strip()
+    print()
+    name = ask("Username", user or "admin").strip()
+    while True:
+        # ask_secret() rather than ask(): a password typed at an install is a
+        # password in the scroll-back and in whatever transcript somebody
+        # pastes into an issue.
+        first = ask_secret("Password")
+        if not first:
+            warn("A blank password would let anybody in. Nothing changed.")
+            return False
+        if len(first) < MIN_PASSWORD:
+            warn(f"That is under {MIN_PASSWORD} characters. It will work, but")
+            warn("it is a short one.")
+        again = ask_secret("Password again")
+        if again == first:
+            break
+        fail("Those did not match.")
+
+    web["auth"] = {"username": name, "password_hash": hash_web_password(first)}
+    good(f"Login set for '{name}'.")
+    note("Only the hash is stored, so this cannot be read back out of the")
+    note("config. If you forget it, `sudo timelapse password` sets a new one;")
+    note("there is nothing to recover and nothing to type the old one into.")
+    return True
+
+
 def choose_web(cfg):
     heading("Web UI (optional)")
     note("A small read-only page: service status, and an index of your")
@@ -1934,10 +2039,11 @@ def choose_web(cfg):
     found = host_addresses()
     if found:
         note(f"This host's addresses: {', '.join(found)}")
-    note("There is no login and no HTTPS, so whoever can reach this address")
-    note("can watch your videos. A LAN address is the useful answer on a")
-    note("recorder you connect to from elsewhere; 127.0.0.1 restricts it to")
-    note("this machine, and 0.0.0.0 accepts every interface.")
+    note("There is no HTTPS, and the video files stay reachable to anyone who")
+    note("knows their address; you can put a login on the pages further down.")
+    note("A LAN address is the useful answer on a recorder you connect to")
+    note("from elsewhere; 127.0.0.1 restricts it to this machine, and")
+    note("0.0.0.0 accepts every interface.")
     if (web.get("bind") or "") in LOOPBACK and suggested not in LOOPBACK:
         # Never move a deliberate loopback choice without saying so out loud.
         print()
@@ -1978,6 +2084,8 @@ def choose_web(cfg):
         print()
         warn("Anyone who can reach this address can watch your videos.")
         warn("Keep it to a trusted LAN, or put a reverse proxy in front.")
+
+    choose_web_login(web)
 
     print()
     where, why = web_library_preview(cfg)
@@ -2566,6 +2674,12 @@ def main():
                     help="add, edit or remove cameras in an existing config")
     ap.add_argument("--web-only", action="store_true",
                     help="reconfigure just the web UI")
+    ap.add_argument("--password-only", action="store_true",
+                    help="set the web UI's login and nothing else")
+    ap.add_argument("--disable", action="store_true",
+                    help="with --password-only: remove the login entirely")
+    ap.add_argument("--enable", action="store_true",
+                    help="with --password-only: set one (the default anyway)")
     ap.add_argument("--restore-only", action="store_true",
                     help="restore a previous config from the backups")
     ap.add_argument("--backup-now", action="store_true",
@@ -2608,6 +2722,14 @@ def main():
                                                            or args.restore_only):
         ap.error("the camera actions need --cameras-only "
                  "(the 'timelapse cameras' command passes it for you)")
+
+    # Same reasoning as the camera actions above. `timelapse setup --disable`
+    # reads like a definite instruction about something; ignoring it and
+    # walking the whole wizard instead would be the wrong kind of surprise.
+    if (args.disable or args.enable) and not args.password_only:
+        ap.error("--disable and --enable belong to 'timelapse password'")
+    if args.disable and args.enable:
+        ap.error("--disable and --enable are opposites; pick one")
 
     # Machine-readable, and the reason `timelapse config` is covered by the
     # backup rotation at all: the wrapper calls this before handing the file
@@ -2698,6 +2820,61 @@ def main():
             if str(t.get("destination", "")).startswith("/"):
                 print()
                 report_readwritepaths(*sync_unit_readwritepaths(cfg))
+        print()
+        return 0
+
+    # `timelapse password`. Changing a password is a thing people do in a
+    # hurry, from a phone, having just been asked for one they cannot
+    # remember; making them walk the web section to get there would be
+    # unkind. There is deliberately no "old password" question: this needs
+    # root to write the config at all, and root can already read every
+    # camera password in that same file, so asking would prove nothing and
+    # would lock out precisely the person entitled to fix it.
+    if args.password_only:
+        cfg = load_existing_config(args.output)
+        if cfg is None:
+            return 1
+        heading("Web UI login")
+        web = cfg.setdefault("web", {})
+        current = (web.get("auth") or {}).get("username")
+
+        if args.disable:
+            # No prompt and no confirmation: --disable says exactly what it
+            # wants, it needs no password to carry out, and it is undone by
+            # running this command again. That also makes it scriptable, which
+            # a prompt would not be.
+            if not current:
+                note("No login was set; nothing to remove.")
+                print()
+                return 0
+            web.pop("auth", None)
+            good(f"Removed the login for '{current}'.")
+            warn("The pages now open to anyone who can reach the address.")
+            note("`sudo timelapse password` sets one again.")
+        else:
+            if current:
+                note(f"Currently set for '{current}'.")
+            else:
+                note("No login is set, so the pages open to anyone who can")
+                note("reach them. This sets one.")
+            if not web.get("enabled", False):
+                print()
+                warn("The web UI itself is switched off. This is still saved,")
+                warn("and applies when you turn it on with `timelapse web`.")
+            if not set_web_login(web):
+                print()
+                note("No changes made.")
+                return 0
+            print()
+            note("To remove it again: `sudo timelapse password --disable`.")
+
+        heading("Writing configuration")
+        write_config(cfg, args.output, args.owner)
+        good(f"Updated {args.output}")
+        # Everyone is logged out by this, twice over: the sessions live in the
+        # server's memory and the restart empties them, which is the behaviour
+        # somebody changing a password is entitled to expect.
+        restart_web_if_running(cfg)
         print()
         return 0
 

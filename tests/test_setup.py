@@ -1240,10 +1240,14 @@ class TestChooseWeb(unittest.TestCase):
         web, _ = self.drive("y\n127.0.0.1\n\n\n\n")
         self.assertEqual(web["bind"], "127.0.0.1")
 
-    def test_the_lack_of_auth_is_stated_before_the_bind_prompt(self):
+    def test_the_exposure_is_stated_before_the_bind_prompt(self):
+        # Choosing an address is the moment this matters, and it is asked
+        # before the login question, so the note has to be true either way:
+        # there is no HTTPS, and the video files are open regardless.
         _, out = self.drive("y\n\n\n\n\n")
         before = out.split("Listen on", 1)[0]
-        self.assertIn("no login", before)
+        self.assertIn("no HTTPS", before)
+        self.assertIn("video files stay reachable", before)
 
     def test_a_non_loopback_bind_is_warned_about(self):
         web, out = self.drive("y\n0.0.0.0\n\n\n\n")
@@ -1317,7 +1321,8 @@ class TestChooseWeb(unittest.TestCase):
         self.assertIn("only outbound connection", before)
 
     def test_the_update_check_can_be_declined(self):
-        web, _ = self.drive("y\n\n\n\n\nn\n")
+        # enable, bind, port, login, library, state_dir, then the answer.
+        web, _ = self.drive("y\n\n\n\n\n\nn\n")
         self.assertFalse(web["update_check"])
 
     def test_an_existing_choice_to_decline_is_kept(self):
@@ -1340,6 +1345,459 @@ class TestChooseWeb(unittest.TestCase):
         self.assertEqual(web["port"], 9000)
         self.assertEqual(web["library_root"], "/srv/tl")
         self.assertEqual(web["state_dir"], "/srv/idx")
+
+
+class TestChooseWebLogin(unittest.TestCase):
+    """The optional single login.
+
+    Driven through choose_web_login() directly rather than the whole wizard,
+    so a change to the questions either side of it does not renumber every
+    keystroke here.
+    """
+
+    def drive(self, keystrokes, web=None, tty=False):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=tty)
+        web = {} if web is None else web
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                setup.choose_web_login(web)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return web, buf.getvalue()
+
+    def configured(self, user="ed", password="hunter2"):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import timelapse_web as web_mod
+        return {"auth": {"username": user,
+                         "password_hash": web_mod.hash_password(password,
+                                                                iters=1000)}}
+
+    def verify(self, web, password):
+        import timelapse_web as web_mod
+        return web_mod.verify_password(web["auth"]["password_hash"], password)
+
+    # -- off is the default and the status quo ------------------------------
+
+    def test_it_is_off_by_default(self):
+        # Every install that predates this. Enter must not switch a login on.
+        web, _ = self.drive("\n")
+        self.assertNotIn("auth", web)
+
+    def test_declining_writes_no_auth_key_at_all(self):
+        # Absent, not blank: two spellings of "off" is one too many, and the
+        # server reads a missing key and an empty one the same way anyway.
+        web, _ = self.drive("n\n")
+        self.assertNotIn("auth", web)
+
+    def test_it_says_what_it_is_for_and_what_it_is_not(self):
+        _, out = self.drive("n\n")
+        self.assertIn("lock on a door", out)
+        self.assertIn("crosses your", out)
+        self.assertIn("video files themselves stay reachable", out)
+
+    # -- setting one --------------------------------------------------------
+
+    def test_a_login_is_stored_as_a_hash_that_verifies(self):
+        web, _ = self.drive("y\ned\nhunter2\nhunter2\n")
+        self.assertEqual(web["auth"]["username"], "ed")
+        self.assertTrue(self.verify(web, "hunter2"))
+        self.assertFalse(self.verify(web, "hunter3"))
+
+    def test_the_password_itself_is_not_written_anywhere(self):
+        web, _ = self.drive("y\ned\nSup3rS3cret\nSup3rS3cret\n")
+        self.assertNotIn("Sup3rS3cret", json.dumps(web))
+
+    def test_the_hash_is_one_the_server_understands(self):
+        # The wizard and the server have to agree about the format, and the
+        # failure if they do not is an operator locked out of their own page.
+        import timelapse_web as web_mod
+        web, _ = self.drive("y\ned\nhunter2\nhunter2\n")
+        auth = web_mod.Auth.from_config({"web": web})
+        self.assertTrue(auth.enabled)
+        self.assertTrue(auth.check("ed", "hunter2"))
+
+    def test_the_username_defaults_to_admin(self):
+        web, _ = self.drive("y\n\nhunter2\nhunter2\n")
+        self.assertEqual(web["auth"]["username"], "admin")
+
+    def test_mistyping_the_confirmation_asks_again(self):
+        web, out = self.drive("y\ned\nhunter2\ntypo\nhunter2\nhunter2\n")
+        self.assertIn("did not match", out)
+        self.assertTrue(self.verify(web, "hunter2"))
+
+    def test_a_blank_password_changes_nothing(self):
+        # An empty password is not a login, and quietly accepting one would
+        # produce a page that asks for a credential and takes any.
+        web, out = self.drive("y\ned\n\n")
+        self.assertNotIn("auth", web)
+        self.assertIn("blank password", out)
+
+    def test_a_short_password_is_allowed_but_called_out(self):
+        # This is a household lock; refusing "cats" would be pretending to be
+        # something it is not. Saying so is still worth it.
+        web, out = self.drive("y\ned\ncats\ncats\n")
+        self.assertTrue(self.verify(web, "cats"))
+        self.assertIn("short one", out)
+
+    def test_it_says_the_password_cannot_be_read_back(self):
+        # So "I forgot it" has an answer, and names the command, before
+        # somebody goes looking in the config for it.
+        _, out = self.drive("y\ned\nhunter2\nhunter2\n")
+        self.assertIn("cannot be read back", out)
+        self.assertIn("sudo timelapse password", out)
+
+    # -- changing and removing an existing one ------------------------------
+
+    def test_an_existing_login_is_named_and_kept_by_default(self):
+        web = self.configured()
+        before = web["auth"]["password_hash"]
+        web, out = self.drive("\n\n", web)
+        self.assertIn("'ed'", out)
+        self.assertEqual(web["auth"]["password_hash"], before)
+
+    def test_an_existing_login_can_be_replaced(self):
+        web = self.configured()
+        before = web["auth"]["password_hash"]
+        web, _ = self.drive("y\ny\nsomeone\nnewpass\nnewpass\n", web)
+        self.assertEqual(web["auth"]["username"], "someone")
+        self.assertNotEqual(web["auth"]["password_hash"], before)
+        self.assertTrue(self.verify(web, "newpass"))
+
+    def test_removing_it_says_what_that_means(self):
+        web, out = self.drive("n\n", self.configured())
+        self.assertNotIn("auth", web)
+        self.assertIn("open to anyone", out)
+
+    def test_the_existing_username_is_the_default_when_replacing(self):
+        web, _ = self.drive("y\ny\n\nnewpass\nnewpass\n", self.configured())
+        self.assertEqual(web["auth"]["username"], "ed")
+
+    # -- no terminal --------------------------------------------------------
+
+    def test_unattended_leaves_an_existing_login_alone(self):
+        # A password cannot come from a default, and reading one from a pipe
+        # is what init_tty() exists to prevent: under `curl | bash` that pipe
+        # is the installer script.
+        prev_auto = setup.AUTO
+        setup.AUTO = True
+        try:
+            web = self.configured()
+            before = web["auth"]["password_hash"]
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                setup.choose_web_login(web)
+            self.assertEqual(web["auth"]["password_hash"], before)
+            # And it never asked: "Set a new one?" defaults to no, so an
+            # unattended re-install cannot reach the password prompt at all.
+            self.assertNotIn("Password", buf.getvalue())
+        finally:
+            setup.AUTO = prev_auto
+
+    def test_unattended_never_reaches_a_prompt_it_cannot_answer(self):
+        # The backstop, forced: the two questions above default to "leave it"
+        # under AUTO, so this branch is normally unreachable. If either
+        # default ever changes, an unattended run must say so rather than
+        # stopping at a password prompt with no terminal behind it.
+        prev_auto = setup.AUTO
+        setup.AUTO = True
+        try:
+            web = {}
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), \
+                    mock.patch.object(setup, "ask_yes", lambda *a, **k: True):
+                setup.choose_web_login(web)
+            self.assertNotIn("auth", web)
+            self.assertIn("nothing to type a password into", buf.getvalue())
+        finally:
+            setup.AUTO = prev_auto
+
+    def test_unattended_does_not_invent_one(self):
+        prev_auto = setup.AUTO
+        setup.AUTO = True
+        try:
+            web = {}
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                setup.choose_web_login(web)
+            self.assertNotIn("auth", web)
+        finally:
+            setup.AUTO = prev_auto
+
+
+class TestPasswordCommand(unittest.TestCase):
+    """`sudo timelapse password`: set or change the web UI's login, and
+    nothing else.
+
+    No "old password" question anywhere in here, deliberately. It needs root
+    to write the config at all, and root can already read every camera
+    password in that same file, so asking would prove nothing while locking
+    out exactly the person entitled to fix a forgotten one.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        self.path = Path(self.dir.name) / "config.json"
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+
+    def write(self, web=None):
+        cfg = setup.default_config()
+        if web is not None:
+            cfg["web"] = web
+        self.path.write_text(json.dumps(cfg), encoding="utf-8")
+        return cfg
+
+    def run_it(self, keystrokes, extra=()):
+        argv = ["timelapse_setup.py", "--password-only",
+                "--output", str(self.path)] + list(extra)
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        out = io.StringIO()
+        try:
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(setup, "init_tty",
+                                      lambda **kw: None), \
+                    mock.patch.object(setup, "restart_web_if_running",
+                                      lambda cfg: None), \
+                    contextlib.redirect_stdout(out):
+                setup.AUTO = False
+                setup._TTY = FakeTTY(keystrokes, tty=False)
+                rc = setup.main()
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        saved = json.loads(self.path.read_text(encoding="utf-8"))
+        return rc, saved, out.getvalue()
+
+    def verify(self, saved, password):
+        import timelapse_web as web_mod
+        return web_mod.verify_password(
+            saved["web"]["auth"]["password_hash"], password)
+
+    def test_it_sets_a_login_on_a_config_that_had_none(self):
+        self.write({"enabled": True, "bind": "127.0.0.1", "port": 8787})
+        rc, saved, _ = self.run_it("ed\nhunter2\nhunter2\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(saved["web"]["auth"]["username"], "ed")
+        self.assertTrue(self.verify(saved, "hunter2"))
+
+    def test_it_does_not_ask_whether_you_want_one(self):
+        # Running the command is the answer to that question.
+        self.write({"enabled": True})
+        _, _, out = self.run_it("ed\nhunter2\nhunter2\n")
+        self.assertNotIn("Require a login?", out)
+
+    def test_it_never_asks_for_the_old_password(self):
+        self.write({"enabled": True, "auth": {
+            "username": "ed", "password_hash": "irrelevant"}})
+        _, _, out = self.run_it("ed\nnewpass\nnewpass\n")
+        self.assertNotIn("Current password", out)
+        self.assertNotIn("Old password", out)
+
+    def test_it_replaces_an_existing_login(self):
+        import timelapse_web as web_mod
+        self.write({"enabled": True, "auth": {
+            "username": "ed",
+            "password_hash": web_mod.hash_password("old", iters=1000)}})
+        _, saved, out = self.run_it("someone\nnewpass\nnewpass\n")
+        self.assertIn("Currently set for 'ed'", out)
+        self.assertEqual(saved["web"]["auth"]["username"], "someone")
+        self.assertTrue(self.verify(saved, "newpass"))
+        self.assertFalse(self.verify(saved, "old"))
+
+    def test_the_existing_username_is_the_default(self):
+        self.write({"enabled": True, "auth": {
+            "username": "ed", "password_hash": "x"}})
+        _, saved, _ = self.run_it("\nnewpass\nnewpass\n")
+        self.assertEqual(saved["web"]["auth"]["username"], "ed")
+
+    def test_a_blank_password_leaves_the_config_untouched(self):
+        self.write({"enabled": True})
+        before = self.path.read_bytes()
+        rc, _, out = self.run_it("ed\n\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertIn("No changes made", out)
+
+    def test_a_mismatch_is_asked_again_not_saved(self):
+        self.write({"enabled": True})
+        _, saved, out = self.run_it("ed\nhunter2\ntypo\nhunter2\nhunter2\n")
+        self.assertIn("did not match", out)
+        self.assertTrue(self.verify(saved, "hunter2"))
+
+    def test_the_password_is_never_written_in_the_clear(self):
+        self.write({"enabled": True})
+        _, _, _ = self.run_it("ed\nSup3rS3cret\nSup3rS3cret\n")
+        self.assertNotIn("Sup3rS3cret",
+                         self.path.read_text(encoding="utf-8"))
+
+    def test_it_works_before_the_web_ui_is_switched_on(self):
+        # Somebody may set the password first and enable the UI after. Saving
+        # it and saying so beats refusing.
+        self.write({"enabled": False})
+        rc, saved, out = self.run_it("ed\nhunter2\nhunter2\n")
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.verify(saved, "hunter2"))
+        self.assertIn("switched off", out)
+
+    def test_it_says_how_to_remove_the_login(self):
+        self.write({"enabled": True})
+        _, _, out = self.run_it("ed\nhunter2\nhunter2\n")
+        self.assertIn("sudo timelapse password --disable", out)
+
+    # -- turning it off -----------------------------------------------------
+
+    def test_disable_removes_the_login(self):
+        import timelapse_web as web_mod
+        self.write({"enabled": True, "auth": {
+            "username": "ed",
+            "password_hash": web_mod.hash_password("hunter2", iters=1000)}})
+        rc, saved, out = self.run_it("", extra=["--disable"])
+        self.assertEqual(rc, 0)
+        # Removed, not blanked: absent is what a config without a login looks
+        # like everywhere else.
+        self.assertNotIn("auth", saved["web"])
+        self.assertFalse(web_mod.Auth.from_config(saved).enabled)
+        self.assertIn("Removed the login for 'ed'", out)
+
+    def test_disable_says_what_it_just_did(self):
+        # Somebody who typed this in a hurry should not have to infer that
+        # the pages are now open.
+        self.write({"enabled": True, "auth": {"username": "ed",
+                                              "password_hash": "x"}})
+        _, _, out = self.run_it("", extra=["--disable"])
+        self.assertIn("open to anyone", out)
+        self.assertIn("sets one again", out)
+
+    def test_disable_asks_nothing_at_all(self):
+        # It needs no password to carry out and it is undone by running the
+        # command again, so a prompt would only stop it being scriptable.
+        self.write({"enabled": True, "auth": {"username": "ed",
+                                              "password_hash": "x"}})
+        _, saved, out = self.run_it("", extra=["--disable"])
+        self.assertNotIn("Password", out)
+        self.assertNotIn("(y/N)", out)
+        self.assertNotIn("auth", saved["web"])
+
+    def test_disable_is_idempotent(self):
+        self.write({"enabled": True})
+        rc, saved, out = self.run_it("", extra=["--disable"])
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing to remove", out)
+        self.assertNotIn("auth", saved["web"])
+
+    def test_disable_works_with_no_terminal_at_all(self):
+        # The point of having a flag: a definite instruction that needs no
+        # answers should run unattended.
+        self.write({"enabled": True, "auth": {"username": "ed",
+                                              "password_hash": "x"}})
+        prev_auto = setup.AUTO
+        argv = ["timelapse_setup.py", "--password-only", "--disable",
+                "--output", str(self.path)]
+        try:
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(setup, "init_tty", lambda **kw: None), \
+                    mock.patch.object(setup, "restart_web_if_running",
+                                      lambda cfg: None), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                setup.AUTO = True
+                setup._TTY = None
+                rc = setup.main()
+        finally:
+            setup.AUTO = prev_auto
+        saved = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(rc, 0)
+        self.assertNotIn("auth", saved["web"])
+
+    def test_disable_restarts_the_web_ui(self):
+        # Otherwise the running server keeps asking for a login that is no
+        # longer configured.
+        self.write({"enabled": True, "auth": {"username": "ed",
+                                              "password_hash": "x"}})
+        argv = ["timelapse_setup.py", "--password-only", "--disable",
+                "--output", str(self.path)]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(setup, "init_tty", lambda **kw: None), \
+                mock.patch.object(setup, "restart_web_if_running") as res, \
+                contextlib.redirect_stdout(io.StringIO()):
+            setup.main()
+        res.assert_called_once()
+
+    def test_enable_is_the_ordinary_behaviour_spelled_out(self):
+        # Nobody should have to discover that the bare command is the enable
+        # path, or meet "unrecognized arguments: --enable".
+        self.write({"enabled": True})
+        rc, saved, _ = self.run_it("ed\nhunter2\nhunter2\n",
+                                   extra=["--enable"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self.verify(saved, "hunter2"))
+
+    def test_the_two_flags_are_refused_together(self):
+        self.write({"enabled": True})
+        with self.assertRaises(SystemExit) as caught:
+            self.run_it("", extra=["--enable", "--disable"])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_the_flags_are_refused_outside_this_command(self):
+        # `timelapse setup --disable` reads as a definite instruction about
+        # something; walking the whole wizard instead would be the wrong kind
+        # of surprise.
+        self.write({"enabled": True})
+        argv = ["timelapse_setup.py", "--disable", "--output", str(self.path)]
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                setup.main()
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_a_missing_config_is_an_error_not_a_new_one(self):
+        # There is no config here at all: nothing was written by setUp.
+        argv = ["timelapse_setup.py", "--password-only",
+                "--output", str(self.path)]
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        try:
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(setup, "init_tty", lambda **kw: None), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                setup.AUTO = False
+                setup._TTY = FakeTTY("ed\nhunter2\nhunter2\n", tty=False)
+                rc = setup.main()
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        self.assertEqual(rc, 1)
+        self.assertFalse(self.path.exists())
+
+    def test_it_restarts_the_web_ui_so_the_change_takes_effect(self):
+        # And logs everybody out with it, which is what somebody changing a
+        # password expects. Sessions are in memory, so the restart is the
+        # revocation.
+        self.write({"enabled": True})
+        argv = ["timelapse_setup.py", "--password-only",
+                "--output", str(self.path)]
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        try:
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(setup, "init_tty", lambda **kw: None), \
+                    mock.patch.object(setup, "restart_web_if_running") as res, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                setup.AUTO = False
+                setup._TTY = FakeTTY("ed\nhunter2\nhunter2\n", tty=False)
+                setup.main()
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        res.assert_called_once()
+
+    def test_the_saved_config_is_one_the_server_accepts(self):
+        # The two ends of this have to agree, and the failure if they do not
+        # is an operator locked out of their own page.
+        import timelapse_web as web_mod
+        self.write({"enabled": True})
+        _, saved, _ = self.run_it("ed\nhunter2\nhunter2\n")
+        auth = web_mod.Auth.from_config(saved)
+        self.assertTrue(auth.enabled)
+        self.assertTrue(auth.check("ed", "hunter2"))
+        self.assertFalse(auth.check("ed", "wrong"))
 
 
 class TestBindProbe(unittest.TestCase):

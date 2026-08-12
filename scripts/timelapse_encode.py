@@ -32,7 +32,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -109,8 +109,16 @@ class RedactingFormatter(logging.Formatter):
 # Matched against key names. Deliberately loose: an unrecognised key gets its
 # value printed, so the cost of a missing name is a leak while the cost of a
 # spurious match is a question on a bug report.
+#
+# `_hash` is part of the same rule and not an exception to it. A stored
+# password hash is not a password, but it is offline-crackable, and the entire
+# use for this dump is pasting it somewhere public. The `$` anchor on the
+# original meant `password_hash` sailed straight through: measured, not
+# assumed, when the web UI's login was designed. What survives is the key
+# itself, so "did you set a password?" is still answerable from the dump.
 SECRET_KEY_RE = re.compile(
-    r"pass(word|wd)?$|^pwd$|secret|token|credential|api[-_]?key", re.I)
+    r"pass(word|wd)?(_?hash)?$|^pwd$|secret|token|credential|api[-_]?key",
+    re.I)
 
 
 def redact_config(node):
