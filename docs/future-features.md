@@ -30,9 +30,54 @@ these are pre-plans, and the traps are the point.
 
 ---
 
+## 0. A day with kept frames is re-encoded every night
+
+**Effort:** small. **Prerequisites:** none. **This is a defect, not a
+feature**, which is why it sits above everything else.
+
+### What happens
+
+`find_pending()` collects every date directory older than today, and
+`encode_day()` SKIPs only on too-few-frames. **Nothing anywhere asks whether a
+day has already been encoded.** Deleting the frames is what has always made
+that safe: the day directory disappears, so the next night cannot find it
+again.
+
+Set `encode.delete_frames_on_success = false` and that safety goes with it.
+The directories stay, so every night the encoder re-encodes the newest N days
+from scratch and re-transfers the results. On the deployment that is seven
+cameras times seven days of GPU work, nightly, to produce videos that already
+exist. Nothing in the log says "again", because as far as the run is concerned
+this is ordinary work.
+
+Found 2026-08-12 while researching item 1, by reading the code rather than by
+running it. It has presumably never been noticed because the default is
+`true` and nobody has had a reason to change it.
+
+### Shape
+
+A marker written into the day directory on success, in the manner of
+`.cadence.json`, naming what was produced and when. `find_pending()` skips a
+day that carries one, and `--force`, or deleting the marker, re-encodes.
+
+The tempting alternative, "skip if the output file already exists", does not
+work: `transfer()` *moves* the video to the NAS, so the output is normally
+gone by morning and every day would look unencoded again.
+
+### Traps
+
+- The marker must not make a genuinely-failed day look finished: write it only
+  on `status == "OK"`, after the file is closed.
+- `--date` must keep overriding it, or re-encoding one day by hand becomes
+  impossible.
+- Retention (item 1) must delete the marker with the day, not leave it behind.
+
+---
+
 ## 1. Frame retention beyond encode
 
-**Effort:** small. **Prerequisites:** none.
+**Effort:** small. **Prerequisites:** item 0, which is what makes "kept
+frames" a supportable configuration in the first place.
 
 ### What exists
 
@@ -41,20 +86,33 @@ directory after a successful encode, gated on
 `encode.delete_frames_on_success` (default true). There is no other deletion
 path anywhere in the project.
 
+### What `max_backlog_days` actually does, because it is easy to misread
+
+It is **a count of the newest distinct date directories present, not an age
+cutoff**:
+
+```python
+keep = sorted({d.name for _, d in jobs})[-max_backlog:]
+```
+
+So an outage does *not* strand anything, and the obvious worry is the wrong
+one. A machine switched off for two weeks leaves two date directories (the
+partial day it went down on, and the day it came back), both of which are
+inside "the newest seven", so both encode on the next run. Downtime produces
+*fewer* directories, never more.
+
 ### The actual gap
 
-Turning that flag off is currently a slow disk-fill with no sweeper behind it,
-and `encode.max_backlog_days` does **not** save you. `find_pending()` collects
-every day older than today and then keeps only the newest `max_backlog`
-*dates*, so a machine that was off for two weeks leaves days outside that
-window which will never be encoded, and therefore (deletion happening only on
-a successful encode) never deleted either.
+Stranding needs `delete_frames_on_success = false` and ordinary running. Frames
+are then never removed, so date directories accumulate one per camera per day,
+and from the eighth day the oldest falls out of the newest-N window: never
+encoded again, never deleted, and reported by nothing.
 
 **Nothing reports those days.** `timelapse usage` flags frame folders belonging
 to cameras that are ORPHAN or disabled, which is a different problem: a day
-that fell out of the backlog window belongs to a camera that is present and
-enabled, so it appears in the usage totals as ordinary current data and
-nothing marks it as never-to-be-encoded. That invisibility, rather than the
+that fell out of the window belongs to a camera that is present and enabled,
+so it appears in the usage totals as ordinary current data with nothing
+marking it as never-to-be-touched-again. That invisibility, rather than the
 disk space, is the strongest argument for this item.
 
 The capture disk guard (`capture.min_free_gb`) means the end state is "capture
