@@ -33,9 +33,43 @@ While the version is `0.x`, the configuration format may change in any release.
   directory is normally empty and every day would look unencoded again.
 
 ### Added
+- **The web UI can now tell you whether your cameras are actually answering.**
+  Two new panels on the Overview: one row per camera with the time its last
+  frame landed, its cadence, its frame count and its failures; and what last
+  night's encode did, with a row per camera showing frames and coverage.
+
+  This is the question `systemctl` structurally cannot answer. A capture
+  daemon whose cameras are all refusing connections is "running", and so is
+  one that has paused itself because the disk filled up. Both look perfect in
+  the Services table and neither is capturing anything. The disk-guard pause
+  now says so in as many words.
+
+  Behind it, the two daemons publish what they know into
+  `paths.state_dir` (new, default `/var/lib/timelapse/state`): capture rewrites
+  `capture.json` once a minute, and the encoder appends to `encode.json` at the
+  end of every run, keeping a fortnight. They are plain JSON and versioned, so
+  anything you want to write can read them.
+
+  They publish facts and not verdicts: there is no "healthy" field anywhere,
+  because whether 42 seconds of silence is a fault depends on that camera's
+  interval, and the page can work that out while a file that had already
+  decided could not be argued with. RTSP cameras report what they actually
+  know, which is process restarts and liveness rather than a last-frame time:
+  ffmpeg writes those frames, not us.
+
+  **Upgrading creates the directory for you.** It has to exist before the
+  services start, because it is named in their `ReadWritePaths` and systemd
+  will not start a unit whose `ReadWritePaths` points at nothing. Your existing
+  `config.json` needs no edit: the key is read with a default like every other
+  key added since 0.1.0. Both panels say plainly that they need the 0.1.6
+  services, so the gap between upgrading and restarting them reads as a
+  version skew rather than as a fault.
 - `timelapse encode --force` re-encodes days that are already marked. `--date`
   keeps overriding the marker on its own, so re-doing a single day by hand
   needs no new flag.
+- `timelapse test` checks the state directory exists and is writable, since a
+  missing one stops both daemons with an error that names neither the
+  directory nor the release that added it.
 
 ## [0.1.5] - 2026-08-12
 

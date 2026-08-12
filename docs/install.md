@@ -11,6 +11,7 @@ Operator guide. For how the system is built and why, see
 <frames_root>/<Camera>/<YYYY-MM-DD>/<HHMMSS>.jpg   ← deleted after a successful encode
 <video_output>/<Camera>.<YYYYMMDD>.mkv             ← emptied by transfer each night
 <log_dir>/{capture,encode}.log
+<state_dir>/{capture,encode}.json                  ← what the services are doing
 ```
 
 Filenames are zero-padded `HHMMSS`, so lexical order **is** chronological.
@@ -141,7 +142,7 @@ sudo cp config/config.example.json /etc/timelapse/config.json
 sudo chown root:timelapse /etc/timelapse/config.json
 sudo chmod 640 /etc/timelapse/config.json        # it holds camera passwords
 
-sudo mkdir -p /var/lib/timelapse/{frames,videos,logs}
+sudo mkdir -p /var/lib/timelapse/{frames,videos,logs,state}
 sudo chown -R timelapse:timelapse /var/lib/timelapse
 ```
 
@@ -152,6 +153,13 @@ put frames anywhere other than `/var/lib/timelapse`, the `paths` block.
 > match. They run with `ProtectSystem=strict`, so an unlisted path fails with a
 > confusing read-only error. The same applies to a local transfer destination
 > such as a CIFS or NFS mountpoint.
+>
+> `state_dir` has a sharper version of the same rule: it is named in
+> `ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths`
+> points at a directory that does not exist. **Create it before you start the
+> services**, or both daemons fail with an error about mount namespaces that
+> mentions neither the directory nor the setting. The installer does this for
+> you; only a hand-built install has to remember.
 
 ## 3. The setup wizard
 
@@ -802,10 +810,20 @@ path; it offers to restart the service so the change takes effect. Editing
 `config.json` by hand does not, so follow that with `sudo systemctl restart
 timelapse-web`: the server reads its config once, at startup.
 
-It gives you five things:
+It gives you six things:
 
 - **Where your videos actually are**: see the warning below, this is the
   question people get wrong.
+- **Whether your cameras are actually answering.** A table on the Overview,
+  one row per camera: when its last frame landed, the cadence it is running
+  at, how many frames it has taken since the service started, and how many
+  failures. This is the thing `systemctl` cannot tell you. A daemon whose
+  cameras are all refusing connections is "running", and so is one that has
+  paused itself because the disk filled up; both look perfect in the Services
+  table and neither is capturing anything.
+- **What last night's encode did**: when it ran, how long it took, which
+  encoder, how many videos, whether the transfer worked, and a row per camera
+  with the frame count and the coverage percentage.
 - **Service status and recent log**, without an SSH session. Service status is
   four rows at the foot of the Overview, saying whether each part is working
   and what to do if it is not, rather than the page of systemd internals

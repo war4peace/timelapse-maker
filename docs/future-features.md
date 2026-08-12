@@ -38,52 +38,6 @@ these are pre-plans, and the traps are the point.
 
 ---
 
-## 2. Machine-readable runtime state
-
-**Effort:** small. **Prerequisites:** none. **Unlocks:** anything richer than
-shelling out to `systemctl`, including several entries in decided-against.md.
-
-### What exists
-
-Nothing. Every status answer in the project comes from running `systemctl
-show` or `journalctl` and parsing the result, which is why the web UI's status
-table is four rows of translated systemd state and no more. "Is capture
-actually capturing?" is not a question systemd can answer: a daemon whose
-cameras are all failing is `active (running)`.
-
-### Why it is cheap here, and this is the non-obvious part
-
-`timelapse-capture.service` and `timelapse-encode.service` both have
-`ReadWritePaths=/var/lib/timelapse`, so a state file anywhere under that tree
-needs **no unit change at all**. And `ProtectSystem=strict` restricts *writes*
-only, so `timelapse-web.service` can read it without gaining a single new
-writable path: the one-writable-directory property survives intact. That is
-the whole reason this is a small item rather than a hardening argument.
-
-### Shape
-
-- A capture heartbeat, rewritten atomically each tick: last attempt, last
-  success and consecutive-failure count per camera. `consec_fail` already
-  exists per thread and is the number worth publishing.
-- An encoder run-record, one JSON object appended per camera-day: date,
-  frames, coverage, encoder used, duration, outcome. The nightly summary
-  already computes every field; it currently formats them into a Discord
-  table and throws the values away.
-
-### Traps
-
-- **This is a second on-disk contract**, and it will outlive whatever reads it
-  first. Version the file, and read it with `.get(key, default)` from day one.
-- **A stale heartbeat and a missing one mean different things** (crashed
-  versus never started), which is the same rule the status table already
-  learned about oneshots: do not let one word cover both.
-- Write atomically (`os.replace`), or a reader eventually gets half a file.
-- Do not put it in `web.state_dir`. That directory belongs to the web UI's
-  index, which is disposable; this is written by the daemons and read by the
-  UI, so it belongs beside the data, not inside the consumer.
-
----
-
 ## 3. Notification sinks other than Discord
 
 **Effort:** small-to-medium. **Prerequisites:** none.

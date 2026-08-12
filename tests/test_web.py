@@ -3289,5 +3289,328 @@ class TestFailedLoginDelay(unittest.TestCase):
             self.assertFalse(hasattr(auth, name), name)
 
 
+class StateMixin:
+    """A config whose state directory is a real, empty temp directory."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        Path(self.tmp, "videos").mkdir()
+        self.state = Path(self.tmp) / "state"
+        self.state.mkdir()
+        self.config = cfg(self.tmp, transfer={"enabled": False})
+        self.config["paths"]["state_dir"] = str(self.state)
+
+    def publish(self, name, payload):
+        (self.state / name).write_text(json.dumps(payload), encoding="utf-8")
+
+    def capture(self, cameras=None, **kw):
+        now = time.time()
+        payload = {"version": 1, "kind": "capture", "running": True,
+                   "paused": False, "pid": 1,
+                   "started": web.datetime.datetime.fromtimestamp(
+                       now - 3600).replace(microsecond=0).isoformat(),
+                   "updated": web.datetime.datetime.fromtimestamp(
+                       now).replace(microsecond=0).isoformat(),
+                   "updated_epoch": int(now),
+                   "cameras": cameras if cameras is not None else [
+                       self.cam("Roof")]}
+        payload.update(kw)
+        self.publish("capture.json", payload)
+        return payload
+
+    def cam(self, name, quiet=0, **kw):
+        """One HTTP camera entry, last seen `quiet` seconds before the snap."""
+        seen = time.time() - quiet
+        entry = {"name": name, "method": "http", "supervised": False,
+                 "interval": 5, "framerate": 60, "ok": 1200, "fail": 0,
+                 "retried": 0, "consec_fail": 0,
+                 "last_attempt": web.datetime.datetime.fromtimestamp(
+                     seen).replace(microsecond=0).isoformat(),
+                 "last_success": web.datetime.datetime.fromtimestamp(
+                     seen).replace(microsecond=0).isoformat()}
+        entry.update(kw)
+        return entry
+
+
+class TestReadState(StateMixin, unittest.TestCase):
+
+    def test_a_good_file_is_returned(self):
+        self.publish("capture.json", {"version": 1, "cameras": []})
+        data, problem = web.read_state(self.config, "capture.json")
+        self.assertEqual(problem, "")
+        self.assertEqual(data["cameras"], [])
+
+    def test_a_missing_file_is_a_sentence_not_a_fault(self):
+        # What every install shows between upgrading and restarting.
+        data, problem = web.read_state(self.config, "capture.json")
+        self.assertIsNone(data)
+        self.assertIn("nothing has been published", problem)
+
+    def test_malformed_json_says_so(self):
+        (self.state / "capture.json").write_text("{ nope", encoding="utf-8")
+        data, problem = web.read_state(self.config, "capture.json")
+        self.assertIsNone(data)
+        self.assertIn("not valid JSON", problem)
+
+    def test_a_list_is_not_the_shape_this_expects(self):
+        self.publish("capture.json", [1, 2, 3])
+        _, problem = web.read_state(self.config, "capture.json")
+        self.assertIn("shape", problem)
+
+    def test_a_newer_format_is_refused_rather_than_guessed_at(self):
+        """The units restart on upgrade and this service may not have.
+
+        Reading a format this build has never seen would put invented numbers
+        on a page whose entire value is being true.
+        """
+        self.publish("capture.json", {"version": web.STATE_VERSION + 1,
+                                      "cameras": []})
+        data, problem = web.read_state(self.config, "capture.json")
+        self.assertIsNone(data)
+        self.assertIn("newer version", problem)
+        self.assertIn("timelapse-web", problem)
+
+    def test_the_same_version_is_fine(self):
+        self.publish("capture.json", {"version": web.STATE_VERSION,
+                                      "cameras": []})
+        _, problem = web.read_state(self.config, "capture.json")
+        self.assertEqual(problem, "")
+
+    def test_it_reads_the_daemons_directory_not_the_web_index(self):
+        # Two different directories whose config keys are both "state_dir".
+        self.config["web"] = {"state_dir": str(Path(self.tmp) / "webidx")}
+        self.publish("capture.json", {"version": 1, "cameras": []})
+        _, problem = web.read_state(self.config, "capture.json")
+        self.assertEqual(problem, "")
+
+
+class TestCameraVerdict(unittest.TestCase):
+    """Judging happens here, not in the daemon: what counts as quiet depends
+    on the camera's interval, and a file that had already decided could not be
+    overruled by a reader that knows better."""
+
+    def verdict(self, quiet, **kw):
+        snap = 1_800_000_000
+        cam = {"name": "Roof", "interval": 5, "supervised": False,
+               "last_success": web.datetime.datetime.fromtimestamp(
+                   snap - quiet).isoformat()}
+        cam.update(kw)
+        return web.camera_verdict(cam, snap)
+
+    def test_a_recent_frame_is_fine(self):
+        cls, phrase = self.verdict(3)
+        self.assertEqual(cls, "ok")
+        self.assertIn("ago", phrase)
+
+    def test_a_long_silence_is_flagged(self):
+        cls, _ = self.verdict(600)
+        self.assertEqual(cls, "bad")
+
+    def test_a_slow_camera_is_not_judged_by_a_fast_cameras_clock(self):
+        # At one frame a minute, 90 seconds of silence is one missed tick.
+        self.assertEqual(self.verdict(90, interval=60)[0], "ok")
+        # The same 90 seconds at a five-second cadence is eighteen.
+        self.assertEqual(self.verdict(90, interval=5)[0], "bad")
+
+    def test_a_single_slow_fetch_does_not_paint_the_row_red(self):
+        # A 5s camera seen 12s ago has missed at most two ticks, and the
+        # heartbeat itself only lands once a minute.
+        self.assertEqual(self.verdict(12, interval=5)[0], "ok")
+
+    def test_a_camera_that_has_never_answered_says_so(self):
+        cls, phrase = self.verdict(0, last_success=None)
+        self.assertEqual(cls, "warn")
+        self.assertIn("no frame yet", phrase)
+
+    def test_an_rtsp_camera_is_judged_on_its_process(self):
+        cls, phrase = self.verdict(0, supervised=True, alive=True)
+        self.assertEqual(cls, "ok")
+        self.assertIn("ffmpeg", phrase)
+        cls, phrase = self.verdict(0, supervised=True, alive=False)
+        self.assertEqual(cls, "bad")
+        self.assertIn("not running", phrase)
+
+    def test_silence_is_measured_against_the_snapshot_not_now(self):
+        """The heartbeat is a minute old by the time anyone reads it.
+
+        Measuring against now would add the file's own age to every camera and
+        make a healthy 5-second camera look a minute quiet.
+        """
+        snap = time.time() - 59
+        cam = {"interval": 5, "supervised": False,
+               "last_success": web.datetime.datetime.fromtimestamp(
+                   snap - 2).isoformat()}
+        self.assertEqual(web.camera_verdict(cam, snap)[0], "ok")
+        self.assertAlmostEqual(web.silence_seconds(cam, snap), 2, delta=1)
+
+
+class TestHumanAge(unittest.TestCase):
+
+    def test_scales(self):
+        self.assertEqual(web.human_age(0), "0s")
+        self.assertEqual(web.human_age(45), "45s")
+        self.assertEqual(web.human_age(90), "1m")
+        self.assertEqual(web.human_age(3600), "1h 0m")
+        self.assertEqual(web.human_age(90000), "1d 1h")
+
+
+class TestCameraPanel(StateMixin, unittest.TestCase):
+
+    def body(self):
+        status, _, body = request("/", self.config)
+        self.assertEqual(status, 200)
+        return " ".join(body.split())
+
+    def test_the_panel_appears_with_a_row_per_camera(self):
+        self.capture([self.cam("Roof"), self.cam("Gate")])
+        body = self.body()
+        self.assertIn("Cameras", body)
+        self.assertIn("Roof", body)
+        self.assertIn("Gate", body)
+
+    def test_missing_state_explains_itself_and_does_not_break_the_page(self):
+        body = self.body()
+        self.assertIn("nothing has been published", body)
+        self.assertIn("0.1.6", body)
+
+    def test_a_paused_daemon_is_shouted_about(self):
+        """systemd calls a paused daemon active (running). It is capturing
+        nothing, and that is the one case the unit table gets actively wrong."""
+        self.capture(paused=True)
+        body = self.body()
+        self.assertIn("PAUSED", body)
+        self.assertIn("min_free_gb", body)
+
+    def test_a_stopped_daemon_says_so_before_listing_quiet_cameras(self):
+        self.capture(running=False)
+        body = self.body()
+        self.assertIn("stopped cleanly", body)
+
+    def test_a_stale_heartbeat_is_reported_as_stale(self):
+        state = self.capture()
+        state["updated_epoch"] = int(time.time() - 3600)
+        self.publish("capture.json", state)
+        body = self.body()
+        self.assertIn("Last heartbeat", body)
+        self.assertIn("wedged", body)
+
+    def test_a_fresh_heartbeat_says_nothing_about_staleness(self):
+        self.capture()
+        self.assertNotIn("Last heartbeat", self.body())
+
+    def test_counters_are_shown(self):
+        self.capture([self.cam("Roof", ok=17280, fail=3, consec_fail=2)])
+        body = self.body()
+        self.assertIn("17,280", body)
+        self.assertIn("2 in a row", body)
+
+    def test_an_rtsp_camera_shows_restarts_and_no_invented_frame_count(self):
+        self.capture([self.cam("Gate", supervised=True, alive=True,
+                               restarts=4, last_success=None)])
+        body = self.body()
+        self.assertIn("4 restart(s)", body)
+        self.assertIn("supervised by ffmpeg", body)
+
+    def test_no_enabled_cameras_is_a_sentence(self):
+        self.capture([])
+        self.assertIn("No cameras are enabled", self.body())
+
+    def test_the_page_says_what_the_counters_count(self):
+        # "1,200 frames" invites being read as today's total, which it is not.
+        self.capture()
+        self.assertIn("since the capture service last started", self.body())
+
+
+class TestLastEncodePanel(StateMixin, unittest.TestCase):
+
+    def run_payload(self, **kw):
+        run = {"started": "2026-08-12T00:05:00",
+               "finished": "2026-08-12T00:27:56", "seconds": 1376.0,
+               "encoder": "AV1 (av1_nvenc)", "error": "",
+               "ok": 1, "skipped": 0, "failed": 0, "bytes": 4200000000,
+               "transfer": {"ok": True, "moved": 1, "detail": ""},
+               "days": [{"camera": "Roof", "date": "2026-08-11",
+                         "status": "OK", "frames": 17280, "bad": 0,
+                         "size": 4200000000, "seconds": 1376.0,
+                         "interval": 5, "coverage": 100.0, "note": ""}]}
+        run.update(kw)
+        self.publish("encode.json", {"version": 1, "kind": "encode",
+                                     "updated": "2026-08-12T00:27:56",
+                                     "updated_epoch": 1786000000,
+                                     "runs": [run]})
+        return run
+
+    def body(self):
+        status, _, body = request("/", self.config)
+        self.assertEqual(status, 200)
+        return " ".join(body.split())
+
+    def test_the_last_run_is_summarised(self):
+        self.run_payload()
+        body = self.body()
+        self.assertIn("Last encode", body)
+        self.assertIn("2026-08-12T00:27:56", body)
+        self.assertIn("AV1 (av1_nvenc)", body)
+        self.assertIn("1 video(s)", body)
+
+    def test_the_days_table_carries_coverage(self):
+        self.run_payload()
+        body = self.body()
+        self.assertIn("Roof", body)
+        self.assertIn("2026-08-11", body)
+        self.assertIn("100%", body)
+        self.assertIn("17,280", body)
+
+    def test_a_failed_transfer_is_visible(self):
+        self.run_payload(transfer={"ok": False, "moved": 0,
+                                   "detail": "exit 23: chgrp failed"})
+        self.assertIn("exit 23", self.body())
+
+    def test_a_run_with_no_transfer_does_not_look_like_a_failed_one(self):
+        self.run_payload(transfer=None)
+        body = self.body()
+        self.assertIn("not attempted", body)
+        self.assertNotIn("failed:", body)
+
+    def test_an_aborted_run_is_not_shown_as_a_quiet_night(self):
+        # Zero videos and zero failures is what a crash before the first
+        # encode looks like from the counters alone.
+        self.run_payload(error="No usable encoder found", ok=0, days=[],
+                         encoder="")
+        body = self.body()
+        self.assertIn("Aborted", body)
+        self.assertIn("No usable encoder", body)
+
+    def test_a_run_that_found_nothing_says_that_plainly(self):
+        self.run_payload(ok=0, days=[], bytes=0)
+        self.assertIn("found nothing to do", self.body())
+
+    def test_missing_state_explains_itself(self):
+        self.assertIn("nothing has been published", self.body())
+
+    def test_only_the_newest_run_is_rendered(self):
+        # The file keeps a fortnight; the panel is about last night.
+        self.publish("encode.json", {
+            "version": 1, "kind": "encode", "runs": [
+                {"finished": "2026-08-12T00:27:56", "seconds": 1,
+                 "encoder": "", "error": "", "ok": 0, "skipped": 0,
+                 "failed": 0, "bytes": 0, "transfer": None,
+                 "days": [{"camera": "Newest", "date": "2026-08-11",
+                           "status": "OK", "frames": 1, "bad": 0, "size": 1,
+                           "seconds": 1, "interval": 5, "coverage": 1.0,
+                           "note": ""}]},
+                {"finished": "2026-08-11T00:27:56", "seconds": 1,
+                 "encoder": "", "error": "", "ok": 0, "skipped": 0,
+                 "failed": 0, "bytes": 0, "transfer": None,
+                 "days": [{"camera": "Older", "date": "2026-08-10",
+                           "status": "OK", "frames": 1, "bad": 0, "size": 1,
+                           "seconds": 1, "interval": 5, "coverage": 1.0,
+                           "note": ""}]}]})
+        body = self.body()
+        self.assertIn("Newest", body)
+        self.assertNotIn("Older", body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -68,6 +68,16 @@ from timelapse_update import (                            # noqa: E402
 # behaviour a security filter should have.
 from timelapse_encode import redact                       # noqa: E402
 
+# The runtime-state contract, from the module that defines it. Aliased on
+# purpose: this file already uses "state_dir" for web.state_dir, the UI's own
+# index directory, which is a different directory holding different things and
+# is the only one this service may write to. Two meanings of one name in one
+# file is how the wrong directory ends up in a hardening claim.
+from timelapse_encode import (                            # noqa: E402
+    CAPTURE_STATE, ENCODE_STATE, STATE_VERSION,
+    state_dir as runtime_state_dir,
+)
+
 __version__ = "0.1.5"
 
 log = logging.getLogger("web")
@@ -1226,6 +1236,116 @@ def unit_states():
              for name, label, kind in STATUS_UNITS], "")
 
 
+# ----------------------------------------------------------------------------
+# Runtime state, published by the daemons
+#
+# Read-only, like everything else this service touches. The files answer the
+# one question the unit table cannot: a capture daemon whose every camera is
+# refusing connections is `active (running)`, and so is one the disk guard has
+# paused with nothing being written at all.
+# ----------------------------------------------------------------------------
+
+# Capture rewrites its heartbeat once a minute, so two missed writes is the
+# earliest point at which silence means anything.
+STATE_STALE_AFTER = 180
+
+
+
+def read_state(cfg, filename):
+    """(data, problem) for one state file.
+
+    A missing file is not an error worth shouting about: it is what every
+    install shows until the daemons have been restarted onto 0.1.6, and what a
+    machine that has never run capture shows forever. It is reported as a
+    plain sentence, not as a fault.
+    """
+    path = runtime_state_dir(cfg) / filename
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        return None, "nothing has been published here yet"
+    except OSError as exc:
+        return None, f"cannot read {path.as_posix()}: {exc}"
+    except ValueError:
+        return None, f"{path.as_posix()} is not valid JSON"
+    if not isinstance(data, dict):
+        return None, f"{path.as_posix()} is not the shape this expects"
+    # Forward compatibility, from the first release that has any: a newer
+    # daemon may publish a format this build has never seen, and guessing at
+    # it would put invented numbers on the page.
+    # A file claiming a newer format than this build knows was written by a
+    # newer daemon than this UI, which happens when the units are restarted on
+    # an upgrade and this service is not. Reading it as if it were this format
+    # would put invented numbers on a page whose whole value is being true.
+    if data.get("version", 0) > STATE_VERSION:
+        return None, (f"written by a newer version of timelapse-maker "
+                      f"(format {data.get('version')}); restart "
+                      f"timelapse-web.service to catch up")
+    return data, ""
+
+
+def parse_stamp(text):
+    """One of our own ISO stamps back to epoch seconds, or None."""
+    if not text:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def silence_seconds(cam, snapshot_epoch):
+    """How long this camera had been quiet when the snapshot was taken.
+
+    Measured against the snapshot rather than against now, deliberately: the
+    heartbeat is written once a minute, so measuring against now would add up
+    to a minute of the file's own age to every camera and make a perfectly
+    healthy 5-second camera look 65 seconds quiet.
+    """
+    last = parse_stamp(cam.get("last_success"))
+    if last is None or not snapshot_epoch:
+        return None
+    return max(0.0, snapshot_epoch - last)
+
+
+def camera_verdict(cam, snapshot_epoch):
+    """(css class, phrase) for one camera row.
+
+    The judgement lives here rather than in the daemon: what counts as quiet
+    depends on that camera's interval, and a file that had already decided
+    could not be overruled by a reader that knows better.
+    """
+    if cam.get("supervised"):
+        # ffmpeg owns the frames on this path, so there is no last-frame time
+        # to judge. Liveness of the process is the honest answer.
+        if cam.get("alive"):
+            return "ok", "supervised by ffmpeg"
+        return "bad", "grabber not running"
+
+    quiet = silence_seconds(cam, snapshot_epoch)
+    if quiet is None:
+        return "warn", "no frame yet"
+    interval = cam.get("interval") or 0
+    # Two intervals of grace, and never less than 15 seconds: at a 5-second
+    # cadence a single slow fetch would otherwise paint the row red.
+    limit = max(15.0, (interval or 5) * 2)
+    if quiet <= limit:
+        return "ok", f"{human_age(quiet)} ago"
+    return "bad", f"{human_age(quiet)} ago"
+
+
+def human_age(seconds):
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+
 def journal_report(unit_key, lines_key):
     unit = LOG_UNITS.get(unit_key, LOG_UNITS[DEFAULT_LOG_UNIT])
     lines = LOG_LINES.get(lines_key, LOG_LINES[DEFAULT_LOG_LINES])
@@ -1711,8 +1831,19 @@ OVERVIEW = """<section>
 
 {update}
 
+{cameras}
+
+{encode}
+
 {services}
 """
+
+# Said once, here, rather than in three branches: an operator upgrading from
+# 0.1.5 sees this until the daemons are restarted, and "nothing is published
+# yet" on its own reads like a fault rather than like a version skew.
+STATE_MISSING = ('This needs the capture and encode services from 0.1.6 or '
+                 'later. If you have just upgraded, they publish it once they '
+                 'have been restarted.')
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -2053,6 +2184,8 @@ class Handler(BaseHTTPRequestHandler):
             lib_state="yes" if lib["usable"] else "no",
             lib_note=note,
             update=self._update_panel(),
+            cameras=self._cameras(),
+            encode=self._last_encode(),
             services=self._services(),
         )
 
@@ -2583,6 +2716,166 @@ class Handler(BaseHTTPRequestHandler):
                            f'</td></tr>')
         out.append("</table></div>")
         return "".join(out)
+
+    def _cameras(self):
+        """Whether the cameras are actually answering, which is the question
+        the Services table below cannot be asked.
+
+        A daemon with every camera refusing connections is `active (running)`,
+        and so is one the disk guard has paused. Both look perfect down there
+        and neither is capturing anything.
+        """
+        state, problem = read_state(self.server.cfg, CAPTURE_STATE)
+        parts = ["<section><h2>Cameras</h2>"]
+        if problem:
+            parts.append(f'<p class="note">{escape(problem)}</p>'
+                         f'<p class="quiet">{STATE_MISSING}</p></section>')
+            return "".join(parts)
+
+        snap = state.get("updated_epoch") or 0
+        age = time.time() - snap if snap else None
+
+        # Order matters: a stopped daemon explains every quiet camera below it,
+        # so say that first rather than leaving the reader to infer it from
+        # eight red rows.
+        if not state.get("running", True):
+            parts.append('<p class="note">Capture stopped cleanly at '
+                         f'{escape(state.get("updated") or "?")}. '
+                         'Nothing is being captured.</p>')
+        elif age is not None and age > STATE_STALE_AFTER:
+            parts.append(
+                f'<p class="note bad">Last heartbeat {escape(human_age(age))} '
+                f'ago. This is written once a minute while capture runs, so '
+                f'the daemon is stopped or wedged, and the rows below are '
+                f'from {escape(state.get("updated") or "?")}.</p>')
+        if state.get("paused"):
+            parts.append('<p class="note bad">Capture is PAUSED by the disk '
+                         'guard: free space fell below '
+                         '<code>capture.min_free_gb</code>. No frames are '
+                         'being written by any camera.</p>')
+
+        cams = state.get("cameras") or []
+        if not cams:
+            parts.append('<p class="note">No cameras are enabled.</p></section>')
+            return "".join(parts)
+
+        parts.append("<table><tr><th>Camera</th><th>Last frame</th>"
+                     "<th>Cadence</th><th>Frames</th><th>Failures</th></tr>")
+        for cam in cams:
+            cls, phrase = camera_verdict(cam, snap)
+            interval = cam.get("interval")
+            cadence = f"1 / {interval}s" if interval else "-"
+            if cam.get("supervised"):
+                # ffmpeg writes these frames, so a count here would be a
+                # number nobody could account for. Restarts are what this
+                # thread actually knows.
+                frames = "-"
+                fails = f'{cam.get("restarts", 0)} restart(s)'
+            else:
+                frames = f'{cam.get("ok", 0):,}'
+                consec = cam.get("consec_fail", 0)
+                fails = f'{cam.get("fail", 0):,}'
+                if consec:
+                    fails += f' ({consec} in a row)'
+            parts.append(
+                f'<tr><td>{escape(str(cam.get("name", "?")))}</td>'
+                f'<td class="{cls}">{escape(phrase)}</td>'
+                f'<td class="dim">{escape(cadence)}</td>'
+                f'<td class="dim">{escape(frames)}</td>'
+                f'<td class="dim">{escape(fails)}</td></tr>')
+        parts.append("</table>")
+        parts.append('<p class="quiet">Counted since the capture service last '
+                     'started, not since midnight. Updated once a minute'
+                     + (f', last at {escape(state.get("updated"))}.'
+                        if state.get("updated") else ".")
+                     + '</p></section>')
+        return "".join(parts)
+
+    def _last_encode(self):
+        """What last night actually produced, rather than what systemd made of
+        it. The unit row can say the timer ran; only this can say the run
+        encoded seven days and shipped them."""
+        state, problem = read_state(self.server.cfg, ENCODE_STATE)
+        parts = ["<section><h2>Last encode</h2>"]
+        if problem:
+            parts.append(f'<p class="note">{escape(problem)}</p>'
+                         f'<p class="quiet">{STATE_MISSING}</p></section>')
+            return "".join(parts)
+
+        runs = state.get("runs") or []
+        if not runs:
+            parts.append('<p class="note">No run has been recorded yet.</p>'
+                         '</section>')
+            return "".join(parts)
+
+        run = runs[0]
+        when = run.get("finished") or run.get("started") or "?"
+        rows = [("Finished", when),
+                ("Took", human_age(run.get("seconds") or 0))]
+        if run.get("encoder"):
+            rows.append(("Encoder", run["encoder"]))
+
+        if run.get("error"):
+            # An aborted run has counts of zero, which would otherwise read as
+            # a quiet night rather than as a crash.
+            rows.append(("Aborted", run["error"]))
+        else:
+            made = (f'{run.get("ok", 0)} video(s), '
+                    f'{human_size(run.get("bytes") or 0)}')
+            if run.get("failed"):
+                made += f', {run["failed"]} failed'
+            if run.get("skipped"):
+                made += f', {run["skipped"]} skipped'
+            rows.append(("Produced", made))
+
+        xfer = run.get("transfer")
+        if xfer is None:
+            rows.append(("Transfer", "not attempted"))
+        elif xfer.get("ok"):
+            rows.append(("Transfer", f'{xfer.get("moved", 0)} file(s) moved'))
+        else:
+            rows.append(("Transfer", f'failed: {xfer.get("detail") or "?"}'))
+
+        parts.append("<dl>")
+        for label, value in rows:
+            cls = ' class="bad"' if label in ("Aborted",) or (
+                label == "Transfer" and xfer is not None
+                and not xfer.get("ok")) else ""
+            parts.append(f"<dt>{escape(label)}</dt>"
+                         f"<dd{cls}>{escape(str(value))}</dd>")
+        parts.append("</dl>")
+
+        days = run.get("days") or []
+        if days:
+            parts.append("<table><tr><th>Camera</th><th>Day</th>"
+                         "<th>Result</th><th>Frames</th><th>Coverage</th>"
+                         "<th>Size</th></tr>")
+            for d in days:
+                # All three built outside the f-string below. Nesting a quote
+                # or a backslash inside an f-string expression is PEP 701
+                # grammar, which is Python 3.12, and this project's floor is
+                # 3.9 (RHEL 9, Debian 11). It is a SyntaxError at *import*
+                # there, so it would not break this panel, it would stop the
+                # web service from starting at all. See the same note in
+                # timelapse_setup.py's summarise_web().
+                cov = d.get("coverage")
+                mark = ' class="bad"' if d.get("status") == "FAIL" else ""
+                shown = "-" if cov is None else f"{cov:g}%"
+                parts.append(
+                    f'<tr><td>{escape(str(d.get("camera", "?")))}</td>'
+                    f'<td class="dim">{escape(str(d.get("date", "?")))}</td>'
+                    f'<td{mark}>{escape(str(d.get("status", "?")))}</td>'
+                    f'<td class="dim">{d.get("frames", 0):,}</td>'
+                    f'<td class="dim">{escape(shown)}</td>'
+                    f'<td class="dim">{escape(human_size(d.get("size") or 0))}'
+                    f'</td></tr>')
+            parts.append("</table>")
+        else:
+            parts.append('<p class="quiet">That run found nothing to do, '
+                         'which is what an ordinary night looks like when '
+                         'yesterday has already been encoded.</p>')
+        parts.append("</section>")
+        return "".join(parts)
 
     def _services(self):
         """Four rows saying whether it works, for the foot of the overview.

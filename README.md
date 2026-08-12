@@ -110,6 +110,13 @@ so either can be stopped, replaced or rewritten without touching the other.
 - **Correct colour.** JPEGs are full-range; the pipeline converts to
   limited-range BT.709 and tags it, so output isn't washed out or crushed
   depending on the player.
+- **Answers "are my cameras actually working?"** The web UI shows a row per
+  camera with the time its last frame landed, its cadence, its frame count and
+  its failures, plus what last night's encode produced. `systemctl` cannot
+  answer this: a capture daemon whose cameras are all refusing connections is
+  "running", and so is one that has paused itself because the disk filled up.
+  The daemons publish it as plain versioned JSON, so anything else you want to
+  read it with can.
 - **Optional read-only web UI.** Service status, an index of your finished
   videos by camera and by day, and a *Play* link that hands each one to VLC,
   including one playlist per day, so reviewing a day means opening a single

@@ -95,6 +95,8 @@ ${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/.cadence.json
 ${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/.encoded.json
 ${paths.video_output}/<CameraName>.<YYYYMMDD>.<container>
 ${paths.log_dir}/{capture,encode}.log
+${paths.state_dir}/capture.json
+${paths.state_dir}/encode.json
 ```
 
 Invariants that both sides depend on:
@@ -112,6 +114,30 @@ Invariants that both sides depend on:
 Adding a camera means adding a directory. Nothing else in either program needs
 to know.
 
+### 3a. Runtime state (0.1.6)
+
+A **second** on-disk contract, and it will outlive whatever reads it first, so
+it is versioned and every reader uses `.get(key, default)`. It exists because
+systemd cannot answer the question anybody actually has: a capture daemon whose
+every camera is refusing connections is `active (running)`, and so is one the
+disk guard has paused with nothing being written at all.
+
+| File | Written by | Contains |
+|---|---|---|
+| `capture.json` | the capture daemon, once a minute, plus once at startup and once on clean shutdown | pid, start time, `running`, `paused`, and a per-camera block: cadence, last attempt, last success, and either frame counters (HTTP) or restarts and process liveness (RTSP) |
+| `encode.json` | the encoder, at the end of every run including one that found nothing to do | the newest `MAX_RUNS` (14) run records: times, encoder, counts, bytes, transfer outcome, and a per-camera-day list with frames and coverage |
+
+Rules that hold this together:
+
+| Rule | Why |
+|---|---|
+| **Facts, never verdicts** | There is deliberately no "healthy" or "state" field. Whether 42 seconds of silence is a fault depends on that camera's interval and on whether capture is paused; a reader can work that out, and a writer that had already decided could not be overruled. The cadence each number should be read against travels beside it for exactly this reason. |
+| **The RTSP path publishes different fields, marked `supervised`** | ffmpeg writes those frames and the thread only supervises the process, so `last_success` stays `null` rather than being filled in from something that is not a frame. Reading the day directory's mtime would have produced a plausible number and taught readers to trust it everywhere. |
+| **Writing it can never fail the job** | A daemon that cannot write its status file must keep capturing, and a run that encoded seven days has not failed because a history file could not be updated. Capture complains once, not once a minute. |
+| **Written atomically** | `os.replace`, like every other file this project writes. A reader gets the previous snapshot or the next one, never half of either. |
+| **The daemons write it; the web UI only reads it** | Not `web.state_dir`, which is the UI's own index directory and the single path that service may write. Verified under systemd: a process with the web unit's `ReadWritePaths` gets `Read-only file system` here. |
+| **`paths.state_dir` must exist before the units start** | It is named in `ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths` points at nothing, with an error about mount namespaces that names neither the directory nor the release that added it. `install.sh` creates it in `sync_units()`, which is what makes the upgrade path safe for an install that answers "don't reconfigure" and never runs the wizard. |
+
 ---
 
 ## 4. Component reference
@@ -126,6 +152,15 @@ Long-running daemon. `systemd` `Type=simple`, `Restart=always`.
 |---|---|
 | `STOP` | `threading.Event`, set by SIGTERM/SIGINT. Every loop uses `STOP.wait(n)` rather than `time.sleep(n)` so shutdown is immediate. |
 | `PAUSED` | `threading.Event`, set by `DiskGuard`. Capture threads check it and skip, but keep their scheduling loop running. |
+
+The same once-a-minute tick in `main()` that calls `record_cadences()` also
+calls `write_state()` (§3a). It is the main thread, so there is one writer and
+no lock: every value it reads off a camera thread is a single int or float,
+and a counter one tick old is not worth taking a lock in the capture path for.
+It also writes **immediately at startup**, or a restart leaves the previous
+run's file in place for a minute, which reads as a live daemon that has
+stopped taking pictures, and **once more on clean shutdown** with
+`running: false`, so a stopped daemon and a wedged one stay tellable apart.
 
 **`HttpCamera(threading.Thread)`**: one per `method: "http"` camera.
 
@@ -253,8 +288,15 @@ Pipeline, in `main()`:
    because `rmtree` runs with `ignore_errors=True`: a deletion that quietly
    failed would otherwise leave an unmarked directory to encode again.
 5. `transfer()` → rsync.
-6. `send_discord()` → embed with a monospace summary table plus fields.
-7. Exit `0` all-good, `1` partial failure, `2` critical.
+6. `write_run_state()` → one record appended to `encode.json` (§3a), **before**
+   the notification: Discord is the part that can be disabled, unreachable or
+   rate-limited, and the local record of what happened should not depend on
+   any of it. Every exit path records, including "nothing to do" and the
+   critical-failure handler, because a status page that cannot tell "the timer
+   fired and there was nothing to do" from "the timer never fired" is not
+   answering the question.
+7. `send_discord()` → embed with a monospace summary table plus fields.
+8. Exit `0` all-good, `1` partial failure, `2` critical.
 
 **`encode_day()`** is the core. Notable choices:
 
@@ -523,6 +565,16 @@ Keep that list to one entry. Reusing the capture/encode `ReadWritePaths` would
 hand a network-facing service write access to every captured frame in exchange
 for nothing, which is why `sync_units()` templates the web unit separately and
 `timelapse_setup.py` has a separate `--print-web-paths`.
+
+The runtime-state files (§3a) are the newest test of that rule and they pass
+it: the daemons write them, this service only reads them, and `state_dir` was
+added to the *daemons'* `ReadWritePaths` and not to this one. Re-verified under
+systemd at 0.1.6 by running a process with this unit's properties against
+`/var/lib/timelapse/state`, which gets `Read-only file system`. Note the name
+collision that makes this easy to get wrong: `web.state_dir` is the UI's index
+directory and `paths.state_dir` is the daemons' runtime state. Two different
+directories, two different owners, one word. The module imports the second one
+as `runtime_state_dir` for that reason.
 
 It logs only to journald: a rotating log file would be a second writable path
 for no benefit.
@@ -964,6 +1016,28 @@ deliberate price of dropping a tab.
     back would otherwise shift every later unit onto the wrong row.
   The one state that looks healthy and is not gets called out: enabled=no
   while running means it will not come back after a reboot.
+- **The Cameras and Last encode panels answer what that table structurally
+  cannot** (0.1.6). Every row above comes from systemd, and systemd's opinion
+  of a capture daemon whose cameras are all refusing connections is `active
+  (running)`. These two read §3a instead, and the judgement lives here rather
+  than in the daemon: `camera_verdict()` allows two intervals of silence and
+  never less than fifteen seconds, so a camera at one frame a minute is not
+  measured by a five-second camera's clock. Four details worth keeping:
+  - **Silence is measured against the snapshot, not against now.** The
+    heartbeat lands once a minute, so measuring against now would add up to a
+    minute of the file's own age to every camera and paint a healthy
+    five-second camera as a minute quiet.
+  - **A stopped or stale daemon is announced above the table**, because it
+    explains every quiet row beneath it and leaving the reader to infer that
+    from eight red rows is not an explanation. `paused` gets its own line for
+    the same reason: it is the one state systemd gets actively wrong.
+  - **A missing state file is a sentence, not a fault.** It is what every
+    install shows between upgrading and restarting the units, and the panel
+    says so in those words rather than reporting an error.
+  - **A file claiming a newer format is refused rather than guessed at.** The
+    units restart on upgrade and this service may not have; reading an unknown
+    format would put invented numbers on a page whose entire value is being
+    true.
 - **The logs page drops the 54rem reading column.** That width suits prose and
   tables and is wrong for raw command output, whose line length journald
   decides, not us. `_render()` adds `pane-page` to `<body>` for it
@@ -1110,7 +1184,9 @@ Four things follow from it that are not obvious:
 - **`Cov%` is measured against the camera's interval.** Each result row
   carries the interval it ran at. Against the global, a camera at one frame a
   minute reads as 8% coverage: a complete day reported as a near-total outage,
-  every night.
+  every night. Since 0.1.6 that arithmetic is `coverage_pct()`, shared by the
+  Discord table and the run record. It was inline in the table, and the file
+  would have been the copy that drifted.
 - **The disk projection sums, it does not multiply.** One camera at 60s and
   five at 5s is not six times any single figure.
 
@@ -1293,6 +1369,7 @@ take an optional path as their first positional argument. See
 | `frames_root` | Must be on a filesystem with room for ~2 days of frames. Temp files are created here, so it must be one mount. |
 | `video_output` | Emptied by `transfer()` each night. |
 | `log_dir` | Rotating logs, 8 MB × 3 (capture) / × 5 (encode). |
+| `state_dir` | Runtime state (§3a), a few KB. Defaults to `/var/lib/timelapse/state` and is not asked by the wizard. Deliberately not derived from the base directory the wizard asks about: that exists because frames are enormous and may want their own disk, and this does not. Absent from every config written before 0.1.6, so it is read with the default; changing it means `install.sh` must run again, because the directory has to exist before the units start. |
 | `ffmpeg`, `ffprobe` | Absolute paths. Point at a BtbN static build if the distro build lacks NVENC. |
 
 ### `capture`
@@ -1435,7 +1512,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 964 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,058 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1456,6 +1533,23 @@ the release query lived in `timelapse_web.py`, four tests patched
 name resolved in the *other* module's namespace and the tests silently started
 hitting api.github.com for real. They passed, against the live repo. Patch the
 module that owns the function, not the one that re-exports it.
+
+`test_grammar.py` holds the Python floor, and exists for one specific gap.
+`ast.parse(feature_version=(3, 9))` sounds like it settles the question and
+does not: it parses with the *running* interpreter's tokenizer, so PEP 701
+f-strings, which are 3.12, sail through it. That is the one 3.10+ construct
+this project can realistically write by accident, and it fails at **import**,
+which means not a broken panel but a service that does not start, on the
+distributions this project most expects (RHEL 9, Debian 11) and never on the
+machine it was written on. It caught a real one on the day it was added, in
+`timelapse_web.py`:
+
+```python
+f'<td{" class=\'bad\'" if bad else ""}>'      # SyntaxError on 3.9
+```
+
+Build the value on its own line instead. The test was confirmed to fail on
+that line before being kept: a guard nobody has seen fail is not a guard.
 
 Three seams exist purely for testability, and should be preserved:
 `scan_filesystems(mounts_path, statvfs, rotational)` and
@@ -1492,6 +1586,26 @@ changes:
   and one 404. Confirmed: files land on exact interval boundaries, correct
   directory layout, no leftover `.tmp`, failure throttling works, clean SIGTERM
   shutdown.
+- **Runtime state** (0.1.6): Ubuntu 24.04 under real systemd, and this one had
+  to be measured because the plan for it was wrong on paper. `future-features`
+  claimed no unit change was needed since both units carry
+  `ReadWritePaths=/var/lib/timelapse`; that is the shipped *template*, while
+  `sync_units()` overwrites the line from the config with three sibling
+  directories, so a new sibling would have been read-only on every real
+  install while passing every test here. Confirmed after the fix: the
+  installer creates `state/` at 0750 `timelapse:timelapse`, both units carry it
+  in `ReadWritePaths` and `systemd-analyze verify` is clean, capture publishes
+  `capture.json` **from inside the sandbox** and records `running: false` on
+  stop, the encoder writes `encode.json` for a run that found nothing to do,
+  the pre-flight passes, and the overview renders both panels over HTTP.
+  A real disk-guard pause (`min_free_gb` set absurdly high) produced
+  `paused: true` and the PAUSED banner. The **upgrade path** was exercised
+  separately: v0.1.5 installed from the published tag (no state directory, no
+  state in `ReadWritePaths`), then this tree over the top, after which the
+  directory exists, the units carry it, and a config that still has no
+  `state_dir` key publishes to the default location. That is the hazard worth
+  re-testing on any future change here: a `ReadWritePaths` entry that does not
+  exist stops **both** daemons, with an error about mount namespaces.
 - **Installer and wizard**: Ubuntu 24.04 with real systemd. Confirmed: package
   detection and dependency install, service account creation, unit templating
   (`systemd-analyze verify` clean), a live capture run against a local HTTP
@@ -1676,16 +1790,17 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 761 lines
-scripts/timelapse_capture.py     daemon, 742 lines
-scripts/timelapse_encode.py      batch job, 1176 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 773 lines
-scripts/timelapse_setup.py       configuration wizard, 2920 lines
+install.sh                       bootstrap installer, 788 lines
+scripts/timelapse_capture.py     daemon, 877 lines
+scripts/timelapse_encode.py      batch job, 1335 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 807 lines
+scripts/timelapse_setup.py       configuration wizard, 2969 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2821 lines
+scripts/timelapse_web.py         read-only web UI, 3114 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
+tests/test_grammar.py            the 3.9 floor, incl. the PEP 701 gap
 tests/test_setup.py              unit tests
 tests/test_update.py             unit tests
 tests/test_usage.py              unit tests

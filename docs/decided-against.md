@@ -111,26 +111,37 @@ design, not a small feature, which is why it is here rather than in the plan.
 
 ## Live status updates, history and coverage graphs
 
-**Refused as premature: the data it would draw does not exist yet.**
+**Refused on the polling, which is the objection that survived.**
 
-Every status answer today comes from shelling out to `systemctl` or
-`journalctl` on request. There is no time series to plot, and a graph built by
-re-running `systemctl` on a timer would be a polling loop drawing a straight
-line.
+It was refused as premature: every status answer came from shelling out to
+`systemctl` or `journalctl` on request, so there was no time series to plot and
+a graph built by re-running `systemctl` on a timer would have been a polling
+loop drawing a straight line.
 
-This is also the one entry here with a live prerequisite: *machine-readable
-runtime state* (future-features.md §2) is what would make it possible, and
-until that exists this is not a feature but a wish.
+**Half of that changed at 0.1.6** and the entry is updated rather than
+quietly left stale. Runtime state now exists, and it was this entry's stated
+prerequisite. What arrived is not symmetrical, though, and the difference is
+the whole argument:
 
-The deeper objection is the polling. The web UI's rule is that it collects
-nothing in the background and answers on request, which is what keeps it
-cheap enough to run on the same host as an NVR and honest enough that the page
-always reflects now rather than a cached minute ago. Live updates mean a
-collector, a retention policy and a storage format: a different service,
-really.
+- `encode.json` keeps the newest fourteen runs, which *is* a short time
+  series. A fortnight of nightly coverage per camera could be drawn from it
+  today, with no collector and no new storage.
+- `capture.json` is a snapshot and nothing more. It is rewritten in place once
+  a minute, so there is no history of camera health to plot, and inventing one
+  means a collector.
 
-**Reopen if:** the runtime-state files land, and there is a specific question
-a graph would answer that a number cannot.
+The deeper objection is the polling, and it is untouched by any of that. The
+web UI's rule is that it collects nothing in the background and answers on
+request, which is what keeps it cheap enough to run on the same host as an NVR
+and honest enough that the page always reflects now rather than a cached
+minute ago. Live updates mean a collector, a retention policy and a storage
+format: a different service, really.
+
+**Reopen if:** there is a specific question a graph would answer that a number
+cannot. That is now the only condition left, and it is the one that was always
+doing the work. A fortnight of encode coverage is the cheapest candidate,
+since the data is already on disk; live *camera* graphs are not, and should be
+argued separately.
 
 ---
 
