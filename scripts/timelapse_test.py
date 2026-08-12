@@ -442,6 +442,39 @@ def scan_camera_frames(cam_dir):
     return {"days": days, "frames": frames, "size": size, "stray": stray}
 
 
+def test_state_dir(cfg):
+    """The runtime-state directory, checked here because of how it fails.
+
+    It is named in the units' ReadWritePaths, and systemd will not start a unit
+    whose ReadWritePaths points at a directory that is not there. The error
+    talks about setting up a mount namespace, names no setting and no release,
+    and arrives on both daemons at once. Anything that says so in words is
+    worth more here than the check costs.
+    """
+    from timelapse_encode import state_dir, whoami
+
+    d = state_dir(cfg)
+    # as_posix() for display: every path this project deals with is a POSIX
+    # path, but a Path stringifies to whatever the running platform separates
+    # with, and the development box is not the deployment box.
+    shown = d.as_posix()
+    if not d.is_dir():
+        bad(f"{shown} does not exist")
+        info("The capture and encode units name it in ReadWritePaths, so they")
+        info("will not start until it is there. Fix with: sudo timelapse setup")
+        return
+    probe = d / ".preflight.tmp"
+    try:
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+        ok(f"{shown} exists and is writable")
+    except OSError as exc:
+        # Reported as the account running this check, which is not necessarily
+        # the account the daemons run as; say so rather than implying a verdict
+        # about them.
+        bad(f"{shown} is not writable by {whoami()}: {exc}")
+
+
 def report_usage(cfg):
     root = Path(cfg["paths"]["frames_root"])
     videos = Path(cfg["paths"]["video_output"])
@@ -758,6 +791,7 @@ def main():
     print("\n=== Disk ===")
     avg = sum(sizes) / len(sizes) if sizes else 0
     test_disk(cfg, avg, len(cams))
+    test_state_dir(cfg)
 
     print("\n=== Transfer destination ===")
     test_transfer(cfg)

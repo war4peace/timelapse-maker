@@ -1278,6 +1278,40 @@ class TestEncodeDayMarksTheDay(unittest.TestCase):
         self.assertEqual((len(good), bad), (5, 0))
 
 
+class TestStateDir(unittest.TestCase):
+
+    def test_the_configured_directory_wins(self):
+        self.assertEqual(
+            enc.state_dir({"paths": {"state_dir": "/srv/tl/state"}}).as_posix(),
+            "/srv/tl/state")
+
+    def test_absent_falls_back_to_the_default(self):
+        # Every config written before 0.1.6 lacks the key, and upgrades keep
+        # the existing config, so this is the normal case for a while.
+        self.assertEqual(enc.state_dir({"paths": {}}).as_posix(),
+                         enc.STATE_DIR_DEFAULT)
+
+    def test_an_empty_or_blank_value_falls_back_too(self):
+        for value in ("", "   ", None):
+            self.assertEqual(
+                enc.state_dir({"paths": {"state_dir": value}}).as_posix(),
+                enc.STATE_DIR_DEFAULT)
+
+    def test_a_config_with_no_paths_block_at_all(self):
+        self.assertEqual(enc.state_dir({}).as_posix(), enc.STATE_DIR_DEFAULT)
+
+    def test_it_is_not_the_web_index_directory(self):
+        # The web UI's state_dir lives under web, not paths, and means
+        # something else entirely: the one directory that service may write.
+        cfg = {"paths": {}, "web": {"state_dir": "/var/lib/timelapse/web"}}
+        self.assertEqual(enc.state_dir(cfg).as_posix(), enc.STATE_DIR_DEFAULT)
+
+    def test_the_state_files_are_named_once(self):
+        self.assertEqual((enc.CAPTURE_STATE, enc.ENCODE_STATE),
+                         ("capture.json", "encode.json"))
+        self.assertEqual(enc.STATE_VERSION, 1)
+
+
 class TestForceIsWiredUp(unittest.TestCase):
     """main() is not unit-testable here, and this is the part that rots."""
 

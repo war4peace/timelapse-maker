@@ -249,12 +249,40 @@ class TestWritablePaths(unittest.TestCase):
     def cfg(self, transfer=None):
         return {"paths": {"frames_root": "/srv/tl/frames",
                           "video_output": "/srv/tl/videos",
-                          "log_dir": "/srv/tl/logs"},
+                          "log_dir": "/srv/tl/logs",
+                          "state_dir": "/srv/tl/state"},
                 "transfer": transfer or {"enabled": False}}
 
-    def test_lists_the_three_data_directories(self):
+    def test_lists_the_four_data_directories(self):
         self.assertEqual(setup.writable_paths(self.cfg()),
-                         ["/srv/tl/frames", "/srv/tl/logs", "/srv/tl/videos"])
+                         ["/srv/tl/frames", "/srv/tl/logs", "/srv/tl/state",
+                          "/srv/tl/videos"])
+
+    def test_the_state_directory_is_included(self):
+        """The daemons cannot publish state into a read-only directory.
+
+        ProtectSystem=strict means an unlisted path is read-only, and the
+        failure is a mount namespace error rather than anything naming the
+        setting. Note this is a *sibling* of the others on a default install
+        (/var/lib/timelapse/state), so the parent-collapse below never absorbs
+        it and it genuinely has to be named.
+        """
+        self.assertIn("/srv/tl/state", setup.writable_paths(self.cfg()))
+
+    def test_the_state_directory_defaults_when_the_key_is_absent(self):
+        # Every config written before 0.1.6 has no such key.
+        cfg = self.cfg()
+        del cfg["paths"]["state_dir"]
+        self.assertIn("/var/lib/timelapse/state", setup.writable_paths(cfg))
+
+    def test_the_state_directory_is_not_the_web_index_directory(self):
+        # Two different directories with confusable names. The web UI's is the
+        # one directory that service may write; this one the daemons write and
+        # the UI only reads.
+        cfg = self.cfg()
+        cfg["web"] = {"state_dir": "/var/lib/timelapse/web"}
+        self.assertNotIn("/var/lib/timelapse/web", setup.writable_paths(cfg))
+        self.assertNotIn("/srv/tl/state", setup.web_writable_paths(cfg))
 
     def test_includes_a_local_transfer_destination(self):
         # Trailing slash on purpose: the shipped example config writes the
@@ -266,14 +294,16 @@ class TestWritablePaths(unittest.TestCase):
     def test_normalises_trailing_and_duplicate_separators(self):
         cfg = {"paths": {"frames_root": "/srv/tl/frames/",
                          "video_output": "/srv/tl//videos",
-                         "log_dir": "/srv/tl/logs/"},
+                         "log_dir": "/srv/tl/logs/",
+                         "state_dir": "/srv/tl/state/"},
                "transfer": {"enabled": False}}
         self.assertEqual(setup.writable_paths(cfg),
-                         ["/srv/tl/frames", "/srv/tl/logs", "/srv/tl/videos"])
+                         ["/srv/tl/frames", "/srv/tl/logs", "/srv/tl/state",
+                          "/srv/tl/videos"])
 
     def test_a_trailing_slash_does_not_defeat_deduplication(self):
         cfg = {"paths": {"frames_root": "/srv/tl", "video_output": "/srv/tl/",
-                         "log_dir": "/srv/tl"},
+                         "log_dir": "/srv/tl", "state_dir": "/srv/tl/"},
                "transfer": {"enabled": False}}
         self.assertEqual(setup.writable_paths(cfg), ["/srv/tl"])
 
@@ -281,7 +311,7 @@ class TestWritablePaths(unittest.TestCase):
         # rsync over SSH writes nothing locally, so systemd needs no permission.
         paths = setup.writable_paths(
             self.cfg({"enabled": True, "destination": "user@nas:/mnt/tl"}))
-        self.assertEqual(len(paths), 3)
+        self.assertEqual(len(paths), 4)
 
     def test_ignores_a_destination_when_transfer_is_disabled(self):
         paths = setup.writable_paths(
@@ -296,13 +326,13 @@ class TestWritablePaths(unittest.TestCase):
     def test_deduplicates_identical_paths(self):
         cfg = self.cfg()
         cfg["paths"]["video_output"] = cfg["paths"]["frames_root"]
-        self.assertEqual(len(setup.writable_paths(cfg)), 2)
+        self.assertEqual(len(setup.writable_paths(cfg)), 3)
 
     def test_a_similar_prefix_is_not_treated_as_a_parent(self):
         # /srv/tl-old must not be swallowed by /srv/tl.
         cfg = {"paths": {"frames_root": "/srv/tl",
                          "video_output": "/srv/tl-old",
-                         "log_dir": "/srv/tl"},
+                         "log_dir": "/srv/tl", "state_dir": "/srv/tl"},
                "transfer": {"enabled": False}}
         self.assertEqual(setup.writable_paths(cfg), ["/srv/tl", "/srv/tl-old"])
 
@@ -2010,6 +2040,101 @@ class TestLoadExistingConfig(unittest.TestCase):
             got, out = self.run_load()
         self.assertIsNone(got)
         self.assertIn("Cannot read", out)
+
+
+class TestRuntimeStateDir(unittest.TestCase):
+    """The directory the daemons publish runtime state into.
+
+    Its whole hazard is that it is named in ReadWritePaths: if it does not
+    exist when the units start, systemd refuses to start them, and the error
+    talks about a mount namespace rather than about a directory or a release.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_created_from_the_config(self):
+        target = Path(self.tmp) / "state"
+        cfg = setup.default_config()
+        cfg["paths"]["state_dir"] = str(target)
+        setup.create_state_dir(cfg)
+        self.assertTrue(target.is_dir())
+
+    def test_parents_are_created_too(self):
+        target = Path(self.tmp) / "a" / "b" / "state"
+        cfg = setup.default_config()
+        cfg["paths"]["state_dir"] = str(target)
+        setup.create_state_dir(cfg)
+        self.assertTrue(target.is_dir())
+
+    def test_create_directories_makes_it_as_well(self):
+        # The wizard's own path. A state directory made only by install.sh
+        # would be missing on any install that reconfigured without upgrading.
+        cfg = setup.default_config()
+        for key, sub in (("frames_root", "f"), ("video_output", "v"),
+                         ("log_dir", "l"), ("state_dir", "s")):
+            cfg["paths"][key] = str(Path(self.tmp) / sub)
+        cfg["web"] = {"state_dir": str(Path(self.tmp) / "w")}
+        setup.create_directories(cfg)
+        self.assertTrue((Path(self.tmp) / "s").is_dir())
+
+    def test_an_unwritable_location_is_reported_not_raised(self):
+        cfg = setup.default_config()
+        cfg["paths"]["state_dir"] = str(Path(self.tmp) / "nope")
+        buf = io.StringIO()
+        with mock.patch.object(Path, "mkdir",
+                               side_effect=PermissionError(13, "denied")):
+            with contextlib.redirect_stdout(buf):
+                setup.create_state_dir(cfg)
+        self.assertIn("Could not create", buf.getvalue())
+
+    def test_print_state_path_is_what_install_sh_reads(self):
+        """install.sh derives the directory it creates from this flag.
+
+        A flag that prints the wrong thing, or prints nothing, sends the
+        installer to its /var/lib/timelapse/state fallback while the units are
+        templated from the config: the directory made and the directory
+        required would then be different ones.
+        """
+        cfg = setup.default_config()
+        cfg["paths"]["state_dir"] = "/srv/tl/state"
+        path = Path(self.tmp) / "config.json"
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv",
+                               ["timelapse_setup.py", "--print-state-path",
+                                str(path)]), \
+                contextlib.redirect_stdout(buf):
+            rc = setup.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), "/srv/tl/state")
+
+    def test_print_state_path_answers_for_a_config_without_the_key(self):
+        cfg = setup.default_config()
+        del cfg["paths"]["state_dir"]
+        path = Path(self.tmp) / "old.json"
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv",
+                               ["timelapse_setup.py", "--print-state-path",
+                                str(path)]), \
+                contextlib.redirect_stdout(buf):
+            setup.main()
+        self.assertEqual(buf.getvalue().strip(), "/var/lib/timelapse/state")
+
+    def test_the_default_is_named_in_exactly_one_place(self):
+        """Two copies of this string is how the unit and the directory drift.
+
+        The wizard's template, the config example and install.sh's fallback all
+        say /var/lib/timelapse/state, but only one of them is consulted at run
+        time.
+        """
+        import timelapse_encode as enc
+
+        cfg = setup.default_config()
+        del cfg["paths"]["state_dir"]
+        self.assertEqual(enc.state_dir(cfg).as_posix(), enc.STATE_DIR_DEFAULT)
 
 
 class TestWebStateDir(unittest.TestCase):

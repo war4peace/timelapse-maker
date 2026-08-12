@@ -212,5 +212,55 @@ class TestRsyncFlagCheckOutput(unittest.TestCase):
         self.assertIn("as timelapse", out)
 
 
+class TestStateDirCheck(unittest.TestCase):
+    """A missing state directory stops both daemons from starting at all.
+
+    systemd's error names a mount namespace and nothing else, so the pre-flight
+    is the only place an operator can be told what is actually wrong.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def run_check(self, cfg):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            tt.test_state_dir(cfg)
+        return buf.getvalue()
+
+    def test_a_present_writable_directory_passes(self):
+        d = self.tmp / "state"
+        d.mkdir()
+        out = self.run_check({"paths": {"state_dir": str(d)}})
+        self.assertIn("PASS", out)
+        self.assertNotIn("FAIL", out)
+
+    def test_it_leaves_nothing_behind(self):
+        d = self.tmp / "state"
+        d.mkdir()
+        self.run_check({"paths": {"state_dir": str(d)}})
+        self.assertEqual(list(d.iterdir()), [])
+
+    def test_a_missing_directory_fails_and_says_why(self):
+        out = self.run_check({"paths": {"state_dir": str(self.tmp / "gone")}})
+        self.assertIn("FAIL", out)
+        self.assertIn("ReadWritePaths", out)
+        self.assertIn("timelapse setup", out)
+
+    def test_an_unwritable_directory_names_the_account_it_tried_as(self):
+        d = self.tmp / "state"
+        d.mkdir()
+        with mock.patch.object(Path, "write_text",
+                               side_effect=PermissionError(13, "denied")):
+            out = self.run_check({"paths": {"state_dir": str(d)}})
+        self.assertIn("FAIL", out)
+        self.assertIn("not writable by", out)
+
+    def test_a_config_without_the_key_checks_the_default(self):
+        out = self.run_check({"paths": {}})
+        self.assertIn("/var/lib/timelapse/state", out)
+
+
 if __name__ == "__main__":
     unittest.main()

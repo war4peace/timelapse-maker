@@ -479,6 +479,20 @@ sync_units() {
             || webrw="/var/lib/timelapse/web"
         [ -z "$webrw" ] && webrw="/var/lib/timelapse/web"
     fi
+    # Where the daemons publish runtime state, and now part of $rw above. It is
+    # made HERE rather than only by the wizard, because an upgrade that answers
+    # "don't reconfigure" never runs the wizard: without this, ReadWritePaths
+    # would name a directory that does not exist and BOTH daemons would stop
+    # starting, reporting a mount namespace error that names neither the
+    # directory nor the release that added it.
+    local staterw="/var/lib/timelapse/state"
+    if [ -f "$CONFIG" ]; then
+        staterw="$(python3 "$PREFIX/timelapse_setup.py" --print-state-path "$CONFIG" 2>/dev/null)" \
+            || staterw="/var/lib/timelapse/state"
+        [ -z "$staterw" ] && staterw="/var/lib/timelapse/state"
+    fi
+    install -d -m 0750 "$staterw" 2>/dev/null || true
+    chown "$SVCUSER:$SVCUSER" "$staterw" 2>/dev/null || true
 
     for unit in timelapse-capture.service timelapse-encode.service; do
         local f="$UNITDIR/$unit"

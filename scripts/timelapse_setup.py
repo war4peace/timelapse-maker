@@ -2217,6 +2217,7 @@ def default_config(template_path=None):
         return cfg
     return {
         "paths": {"frames_root": "", "video_output": "", "log_dir": "",
+                  "state_dir": "/var/lib/timelapse/state",
                   "ffmpeg": "/usr/bin/ffmpeg", "ffprobe": "/usr/bin/ffprobe"},
         "capture": {"interval_seconds": 5, "timeout_seconds": 4,
                     "min_bytes": 4096, "min_free_gb": 60,
@@ -2240,8 +2241,18 @@ def writable_paths(cfg):
     PurePosixPath, not Path: the output goes into a systemd unit, so it is a
     POSIX path whatever platform normalises it.
     """
+    from timelapse_encode import state_dir
+
     paths = [cfg["paths"][k] for k in ("frames_root", "video_output", "log_dir")
              if cfg["paths"].get(k)]
+    # Both daemons publish runtime state here. It is usually /var/lib/timelapse
+    # /state, a sibling of the others rather than a child, so the collapse
+    # below does not absorb it and it genuinely needs naming.
+    #
+    # as_posix(), not str(): state_dir() hands back a Path, and on Windows that
+    # stringifies with backslashes, which PurePosixPath below then treats as
+    # one long filename rather than a path. Same reason as the docstring above.
+    paths.append(state_dir(cfg).as_posix())
     t = cfg.get("transfer", {})
     dest = t.get("destination", "")
     if t.get("enabled") and dest.startswith("/"):
@@ -2567,7 +2578,33 @@ def create_directories(cfg, owner=None):
                 shutil.chown(p, user=owner, group=owner)
             except (OSError, LookupError):
                 pass
+    create_state_dir(cfg, owner)
     create_web_state_dir(cfg, owner)
+
+
+def create_state_dir(cfg, owner=None):
+    """The directory the daemons publish runtime state into.
+
+    Same reasoning as create_web_state_dir() below, and the same failure if it
+    is skipped: ReadWritePaths names this directory, so a unit whose
+    ReadWritePaths points at something absent does not start at all, and the
+    error names a mount namespace rather than a missing directory. The daemons
+    cannot create it themselves either, because inside the sandbox its parent
+    is read-only to them.
+    """
+    from timelapse_encode import state_dir
+
+    p = state_dir(cfg)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        fail(f"Could not create {p}: {exc}")
+        return
+    if owner:
+        try:
+            shutil.chown(p, user=owner, group=owner)
+        except (OSError, LookupError):
+            pass
 
 
 def create_web_state_dir(cfg, owner=None):
@@ -2711,6 +2748,8 @@ def main():
                     help="print the paths systemd must be allowed to write")
     ap.add_argument("--print-web-paths", metavar="CONFIG",
                     help="print the one path the web UI must be allowed to write")
+    ap.add_argument("--print-state-path", metavar="CONFIG",
+                    help="print the directory the daemons publish state into")
     ap.add_argument("--version", action="version",
                     version=f"%(prog)s {__version__}")
     args = ap.parse_args()
@@ -2753,6 +2792,16 @@ def main():
     if args.print_web_paths:
         with open(args.print_web_paths, encoding="utf-8") as fh:
             print(" ".join(web_writable_paths(json.load(fh))))
+        return 0
+
+    if args.print_state_path:
+        from timelapse_encode import state_dir
+
+        with open(args.print_state_path, encoding="utf-8") as fh:
+            # as_posix() for the same reason writable_paths() uses it: this is
+            # read by install.sh to make a directory on the target, and a Path
+            # stringifies to whatever the *running* platform separates with.
+            print(state_dir(json.load(fh)).as_posix())
         return 0
 
     init_tty(force_defaults=args.defaults, use_stdin=args.stdin)

@@ -5,6 +5,8 @@
     "frames_root": "/var/lib/timelapse/frames",
     "video_output": "/var/lib/timelapse/videos",
     "log_dir": "/var/lib/timelapse/logs",
+    "_comment_state": "state_dir holds capture.json and encode.json: what the daemons know that systemd cannot, such as whether the cameras are actually answering. A few KB, read by the web UI and by 'timelapse test'. Keep it on /var; it does not belong on the frames disk.",
+    "state_dir": "/var/lib/timelapse/state",
     "ffmpeg": "/usr/bin/ffmpeg",
     "ffprobe": "/usr/bin/ffprobe"
   },

@@ -518,6 +518,47 @@ def mark_encoded(day_dir, out_file, result, encoder_name):
         return False
 
 
+# ----------------------------------------------------------------------------
+# Runtime state
+#
+# systemd knows whether a process is alive. It cannot know whether the cameras
+# are answering: a capture daemon whose every camera is refusing connections is
+# `active (running)`, and looks perfect on the status page. These files are how
+# the programs that *do* know say so.
+#
+# This is a second on-disk contract and it will outlive whatever reads it
+# first, so it carries a version and every reader uses .get(key, default).
+#
+# `/var/lib/timelapse/state` rather than anywhere derived from the config's
+# other paths. The base directory the wizard asks about exists because frames
+# are enormous and may want their own disk; a few KB of JSON does not, and
+# /var/lib is where FHS puts exactly this. Deriving it from log_dir's parent
+# was considered and is a trap: log_dir may be /var/log/timelapse, whose
+# parent is /var/log.
+#
+# NOT `web.state_dir`. That belongs to the web UI's index, which is disposable
+# and is the one directory that service may write; this is written by the
+# daemons and only read by the UI.
+# ----------------------------------------------------------------------------
+
+STATE_DIR_DEFAULT = "/var/lib/timelapse/state"
+CAPTURE_STATE = "capture.json"
+ENCODE_STATE = "encode.json"
+STATE_VERSION = 1
+
+
+def state_dir(cfg):
+    """Where the daemons publish runtime state.
+
+    Absent from every config written before 0.1.6, so it is read with a
+    default like every other added key. The directory must exist before the
+    units start: it is named in ReadWritePaths, and systemd refuses to start a
+    unit whose ReadWritePaths points at nothing. install.sh creates it.
+    """
+    return Path((cfg.get("paths", {}).get("state_dir") or "").strip()
+                or STATE_DIR_DEFAULT)
+
+
 def camera_entry(cfg, name):
     """The config entry for a camera name, or {}.
 
