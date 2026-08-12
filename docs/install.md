@@ -260,6 +260,15 @@ budget.
   NVR's timelapse/snapshot schedule for cameras this tool owns; you are
   replacing that feature, which is the point.
 
+  **The other symptom is a frame count that is short.** `timelapse usage`
+  reports one camera a few hundred frames below the others for the same day,
+  with nothing in the log that looks like a fault, because each individual
+  failure was retried or simply lost a tick. Confirmed on the author's own
+  deployment: one camera finished a day 220 frames (about 18 minutes) behind
+  six identical ones, purely because the NVR's own timelapse was still running
+  against it. If one camera is persistently short, look for the second client
+  before you look at the camera.
+
   You do not need to watch the journal for this. The nightly Discord summary
   prints `Cov%` per camera; one camera sitting a few points below the others is
   the same story.
