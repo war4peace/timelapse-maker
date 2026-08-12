@@ -27,56 +27,20 @@ this list as item 0 went the same way once it was fixed: the invariant it
 established is in architecture.md §3, where the next person will actually meet
 it.
 
-**Numbering is not reused**, which is why this list opens at 2. Item 0 shipped
-and item 1 (frame retention) was refused on scope and moved to
-[decided-against.md](decided-against.md), where the arguments for it are
+**Numbering is not reused**, which is why this list opens at 4. Items 0, 2 and
+3 shipped in 0.1.6, and item 1 (frame retention) was refused on scope and moved
+to [decided-against.md](decided-against.md), where the arguments for it are
 recorded rather than left to be re-made.
+
+Item 3 shipped **narrower than it was planned**, and that is worth noting for
+the next entry that lists candidates: it proposed ntfy, gotify and email, and
+what was actually wanted was ntfy and **Telegram**, which the entry never
+mentioned. Email was refused as a different job with a different failure mode.
+A pre-plan is a starting point for the conversation, not the specification.
 
 Everything below is **researched against the code as of 0.1.5**, so each entry
 says where it would hook in and what is already there. None of it is designed;
 these are pre-plans, and the traps are the point.
-
----
-
-## 3. Notification sinks other than Discord
-
-**Effort:** small-to-medium. **Prerequisites:** none.
-
-### What exists
-
-`post_webhook()` is a generic JSON POST with the explicit `User-Agent` that
-Cloudflare requires. `send_discord()` builds the Discord embed and is called
-from exactly three places: the nightly summary, the no-work summary, and the
-critical-failure handler. The summary table is already rendered as plain text
-before it is wrapped in an embed.
-
-### Shape
-
-The transport is already generic; what is Discord-specific is the payload and
-the embed's width. ntfy and gotify are one `post_webhook()` call each with a
-different payload shape. Email is `smtplib` plus `email.message`, both stdlib,
-so it costs no dependency either.
-
-The honest structure is a list of configured sinks, each with a type, rather
-than a second `discord`-shaped block per vendor.
-
-### Traps
-
-- **Failure isolation is a hard requirement here.** `send_discord()` already
-  swallows everything with a deliberately broad `except`, because a socket
-  timeout is not a `URLError` and a failed notification must never take down
-  the run it is reporting on. Several sinks means that guarantee has to hold
-  per sink: one broken webhook must not stop the others, and none of them may
-  fail the encode. Same rule the cameras get.
-- **The 50-column embed lesson does not transfer.** That width was forced by
-  Discord's embed rendering; email and ntfy have entirely different
-  constraints, so the table must be rendered per sink rather than once.
-- **Every sink is a new credential in `config.json`.** `SECRET_KEY_RE` must
-  cover whatever the keys are called, or `timelapse config --redacted` leaks
-  them: exactly the `password_hash` gap found in 0.1.5.
-- SMTP means a password, a port, TLS-or-not, and a from-address: it is the
-  only sink here with real configuration surface, and probably the one to do
-  last despite being the most requested kind.
 
 ---
 

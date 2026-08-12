@@ -278,6 +278,11 @@ CONFIGURING
   transfer     [sudo]  Reconfigure where finished videos are sent, including
                        mounting an SMB/CIFS share and re-deriving the
                        ReadWritePaths= the systemd units need.
+  notify       [sudo]  Where the nightly summary goes: a Discord webhook,
+                       ntfy (ntfy.sh or your own server), Telegram, any
+                       combination, or none. Offers a test message for each.
+                       Needs no restart: the encode job reads the config when
+                       it runs.
   web          [sudo]  Turn the read-only web UI on or off and set its
                        address, port and library path, including whether it
                        asks for a login. Offers to restart it.
@@ -371,6 +376,8 @@ case "\${1:-}" in
     web)       shift; exec python3 $PREFIX/timelapse_setup.py --web-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     password)  shift; exec python3 $PREFIX/timelapse_setup.py --password-only \\
+                          --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
+    notify)    shift; exec python3 $PREFIX/timelapse_setup.py --notify-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     web-serve) shift; exec python3 $PREFIX/timelapse_web.py "$CONFIG" "\$@" ;;
     # No "$CONFIG": updating neither reads nor writes it, which is why

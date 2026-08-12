@@ -1279,6 +1279,339 @@ class TestEncodeDayMarksTheDay(unittest.TestCase):
         self.assertEqual((len(good), bad), (5, 0))
 
 
+class SinkHarness(unittest.TestCase):
+    """Captures every request a notification attempt would make.
+
+    No network, ever. urlopen is replaced, and a test that reached the wire
+    would be a test that fails on a build machine with no internet and posts
+    to somebody's real channel on the machine that does.
+    """
+
+    def setUp(self):
+        self.sent = []
+        self.fail_with = None
+
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return b'{"ok":true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            self.sent.append(req)
+            if self.fail_with:
+                raise self.fail_with
+            return FakeResponse()
+
+        original = enc.urlrequest.urlopen
+        enc.urlrequest.urlopen = fake_urlopen
+        self.addCleanup(setattr, enc.urlrequest, "urlopen", original)
+
+    def body(self, index=0):
+        return json.loads(self.sent[index].data.decode("utf-8"))
+
+    def url(self, index=0):
+        return self.sent[index].full_url
+
+
+class TestNotifySinkSelection(SinkHarness):
+
+    def test_no_configuration_sends_nothing(self):
+        sent, failed = enc.notify({}, "t", "d", "ok", [])
+        self.assertEqual((sent, failed, self.sent), (0, 0, []))
+
+    def test_the_legacy_discord_block_still_works(self):
+        """Every config written before 0.1.6 has this shape, and upgrades keep
+        the existing config, so it has to go on working untouched."""
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://d/x",
+                           "username": "Bot"}}
+        sent, failed = enc.notify(cfg, "Title", "Desc", "ok", [])
+        self.assertEqual((sent, failed), (1, 0))
+        self.assertEqual(self.url(), "https://d/x")
+
+    def test_a_disabled_legacy_block_sends_nothing(self):
+        cfg = {"discord": {"enabled": False, "webhook_url": "https://d/x"}}
+        self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (0, 0))
+
+    def test_a_legacy_block_with_no_url_sends_nothing(self):
+        cfg = {"discord": {"enabled": True, "webhook_url": ""}}
+        self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (0, 0))
+
+    def test_the_notify_list_is_authoritative_when_present(self):
+        # Both configured; the legacy block must not produce a second message.
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://old/x"},
+               "notify": [{"type": "discord", "enabled": True,
+                           "webhook_url": "https://new/x"}]}
+        enc.notify(cfg, "t", "d", "ok", [])
+        self.assertEqual([self.url(i) for i in range(len(self.sent))],
+                         ["https://new/x"])
+
+    def test_disabled_sinks_are_skipped(self):
+        cfg = {"notify": [
+            {"type": "discord", "enabled": False, "webhook_url": "https://a/x"},
+            {"type": "discord", "enabled": True, "webhook_url": "https://b/x"}]}
+        enc.notify(cfg, "t", "d", "ok", [])
+        self.assertEqual([self.url(i) for i in range(len(self.sent))],
+                         ["https://b/x"])
+
+    def test_several_sinks_all_get_it(self):
+        cfg = {"notify": [
+            {"type": "discord", "enabled": True, "webhook_url": "https://d/x"},
+            {"type": "ntfy", "enabled": True, "topic": "tl"},
+            {"type": "telegram", "enabled": True, "token": "T", "chat_id": "1"}]}
+        self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (3, 0))
+        self.assertEqual(len(self.sent), 3)
+
+    def test_one_sink_failing_does_not_stop_the_others(self):
+        """The hard requirement. A failed notification must never take down
+        the run it is reporting on, nor the sink after it."""
+        cfg = {"notify": [
+            {"type": "discord", "enabled": True, "webhook_url": ""},
+            {"type": "ntfy", "enabled": True, "topic": "tl"}]}
+        with self.assertLogs("encode", level="WARNING"):
+            sent, failed = enc.notify(cfg, "t", "d", "ok", [])
+        self.assertEqual((sent, failed), (1, 1))
+
+    def test_a_transport_error_is_caught_not_raised(self):
+        self.fail_with = OSError("connection reset")
+        cfg = {"notify": [{"type": "ntfy", "enabled": True, "topic": "tl"}]}
+        with self.assertLogs("encode", level="WARNING") as cm:
+            self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (0, 1))
+        self.assertIn("connection reset", "\n".join(cm.output))
+
+    def test_an_unknown_type_says_what_it_knows(self):
+        cfg = {"notify": [{"type": "carrier-pigeon", "enabled": True}]}
+        with self.assertLogs("encode", level="WARNING") as cm:
+            enc.notify(cfg, "t", "d", "ok", [])
+        out = "\n".join(cm.output)
+        self.assertIn("carrier-pigeon", out)
+        self.assertIn("discord", out)
+        self.assertIn("ntfy", out)
+        self.assertIn("telegram", out)
+
+    def test_a_sink_with_no_type_is_a_discord_webhook(self):
+        # What the legacy block looks like once it is moved into the list.
+        cfg = {"notify": [{"enabled": True, "webhook_url": "https://d/x"}]}
+        self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (1, 0))
+
+    def test_the_old_entry_point_still_works(self):
+        # send_discord() was the only one for six releases; a fork may use it.
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://d/x"}}
+        enc.send_discord(cfg, "t", "d", 0x2ECC71, [])
+        self.assertEqual(self.body()["embeds"][0]["color"], 0x2ECC71)
+
+
+class TestDiscordSink(SinkHarness):
+
+    def send(self, level="ok", description="body", fields=()):
+        cfg = {"notify": [{"type": "discord", "enabled": True,
+                           "webhook_url": "https://d/x", "username": "Bot"}]}
+        enc.notify(cfg, "Title", description, level, list(fields))
+        return self.body()
+
+    def test_the_embed_shape_is_unchanged(self):
+        got = self.send(fields=[("Encoder", "AV1")])
+        embed = got["embeds"][0]
+        self.assertEqual(got["username"], "Bot")
+        self.assertEqual(embed["title"], "Title")
+        self.assertEqual(embed["description"], "body")
+        self.assertEqual(embed["fields"][0], {"name": "Encoder",
+                                              "value": "AV1", "inline": False})
+        self.assertIn("timestamp", embed)
+
+    def test_levels_map_to_the_colours_that_were_hardcoded_before(self):
+        for level, colour in (("ok", 0x2ECC71), ("info", 0x95A5A6),
+                              ("warn", 0xF1C40F), ("error", 0xE74C3C)):
+            self.sent.clear()
+            self.assertEqual(self.send(level)["embeds"][0]["color"], colour)
+
+    def test_an_empty_field_value_becomes_a_dash(self):
+        # Discord rejects an empty field value with a 400.
+        self.assertEqual(self.send(fields=[("Note", "")])["embeds"][0]
+                         ["fields"][0]["value"], "-")
+
+    def test_long_text_is_trimmed_and_says_so(self):
+        embed = self.send(description="x" * 5000)["embeds"][0]
+        self.assertLessEqual(len(embed["description"]), enc.DISCORD_DESC_LIMIT)
+        self.assertIn("truncated", embed["description"])
+
+    def test_at_most_25_fields(self):
+        embed = self.send(fields=[(f"f{i}", "v") for i in range(40)])["embeds"][0]
+        self.assertEqual(len(embed["fields"]), 25)
+
+    def test_it_keeps_the_discord_user_agent(self):
+        self.send()
+        self.assertTrue(self.sent[0].get_header("User-agent")
+                        .startswith("DiscordBot ("))
+
+
+class TestNtfySink(SinkHarness):
+
+    def send(self, sink=None, title="Title", description="body", level="ok",
+             fields=()):
+        base = {"type": "ntfy", "enabled": True, "topic": "timelapse"}
+        base.update(sink or {})
+        enc.notify({"notify": [base]}, title, description, level, list(fields))
+
+    def test_it_posts_json_to_the_server_root(self):
+        """Not text to /topic, deliberately: that form carries the title in an
+        HTTP header, headers are ASCII, and every title here starts with an
+        emoji."""
+        self.send(title="✅ Timelapse")
+        self.assertEqual(self.url(), "https://ntfy.sh")
+        self.assertEqual(self.body()["topic"], "timelapse")
+        self.assertEqual(self.body()["title"], "✅ Timelapse")
+
+    def test_a_self_hosted_server_is_honoured(self):
+        self.send({"server": "https://ntfy.example.lan/"})
+        self.assertEqual(self.url(), "https://ntfy.example.lan")
+
+    def test_the_message_carries_the_summary_and_the_fields(self):
+        self.send(description="TABLE HERE", fields=[("Encoder", "AV1")])
+        msg = self.body()["message"]
+        self.assertIn("TABLE HERE", msg)
+        self.assertIn("Encoder: AV1", msg)
+
+    def test_severity_becomes_priority(self):
+        for level, priority in (("ok", 3), ("info", 2), ("warn", 4),
+                                ("error", 5)):
+            self.sent.clear()
+            self.send(level=level)
+            self.assertEqual(self.body()["priority"], priority, level)
+
+    def test_a_configured_priority_wins(self):
+        self.send({"priority": 1}, level="error")
+        self.assertEqual(self.body()["priority"], 1)
+
+    def test_a_token_becomes_a_bearer_header(self):
+        self.send({"token": "tk_secret"})
+        self.assertEqual(self.sent[0].get_header("Authorization"),
+                         "Bearer tk_secret")
+
+    def test_no_token_means_no_authorization_header(self):
+        self.send()
+        self.assertIsNone(self.sent[0].get_header("Authorization"))
+
+    def test_tags_are_split_on_commas(self):
+        self.send({"tags": "camera, night"})
+        self.assertEqual(self.body()["tags"], ["camera", "night"])
+
+    def test_no_topic_is_a_configuration_error_not_a_crash(self):
+        with self.assertLogs("encode", level="WARNING") as cm:
+            self.send({"topic": ""})
+        self.assertIn("topic", "\n".join(cm.output))
+        self.assertEqual(self.sent, [])
+
+    def test_it_does_not_claim_to_be_a_discord_bot(self):
+        self.send()
+        agent = self.sent[0].get_header("User-agent")
+        self.assertIn("timelapse-maker", agent)
+        self.assertNotIn("DiscordBot", agent)
+
+    def test_a_long_message_is_trimmed(self):
+        self.send(description="x" * 6000)
+        self.assertLessEqual(len(self.body()["message"]), enc.NTFY_LIMIT)
+
+
+class TestTelegramSink(SinkHarness):
+
+    def send(self, sink=None, title="Title", description="body", fields=()):
+        base = {"type": "telegram", "enabled": True,
+                "token": "123:ABC", "chat_id": "-100200"}
+        base.update(sink or {})
+        enc.notify({"notify": [base]}, title, description, "ok", list(fields))
+
+    def test_it_calls_sendmessage_with_the_bot_token_in_the_path(self):
+        self.send()
+        self.assertEqual(self.url(),
+                         "https://api.telegram.org/bot123:ABC/sendMessage")
+        self.assertEqual(self.body()["chat_id"], "-100200")
+
+    def test_the_table_is_wrapped_in_pre_so_it_stays_monospace(self):
+        """A proportional font turns the summary table into rubble, which is
+        the whole reason this uses HTML rather than plain text."""
+        self.send(description="Camera  St  Frames")
+        text = self.body()["text"]
+        self.assertIn("<pre>", text)
+        self.assertIn("Camera  St  Frames", text)
+        self.assertEqual(self.body()["parse_mode"], "HTML")
+
+    def test_html_special_characters_are_escaped(self):
+        # An unescaped < is a 400 from the API, not a wrong-looking message.
+        self.send(title="A & B", description="1 < 2 > 0 & <b>x</b>")
+        text = self.body()["text"]
+        self.assertIn("A &amp; B", text)
+        self.assertIn("1 &lt; 2 &gt; 0 &amp; &lt;b&gt;x&lt;/b&gt;", text)
+
+    def test_the_title_is_bold_and_outside_the_pre_block(self):
+        self.send(title="Timelapse")
+        self.assertTrue(self.body()["text"].startswith("<b>Timelapse</b>"))
+
+    def test_fields_are_included(self):
+        self.send(fields=[("Transfer", "OK")])
+        self.assertIn("Transfer: OK", self.body()["text"])
+
+    def test_it_is_trimmed_to_telegrams_limit(self):
+        self.send(description="x" * 9000)
+        self.assertLessEqual(len(self.body()["text"]), enc.TELEGRAM_LIMIT)
+
+    def test_link_previews_are_off(self):
+        self.send()
+        self.assertTrue(self.body()["disable_web_page_preview"])
+
+    def test_missing_credentials_are_a_configuration_error(self):
+        for sink in ({"token": ""}, {"chat_id": ""}):
+            self.sent.clear()
+            with self.assertLogs("encode", level="WARNING") as cm:
+                self.send(sink)
+            self.assertIn("chat_id", "\n".join(cm.output))
+            self.assertEqual(self.sent, [])
+
+    def test_it_does_not_claim_to_be_a_discord_bot(self):
+        self.send()
+        self.assertNotIn("DiscordBot", self.sent[0].get_header("User-agent"))
+
+
+class TestSinkCredentialsAreRedacted(unittest.TestCase):
+    """Three new places a credential can now sit in the config.
+
+    `timelapse config --redacted` exists to be pasted into a bug report, and
+    the existing key rules happen to cover all of these. "Happen to" is why
+    this is pinned: the next sink type may not be so lucky.
+    """
+
+    def redact(self, sink):
+        return enc.redact_config({"notify": [sink]})["notify"][0]
+
+    def test_a_telegram_bot_token_is_masked(self):
+        # Whoever holds it controls the bot.
+        got = self.redact({"type": "telegram", "token": "123456:SECRET",
+                           "chat_id": "-100"})
+        self.assertEqual(got["token"], enc.MASK)
+        self.assertEqual(got["chat_id"], "-100")   # not a secret, and useful
+
+    def test_an_ntfy_token_is_masked(self):
+        got = self.redact({"type": "ntfy", "topic": "t", "token": "tk_SECRET"})
+        self.assertEqual(got["token"], enc.MASK)
+        self.assertEqual(got["topic"], "t")
+
+    def test_a_discord_webhook_keeps_its_id_and_loses_its_secret(self):
+        got = self.redact({"type": "discord",
+                           "webhook_url": "https://discord.com/api/webhooks/17/SECRET"})
+        self.assertIn("17", got["webhook_url"])
+        self.assertNotIn("SECRET", got["webhook_url"])
+
+    def test_an_empty_token_stays_empty(self):
+        # "" answers "did you set one?", which is what a bug report needs.
+        self.assertEqual(self.redact({"type": "ntfy", "token": ""})["token"], "")
+
+
 class TestStateDir(unittest.TestCase):
 
     def test_the_configured_directory_wins(self):
@@ -1434,11 +1767,11 @@ class TestRunRecord(unittest.TestCase):
                          [enc.ENCODE_STATE])
 
     def test_main_records_before_it_notifies(self):
-        """Discord is the part that can be disabled or unreachable; the local
-        record of what happened must not depend on it."""
+        """A notification sink is the part that can be disabled, unreachable
+        or rate-limited; the local record must not depend on it."""
         source = inspect.getsource(enc.main)
         self.assertLess(source.index("write_run_state"),
-                        source.index("send_discord"))
+                        source.index("notify("))
 
     def test_main_records_on_every_exit_path(self):
         # Nothing to do, ordinary completion, and the critical-failure handler.

@@ -188,7 +188,8 @@ default in brackets; Enter accepts it.
 
 It then covers ffmpeg paths (probing for NVENC and telling you which encoder you
 will actually get), the capture interval, a disk budget for your camera count,
-the low-space threshold, cameras, transfer, Discord and the optional web UI.
+the low-space threshold, cameras, transfer, notifications and the optional
+web UI.
 
 Two things it does that are easy to get wrong by hand:
 
@@ -391,6 +392,42 @@ write read-only.
 Set `transfer.enabled` to `false` to keep videos on the local disk. Note that
 nothing then prunes `video_output`; add your own retention if you do this.
 
+## 6a. Notifications
+
+One summary per nightly run: what encoded, coverage, size, failures, and
+whether the transfer worked. It goes to as many places as you like, or
+nowhere, which is the default.
+
+```bash
+sudo timelapse notify
+```
+
+| Sink | What you need | Notes |
+|---|---|---|
+| **Discord** | A webhook URL from Channel Settings → Integrations | The summary arrives as an embed with a monospace table. |
+| **ntfy** | A topic name, and a server if you self-host | No account needed on `ntfy.sh`. Subscribe in the app or at `https://ntfy.sh/<topic>`. **On the public server the topic name is the only secret there is**, so pick one nobody would guess. An access token is supported for servers that require one. |
+| **Telegram** | A bot token from `@BotFather` and a chat id | Message your bot once before testing: a bot cannot open a conversation with you. For a group, add the bot and use the group's id, which starts with `-100`. |
+
+Each one is offered a test message as you configure it, and `timelapse test`
+sends one to every configured sink. It skips a sink the wizard verified in the
+last few minutes, so an install does not put two identical messages in your
+channel seconds apart; `timelapse test --force-notify` sends anyway.
+
+A failing sink can never fail the run it is reporting on, and one sink being
+down does not stop the others. Failures are logged and the encode's exit
+status is unaffected.
+
+**If you configured Discord before 0.1.6**, nothing changes and there is
+nothing to do: the old `discord` block in `config.json` still works exactly as
+it did. The moment you run `timelapse notify`, the settings move into a
+`notify` list that can hold several sinks, and the old block is switched off so
+it cannot look configured while being ignored.
+
+Notification credentials are masked by `timelapse config --redacted`: the bot
+token, the ntfy token and the secret half of a Discord webhook URL. The chat
+id, the topic and the webhook's numeric id survive, because they are what a
+fault report is about.
+
 ## 7. Sizing
 
 At a 5s interval: **17,280 frames/camera/day** → 4:48 of video at 60fps.
@@ -417,13 +454,14 @@ of it; nothing needs a reinstall.
 | `timelapse status` | `systemctl status` for all four units in one shot: capture, the encode timer **and the encode service**, and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
 | `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
-| `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and Discord. Run it after any change. |
+| `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and every notification sink. Run it after any change. |
 | `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. A menu with no options; `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` go straight to one. §9. |
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
+| `timelapse notify` | Where the nightly summary goes: a Discord webhook, ntfy, Telegram, any combination of them, or none. Offers a test message for each. Needs no restart, because the encode job reads the config when it runs. §6a. |
 | `timelapse web` | Turn the read-only web UI on or off and set its address, port, library path and whether it asks for a login. §11. |
 | `timelapse password` | Set or change the web UI's login, and nothing else: a username, a password twice, and a restart. Never asks for the old one, because this already needs root. §11. |
 | `timelapse web-serve` | Run the web UI in the foreground for a look at its log. The service normally does this. |
-| `timelapse setup` | The full wizard again: storage, capture settings, cameras, transfer, Discord. Overwrites the whole config, so prefer `cameras` or `transfer` for a single change. |
+| `timelapse setup` | The full wizard again: storage, capture settings, cameras, transfer, notifications. Overwrites the whole config, so prefer `cameras`, `transfer` or `notify` for a single change. |
 | `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover, such as the encoder's container and quality. A backup is taken first, and the file's `0640 root:timelapse` is restored afterwards whatever your editor did to it. You are then responsible for restarting capture yourself. |
 | `timelapse config --redacted` | Prints the config with the passwords masked, for pasting into a bug report. Opens no editor and changes nothing. See below. |
 | `timelapse restore` | Put back an earlier config. One is kept before every change, five deep. §10. |

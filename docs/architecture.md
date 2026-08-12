@@ -295,7 +295,7 @@ Pipeline, in `main()`:
    critical-failure handler, because a status page that cannot tell "the timer
    fired and there was nothing to do" from "the timer never fired" is not
    answering the question.
-7. `send_discord()` → embed with a monospace summary table plus fields.
+7. `notify()` → one summary to every configured sink.
 8. Exit `0` all-good, `1` partial failure, `2` critical.
 
 **`encode_day()`** is the core. Notable choices:
@@ -350,16 +350,51 @@ failure must not turn a successful encode into a critical abort**, because the
 encode result and the Discord summary are still valid and the videos are still
 on disk. This was a real bug found in testing.
 
-**`send_discord()`** uses `urllib` only, no dependency. Posts through
-`post_webhook()`, which sets an explicit `User-Agent`. This is not cosmetic:
-Discord is behind Cloudflare, which rejects urllib's default
-`Python-urllib/3.x` with **HTTP 403, Cloudflare error 1010**, before the
-request reaches Discord at all. With the documented
-`DiscordBot ($url, $version)` form the same request reaches the API. Truncates
-to Discord's limits (4096 description, 1024 per field value, 25 fields). Failure is logged and
-swallowed, catching `Exception` deliberately: a socket timeout is not a
-`URLError`, and notification is never load-bearing, least of all in the
-critical-failure handler, where an exception would mask the original error.
+**`notify()`** delivers one summary to any number of sinks: `discord`, `ntfy`
+and `telegram` at 0.1.6, from a `notify` list in the config. `urllib` only, no
+dependency. Everything goes through `post_webhook()`, which sets an explicit
+`User-Agent`. This is not cosmetic: Discord is behind Cloudflare, which rejects
+urllib's default `Python-urllib/3.x` with **HTTP 403, Cloudflare error 1010**,
+before the request reaches Discord at all. With the documented
+`DiscordBot ($url, $version)` form the same request reaches the API. The other
+sinks send a project agent instead, because claiming to be a Discord bot to
+somebody's ntfy server is a lie that would eventually cost an afternoon.
+
+Each sink is wrapped separately, catching `Exception` deliberately: a socket
+timeout is not a `URLError`, one sink being down must not stop the next, and
+notification is never load-bearing, least of all in the critical-failure
+handler where an exception would mask the original error. `notify()` returns
+`(sent, failed)` for callers that want to report it; the run's exit status
+never depends on either.
+
+Three things the sinks do not share, and each is a trap in its own right:
+
+- **Limits.** Discord takes 4096 for a description, 1024 per field and 25
+  fields; Telegram takes 4096 for the entire message; ntfy's default is around
+  4KB. `clip()` trims and *says* it trimmed, the same lesson as the release
+  notes at 0.1.0: text that stops without saying so reads as this program
+  having lost the rest.
+- **ntfy is sent as JSON to the server root**, not as text to `/topic`. The
+  other form carries the title in an HTTP *header*, headers are ASCII, and
+  every title this program sends begins with an emoji.
+- **Telegram is sent as HTML, not MarkdownV2.** The summary is a monospace
+  table, and a proportional font turns it into rubble, so it has to be wrapped
+  in `<pre>`. MarkdownV2 would mean escaping fourteen characters correctly
+  everywhere, including inside camera names, where a miss is a 400 rather than
+  a message that merely looks wrong. HTML mode needs three: `&`, `<`, `>`.
+
+**Severity, not colour.** Call sites pass `"ok"`, `"info"`, `"warn"` or
+`"error"`; each sink maps that to its own vocabulary (a Discord embed colour,
+an ntfy priority, nothing at all for Telegram). They used to pass a hex colour,
+which meant a Discord concept travelling through code with no business knowing
+what Discord is.
+
+**The legacy `discord` block still works and is still read.** Every config
+written before 0.1.6 has one, upgrades keep the existing config, and
+`notify_sinks()` falls back to it when no `notify` list is present. When both
+exist the list wins and the old block is logged as ignored, because a webhook
+that looks configured and never fires is worse than one that is plainly off;
+the wizard turns it off when it writes the list, for the same reason.
 
 **`build_summary()`** writes the table inside that embed, and **the embed is
 narrower than a message**. Roughly 50 columns survive; past that Discord wraps,
@@ -387,7 +422,7 @@ logic cannot drift between the two).
 | `test_encoders` | ffmpeg built without NVENC |
 | `test_disk` | projects daily usage from *measured* snapshot sizes against actual free space |
 | `test_transfer` | unmounted CIFS path, missing SSH key |
-| `test_discord` | bad webhook URL |
+| `test_notify` | a bad webhook URL, a wrong ntfy topic, a Telegram bot nobody has messaged. It sends through the encoder's own `notify()`, so what is proven is the request the nightly run will make; a pre-flight that builds its own payload is how a check passes while the thing it checks is broken |
 
 It also hosts `--usage` (`timelapse usage`), which is a report rather than a
 check but belongs to the same "inspect this installation" job and reuses
@@ -1401,6 +1436,17 @@ take an optional path as their first positional argument. See
 | `rsync_args` | Defaults include `--remove-source-files`; if you drop that, set `delete_local_after_transfer` accordingly or files accumulate. On a CIFS mount `-a` may exit 23 because owner/group cannot be set; the wizard measures which flags your share accepts and writes those. |
 | `require_mountpoint` | `false` (default), `true`, or an explicit mount path. Refuses to transfer when the destination is not on a mounted filesystem. Only meaningful for a local destination; ignored for a remote spec. |
 
+### `notify`
+A list, not a block. Each entry has a `type` and an `enabled`, plus its own
+keys: `webhook_url` and `username` for `discord`; `server`, `topic`, optional
+`token`, `priority` and `tags` for `ntfy`; `token` and `chat_id` for
+`telegram`. An entry with no `type` is a Discord webhook, which is what the
+legacy block becomes when the wizard moves it.
+
+Absent from every config written before 0.1.6, and the fallback is the old
+top-level `discord` block rather than "no notifications". When this list is
+present it is authoritative and that block is ignored.
+
 ### `web`
 Optional; absent from configs written before the feature existed, so every key
 is read with `.get(key, default)`.
@@ -1462,9 +1508,12 @@ resolution and quality would follow the same shape. The camera dict is passed
 whole to the thread constructor, so it is `cam.get(key) or <global>` and
 nothing structural.
 
-**Different notification sink**: `send_discord()` is the only
-outbound-notification function and takes `(title, description, color, fields)`.
-Add a sibling and call both from `main()`; keep failures swallowed.
+**Another notification sink**: add a function taking
+`(sink, title, description, level, fields)` and register it in `SINKS`. The
+dispatch, the per-sink error isolation and the config plumbing are already
+there. What is not automatic is the wizard: a sink type the wizard cannot
+configure is one nobody finds, so `choose_notify()` needs a section too, and
+`sink_identity()` needs to know what makes two of them different.
 
 **Camera restart on hang**: natural home is a new module invoked by the capture
 daemon's failure path, gated on consecutive-failure count, with a cooldown so it
@@ -1512,7 +1561,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,058 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,118 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1790,11 +1839,11 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 788 lines
+install.sh                       bootstrap installer, 795 lines
 scripts/timelapse_capture.py     daemon, 877 lines
-scripts/timelapse_encode.py      batch job, 1335 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 807 lines
-scripts/timelapse_setup.py       configuration wizard, 2969 lines
+scripts/timelapse_encode.py      batch job, 1518 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 830 lines
+scripts/timelapse_setup.py       configuration wizard, 3166 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_web.py         read-only web UI, 3114 lines
 tests/_support.py                path setup and fakes
@@ -1816,6 +1865,19 @@ docs/install.md                  operator guide
 docs/future-features.md          planned work, in build order
 docs/decided-against.md          considered and refused, and why
 ```
+
+**The Python floor is 3.9 and is a deliberate, machine-checked property**, not
+an accident of when this was written. RHEL 9 and its rebuilds ship 3.9 as the
+system `python3` and are supported to 2032, and, more to the point, that is the
+interpreter their packaged `python3-requests` is built for: pointing the units
+at a newer AppStream python would mean pip and a venv on one distro family, in
+exchange for syntax this project does not need. It costs nothing to hold, since
+stdlib-only with no type hints avoids nearly everything 3.10+ added, and it is
+enforced rather than asserted by the CI 3.9 leg and by `tests/test_grammar.py`.
+Debian 11 was the other justification and its LTS ends in August 2026, so the
+floor now rests on RHEL 9 alone; revisit it if that stops mattering, if anyone
+reports friction it actually causes, or if it ever stops being machine-checked,
+because it is only cheap while it is automatic.
 
 Dependencies: Python 3.9+ stdlib, `requests`, `ffmpeg`/`ffprobe` (NVENC for
 AV1/HEVC), `rsync`. No virtualenv required, one pip package, no database. The

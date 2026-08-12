@@ -46,8 +46,30 @@
     "delete_local_after_transfer": true,
     "require_mountpoint": false
   },
+  "_comment_notify": "Optional nightly summary, to any number of sinks. Configure with 'sudo timelapse notify'. Types: discord (webhook_url), ntfy (server, topic, optional token), telegram (token, chat_id). The older top-level 'discord' block still works and is used when this list is absent, so configs written before 0.1.6 need no edit; when this list exists, that block is ignored.",
+  "notify": [
+    {
+      "type": "discord",
+      "enabled": false,
+      "webhook_url": "",
+      "username": "Timelapse Bot"
+    },
+    {
+      "type": "ntfy",
+      "enabled": false,
+      "server": "https://ntfy.sh",
+      "topic": "",
+      "token": ""
+    },
+    {
+      "type": "telegram",
+      "enabled": false,
+      "token": "",
+      "chat_id": ""
+    }
+  ],
   "discord": {
-    "_comment": "Optional nightly summary. Leave webhook_url empty to disable.",
+    "_comment": "Legacy, kept for configs written before 0.1.6. Ignored when 'notify' above is present.",
     "enabled": false,
     "webhook_url": "",
     "username": "Timelapse Bot"

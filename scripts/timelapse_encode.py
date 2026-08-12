@@ -1017,48 +1017,231 @@ def transfer(cfg, dry_run):
 
 
 # ----------------------------------------------------------------------------
-# Discord
+# Notifications
+#
+# One nightly summary, delivered to any number of sinks. The transport is the
+# same POST for all of them; what differs is the payload shape and the limits.
+#
+# Every sink obeys two rules that are not negotiable. **A failed notification
+# must never fail the run it is reporting on**, so each is wrapped
+# individually and one sink being down cannot stop the next. And **an explicit
+# User-Agent, always**: Discord sits behind Cloudflare, which answers urllib's
+# default "Python-urllib/3.x" with a 403 before the request ever reaches the
+# webhook. GitHub refuses one outright in `timelapse_update.py`. Assume any
+# service will.
 # ----------------------------------------------------------------------------
 
-# Discord sits behind Cloudflare, which rejects urllib's default
-# "Python-urllib/3.x" User-Agent with HTTP 403 before the request ever reaches
-# the webhook. This is the format Discord documents for API clients.
+# The format Discord documents for API clients. Discord only; sending this to
+# ntfy or Telegram would be claiming to be something we are not.
 USER_AGENT = ("DiscordBot (https://github.com/war4peace/timelapse-maker, "
               f"{__version__})")
 
+PROJECT_AGENT = f"timelapse-maker/{__version__} (+https://github.com/war4peace/timelapse-maker)"
 
-def post_webhook(url, payload, timeout=20):
-    """POST a JSON payload to a webhook. Raises on transport or HTTP error."""
+# Severity, chosen at the call site, translated per sink. The call sites used
+# to pass a Discord colour, which meant a Discord concept travelled through
+# code that had no business knowing about Discord.
+LEVEL_COLOR = {"ok": 0x2ECC71, "info": 0x95A5A6,
+               "warn": 0xF1C40F, "error": 0xE74C3C}
+# ntfy's 1-5 scale. A summary nobody needs to act on should not buzz a phone
+# the same way a failed run does.
+LEVEL_PRIORITY = {"ok": 3, "info": 2, "warn": 4, "error": 5}
+
+DISCORD_DESC_LIMIT = 4000
+DISCORD_FIELD_LIMIT = 1024
+TELEGRAM_LIMIT = 4096
+NTFY_LIMIT = 4000
+
+
+def post_webhook(url, payload, timeout=20, headers=None, agent=USER_AGENT):
+    """POST a JSON payload. Raises on transport or HTTP error.
+
+    Kept exactly this callable because the wizard and the pre-flight both
+    import it to send their test messages.
+    """
+    head = {"Content-Type": "application/json", "User-Agent": agent}
+    head.update(headers or {})
     req = urlrequest.Request(
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/json",
-                 "User-Agent": USER_AGENT})
+        headers=head)
     with urlrequest.urlopen(req, timeout=timeout) as resp:
         return resp.status, resp.read()
 
 
-def send_discord(cfg, title, description, color, fields):
-    d = cfg.get("discord", {})
-    if not d.get("enabled") or not d.get("webhook_url"):
-        log.info("Discord disabled or no webhook set; skipping notification.")
-        return
-    payload = {
-        "username": d.get("username", "Timelapse Bot"),
+def clip(text, limit):
+    """Trim to a limit and say so, rather than slicing mid-sentence.
+
+    Same lesson as the release notes at 0.1.0: text that stops without saying
+    it stopped reads as this program having lost the rest.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit - 20].rstrip() + "\n... (truncated)"
+
+
+def notify_sinks(cfg):
+    """Every configured sink, newest config shape first.
+
+    `notify` is a list of sinks and is authoritative when present. The legacy
+    `discord` block is what every config written before 0.1.6 has, and it goes
+    on working untouched: upgrades keep the existing config, so a key read any
+    other way would break every install that has one.
+    """
+    sinks = cfg.get("notify")
+    if isinstance(sinks, list) and sinks:
+        if cfg.get("discord", {}).get("enabled"):
+            # Quietly, and once: an operator who hand-edits the old block
+            # after the wizard has written the new one deserves to find out
+            # here rather than by wondering why nothing arrived.
+            log.info("Using the 'notify' sinks; the legacy 'discord' block is "
+                     "ignored while it is present.")
+        return [s for s in sinks if isinstance(s, dict) and s.get("enabled")]
+
+    legacy = cfg.get("discord", {})
+    if legacy.get("enabled") and legacy.get("webhook_url"):
+        return [dict(legacy, type="discord")]
+    return []
+
+
+def discord_payload(sink, title, description, level, fields):
+    return {
+        "username": sink.get("username", "Timelapse Bot"),
         "embeds": [{
             "title": title,
-            "description": description[:4000],
-            "color": color,
-            "fields": [{"name": n, "value": (v or "-")[:1024], "inline": False}
+            "description": clip(description, DISCORD_DESC_LIMIT),
+            "color": LEVEL_COLOR.get(level, LEVEL_COLOR["info"]),
+            "fields": [{"name": n,
+                        "value": clip(v or "-", DISCORD_FIELD_LIMIT),
+                        "inline": False}
                        for n, v in fields][:25],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }],
     }
-    try:
-        post_webhook(d["webhook_url"], payload)
-    except Exception as exc:
-        # Deliberately broad: a socket timeout is not a URLError, and a failed
-        # notification must never take down the run that it is reporting on.
-        log.warning("Discord notification failed: %s", exc)
+
+
+def plain_text(title, description, fields):
+    """The summary as one block of text, for sinks with no embed concept."""
+    parts = [title, ""]
+    if description:
+        parts.append(description)
+    for name, value in fields:
+        parts.append(f"\n{name}: {value or '-'}")
+    return "\n".join(parts).strip()
+
+
+def send_discord_sink(sink, title, description, level, fields):
+    url = sink.get("webhook_url", "")
+    if not url:
+        raise ValueError("no webhook_url configured")
+    post_webhook(url, discord_payload(sink, title, description, level, fields))
+
+
+def send_ntfy(sink, title, description, level, fields):
+    """ntfy.sh or a self-hosted ntfy server.
+
+    JSON to the server root rather than text to /topic, deliberately: the
+    other form carries the title in an HTTP *header*, headers are ASCII, and
+    every title this program sends starts with an emoji.
+    """
+    server = (sink.get("server") or "https://ntfy.sh").rstrip("/")
+    topic = (sink.get("topic") or "").strip().lstrip("/")
+    if not topic:
+        raise ValueError("no topic configured")
+    body = {
+        "topic": topic,
+        "title": clip(title, 250),
+        "message": clip(plain_text("", description, fields), NTFY_LIMIT),
+        "priority": int(sink.get("priority")
+                        or LEVEL_PRIORITY.get(level, 3)),
+    }
+    if sink.get("tags"):
+        body["tags"] = [t.strip() for t in str(sink["tags"]).split(",")
+                        if t.strip()]
+    headers = {}
+    token = (sink.get("token") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    post_webhook(server, body, headers=headers, agent=PROJECT_AGENT)
+
+
+def telegram_escape(text):
+    """Telegram HTML mode understands exactly these three."""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;") \
+                       .replace(">", "&gt;")
+
+
+def send_telegram(sink, title, description, level, fields):
+    """Telegram Bot API sendMessage.
+
+    HTML rather than MarkdownV2: the summary is a monospace table, and a
+    proportional font turns it into rubble, so it has to be wrapped in
+    something. MarkdownV2 would mean escaping fourteen characters correctly
+    everywhere, including inside camera names, where getting it wrong is a 400
+    rather than a wrong-looking message.
+    """
+    token = (sink.get("token") or "").strip()
+    chat = str(sink.get("chat_id") or "").strip()
+    if not token or not chat:
+        raise ValueError("token and chat_id are both required")
+    body = telegram_escape(plain_text("", description, fields))
+    text = f"<b>{telegram_escape(title)}</b>\n<pre>{body}</pre>"
+    post_webhook(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        {"chat_id": chat, "text": clip(text, TELEGRAM_LIMIT),
+         "parse_mode": "HTML", "disable_web_page_preview": True},
+        agent=PROJECT_AGENT)
+
+
+SINKS = {
+    "discord": send_discord_sink,
+    "ntfy": send_ntfy,
+    "telegram": send_telegram,
+}
+
+
+def notify(cfg, title, description, level, fields):
+    """Deliver one summary to every configured sink.
+
+    Returns (sent, failed) counts, for the caller that wants to log them; the
+    run's own exit status never depends on either.
+    """
+    sinks = notify_sinks(cfg)
+    if not sinks:
+        log.info("No notification sinks configured; skipping.")
+        return 0, 0
+
+    sent = failed = 0
+    for sink in sinks:
+        kind = (sink.get("type") or "discord").lower()
+        handler = SINKS.get(kind)
+        if handler is None:
+            log.warning("Unknown notification type %r; skipping it. "
+                        "Known types: %s", kind, ", ".join(sorted(SINKS)))
+            failed += 1
+            continue
+        try:
+            handler(sink, title, description, level, fields)
+            sent += 1
+            log.info("Notified %s.", kind)
+        except Exception as exc:
+            # Deliberately broad, and deliberately per sink: a socket timeout
+            # is not a URLError, one sink being down must not stop the next,
+            # and none of it may take down the run being reported on.
+            failed += 1
+            log.warning("%s notification failed: %s", kind, exc)
+    return sent, failed
+
+
+def send_discord(cfg, title, description, color, fields):
+    """Backwards-compatible shim: colour in, level out.
+
+    Nothing in this project calls it any more. It stays because it was the
+    only notification entry point for six releases, and a fork or a local
+    patch may still use it.
+    """
+    level = next((k for k, v in LEVEL_COLOR.items() if v == color), "info")
+    return notify(cfg, title, description, level, fields)
 
 
 NAME_COL = 12
@@ -1245,13 +1428,13 @@ def main():
             # "None found" and "all of them are already done" look identical
             # from here and are very different things to read at breakfast,
             # so say which one it was.
-            send_discord(cfg,
-                         "Timelapse - nothing to do" if good
-                         else "⚠️ Timelapse - transfer failed",
-                         (f"{done} completed day folder(s) were already "
-                          f"encoded; nothing new." if done else
-                          "No completed day folders were found."),
-                         0x95A5A6 if good else 0xF1C40F, fields)
+            notify(cfg,
+                   "Timelapse - nothing to do" if good
+                   else "⚠️ Timelapse - transfer failed",
+                   (f"{done} completed day folder(s) were already "
+                    f"encoded; nothing new." if done else
+                    "No completed day folders were found."),
+                   "info" if good else "warn", fields)
             return 0 if good else 1
 
         log.info("Found %d job(s) across %d camera(s).", len(jobs), len(cameras))
@@ -1311,11 +1494,11 @@ def main():
         # what happened should not depend on any of that.
         write_run_state(cfg, run_record(run_start, encoder, results, xfer,
                                         interval))
-        send_discord(
+        notify(
             cfg,
             ("\u2705 " if all_good else "\u26a0\ufe0f ") + "Timelapse Generation",
             build_summary(results, interval),
-            0x2ECC71 if all_good else 0xF1C40F,
+            "ok" if all_good else "warn",
             fields)
         return 0 if all_good else 1
 
@@ -1323,9 +1506,9 @@ def main():
         log.exception("Critical failure")
         write_run_state(cfg, run_record(run_start, encoder, results, xfer,
                                         interval, error=str(exc)[:300]))
-        send_discord(cfg, "\u274c Timelapse - Critical Failure",
+        notify(cfg, "\u274c Timelapse - Critical Failure",
                      f"The run aborted before completing.\n```\n{exc}\n```",
-                     0xE74C3C,
+                     "error",
                      [("Host", platform.node()),
                       ("Run time", human_duration(time.time() - run_start))])
         return 2

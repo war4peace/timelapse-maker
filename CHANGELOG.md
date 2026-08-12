@@ -33,6 +33,25 @@ While the version is `0.x`, the configuration format may change in any release.
   directory is normally empty and every day would look unencoded again.
 
 ### Added
+- **The nightly summary can go to ntfy and Telegram, as well as Discord, and
+  to any combination of them at once.** Configure it with `sudo timelapse
+  notify`, which offers a test message for each; `timelapse test` then checks
+  every configured sink.
+
+  ntfy needs no account: pick a topic on `ntfy.sh` and subscribe to it, or
+  point it at your own server. Telegram needs a bot token from `@BotFather`
+  and a chat id. Neither sink can fail the run it is reporting on, and one
+  being down does not stop the others.
+
+  **Nothing changes if you use Discord.** The existing `discord` block in your
+  config keeps working exactly as it did, and is what gets used until you run
+  `timelapse notify`. Then it moves into a `notify` list that can hold several
+  sinks, and the old block is switched off rather than left to look configured
+  while being ignored.
+
+  Email was considered and left out deliberately: it is a different job with a
+  different failure mode (relays, SPF, spam folders), and the two sinks above
+  cover phone notifications without any of it.
 - **The web UI can now tell you whether your cameras are actually answering.**
   Two new panels on the Overview: one row per camera with the time its last
   frame landed, its cadence, its frame count and its failures; and what last

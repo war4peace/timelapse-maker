@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -704,34 +705,52 @@ def webhook_verified_age(config_path, url):
     return age if 0 <= age <= WEBHOOK_MARKER_TTL else 0
 
 
-def test_discord(cfg, config_path=None, force=False):
-    d = cfg.get("discord", {})
-    if not d.get("enabled") or not d.get("webhook_url"):
-        info("Discord disabled or no webhook configured")
+def test_notify(cfg, config_path=None, force=False):
+    """Send one test message per configured sink.
+
+    Through the encoder's own `notify()`, so what is exercised is the request
+    the nightly run will actually make. A pre-flight that proves a different
+    request is how a check comes to pass while the thing it checks is broken.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import notify, notify_sinks
+    from timelapse_setup import sink_identity
+
+    sinks = notify_sinks(cfg)
+    if not sinks:
+        info("No notification sinks configured")
         return
 
-    if not force and config_path:
-        age = webhook_verified_age(config_path, d["webhook_url"])
-        if age:
-            ok(f"Discord webhook verified during setup {int(age)}s ago")
-            info("not sending a second test message; --force-discord to re-send")
-            return
-    payload = {"username": d.get("username", "Timelapse Bot"),
-               "embeds": [{"title": "Timelapse pre-flight test",
-                           "description": "If you can read this, the webhook works.",
-                           "color": 0x3498DB}]}
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from timelapse_encode import post_webhook
-    try:
-        post_webhook(d["webhook_url"], payload)
-        ok("Discord webhook accepted the test message")
-    except Exception as exc:
-        bad(f"Discord webhook failed: {exc}")
-        if "403" in str(exc):
+    for sink in sinks:
+        kind = (sink.get("type") or "discord").lower()
+        if not force and config_path:
+            age = webhook_verified_age(config_path, sink_identity(sink))
+            if age:
+                ok(f"{kind} verified during setup {int(age)}s ago")
+                info("not sending a second test message; "
+                     "--force-notify to re-send")
+                continue
+        sent, _ = notify({"notify": [dict(sink, enabled=True)]},
+                         "Timelapse pre-flight test",
+                         "If you can read this, notifications work.",
+                         "info", [("Host", socket.gethostname())])
+        if sent:
+            ok(f"{kind} accepted the test message")
+            continue
+        bad(f"{kind} did not accept the test message")
+        if kind == "discord":
             info("403 usually means the webhook URL was deleted or regenerated;")
             info("check it in Discord under Channel Settings -> Integrations.")
-        elif "404" in str(exc):
-            info("404 means the webhook no longer exists at that URL.")
+        elif kind == "ntfy":
+            info("Check the topic, and the token if the server requires one.")
+        else:
+            info("Check the bot token and chat id, and that you have messaged")
+            info("the bot at least once: a bot cannot start the conversation.")
+
+
+def test_discord(cfg, config_path=None, force=False):
+    """Kept as the old name for anything that calls it."""
+    return test_notify(cfg, config_path, force)
 
 
 def main():
@@ -739,9 +758,13 @@ def main():
     ap.add_argument("config", nargs="?", default="/etc/timelapse/config.json")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("--camera", help="test only this camera")
-    ap.add_argument("--no-discord", action="store_true",
-                    help="skip the webhook check entirely")
-    ap.add_argument("--force-discord", action="store_true",
+    # The --*-discord spellings are kept as aliases: they are in the docs, in
+    # install.sh and in whatever anyone has scripted since 0.0.1.
+    ap.add_argument("--no-notify", "--no-discord", dest="no_notify",
+                    action="store_true",
+                    help="skip the notification check entirely")
+    ap.add_argument("--force-notify", "--force-discord", dest="force_notify",
+                    action="store_true",
                     help="send a test message even if setup just verified it")
     ap.add_argument("--probe-profiles", action="store_true",
                     help="for ONVIF snapshot URLs, compare Profile_1..4 resolutions")
@@ -796,9 +819,9 @@ def main():
     print("\n=== Transfer destination ===")
     test_transfer(cfg)
 
-    if not args.no_discord:
-        print("\n=== Discord ===")
-        test_discord(cfg, args.config, args.force_discord)
+    if not args.no_notify:
+        print("\n=== Notifications ===")
+        test_notify(cfg, args.config, args.force_notify)
 
     print(f"\nSample images: {OUT}\n")
 

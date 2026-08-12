@@ -2828,5 +2828,179 @@ class TestRedactedDump(unittest.TestCase):
         json.loads(out.getvalue())
 
 
+class TestChooseNotify(unittest.TestCase):
+    """The notification sinks, driven one section at a time.
+
+    Whole-wizard driving would renumber every keystroke here whenever a
+    question moves, which is why the login tests do the same thing.
+    """
+
+    def drive(self, func, keystrokes, cfg=None):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        # A list of answers is easier to read and to comment than one long
+        # string, and the prompts here are numerous enough to need it.
+        setup._TTY = FakeTTY("\n".join(list(keystrokes) + [""]), tty=False)
+        cfg = {"discord": {"enabled": False, "webhook_url": "",
+                           "username": "Timelapse Bot"}} if cfg is None else cfg
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                func(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return cfg, buf.getvalue()
+
+    def sink(self, cfg, kind):
+        return setup.existing_sink(cfg, kind)
+
+    # -- discord ------------------------------------------------------------
+
+    def test_declining_leaves_nothing_enabled(self):
+        cfg, _ = self.drive(setup.choose_discord_sink, ["n"])
+        self.assertFalse(self.sink(cfg, "discord").get("enabled"))
+
+    def test_a_webhook_becomes_a_sink(self):
+        cfg, _ = self.drive(setup.choose_discord_sink,
+                            ["y", "https://discord.com/api/webhooks/1/x", "n"])
+        sink = self.sink(cfg, "discord")
+        self.assertTrue(sink["enabled"])
+        self.assertEqual(sink["webhook_url"],
+                         "https://discord.com/api/webhooks/1/x")
+        self.assertEqual(sink["type"], "discord")
+
+    def test_an_existing_legacy_webhook_is_offered_as_the_default(self):
+        """Re-running this against a pre-0.1.6 config must not present a blank
+        prompt for a webhook that is already configured."""
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://old/x",
+                           "username": "Bot"}}
+        cfg, _ = self.drive(setup.choose_discord_sink, ["", "", "n"], cfg)
+        self.assertEqual(self.sink(cfg, "discord")["webhook_url"],
+                         "https://old/x")
+
+    # -- ntfy ---------------------------------------------------------------
+
+    def test_ntfy_defaults_to_the_public_server(self):
+        cfg, _ = self.drive(setup.choose_ntfy_sink,
+                            ["y", "", "mytopic", "", "n"])
+        sink = self.sink(cfg, "ntfy")
+        self.assertEqual(sink["server"], "https://ntfy.sh")
+        self.assertEqual(sink["topic"], "mytopic")
+        self.assertTrue(sink["enabled"])
+
+    def test_ntfy_says_a_public_topic_is_the_only_secret(self):
+        _, out = self.drive(setup.choose_ntfy_sink,
+                            ["y", "", "mytopic", "", "n"])
+        self.assertIn("only secret", out)
+
+    def test_a_self_hosted_ntfy_is_not_lectured_about_public_topics(self):
+        _, out = self.drive(setup.choose_ntfy_sink,
+                            ["y", "https://ntfy.lan", "t", "", "n"])
+        self.assertNotIn("only secret", out)
+
+    def test_an_ntfy_token_is_kept(self):
+        cfg, _ = self.drive(setup.choose_ntfy_sink,
+                            ["y", "", "t", "tk_abc", "n"])
+        self.assertEqual(self.sink(cfg, "ntfy")["token"], "tk_abc")
+
+    # -- telegram -----------------------------------------------------------
+
+    def test_telegram_needs_both_halves_to_be_enabled(self):
+        cfg, _ = self.drive(setup.choose_telegram_sink,
+                            ["y", "123:ABC", "", "n"])
+        self.assertFalse(self.sink(cfg, "telegram")["enabled"])
+
+    def test_telegram_with_both_halves(self):
+        cfg, _ = self.drive(setup.choose_telegram_sink,
+                            ["y", "123:ABC", "-100200", "n"])
+        sink = self.sink(cfg, "telegram")
+        self.assertEqual((sink["token"], sink["chat_id"]),
+                         ("123:ABC", "-100200"))
+        self.assertTrue(sink["enabled"])
+
+    def test_telegram_explains_where_the_token_comes_from(self):
+        _, out = self.drive(setup.choose_telegram_sink, ["n"])
+        self.assertIn("BotFather", out)
+
+    # -- the section as a whole ---------------------------------------------
+
+    def test_several_sinks_can_be_on_at_once(self):
+        cfg, _ = self.drive(
+            setup.choose_notify,
+            ["y", "https://d/x", "n",          # discord, no test message
+             "y", "", "topic", "", "n",        # ntfy
+             "y", "123:ABC", "-100", "n"])     # telegram
+        kinds = [(s.get("type"), s.get("enabled")) for s in cfg["notify"]]
+        self.assertEqual(kinds, [("discord", True), ("ntfy", True),
+                                 ("telegram", True)])
+
+    def test_the_legacy_block_is_turned_off_once_notify_exists(self):
+        """It is ignored while `notify` is present, so leaving it enabled
+        would be a webhook that looks configured and never fires."""
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://old/x",
+                           "username": "Bot"}}
+        cfg, _ = self.drive(setup.choose_notify,
+                            ["y", "https://new/x", "n", "n", "n"], cfg)
+        self.assertFalse(cfg["discord"]["enabled"])
+        self.assertEqual(cfg["discord"]["webhook_url"], "")
+        self.assertEqual(self.sink(cfg, "discord")["webhook_url"],
+                         "https://new/x")
+
+    def test_declining_everything_leaves_nothing_to_send_to(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import timelapse_encode as enc_mod
+        cfg, _ = self.drive(setup.choose_notify, ["n", "n", "n"])
+        self.assertEqual(enc_mod.notify_sinks(cfg), [])
+
+    def test_the_order_of_sinks_is_stable_across_runs(self):
+        # A list that reshuffles itself makes a config diff unreadable.
+        cfg, _ = self.drive(setup.choose_notify,
+                            ["y", "https://d/x", "n", "y", "", "t", "", "n",
+                             "n"])
+        first = [s.get("type") for s in cfg["notify"]]
+        cfg, _ = self.drive(setup.choose_notify,
+                            ["y", "", "n", "y", "", "", "", "n", "n"], cfg)
+        self.assertEqual([s.get("type") for s in cfg["notify"]], first)
+
+
+class TestSinkIdentity(unittest.TestCase):
+    """What the "already verified" marker hashes.
+
+    Every one of these strings is or contains a credential, which is why only
+    a digest of it is ever written to disk.
+    """
+
+    def test_each_type_has_its_own_identity(self):
+        seen = {
+            setup.sink_identity({"type": "discord",
+                                 "webhook_url": "https://d/x"}),
+            setup.sink_identity({"type": "ntfy", "server": "https://ntfy.sh",
+                                 "topic": "t"}),
+            setup.sink_identity({"type": "telegram", "token": "T",
+                                 "chat_id": "1"}),
+        }
+        self.assertEqual(len(seen), 3)
+
+    def test_changing_the_topic_changes_the_identity(self):
+        a = setup.sink_identity({"type": "ntfy", "topic": "one"})
+        b = setup.sink_identity({"type": "ntfy", "topic": "two"})
+        self.assertNotEqual(a, b)
+
+    def test_a_sink_with_no_type_is_a_discord_webhook(self):
+        self.assertEqual(setup.sink_identity({"webhook_url": "https://d/x"}),
+                         "https://d/x")
+
+    def test_only_a_digest_reaches_the_disk(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg_path = tmp / "config.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        setup.record_notify_verified(str(cfg_path),
+                                     {"type": "telegram", "token": "SECRET",
+                                      "chat_id": "1"})
+        written = (tmp / setup.WEBHOOK_MARKER).read_text(encoding="utf-8")
+        self.assertNotIn("SECRET", written)
+
+
 if __name__ == "__main__":
     unittest.main()

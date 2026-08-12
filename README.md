@@ -23,7 +23,7 @@
 Unattended daily timelapses from IP cameras. Pulls a full-resolution snapshot
 from each camera on a fixed interval, encodes each finished day into one video
 per camera overnight, and optionally ships the results to a NAS and posts a
-summary to Discord.
+nightly summary to Discord, ntfy or Telegram.
 
 It exists because NVR timelapse features are generally built around *clips*,
 not around one contiguous file per camera per day. Agent DVR, for instance, is
@@ -62,9 +62,10 @@ Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 | `timelapse logs` | Follow the capture journal live | |
 | `timelapse version` | What is installed, and whether the daemon is still running an older build | |
 | `timelapse usage` | Frames, bytes and date range per camera, and which folders nothing will ever encode | **sudo** |
-| `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord | **sudo** |
+| `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, notifications | **sudo** |
 | `timelapse cameras` | Add, edit, remove or disable a camera, set its own interval and frame rate, then restart capture. `-l` lists; `-a`, `-e:NAME`, `-x:NAME`, `-t:NAME`, `-r:NAME` skip the menu | **sudo** |
 | `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed | **sudo** |
+| `timelapse notify` | Where the nightly summary goes: Discord, ntfy, Telegram, any combination, with a test message for each | **sudo** |
 | `timelapse web` | Turn the read-only web UI on or off, set its address, library path and whether it asks for a login | **sudo** |
 | `timelapse password` | Set or change the web UI's login; `--disable` removes it. Never asks for the old one: this needs root, and root can read the config anyway | **sudo** |
 | `timelapse encode` | Run tonight's encode now | **sudo** |
@@ -138,7 +139,12 @@ so either can be stopped, replaced or rewritten without touching the other.
 ## Requirements
 
 - Linux with systemd (developed on Ubuntu Server; nothing is distro-specific)
-- Python 3.9+ and `requests`
+- **Python 3.9 or newer.** The floor is deliberate and machine-checked: RHEL 9
+  and its rebuilds ship 3.9 as the system `python3`, and that is the
+  interpreter their packaged `requests` is built for, so a newer one would mean
+  pip and a venv on one distro family for no gain. It costs this project
+  nothing to hold: stdlib only, no type hints, no compatibility shims, no
+  version-gated code. CI runs the suite on 3.9, 3.12 and 3.14.
 - `ffmpeg` / `ffprobe`, with NVENC if you want AV1 or HEVC hardware encoding
 - `rsync`, only if you enable transfer
 - Cameras exposing an HTTP snapshot URL (Dahua, Hikvision/ONVIF, Reolink and
