@@ -546,6 +546,11 @@ CAPTURE_STATE = "capture.json"
 ENCODE_STATE = "encode.json"
 STATE_VERSION = 1
 
+# Runs kept in encode.json. Two weeks is enough to see a pattern and small
+# enough that the file stays a few KB, which matters because the web UI reads
+# the whole thing on every page view.
+MAX_RUNS = 14
+
 
 def state_dir(cfg):
     """Where the daemons publish runtime state.
@@ -557,6 +562,103 @@ def state_dir(cfg):
     """
     return Path((cfg.get("paths", {}).get("state_dir") or "").strip()
                 or STATE_DIR_DEFAULT)
+
+
+def stamp(epoch):
+    """Epoch to a local ISO string, or None. None means "never", not "now"."""
+    if not epoch:
+        return None
+    return datetime.fromtimestamp(epoch).replace(microsecond=0).isoformat()
+
+
+def coverage_pct(result, interval):
+    """Frames as a percentage of a full day at the cadence this day ran at.
+
+    Shared by the Discord table and the run record so the two cannot disagree.
+    Using the *global* interval made a camera at one frame a minute read as 8%
+    every night, which is a full day of frames reported as a near-outage.
+    """
+    expected = int(86400 / (result.get("interval") or interval))
+    if not expected or not result.get("frames"):
+        return None
+    return round(100.0 * result["frames"] / expected, 1)
+
+
+def run_record(started, encoder, results, xfer, interval, error=""):
+    """One night's work, as facts. No verdict beyond what the run itself
+    already decided by its exit code.
+
+    `error` is set only by the critical-failure path, where the run aborted
+    before it could finish. An empty string there and no days at all is a run
+    that found nothing to do, which is an entirely different night.
+    """
+    finished = time.time()
+    return {
+        "started": stamp(started),
+        "finished": stamp(finished),
+        "seconds": round(finished - started, 1),
+        "encoder": (encoder or {}).get("name", ""),
+        "error": error,
+        "ok": sum(1 for r in results if r["status"] == "OK"),
+        "skipped": sum(1 for r in results if r["status"] == "SKIP"),
+        "failed": sum(1 for r in results if r["status"] == "FAIL"),
+        "bytes": sum(r["size"] for r in results),
+        "transfer": None if xfer is None else {
+            "ok": bool(xfer.get("ok")),
+            "moved": xfer.get("moved", 0),
+            "detail": xfer.get("detail", ""),
+        },
+        "days": [{
+            "camera": r["camera"],
+            "date": r["date"],
+            "status": r["status"],
+            "frames": r["frames"],
+            "bad": r["bad"],
+            "size": r["size"],
+            "seconds": round(r["seconds"], 1),
+            "interval": r.get("interval"),
+            "coverage": coverage_pct(r, interval),
+            "note": r["note"],
+        } for r in results],
+    }
+
+
+def write_run_state(cfg, record):
+    """Prepend one run to encode.json, keeping the newest MAX_RUNS. Never
+    raises: a run that encoded seven days successfully has not failed because
+    its history file could not be updated.
+
+    An unreadable or malformed history starts a new one rather than aborting.
+    The alternative loses tonight's record to protect a file that is already
+    damaged, which is the wrong way round.
+    """
+    path = state_dir(cfg) / ENCODE_STATE
+    runs = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            old = json.load(fh)
+        if isinstance(old, dict) and isinstance(old.get("runs"), list):
+            runs = old["runs"]
+    except (OSError, ValueError):
+        runs = []
+
+    now = time.time()
+    payload = {
+        "version": STATE_VERSION,
+        "kind": "encode",
+        "updated": stamp(now),
+        "updated_epoch": int(now),
+        "runs": ([record] + runs)[:MAX_RUNS],
+    }
+    try:
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        log.warning("could not update %s: %s", path, exc)
+        return False
 
 
 def camera_entry(cfg, name):
@@ -989,15 +1091,14 @@ def build_summary(results, interval):
         for r in results:
             if r["date"] != date:
                 continue
-            # Against the cadence this camera ran at. Using the global interval
-            # made a camera at one frame a minute read as 8% coverage every
-            # night, which is a full day of frames reported as a near-outage.
-            expected = int(86400 / (r.get("interval") or interval))
+            # Against the cadence this camera ran at, via the same helper the
+            # run record uses, so the table and the file cannot disagree.
+            cov = coverage_pct(r, interval)
             rows.append((
                 str(r["camera"])[:NAME_COL],
                 r["status"],
                 str(r["frames"] or "-"),
-                f"{100.0 * r['frames'] / expected:.0f}" if r["frames"] else "-",
+                f"{cov:.0f}" if cov is not None else "-",
                 human_size(r["size"]) if r["size"] else "-",
                 human_duration(r["seconds"])))
         widths = [max([len(h)] + [len(row[i]) for row in rows])
@@ -1101,6 +1202,11 @@ def main():
     log.info(" Timelapse encode run - %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     log.info("=" * 62)
 
+    # Bound before the try so the critical-failure path can still record what
+    # it got through. An aborted run is the single most useful thing a status
+    # page can show, and it is the one a crash would otherwise take with it.
+    encoder, results, xfer = None, [], None
+
     try:
         log.info("Encoder detection:")
         encoder = select_encoder(cfg["paths"]["ffmpeg"], cfg["encode"])
@@ -1131,6 +1237,11 @@ def main():
                                ("OK - %d file(s) moved" % xfer["moved"])
                                if xfer["ok"] else "FAILED - " + xfer["detail"]))
             good = xfer is None or xfer["ok"]
+            # Recorded even though nothing was encoded. "The timer fired at
+            # 00:05 and there was nothing to do" is an answer; a status page
+            # that cannot tell that from "the timer never fired" is not.
+            write_run_state(cfg, run_record(run_start, encoder, [], xfer,
+                                            interval))
             # "None found" and "all of them are already done" look identical
             # from here and are very different things to read at breakfast,
             # so say which one it was.
@@ -1195,6 +1306,11 @@ def main():
                 f"{r['camera']} {r['date']}: {r['note']}" for r in skipped)))
 
         all_good = not failed and (xfer is None or xfer["ok"])
+        # Before the notification, deliberately: Discord is the part that can
+        # be disabled, unreachable or rate-limited, and the local record of
+        # what happened should not depend on any of that.
+        write_run_state(cfg, run_record(run_start, encoder, results, xfer,
+                                        interval))
         send_discord(
             cfg,
             ("\u2705 " if all_good else "\u26a0\ufe0f ") + "Timelapse Generation",
@@ -1205,6 +1321,8 @@ def main():
 
     except Exception as exc:
         log.exception("Critical failure")
+        write_run_state(cfg, run_record(run_start, encoder, results, xfer,
+                                        interval, error=str(exc)[:300]))
         send_discord(cfg, "\u274c Timelapse - Critical Failure",
                      f"The run aborted before completing.\n```\n{exc}\n```",
                      0xE74C3C,

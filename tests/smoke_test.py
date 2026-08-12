@@ -90,7 +90,8 @@ def main():
 
     cfg = {
         "paths": {"frames_root": str(frames_root), "video_output": str(videos),
-                  "log_dir": str(tmp / "logs"), "ffmpeg": FFMPEG, "ffprobe": FFPROBE},
+                  "log_dir": str(tmp / "logs"), "state_dir": str(tmp / "state"),
+                  "ffmpeg": FFMPEG, "ffprobe": FFPROBE},
         "capture": {"interval_seconds": INTERVAL, "timeout_seconds": 4,
                     "min_bytes": 4096, "min_free_gb": 0},
         "encode": {"framerate": FPS, "container": "mkv", "gop": 60,
@@ -104,6 +105,8 @@ def main():
     }
     cfg_path = tmp / "config.json"
     cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    # The real installer makes this; the encoder must not have to.
+    (tmp / "state").mkdir()
 
     print("Running encoder...\n")
     proc = subprocess.run([sys.executable, str(ENCODE), str(cfg_path)],
@@ -140,6 +143,24 @@ def main():
     check("pixel format is yuv420p",
           ffprobe_field(out, "stream=pix_fmt") == "yuv420p")
     check("frames deleted after success", not day_dir.exists())
+
+    # The run record, from a real run rather than a constructed one. Coverage
+    # is the field worth checking here: it is arithmetic over the cadence the
+    # day ran at, and the unit tests can only feed it numbers.
+    state = tmp / "state" / "encode.json"
+    check("run recorded", state.is_file())
+    if state.is_file():
+        runs = json.loads(state.read_text(encoding="utf-8"))["runs"]
+        check("one run so far", len(runs) == 1, str(len(runs)))
+        day = runs[0]["days"][0] if runs and runs[0]["days"] else {}
+        check("the record names the day encoded",
+              day.get("date") == yesterday and day.get("camera") == "TestCam")
+        check("frame count matches the encode",
+              day.get("frames") == GOOD_FRAMES, str(day.get("frames")))
+        expected_cov = round(100.0 * GOOD_FRAMES / int(86400 / INTERVAL), 1)
+        check("coverage is against the day's own cadence",
+              day.get("coverage") == expected_cov,
+              f"{day.get('coverage')} vs {expected_cov}")
 
     return second_night(tmp, cfg, cfg_path, videos)
 
@@ -194,6 +215,17 @@ def second_night(tmp, cfg, cfg_path, videos):
         capture_output=True, text=True, timeout=900)
     check("--force encodes it again", forced.returncode == 0
           and out.stat().st_mtime_ns != stamp, f"rc={forced.returncode}")
+
+    # Four runs now: last night, this one, the re-run that did nothing, and
+    # the forced one. The third is the interesting one, because a run that
+    # legitimately encodes nothing still has to leave a trace, or a status page
+    # cannot tell it from a timer that never fired.
+    runs = json.loads((Path(cfg["paths"]["state_dir"]) / "encode.json")
+                      .read_text(encoding="utf-8"))["runs"]
+    check("every run is recorded, including the empty one",
+          len(runs) == 4, str(len(runs)))
+    check("the empty run recorded no days and no error",
+          len(runs) > 1 and runs[1]["days"] == [] and not runs[1]["error"])
 
     return finish(tmp)
 

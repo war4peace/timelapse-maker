@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -1310,6 +1311,138 @@ class TestStateDir(unittest.TestCase):
         self.assertEqual((enc.CAPTURE_STATE, enc.ENCODE_STATE),
                          ("capture.json", "encode.json"))
         self.assertEqual(enc.STATE_VERSION, 1)
+
+
+class TestRunRecord(unittest.TestCase):
+    """What the nightly job leaves behind for anything that wants to know.
+
+    The numbers all existed already: they were formatted into a Discord table
+    and thrown away, so a status page could say nothing about last night.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = {"paths": {"state_dir": str(self.tmp)}}
+        self.enc = {"name": "H.265 (hevc_nvenc)", "codec": "hevc_nvenc"}
+
+    def result(self, **kw):
+        base = {"camera": "Roof", "date": "2026-08-11", "status": "OK",
+                "frames": 17280, "bad": 0, "size": 1024, "seconds": 12.34,
+                "note": "", "interval": 5, "fps": 60}
+        base.update(kw)
+        return base
+
+    def read(self):
+        return json.loads((self.tmp / enc.ENCODE_STATE)
+                          .read_text(encoding="utf-8"))
+
+    def test_a_run_is_recorded_with_its_days(self):
+        enc.write_run_state(self.cfg, enc.run_record(
+            time.time() - 90, self.enc, [self.result()], None, 5))
+        got = self.read()
+        self.assertEqual(got["version"], enc.STATE_VERSION)
+        self.assertEqual(got["kind"], "encode")
+        run = got["runs"][0]
+        self.assertEqual(run["ok"], 1)
+        self.assertEqual(run["encoder"], "H.265 (hevc_nvenc)")
+        self.assertEqual(run["days"][0]["camera"], "Roof")
+        self.assertGreaterEqual(run["seconds"], 90)
+
+    def test_coverage_is_computed_against_the_cameras_own_cadence(self):
+        # A camera at one frame a minute is not at 8% because the global
+        # interval is 5s. This is the bug the Discord table already had.
+        run = enc.run_record(time.time(), self.enc,
+                             [self.result(frames=1440, interval=60)], None, 5)
+        self.assertEqual(run["days"][0]["coverage"], 100.0)
+
+    def test_coverage_matches_what_the_discord_table_says(self):
+        """One formula, two consumers. They used to be one formula in one
+        consumer, and the file would have been the copy that drifted."""
+        r = self.result(frames=8640, interval=5)
+        run = enc.run_record(time.time(), self.enc, [r], None, 5)
+        self.assertEqual(run["days"][0]["coverage"], 50.0)
+        self.assertIn("50", enc.build_summary([r], 5))
+
+    def test_a_day_with_no_frames_has_no_coverage_rather_than_zero(self):
+        run = enc.run_record(time.time(), self.enc,
+                             [self.result(status="SKIP", frames=0)], None, 5)
+        self.assertIsNone(run["days"][0]["coverage"])
+        self.assertEqual(run["skipped"], 1)
+
+    def test_the_transfer_outcome_is_carried(self):
+        run = enc.run_record(time.time(), self.enc, [self.result()],
+                             {"ok": False, "moved": 0, "detail": "exit 23"}, 5)
+        self.assertFalse(run["transfer"]["ok"])
+        self.assertEqual(run["transfer"]["detail"], "exit 23")
+
+    def test_no_transfer_is_null_not_a_failed_one(self):
+        # --no-transfer and "the transfer failed" must not look alike.
+        run = enc.run_record(time.time(), self.enc, [self.result()], None, 5)
+        self.assertIsNone(run["transfer"])
+
+    def test_a_run_that_found_nothing_is_still_a_run(self):
+        # Otherwise "the timer fired and there was nothing to do" is
+        # indistinguishable from "the timer never fired".
+        run = enc.run_record(time.time(), self.enc, [], None, 5)
+        self.assertEqual((run["ok"], run["failed"], run["days"]), (0, 0, []))
+        self.assertEqual(run["error"], "")
+
+    def test_an_aborted_run_carries_its_error(self):
+        run = enc.run_record(time.time(), None, [], None, 5,
+                             error="No usable encoder found")
+        self.assertIn("No usable encoder", run["error"])
+        self.assertEqual(run["encoder"], "")
+
+    def test_runs_accumulate_newest_first(self):
+        for n in range(3):
+            enc.write_run_state(self.cfg, enc.run_record(
+                time.time(), self.enc, [self.result(camera=f"C{n}")], None, 5))
+        cams = [r["days"][0]["camera"] for r in self.read()["runs"]]
+        self.assertEqual(cams, ["C2", "C1", "C0"])
+
+    def test_history_is_bounded(self):
+        for n in range(enc.MAX_RUNS + 5):
+            enc.write_run_state(self.cfg, enc.run_record(
+                time.time(), self.enc, [], None, 5))
+        self.assertEqual(len(self.read()["runs"]), enc.MAX_RUNS)
+
+    def test_a_damaged_history_starts_a_new_one_rather_than_losing_tonight(self):
+        (self.tmp / enc.ENCODE_STATE).write_text("{ truncated",
+                                                 encoding="utf-8")
+        self.assertTrue(enc.write_run_state(self.cfg, enc.run_record(
+            time.time(), self.enc, [self.result()], None, 5)))
+        self.assertEqual(len(self.read()["runs"]), 1)
+
+    def test_a_history_of_the_wrong_shape_is_replaced_not_appended_to(self):
+        (self.tmp / enc.ENCODE_STATE).write_text('{"runs": "nope"}',
+                                                 encoding="utf-8")
+        enc.write_run_state(self.cfg, enc.run_record(
+            time.time(), self.enc, [], None, 5))
+        self.assertEqual(len(self.read()["runs"]), 1)
+
+    def test_an_unwritable_state_directory_does_not_fail_the_run(self):
+        cfg = {"paths": {"state_dir": str(self.tmp / "gone")}}
+        with self.assertLogs("encode", level="WARNING"):
+            self.assertFalse(enc.write_run_state(
+                cfg, enc.run_record(time.time(), self.enc, [], None, 5)))
+
+    def test_it_leaves_no_temporary_file_behind(self):
+        enc.write_run_state(self.cfg, enc.run_record(
+            time.time(), self.enc, [], None, 5))
+        self.assertEqual([p.name for p in self.tmp.iterdir()],
+                         [enc.ENCODE_STATE])
+
+    def test_main_records_before_it_notifies(self):
+        """Discord is the part that can be disabled or unreachable; the local
+        record of what happened must not depend on it."""
+        source = inspect.getsource(enc.main)
+        self.assertLess(source.index("write_run_state"),
+                        source.index("send_discord"))
+
+    def test_main_records_on_every_exit_path(self):
+        # Nothing to do, ordinary completion, and the critical-failure handler.
+        self.assertEqual(inspect.getsource(enc.main).count("write_run_state"), 3)
 
 
 class TestForceIsWiredUp(unittest.TestCase):

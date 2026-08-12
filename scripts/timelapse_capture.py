@@ -390,6 +390,10 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
         self.fail = 0
         self.consec_fail = 0
         self.retried = 0        # ticks a second attempt rescued
+        # Published in the heartbeat. None means "not yet", which is a
+        # different thing from "a long time ago" and has to stay tellable.
+        self.last_attempt = None
+        self.last_success = None
 
     # -- helpers ------------------------------------------------------------
 
@@ -506,6 +510,7 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
                 continue
 
             dt = datetime.fromtimestamp(fire_t)
+            self.last_attempt = fire_t
             try:
                 self._grab(dt)
                 err = None
@@ -520,6 +525,10 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
                                   self.consec_fail)
                 self.ok += 1
                 self.consec_fail = 0
+                # Wall clock, not fire_t: this is "when did a frame last land",
+                # which a reader compares against now to decide whether a
+                # camera has gone quiet. fire_t is when the tick was due.
+                self.last_success = time.time()
             else:
                 self.fail += 1
                 self.consec_fail += 1
@@ -560,6 +569,14 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
         self.log = logging.getLogger(self.name_)
         self.proc = None
         self.restarts = 0
+        # The RTSP path cannot report per-frame success: ffmpeg writes the
+        # frames and this thread only supervises the process. What it does know
+        # is when that process last started and how often it has had to be
+        # restarted, so those are what it publishes, and last_success stays
+        # None rather than being invented from something that is not one.
+        self.last_attempt = None
+        self.last_success = None
+        self.last_started = None
 
     def _cmd(self):
         pattern = str(self.root / "%Y-%m-%d" / "%H%M%S.jpg")
@@ -602,6 +619,7 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
             try:
                 self.proc = subprocess.Popen(
                     self._cmd(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                self.last_started = self.last_attempt = time.time()
                 _, err = self.proc.communicate()
                 if not STOP.is_set():
                     # rc=0 means it reached the -t deadline, which is the
@@ -684,6 +702,112 @@ def record_cadences(cams):
             write_cadence(day_dir, cam.interval, cam.framerate)
 
 
+# ----------------------------------------------------------------------------
+# Runtime state
+#
+# systemd can say this process is alive. It cannot say the cameras are
+# answering: a daemon whose every camera is refusing connections is
+# `active (running)` and looks perfect on a status page. This is where the
+# program that knows better says so.
+#
+# Duplicated from timelapse_encode.py, deliberately and for the same reason
+# load_config() and the redaction rule are: this daemon imports nothing from
+# its siblings, so that a syntax error in a script it does not need cannot
+# stop the capture. A test pins the copies together.
+#
+# Facts only, never conclusions. Whether "42 seconds since the last frame"
+# means a fault depends on the interval, on whether capture is paused and on
+# who is asking; a reader can work that out and a writer cannot take it back.
+# ----------------------------------------------------------------------------
+
+STATE_DIR_DEFAULT = "/var/lib/timelapse/state"
+CAPTURE_STATE = "capture.json"
+STATE_VERSION = 1
+_state_warned = False
+
+
+def state_dir(cfg):
+    return Path((cfg.get("paths", {}).get("state_dir") or "").strip()
+                or STATE_DIR_DEFAULT)
+
+
+def stamp(epoch):
+    """Epoch to a local ISO string, or None. None means "never", not "now"."""
+    if not epoch:
+        return None
+    return datetime.fromtimestamp(epoch).replace(microsecond=0).isoformat()
+
+
+def capture_state(cams, started, running=True):
+    """The snapshot published to capture.json.
+
+    Read from the camera threads without a lock. Every value taken here is a
+    single int or float that one thread writes and this one reads, so the worst
+    outcome is a counter that is one tick old, which for a heartbeat written
+    once a minute is not worth a lock in the capture path.
+    """
+    now = time.time()
+    cameras = []
+    for c in cams:
+        entry = {
+            "name": c.name_,
+            "method": "rtsp" if isinstance(c, RtspCamera) else "http",
+            "interval": c.interval,
+            "framerate": c.framerate,
+            "last_attempt": stamp(c.last_attempt),
+            "last_success": stamp(c.last_success),
+        }
+        if isinstance(c, RtspCamera):
+            # No per-frame answer exists here; see the comment in __init__.
+            entry.update(supervised=True, restarts=c.restarts,
+                         last_started=stamp(c.last_started),
+                         alive=bool(c.proc and c.proc.poll() is None))
+        else:
+            entry.update(supervised=False, ok=c.ok, fail=c.fail,
+                         retried=c.retried, consec_fail=c.consec_fail)
+        cameras.append(entry)
+    return {
+        "version": STATE_VERSION,
+        "kind": "capture",
+        "pid": os.getpid(),
+        "started": stamp(started),
+        "updated": stamp(now),
+        "updated_epoch": int(now),
+        "running": running,
+        # The disk guard's verdict, which is the one thing here that systemd
+        # actively misrepresents: a paused daemon is still `active (running)`
+        # and still capturing nothing.
+        "paused": PAUSED.is_set(),
+        "cameras": cameras,
+    }
+
+
+def write_state(cfg, cams, started, running=True):
+    """Publish the heartbeat. Never raises.
+
+    A daemon that cannot write its status file must keep capturing; the file
+    is how you find out about a problem, not a part of the job. It complains
+    once and then stays quiet, because the alternative is a line a minute in
+    the journal for as long as the condition lasts.
+    """
+    global _state_warned
+    path = state_dir(cfg) / CAPTURE_STATE
+    try:
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(capture_state(cams, started, running), fh)
+        os.replace(tmp, path)
+        _state_warned = False
+        return True
+    except OSError as exc:
+        if not _state_warned:
+            log.warning("cannot write %s (%s); capture continues, but the web "
+                        "UI and 'timelapse test' will report capture state as "
+                        "unavailable", path, exc)
+            _state_warned = True
+        return False
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
         print(f"timelapse_capture.py {__version__}")
@@ -726,15 +850,26 @@ def main():
 
     cams = [t for t in threads if isinstance(t, DayCadenceMixin)]
     log.info("running with %d camera thread(s)", len(cams))
+    started = time.time()
+    # Immediately, not at the first minute mark. A restart otherwise leaves the
+    # previous run's file in place for a minute, which reads as a live daemon
+    # that has stopped taking pictures.
+    write_state(cfg, cams, started)
     ticks = 0
     while not STOP.is_set():
         STOP.wait(1)
         ticks += 1
         if ticks % 60 == 0:
             record_cadences(cams)
+            write_state(cfg, cams, started)
 
     for t in threads:
         t.join(timeout=20)
+    # A final write with running=false, so a stopped daemon is distinguishable
+    # from a wedged one. A reader that only had staleness to go on would call
+    # both of them the same thing after a minute, and only one of them is a
+    # fault.
+    write_state(cfg, cams, started, running=False)
     log.info("exited cleanly")
 
 

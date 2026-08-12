@@ -698,6 +698,22 @@ class TestCredentialsNeverReachTheLog(unittest.TestCase):
         self.assertIn("Traceback", out)
         self.assertNotIn(self.SECRET, out)
 
+    def test_the_daemons_copy_of_the_state_location_has_not_drifted(self):
+        """Same reasoning as the redaction rule below, different constant.
+
+        The encoder and the web UI look for capture.json where timelapse_encode
+        says it is; the daemon writes it where its own copy says. Two answers
+        means a heartbeat nobody reads and a status page that says capture is
+        not running while it is.
+        """
+        import timelapse_encode as enc
+        self.assertEqual(cap.STATE_DIR_DEFAULT, enc.STATE_DIR_DEFAULT)
+        self.assertEqual(cap.CAPTURE_STATE, enc.CAPTURE_STATE)
+        self.assertEqual(cap.STATE_VERSION, enc.STATE_VERSION)
+        self.assertEqual(cap.state_dir({"paths": {"state_dir": "/srv/s"}}),
+                         enc.state_dir({"paths": {"state_dir": "/srv/s"}}))
+        self.assertEqual(cap.state_dir({}), enc.state_dir({}))
+
     def test_the_daemons_copy_of_the_rule_has_not_drifted(self):
         """The rule exists twice: this daemon imports nothing from its
         siblings, for the same reason load_config() is duplicated. A security
@@ -708,6 +724,168 @@ class TestCredentialsNeverReachTheLog(unittest.TestCase):
         self.assertEqual(
             [(p.pattern, p.flags, r) for p, r in cap.CRED_PATTERNS],
             [(p.pattern, p.flags, r) for p, r in enc.CRED_PATTERNS])
+
+
+class TestCaptureState(unittest.TestCase):
+    """The heartbeat: what systemd cannot say about a running daemon."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.cfg = make_config(self.tmp / "frames")
+        self.cfg["paths"]["state_dir"] = str(self.state)
+        self.addCleanup(cap.PAUSED.clear)
+
+    def camera(self, name="Roof", **kw):
+        cam = cap.HttpCamera({"name": name, "url": "http://192.0.2.1/s"},
+                             self.cfg)
+        for key, value in kw.items():
+            setattr(cam, key, value)
+        return cam
+
+    def write(self, cams, running=True):
+        cap.write_state(self.cfg, cams, time.time() - 60, running)
+        return json.loads((self.state / cap.CAPTURE_STATE)
+                          .read_text(encoding="utf-8"))
+
+    # -- the file itself ----------------------------------------------------
+
+    def test_it_lands_in_the_configured_state_directory(self):
+        self.write([self.camera()])
+        self.assertTrue((self.state / "capture.json").is_file())
+
+    def test_it_is_versioned_from_the_first_release(self):
+        """A second on-disk contract outlives whatever reads it first."""
+        got = self.write([self.camera()])
+        self.assertEqual(got["version"], cap.STATE_VERSION)
+        self.assertEqual(got["kind"], "capture")
+
+    def test_it_leaves_no_temporary_file_behind(self):
+        self.write([self.camera()])
+        self.assertEqual([p.name for p in self.state.iterdir()],
+                         [cap.CAPTURE_STATE])
+
+    def test_a_second_write_replaces_the_first(self):
+        self.write([self.camera(ok=1)])
+        got = self.write([self.camera(ok=9)])
+        self.assertEqual(got["cameras"][0]["ok"], 9)
+
+    def test_an_unwritable_directory_is_a_warning_not_a_crash(self):
+        self.cfg["paths"]["state_dir"] = str(self.tmp / "nope")
+        with self.assertLogs("capture", level="WARNING") as cm:
+            self.assertFalse(cap.write_state(self.cfg, [self.camera()], 0))
+        self.assertIn("capture continues", "\n".join(cm.output))
+
+    def test_it_complains_once_not_every_minute(self):
+        # A line a minute for as long as the condition lasts is how a journal
+        # becomes unreadable.
+        self.cfg["paths"]["state_dir"] = str(self.tmp / "nope")
+        cap._state_warned = False
+        self.addCleanup(setattr, cap, "_state_warned", False)
+        with self.assertLogs("capture", level="WARNING") as cm:
+            for _ in range(5):
+                cap.write_state(self.cfg, [self.camera()], 0)
+        self.assertEqual(len(cm.output), 1)
+
+    # -- what it says -------------------------------------------------------
+
+    def test_an_http_camera_publishes_its_counters(self):
+        got = self.write([self.camera(ok=1200, fail=3, retried=2,
+                                      consec_fail=0)])
+        cam = got["cameras"][0]
+        self.assertEqual((cam["ok"], cam["fail"], cam["retried"],
+                          cam["consec_fail"]), (1200, 3, 2, 0))
+        self.assertFalse(cam["supervised"])
+
+    def test_never_captured_is_null_not_zero(self):
+        # None means "not yet" and has to stay distinguishable from "a long
+        # time ago", which is what an epoch of 0 would read as.
+        cam = self.write([self.camera()])["cameras"][0]
+        self.assertIsNone(cam["last_success"])
+        self.assertIsNone(cam["last_attempt"])
+
+    def test_timestamps_are_local_iso_seconds(self):
+        cam = self.write([self.camera(last_success=1786000000.4)])["cameras"][0]
+        self.assertRegex(cam["last_success"],
+                         r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+
+    def test_it_carries_an_epoch_for_the_reader_to_do_maths_with(self):
+        got = self.write([self.camera()])
+        self.assertAlmostEqual(got["updated_epoch"], time.time(), delta=5)
+
+    def test_a_paused_daemon_says_so(self):
+        """The one thing systemd actively misrepresents: a disk-guard pause
+        leaves the unit active (running) and capturing nothing."""
+        cap.PAUSED.set()
+        self.assertTrue(self.write([self.camera()])["paused"])
+
+    def test_a_running_daemon_is_not_paused_by_default(self):
+        self.assertFalse(self.write([self.camera()])["paused"])
+
+    def test_a_clean_exit_is_distinguishable_from_a_wedge(self):
+        # Staleness alone would call a stopped daemon and a hung one the same
+        # thing, and only one of them is a fault.
+        self.assertFalse(self.write([self.camera()], running=False)["running"])
+
+    def test_every_camera_appears(self):
+        got = self.write([self.camera("Roof"), self.camera("Gate")])
+        self.assertEqual([c["name"] for c in got["cameras"]],
+                         ["Roof", "Gate"])
+
+    def test_it_publishes_facts_not_verdicts(self):
+        """Deliberate: no "healthy"/"failing" field anywhere.
+
+        Whether 42 seconds of silence is a fault depends on the camera's
+        interval and on whether capture is paused. A reader can work that out
+        from these numbers; a writer that guessed could not be overruled.
+        """
+        cam = self.write([self.camera(consec_fail=99)])["cameras"][0]
+        self.assertNotIn("state", cam)
+        self.assertNotIn("healthy", cam)
+        self.assertIn("interval", cam)
+
+    def test_a_camera_carries_the_cadence_its_numbers_mean_something_against(self):
+        self.cfg["capture"]["interval_seconds"] = 5
+        cam = self.write([self.camera()])["cameras"][0]
+        self.assertEqual(cam["interval"], 5)
+
+
+class TestRtspStateIsHonest(unittest.TestCase):
+    """An RTSP camera cannot report per-frame success, and must not pretend.
+
+    ffmpeg writes the frames; this thread only supervises the process. What it
+    knows is when that process started and how often it has been restarted.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = make_config(self.tmp / "frames")
+        self.cam = cap.RtspCamera({"name": "Gate", "url": "rtsp://192.0.2.1/s",
+                                   "method": "rtsp"}, self.cfg)
+
+    def entry(self):
+        return cap.capture_state([self.cam], time.time())["cameras"][0]
+
+    def test_it_is_marked_supervised(self):
+        self.assertTrue(self.entry()["supervised"])
+        self.assertEqual(self.entry()["method"], "rtsp")
+
+    def test_last_success_stays_null_rather_than_being_invented(self):
+        self.cam.last_started = time.time()
+        self.assertIsNone(self.entry()["last_success"])
+
+    def test_it_publishes_restarts_and_liveness(self):
+        self.cam.restarts = 4
+        self.assertEqual(self.entry()["restarts"], 4)
+        self.assertFalse(self.entry()["alive"])
+
+    def test_no_frame_counters_are_offered(self):
+        # ok/fail here would be a number nobody could account for.
+        self.assertNotIn("ok", self.entry())
+        self.assertNotIn("consec_fail", self.entry())
 
 
 if __name__ == "__main__":
