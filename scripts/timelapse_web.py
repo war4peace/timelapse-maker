@@ -195,7 +195,7 @@ def resolve_library(cfg):
 # ----------------------------------------------------------------------------
 
 # Six conventions, measured against a real five-year library (6,848 files;
-# docs/future-features.md records the survey). The native format is 64% of it -
+# docs/architecture.md §9a records the survey). The native format is 64% of it -
 # a parser that handles only that silently drops a third of the library and all
 # history before 2024-04. Order matters: most specific first.
 #
@@ -646,7 +646,7 @@ class Index:
     def cameras(self):
         # ORDER BY lower(camera): two spellings of a place sit next to each
         # other so the reader can judge them. They are never merged - see
-        # future-features.md; a name is a place, and places get recycled.
+        # architecture.md §9a; a name is a place, and places get recycled.
         return self._query(
             "SELECT camera, COUNT(*) n, SUM(size) b, MIN(day) a, MAX(day) z "
             "FROM files GROUP BY camera ORDER BY lower(camera), camera")

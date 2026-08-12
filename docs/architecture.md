@@ -1566,6 +1566,87 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 
 ---
 
+## 9a. Appendix: the destination library, surveyed 2026-08-07
+
+Reference data, not a plan. This is the measurement `parse_name()` was built
+against, and the reason it is a chain of six patterns rather than one regex.
+It lived in `future-features.md` until that file was trimmed back to being a
+plan; the numbers are a record of one real library at one moment, and are not
+re-measured.
+
+A read-only survey of the author's own destination (`U:\TL`, an Unraid share
+over SMB), the only real library this has ever been measured against. 6,848
+files, 2.78 TiB, 2021-06-26 to 2026-08-06, in 55 `YYYY-MM/` folders plus two
+named event folders and 1,247 loose files at the root.
+
+**The destination is not a timelapse-maker output directory.** It is five
+years of accumulated history from three predecessor systems, and this is the
+single most important fact about the index: a parser written against the
+native filename format handles **64% of it**.
+
+| Pattern | Files | Era |
+|---|---|---|
+| `Camera.YYYYMMDD.mkv`, native | 4,384 | 2024-04 → now |
+| `YYYY-MM-DD_Camera.mp4` | 1,594 | 2022-09 → 2024-02 |
+| `YYYY-MM-DD.mp4`, **no camera name** | 449 | 2021-06 → 2022-09 |
+| `Camera_YYYY-MM-DD.mp4` | 415 | 2021-07 → 2022-09 |
+| `Camera<date>_<timestamp>.mkv` | 3 | 2024-04 |
+| `YYYY-MM-DDTHH-MM-SS[_cam].mp4` | 2 | event folders |
+
+A chain of patterns, tried most-specific first, parses 6,847 of 6,848. The one
+failure is `MakeTLALL_backup.ps1`, the PowerShell predecessor still sitting in
+the root, which is also the proof that "not a directory" is not a sufficient
+test for "is a video".
+
+Constraints this survey establishes, each of which breaks a naive index:
+
+- **`Workshop` (723) and `workshop` (446) stay two entries.** They are almost
+  certainly one place typed two ways, but see the rule below: the index does
+  not decide that. Sort case-insensitively so they sit adjacent and the reader
+  can see it for themselves.
+- **449 files have no camera name.** They need a real bucket, not an
+  exception. (This is also where `keep_blank_values=True` earns its place: the
+  group's key is the empty string, and a `?camera=` link to it is a real
+  link.)
+- **`(camera, date)` is not unique**: 6,844 keys for 6,848 files. The primary
+  key is the relative path. Nothing else is safe.
+- **Extension allow-list**, not a directory test. See the `.ps1`.
+- **Container changes with era**: mp4 through 2024, mkv after. Do not infer it.
+- **Human-made folders carry meaning.** `2023-05-10 - Renovări` and
+  `2023-05-12 - Dubios la poartă` are events, not clutter. Keep the folder as
+  a label rather than flattening it away.
+- **Never merge two names.** `garaj`/`Garage` and `street4k`/`StreetPTZ` look
+  like renames and are not: a camera name is a **place**, cameras get
+  repurposed over the years, and the same device may cover a different area
+  while a new device covers the old one. The name is a location label, not a
+  device identity, and the two drift apart deliberately. Corrected by the user
+  2026-08-07; do not regress this. Deciding whether `garaj` and `Garage` are
+  the same place is the *user's* call, not the index's. Show what is on disk.
+- **Some files are broken.** 11 are implausibly small: `Gate.20240727.mkv` at
+  17 KB, `Gate.20251109.mkv` at 86 KB, almost certainly failed encodes. List
+  them with their **full path**, so they can be checked and removed by other
+  means. The UI is read-only and does not delete; naming the path is the whole
+  service it can offer.
+
+Two findings make reconciliation cheap:
+
+- **mtime is exact.** Across all 4,384 native files, mtime is precisely one
+  day after the filename date: min, median, p95 and max all equal 1. That is
+  the 00:05 encode timer. `(size, mtime)` is a dependable change key.
+- **The folder never disagrees with the filename.** Zero mismatches in 5,601
+  filed files, so `YYYY-MM/` is redundant and the index can key entirely on
+  filenames.
+
+**On scan duration: there is no baseline, and the design must not need one.**
+A full recursive enumeration measured 1.7 s, but that was from a workstation
+with 10G to the server, and the deployment reads over CIFS from Linux on a
+different stack. The work is latency-bound rather than bandwidth-bound (size
+and mtime arrive with the directory entries, so it is round-trips, not
+megabytes), but that only means the number moves for reasons that are hard to
+predict. Treat 1.7 s as a floor observed once, never as a budget.
+
+---
+
 ## 10. File inventory
 
 ```
@@ -1592,6 +1673,7 @@ service/timelapse-web.service
 docs/architecture.md             this file
 docs/install.md                  operator guide
 docs/future-features.md          planned work, in build order
+docs/decided-against.md          considered and refused, and why
 ```
 
 Dependencies: Python 3.9+ stdlib, `requests`, `ffmpeg`/`ffprobe` (NVENC for
