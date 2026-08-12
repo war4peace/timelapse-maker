@@ -1314,7 +1314,7 @@ take an optional path as their first positional argument. See
 | `av1_preset` / `av1_cq` | `p6` / 26 | p1 fastest … p7 slowest. Lower cq = higher quality. |
 | `hevc_cq`, `x264_crf` | 24, 20 | Fallback encoders only. |
 | `min_frames` | 100 | Below this, `SKIP` rather than produce a 2-second video. |
-| `delete_frames_on_success` | true | Off keeps the day directory. Safe since 0.1.6: `.encoded.json` is what stops the day being encoded again. There is still no age-based sweeper, so kept frames are kept forever. |
+| `delete_frames_on_success` | true | Off keeps the day directory. Safe since 0.1.6: `.encoded.json` is what stops the day being encoded again. There is no age-based sweeper and there is not going to be one (decided-against.md), so kept frames are kept forever, one directory per camera per day. |
 | `max_backlog_days` | 7 | Bounds a catch-up run after long downtime. A count of the newest distinct dates *still pending*, not an age cutoff: downtime produces fewer date directories, never more, so it cannot strand a day. |
 
 ### `transfer`
@@ -1394,12 +1394,14 @@ daemon's failure path, gated on consecutive-failure count, with a cooldown so it
 can't reboot-loop a camera. Detection already exists (`consec_fail`); this is
 remediation only.
 
-**Frame retention beyond encode**: set `delete_frames_on_success: false` and add
-a separate age-based sweeper. Do not add retention logic to `encode_day()`; keep
-"encode" and "delete" separable. Since 0.1.6 the first half of that is real: a
-kept day carries `.encoded.json` and is not encoded again, so a sweeper only
-has to decide *when* to delete, never *whether* the work was done. It must
-delete the marker with the day rather than leaving it behind.
+**Frame retention beyond encode**: **decided against on scope at 0.1.6**, see
+decided-against.md; this paragraph describes the extension point, not a plan.
+Set `delete_frames_on_success: false` and add a separate age-based sweeper. Do
+not put retention logic in `encode_day()`; keep "encode" and "delete"
+separable. The marker makes the hard half free, since a kept day carries
+`.encoded.json` and is not encoded again, so a sweeper decides only *when* to
+delete and never *whether* the work was done. It must take the whole day
+directory, markers included, rather than leaving either dotfile behind.
 
 **Parallel encoding**: currently sequential and deliberately so. NVENC session
 limits on consumer GeForce cards are low, and the real bottleneck is CPU JPEG

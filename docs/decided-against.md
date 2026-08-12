@@ -3,13 +3,59 @@
 Things that were considered and turned down, with the reasoning that turned
 them down. Kept because a rejected idea with no record attached comes back
 every six months, and because most of these are reasonable-sounding: the
-reason they were refused is usually a constraint elsewhere in the design, not
-a lack of interest.
+reason they were refused is a constraint elsewhere in the design, or the scope
+of the program, and never a lack of interest.
 
 Nothing here is forbidden forever. If the constraint changes, the entry says
 which constraint, so the argument can be reopened on the facts rather than
-relitigated from scratch. Things still wanted live in
+relitigated from scratch. Scope is the harder one to reopen, since it moves on
+demand rather than on facts; those entries say so. Things still wanted live in
 [future-features.md](future-features.md).
+
+---
+
+## Frame retention beyond encode
+
+**Refused on scope, 2026-08-12. This program makes one timelapse per camera
+per day and writes it where you asked. The frames are an intermediate, not an
+output.**
+
+It was item 1 in the plan, researched and ready to build, and every argument
+for it fell to that one sentence. They are recorded here because each of them
+sounds reasonable on its own, and because three of the four turned out to be
+solved elsewhere rather than merely outweighed.
+
+| The argument for keeping frames | Why it fails |
+|---|---|
+| **A verification window.** Hold the source until you have seen that the video is good, or until you know the cadence was right. | The half that matters is already in the code: deletion is gated on `status == "OK"`, so a failed encode keeps its frames with no setting involved. The cadence half is not recoverable in either direction. Nothing revives frames that were never captured, so too slow is unfixable whatever you kept, and too fast merely makes a long video. The frame *rate* needs no source at all: 60 fps is the default so a player can run it at 0.25x, and a 10 fps video speeds up as easily. Change the camera's cadence tomorrow. |
+| **Frames are the product**, for photogrammetry, training sets, or a record of individual full-resolution stills. | A different program, and the name of this one says which. Not refused because the use is bad; refused because building for a user who has not appeared is how scope goes. If people ask, that is data, and this entry is where the argument resumes. |
+| **Forensics.** Which ticks went missing, and were they clustered or scattered? | The capture log already answers it. `timelapse_capture.py` logs the **first** failure of every burst as well as every `log_every_n_failures`-th, and the recovery line carries the total, so scattered singles and a solid outage do not look alike. Not theoretical: the Court180 frame delta of August 2026 was diagnosed exactly this way, from bursts of two 500s in the log, with no frame directory involved. |
+| **Re-encoding later at better settings.** | The lossy knobs (`av1_cq`, `hevc_cq`, `x264_crf`) are config-only, never offered by the wizard, and conservative by default. This is insurance against a user who has already hand-edited JSON onto a path the program does not offer. |
+
+### What this entry does not refuse
+
+Three things exist today and should not be removed on the strength of the
+decision above:
+
+- **`encode.delete_frames_on_success` keeps working.** Honouring it costs
+  nothing, and removing it would delete frames on somebody's next upgrade,
+  which is the most destructive thing this project is capable of. It stays
+  unbounded and stays out of the wizard: set it false and frames are kept
+  forever, one directory per camera per day.
+- **`--keep-frames` keeps working**, for a single manual run.
+- **The encode-once marker (`.encoded.json`, 0.1.6) is not retention
+  groundwork** and does not depend on this decision. `--keep-frames` alone
+  leaves a day directory for the nightly timer to find and encode again, so
+  the defect it fixes is reachable from the CLI with no config change at all.
+
+**Reopen if:** users ask for kept frames. Nothing technical stands in the way,
+which is unusual for this file: the design was finished. Two researched traps
+are worth having back if it happens. A day directory's *name* is the date it
+covers and its mtime is not, since an interrupted day gets touched later than
+it represents. And a sweeper must delete the whole directory or nothing in it:
+removing `.cadence.json` alone makes the encoder measure an old day against
+today's config, and removing `.encoded.json` alone puts the day back in the
+queue to be encoded a second time.
 
 ---
 

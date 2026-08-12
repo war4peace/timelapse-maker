@@ -25,88 +25,16 @@ keeping was the library survey that justified the filename parser, which is
 now architecture.md §9a. The re-encode defect that briefly sat at the top of
 this list as item 0 went the same way once it was fixed: the invariant it
 established is in architecture.md §3, where the next person will actually meet
-it. Numbering is not reused, so item 1 stays item 1.
+it.
+
+**Numbering is not reused**, which is why this list opens at 2. Item 0 shipped
+and item 1 (frame retention) was refused on scope and moved to
+[decided-against.md](decided-against.md), where the arguments for it are
+recorded rather than left to be re-made.
 
 Everything below is **researched against the code as of 0.1.5**, so each entry
 says where it would hook in and what is already there. None of it is designed;
 these are pre-plans, and the traps are the point.
-
----
-
-## 1. Frame retention beyond encode
-
-**Effort:** small. **Prerequisites:** none any more. The one that mattered was
-the encode-once marker, which shipped in 0.1.6 and is what makes "kept frames"
-a supportable configuration in the first place.
-
-### What exists
-
-Frames are deleted in exactly one place: `encode_day()` removes the day
-directory after a successful encode, gated on
-`encode.delete_frames_on_success` (default true). There is no other deletion
-path anywhere in the project.
-
-Turning that off is now safe rather than merely possible: since 0.1.6 a
-successful encode leaves `.encoded.json` in the day directory and
-`find_pending()` skips any day that has one, so the frames stay and the day is
-not encoded a second time. What is still missing is the other half, below.
-
-### What `max_backlog_days` actually does, because it is easy to misread
-
-It is **a count of the newest distinct date directories present, not an age
-cutoff**:
-
-```python
-keep = sorted({d.name for _, d in jobs})[-max_backlog:]
-```
-
-So an outage does *not* strand anything, and the obvious worry is the wrong
-one. A machine switched off for two weeks leaves two date directories (the
-partial day it went down on, and the day it came back), both of which are
-inside "the newest seven", so both encode on the next run. Downtime produces
-*fewer* directories, never more.
-
-### The actual gap
-
-Stranding needs `delete_frames_on_success = false` and ordinary running. Frames
-are then never removed, so date directories accumulate one per camera per day,
-and from the eighth day the oldest falls out of the newest-N window: never
-encoded again, never deleted, and reported by nothing.
-
-**Nothing reports those days.** `timelapse usage` flags frame folders belonging
-to cameras that are ORPHAN or disabled, which is a different problem: a day
-that fell out of the window belongs to a camera that is present and enabled,
-so it appears in the usage totals as ordinary current data with nothing
-marking it as never-to-be-touched-again. That invisibility, rather than the
-disk space, is the strongest argument for this item.
-
-The capture disk guard (`capture.min_free_gb`) means the end state is "capture
-pauses", not "disk full", so this is a comfort feature rather than a data-loss
-one. Worth knowing before ranking it higher.
-
-### Shape
-
-An age-based sweep, `encode.keep_frames_days`, run at the end of the nightly
-job after the encode and transfer have finished. Keep *encode* and *delete*
-separable: retention must not move into `encode_day()`, or "delete after
-encoding" and "delete after N days" become one tangled condition.
-
-### Traps
-
-- **A day directory is not the unit of age.** Its name is the date it covers,
-  which is what to compare against, not its mtime: an interrupted day gets
-  touched later than it represents.
-- **Never sweep a day the encoder has not finished with.** Ordering matters:
-  sweep last, and skip anything in the pending list.
-- **Two dotfiles live in the day directory, and they fail differently.** A
-  sweeper that deletes `.cadence.json` but leaves the frames would make the
-  encoder read the config's current cadence for an old day and report nonsense
-  coverage. Deleting `.encoded.json` and leaving the frames is worse: the day
-  becomes pending again and is re-encoded, which is exactly the defect 0.1.6
-  fixed. Delete the whole directory or nothing in it.
-- Deleting is the one irreversible thing this project would do to captured
-  data. It deserves the same treatment as the transfer's mountpoint guard: a
-  refusal when the situation looks wrong, not a best-effort delete.
 
 ---
 
