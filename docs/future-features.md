@@ -106,28 +106,35 @@ A status-code-only implementation misses the second, which is the shape the
 redaction rules were written around. `explain_payload()`
 (`timelapse_setup.py:1186`) already parses that body and is the thing to reuse.
 
-**Row 1 measured on a real Dahua, 2026-08-14**, on `/cgi-bin/snapshot.cgi`,
-presenting one wrong credential exactly once:
+**Row 1 measured on two different makes, 2026-08-14**, presenting one wrong
+credential exactly once to each:
 
-| Request | Status | Body |
+| Camera, endpoint | No credentials | Wrong credentials |
 |---|---|---|
-| No credentials | **401** with `WWW-Authenticate: Digest ... qop="auth"` | empty |
-| Wrong credentials | **401** | 27 bytes of `text/plain`: `Error` / `Invalid Authority!` |
+| Dahua, `/cgi-bin/snapshot.cgi` | 401, digest challenge, empty body | **401**, 27 bytes `text/plain`: `Invalid Authority!` |
+| Hikvision, `/onvif-http/snapshot?Profile_1` | 401, digest challenge, 255 bytes of HTML | **401**, 233 bytes of HTML: `Digest authentication information verification failed` |
 
-The status settles it and nothing needs to read the body, which is what makes
-this the easy half. Worth noticing anyway that the body is *not* constant: the
-challenge carries none and the rejection carries prose, so anything keying on
-the body would have to handle both, for no gain over reading the status.
+**The feared ONVIF shape does not exist here.** The worry was that an ONVIF
+snapshot endpoint might answer a failed auth with 200 and a SOAP fault, which
+would have been the Reolink surprise in a different costume on the *most*
+common endpoint in this deployment. It answers 401 like any other digest
+endpoint, so the design needs no third branch.
 
-**The ONVIF shape is still unmeasured**, and the probe is why that is now a
-statement rather than an assumption: `/onvif-http/snapshot?Profile_1` returns
-**404** on that Dahua, so the cameras here using that path are a different make
-and their behaviour is still unknown. Of seven enabled cameras: three on
-`/onvif-http/snapshot` (**unmeasured**, and the remaining gap), two on
-`/cgi-bin/snapshot.cgi` (measured above), one Reolink on the query string
-(measured below), one RTSP (out of scope). A snapshot endpoint answering a
-failed auth with a 200 and a SOAP fault would be the Reolink surprise in a
-different costume, on the most common endpoint in this deployment.
+**All three shapes in this deployment are now measured**: three Hikvision on
+`/onvif-http/snapshot`, two Dahua on `/cgi-bin/snapshot.cgi`, one Reolink on
+the query string (below), one RTSP which is out of scope and disabled.
+
+**Every vendor's body is different and not one of them is needed.** Dahua
+answers `text/plain`, Hikvision `text/html`, Reolink JSON declared as
+`text/html`; and both digest vendors return a *different* body for the
+challenge than for the rejection. The only thing stable across the two is the
+status code, which is exactly what the classifier is specified to read. Design
+confirmed by measurement rather than assumed, and the reason to resist anyone
+later "improving" it by parsing the prose.
+
+One negative result worth keeping: `/onvif-http/snapshot?Profile_1` returns
+**404** on the Dahua, so endpoint paths are not portable between makes even
+within one fleet, and a measurement on one camera says nothing about another.
 
 **How to measure this safely**, since the cost of getting it wrong is a locked
 account for half an hour. An unauthenticated GET presents no credential and so
