@@ -200,14 +200,34 @@ cannot succeed and is pure lockout fuel. Suppressing it puts the total at
 **two** authentication attempts before the daemon goes quiet, comfortably under
 the handful that firmware tends to allow.
 
-**After the notification, keep probing, slower, and never stop.** The proposal
-leaves this open and the answer matters: resuming the normal cadence would
-re-lock the account immediately. An escalating interval (10 minutes, then 30,
-then 60, capped) is what escapes a lockout window that cannot be measured from
-here, and the one measured window in evidence is **30 minutes**, which a fixed
-10-minute probe would sit inside and might keep renewing. Never stopping is
-what keeps "fix the password and walk away" true; a daemon that gave up would
-need a restart to notice the fix.
+**After the notification, probe every 31 minutes, flat, and never stop.**
+Decided 2026-08-13 against an escalating ladder. The observed lockout is **30
+minutes** across several cameras of different makes in this deployment, so the
+interval is that window plus a minute of margin, and the constant should carry
+that measurement in a comment beside it.
+
+Flat beats escalating here for a reason that generalises past the one
+deployment: lockout policies are near-universally "N failures inside a window",
+and **one attempt every 31 minutes will essentially never reach N** on any such
+policy. An escalating ladder buys protection against a longer window at the
+cost of a much slower recovery, and the thing it protects against is one this
+cadence already cannot sustain. If somebody reports a window longer than 31
+minutes, that is evidence and the constant moves; it is not a reason to guess
+upward now.
+
+**The cost is bounded and the user has a faster route anyway.** Worst case is
+about 25 minutes of one camera's frames after the credentials are fixed. But
+rotating a camera's password already requires reconfiguring it here, so the
+operator who wants those frames back runs the camera command they were going to
+run regardless, and the wait is only for the operator who changes nothing.
+Never stopping is what keeps "fix it and walk away" true; a daemon that gave up
+would need a restart to notice.
+
+**One notification per incident, and no repeats.** The 31-minute probe is
+silent. A camera stuck refusing all day is not worth a message every half hour,
+and it is already carried by the nightly summary's `Cov%`, which is the
+recurring reminder this does not need to duplicate. Recovery sends a single
+all-clear, which is an end, not a repeat.
 
 **A camera can reject a correct password.** Once a lockout is running, the
 right credentials fail too, so the notification can arrive after the operator
@@ -249,13 +269,24 @@ everything the check needs.
   the conservative direction and the right one: a camera that is sometimes
   refusing and sometimes unreachable is not a diagnosis anybody should be woken
   for.
-- **A restart re-enters at step 1.** The ladder lives in memory, so every start
-  of the daemon spends two more authentication attempts on a camera that is
-  already refusing. Ordinarily that is nothing, but a unit in an `on-failure`
-  restart loop would be back to hammering the account through the very
-  mechanism this exists to stop, just at a slower rate. Persisting the ladder's
-  position beside the rest of the runtime state is the obvious answer, and it
-  should be decided deliberately rather than by omission.
+- **A restart re-enters at step 1, deliberately.** The ladder lives in memory
+  and is not persisted: a fresh process knows nothing, two attempts settle it,
+  and business as usual is the right behaviour. One interaction to keep in
+  view rather than design around: `timelapse-capture.service` ships
+  `Restart=always` with `RestartSec=15`, and systemd's default start limit
+  never trips at that spacing, so a daemon crash-looping for some unrelated
+  reason would spend two authentication attempts every 15 seconds. That is a
+  crash-loop problem rather than this feature's, but it is the one path where
+  the back-off does not hold.
+- **Decide what to do about redirects.** `requests` follows them by default, so
+  an endpoint answering `302` to a `/login` page arrives as a 200 HTML document
+  and classifies as `other`, with the redirect invisible. This shape was
+  observed on a **non-camera** device on the same LAN while probing, so it is
+  plausible rather than measured: firmware with a modern web front end could
+  behave the same way. A redirect away from a snapshot endpoint is never going
+  to yield a JPEG, so `allow_redirects=False` would make the failure legible
+  instead of disguising it as a content problem. Worth deciding rather than
+  inheriting.
 - **RTSP is out of scope here.** ffmpeg holds the credential and fetches the
   frames, so an auth failure arrives as process stderr, not as a response
   anyone inspects. Say so plainly rather than implying coverage.
