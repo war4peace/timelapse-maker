@@ -194,7 +194,17 @@ everything the check needs.
 
 - **Report the observation, not the diagnosis.** "The camera rejected our
   credentials" is a fact; "your password is wrong" is an inference, and this
-  project has already shipped two checks that guessed.
+  project has already shipped two checks that guessed. It also covers a case
+  that is not a wrong password at all: a config saying `basic` where the camera
+  wants `digest` produces the same 401, and the wizard already offers to retry
+  with the other scheme for exactly that reason.
+- **Our own retry loop can make a wrong password worse.** Some firmware locks
+  an account after a handful of failed authentications, for minutes at a time.
+  A daemon presenting bad credentials every five seconds can hold such an
+  account locked continuously, and the account is often shared with whatever
+  else pulls from that camera, so the damage is not confined to us. This is an
+  argument *for* telling somebody quickly, and a reason not to consider backing
+  off on `auth` an optimisation: if it is ever built, it is a correctness fix.
 - **The clock and the counter reset together**, on any success and on any
   change of class. A tick that times out between two refusals is an
   `unreachable`, not a refusal, so an intermittent mix never accumulates
