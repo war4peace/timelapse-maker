@@ -234,6 +234,57 @@ the daemon exactly as connectionless as it is today.
 
 ---
 
+## An ONVIF client library
+
+**Refused on install risk, 2026-08-14. `onvif-python` is a decent library,
+MIT, actively maintained, and its 3.9 to 3.14 support matches this project's
+range exactly. It depends on `zeep`, and that puts
+`pip install --break-system-packages` on the critical path of every install,
+including the majority that never touch ONVIF at all.**
+
+**The case for it is real, and is why this entry exists** rather than a one
+line appeal to the no-dependencies rule. ONVIF implementations differ wildly
+between makes. Code validated against one person's fleet is not evidence about
+anybody else's, and a maintained library carries accumulated workarounds for
+devices nobody here will ever own. Everything in that argument is true.
+
+What it runs into is an asymmetry in who pays:
+
+| | With the library | Hand-rolled |
+|---|---|---|
+| Who is affected | **Every** install, including the many that never use ONVIF | Only a user whose camera has a quirk our code misses |
+| When | At install, before anything works at all | At setup, on one camera |
+| How it fails | Dependency resolution into a system Python: `zeep`, and transitively `lxml`, a C extension | Discovery does not produce a URL |
+| Recovery | Fix packaging on the operator's distro | Type the URL in, which the wizard already offers |
+
+`install.sh` takes `requests` from the distro across all five package managers
+it supports (`python3-requests`, `python-requests`, `py3-requests`) and falls
+back to pip only with `--break-system-packages`. zeep is not dependably
+packaged on RHEL 9 or Alpine, so it would land on that fallback, on precisely
+the platform the Python 3.9 floor exists to serve.
+
+**ONVIF is not load-bearing here, and that is what makes the asymmetry
+decisive** rather than merely arithmetic. Nothing at runtime speaks it: the
+capture daemon fetches a JPEG over HTTP, or hands an RTSP URL to ffmpeg. ONVIF
+is a setup-time convenience used once per camera, so a vendor quirk degrades
+the wizard instead of breaking a deployment.
+
+**What the need actually measured.** `GetServices`, `GetProfiles`,
+`GetSnapshotUri` and `GetStreamUri`, with WS-Security digest authentication,
+came to about 150 lines of stdlib and worked first time against three makes on
+2026-08-14, including a camera answering `ter:ActionNotSupported` for snapshots
+and another returning HTTP 400 for an authentication failure. Three makes is
+encouragement, not proof, and this entry does not pretend otherwise.
+
+**Reopen if:** ONVIF becomes load-bearing at *runtime* rather than at setup, or
+quirk reports arrive in numbers that a table of shapes cannot absorb. Try the
+cheaper middle path first: vendor the *knowledge* rather than the library, the
+way the wizard's camera template table already does. See also
+future-features.md item 9, WS-Discovery, which is the one ONVIF capability
+worth having here and needs no SOAP stack at all.
+
+---
+
 ## In-browser `<video>` playback
 
 **Refused because the output format is close to the worst case for a browser,
