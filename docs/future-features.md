@@ -106,15 +106,36 @@ A status-code-only implementation misses the second, which is the shape the
 redaction rules were written around. `explain_payload()`
 (`timelapse_setup.py:1186`) already parses that body and is the thing to reuse.
 
-**The author's own deployment is mostly the first row, not the second**, which
-is worth stating because the measured evidence below is all from the second.
-Of seven enabled cameras: three on `/onvif-http/snapshot`, two on
-`/cgi-bin/snapshot.cgi` (the Dahua and Amcrest shape), one Reolink on the query
-string, one RTSP. So **six of seven use digest**, and what a wrong password
-does on those endpoints has never been observed here. The gap that matters is
-the ONVIF one: a snapshot endpoint that answers a failed auth with a 200 and a
-SOAP fault would be the Reolink surprise in a different costume, on the most
-common endpoint in this deployment.
+**Row 1 measured on a real Dahua, 2026-08-14**, on `/cgi-bin/snapshot.cgi`,
+presenting one wrong credential exactly once:
+
+| Request | Status | Body |
+|---|---|---|
+| No credentials | **401** with `WWW-Authenticate: Digest ... qop="auth"` | empty |
+| Wrong credentials | **401** | 27 bytes of `text/plain`: `Error` / `Invalid Authority!` |
+
+The status settles it and nothing needs to read the body, which is what makes
+this the easy half. Worth noticing anyway that the body is *not* constant: the
+challenge carries none and the rejection carries prose, so anything keying on
+the body would have to handle both, for no gain over reading the status.
+
+**The ONVIF shape is still unmeasured**, and the probe is why that is now a
+statement rather than an assumption: `/onvif-http/snapshot?Profile_1` returns
+**404** on that Dahua, so the cameras here using that path are a different make
+and their behaviour is still unknown. Of seven enabled cameras: three on
+`/onvif-http/snapshot` (**unmeasured**, and the remaining gap), two on
+`/cgi-bin/snapshot.cgi` (measured above), one Reolink on the query string
+(measured below), one RTSP (out of scope). A snapshot endpoint answering a
+failed auth with a 200 and a SOAP fault would be the Reolink surprise in a
+different costume, on the most common endpoint in this deployment.
+
+**How to measure this safely**, since the cost of getting it wrong is a locked
+account for half an hour. An unauthenticated GET presents no credential and so
+cannot count toward a lockout, yet it already reveals whether an endpoint
+challenges with 401, redirects to a login page, or answers 200 with a fault.
+Establish reachability and shape for free first; only the question "does a
+*wrong* credential differ from no credential" needs a real attempt, and one is
+enough.
 
 ### What exists
 
