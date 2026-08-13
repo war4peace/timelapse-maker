@@ -247,10 +247,17 @@ encoders, and projects real disk usage from your actual snapshot sizes.
 - **Cameras are polled independently**, so frames are not synchronised to the
   same instant across cameras.
 - **A frozen-but-reachable camera** produces a full frame count and a static
-  video. The tell is a suspiciously small output file.
-- **Thin test coverage.** ~115 unit tests plus one end-to-end encode test,
-  covering the pure logic; the RTSP path, transfer and installer behaviour on
-  non-apt distros have no automated coverage. See §9 of the architecture doc.
+  video. There is no automatic detection and this is deliberate, not an
+  oversight: see [docs/decided-against.md](docs/decided-against.md). The tell
+  is a suspiciously small output file.
+- **It never touches your cameras.** It reads snapshots and nothing else: no
+  reboots, no settings, no PTZ. If a camera hangs, something else on your
+  network is better placed to deal with it, and would only end up fighting
+  this one over the same device.
+- **Test coverage is uneven.** 1,118 unit tests plus one end-to-end encode
+  test, covering the pure logic; the RTSP path, transfer and installer
+  behaviour on non-apt distros still have no automated coverage. See §9 of the
+  architecture doc.
 
 ## License
 

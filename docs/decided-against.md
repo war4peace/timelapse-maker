@@ -59,6 +59,97 @@ queue to be encoded a second time.
 
 ---
 
+## Frozen-camera detection
+
+**Refused on evidence, 2026-08-13: in five years of running IP cameras for
+timelapses, across a fleet, the operator has never seen one keep answering HTTP
+while serving an unchanging image.**
+
+It was item 4, and its own design split is what settles it. Two different
+faults hide behind "frozen" and they need different detectors:
+
+| Detector | Catches | Why that is not enough |
+|---|---|---|
+| **Byte-identity** between consecutive JPEGs, nearly free in the capture loop | A stuck encoder re-serving one frame | The fault nobody here has ever observed. And it cannot live on the RTSP path at all, because ffmpeg fetches those frames, not us; it would apply only to HTTP snapshot cameras, where each fetch is an independent request and a stuck encoder is least likely. |
+| **Image comparison**, needing an ffmpeg decode per sampled frame | A live sensor pointed at nothing: a painted lens, a turned camera | A live sensor produces different bytes every time from noise alone, so this is the *only* half that could catch vandalism, and it is the half that has to guess. Any threshold must survive a dark, empty driveway all night. This project has shipped that mistake twice already (the rsync flags, the ReadWritePaths warning), which is why "a check that guesses is worse than no check" is written into architecture.md. |
+
+So the cheap half catches a fault never seen, and the expensive half catches a
+case that is out of scope anyway, by guessing.
+
+**The second-hand evidence probably is not about cameras.** NVR communities do
+discuss "stuck on last frame", and NVRs do ship watchdogs for it. Two things
+about that. If the mitigation lives in every NVR then it is the NVR's job, not
+this program's. And the freeze itself is usually in the *consumer*: an analogue
+camera has no frame buffer to be stuck on, since it emits a continuous
+baseband signal and fails as video loss or noise, so a held frame in an
+analogue setup is the DVR's decoder. The same is true of a stalled RTSP session
+in a viewer, which looks exactly like a frozen camera to whoever is watching.
+This program is a different consumer making its own independent request, so
+most of those reports would not reproduce here.
+
+**The adjacent need is already met**, which is the third time that has been the
+answer in this file. The observed failure is a camera that stops answering, and
+since 0.1.6 `capture.json` publishes `last_success` and `consec_fail` per
+camera and the Overview turns the row red.
+
+**Reopen if:** somebody reports a real instance, ideally keeping the frames. A
+detector built against evidence is a different proposition from one built
+against a guess, and the byte-identity half is genuinely cheap if there turns
+out to be anything to catch.
+
+---
+
+## Restarting a camera automatically
+
+**Refused structurally, 2026-08-13: two independent control loops acting on one
+device, with no shared state and no arbitration, eventually fight. The fighting
+is intermittent and horrible to diagnose.**
+
+It was item 5, and unlike the entry above the *fault* is real: cameras do stop
+answering. What is refused is this program doing something about it.
+
+**The case that settles it is a real deployment, not a hypothetical.** One
+camera fails to switch its warm light off at dawn, so a Home Assistant
+automation reboots it at first light; the reboot itself is what clears the
+light. This feature would see that camera stop answering, count its failures,
+and issue a reboot of its own during or just after the one that was supposed to
+happen. The worst version is not a redundant reboot but a second reboot landing
+**while the device is still booting**, which is the one moment its firmware is
+most exposed.
+
+The general form: **this program cannot tell a fault from an intention.** A
+camera that stops answering may be broken, may be rebooting on somebody's
+schedule, may be having its lens cleaned, may be on a switch port somebody just
+unplugged on purpose. Every one of those looks identical from here, and only
+one of them wants a reboot.
+
+Three more, each sufficient on its own:
+
+- **It needs a stronger credential than this project has ever asked for.** The
+  config holds whatever fetches a JPEG, which can be a view-only account on
+  most cameras. A reboot API needs admin. That raises what a leaked config is
+  worth, on a project that has already shipped one credential leak and
+  rewritten its logging around it.
+- **"Disable it during maintenance" contradicts "set and forget".** The core
+  promise here is running untouched for weeks or months. A guard you must
+  remember to turn off before touching anything is a guard that fires exactly
+  when you are busy.
+- **Anyone with several IP cameras already owns something that does this**, and
+  better: an NVR, Agent DVR, Home Assistant, Uptime Kuma. This program is
+  supplementary by design, and stepping onto ground another tool already holds
+  is how it starts conflicting with setups it cannot see.
+
+**What replaces it** is future-features.md item 7: an optional notification on
+repeated snapshot failures, default off. Telling someone is not the same as
+acting, it cannot fight another controller, and it needs no new credential.
+
+**Reopen if:** there is real demand *and* an answer to the arbitration
+question, which is not "add a config flag". Knowing that a reboot is safe means
+knowing what else touches that camera, and nothing in this program's design
+gives it that.
+
+---
+
 ## In-browser `<video>` playback
 
 **Refused because the output format is close to the worst case for a browser,

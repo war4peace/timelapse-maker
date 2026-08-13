@@ -1515,10 +1515,14 @@ there. What is not automatic is the wizard: a sink type the wizard cannot
 configure is one nobody finds, so `choose_notify()` needs a section too, and
 `sink_identity()` needs to know what makes two of them different.
 
-**Camera restart on hang**: natural home is a new module invoked by the capture
-daemon's failure path, gated on consecutive-failure count, with a cooldown so it
-can't reboot-loop a camera. Detection already exists (`consec_fail`); this is
-remediation only.
+**Camera restart on hang**: **decided against at 0.1.6**, see
+decided-against.md. Two independent control loops acting on one camera with no
+arbitration will eventually fight, and this one could not tell a fault from a
+scheduled reboot. If you fork it anyway, the natural home is a new module
+invoked by the capture daemon's failure path, gated on consecutive-failure
+count, with a cooldown; detection already exists (`consec_fail`), and note that
+it would need an admin credential where the config today needs only one that
+can fetch a JPEG.
 
 **Frame retention beyond encode**: **decided against on scope at 0.1.6**, see
 decided-against.md; this paragraph describes the extension point, not a plan.
@@ -1546,7 +1550,10 @@ help.
 - **Cameras are polled independently**, so frames across cameras are not
   synchronised to the same instant.
 - **A frozen-but-reachable camera** produces a full frame count and a static
-  video. No automatic detection; the tell is a suspiciously small output file.
+  video. No automatic detection, and that is now a decision rather than an
+  omission (decided-against.md): nobody has observed the fault, the cheap
+  detector cannot see a painted lens, and the one that could would have to
+  guess. The tell is a suspiciously small output file.
 - **Video length varies with capture coverage**: a camera down for 6 hours
   produces a shorter video, not a video with gaps.
 - `Cov%` is computed against a nominal `86400/interval` and will read ~104% or

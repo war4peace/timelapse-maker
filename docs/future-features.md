@@ -27,9 +27,11 @@ this list as item 0 went the same way once it was fixed: the invariant it
 established is in architecture.md §3, where the next person will actually meet
 it.
 
-**Numbering is not reused**, which is why this list opens at 4. Items 0, 2 and
-3 shipped in 0.1.6, and item 1 (frame retention) was refused on scope and moved
-to [decided-against.md](decided-against.md), where the arguments for it are
+**A number identifies an item; its position orders it.** Numbers are never
+reused, so that a commit or a CHANGELOG entry referring to "item 3" still means
+something a year later, and the list is therefore not in numeric order. Items
+0, 2 and 3 shipped in 0.1.6. Items 1, 4 and 5 were refused and moved to
+[decided-against.md](decided-against.md), where the arguments for them are
 recorded rather than left to be re-made.
 
 Item 3 shipped **narrower than it was planned**, and that is worth noting for
@@ -44,95 +46,50 @@ these are pre-plans, and the traps are the point.
 
 ---
 
-## 4. Frozen-camera detection
+## 7. Alert on repeated snapshot failures
 
-**Effort:** medium. **Prerequisites:** none, but it reports through (2) if
-that exists.
+**Effort:** small. **Prerequisites:** none; item 3 shipped the sinks and item 2
+shipped the counter this would read. **Default OFF**, and that is part of the
+design rather than a courtesy.
 
-### What exists
+### Where it came from
 
-Capture already inspects every frame: `min_bytes` rejects a truncated
-response and the JPEG SOI marker is checked. So there is a per-frame
-inspection point already, and it costs nothing extra to look at what is
-already in memory.
-
-Nothing looks at *content*. A camera that has frozen but is still serving
-produces a full day of valid JPEGs, a perfect frame count, 100% coverage and a
-video of a still image. Every check in the project passes.
-
-### Shape, and the split that matters
-
-Two different faults hide behind "frozen", and they need different detectors:
-
-- **A stuck stream** repeats one encoded frame, so successive JPEGs are often
-  *byte-identical*. A hash of the response, compared with the previous one, is
-  nearly free and catches this in the capture loop.
-- **A live sensor pointed at a static scene** produces different bytes every
-  time (sensor noise), so byte comparison never fires. Catching that needs
-  actual image comparison.
-
-Image comparison needs a decoder, and the stdlib has none: no PIL, no numpy,
-and the one third-party dependency this project allows is already spent on
-`requests`. **ffmpeg is a hard dependency though**, so the decode can be shelled
-out. That puts the expensive detector in the nightly encode, which is already
-reading every frame, rather than in the capture loop, which must stay cheap.
-
-So: byte-identity in capture (cheap, catches the stuck stream), optional
-sampled comparison in the encoder (catches the static scene), and neither
-pretends to be the other.
-
-### Traps
-
-- **A static scene at 03:00 is normal.** Any threshold has to survive a dark,
-  empty driveway all night without crying wolf, which is the same false-alarm
-  problem the rsync and ReadWritePaths checks got wrong twice.
-- Reporting is the hard half, not detection. There is no channel for "camera
-  N looks frozen" other than the log and the nightly summary.
-
----
-
-## 5. Camera restart on hang
-
-**Effort:** medium. **Prerequisites:** none. Detection exists; remediation
-does not.
+It is what survived items 4 and 5. Both were refused (decided-against.md), and
+this is the part of them that was actually wanted: not detecting a frozen
+image, not restarting anything, just saying "Court180 has failed 200 times in a
+row" to whoever asked to be told.
 
 ### What exists
 
-`consec_fail` counts consecutive failures per camera thread and drives the log
-throttle (`log_every_n_failures`). It is already the number a remediation
-would trigger on. Nothing acts on it.
-
-### The thing to decide before any code
-
-**This would be the first action this project takes *against* a camera.**
-Everything today is a read: fetch a snapshot, probe a profile. A reboot is a
-write, it interrupts whatever else is watching that camera (the NVR, very much
-including the one on the same host), and it is the kind of thing that looks
-fine in testing and reboot-loops a camera at 3 a.m.
+Everything except the decision to send. `consec_fail` is maintained per camera
+in the capture daemon, `capture.json` publishes it once a minute, and the
+notify sinks take a title, a body and a severity. The daemon already logs the
+first failure of every burst and the recovery line with its total.
 
 ### Shape
 
-No ONVIF client exists here and none should be written casually: device
-discovery plus WS-Security digest is a real amount of hand-rolled SOAP.
-`probe_profiles()` is the closest thing and it only substitutes a number into
-a URL.
-
-The tractable version is a per-camera `reboot_url` in the config, since every
-vendor already exposes one over plain HTTP (Dahua `magicBox.cgi?action=reboot`,
-Reolink `?cmd=Reboot`, Hikvision ISAPI). The project does not have to know the
-vendor; the operator pastes the URL, exactly as they already do for snapshots.
+A threshold in the capture config, checked where `consec_fail` is incremented,
+firing once per burst and once more on recovery. Never from the encoder: the
+encode runs at 00:05 and an alert about a camera that died at 09:00 the
+previous morning is not an alert, it is a history lesson.
 
 ### Traps
 
-- **A cooldown is mandatory**, and it must survive a restart of the daemon, or
-  a crash loop becomes a reboot loop. That means it is really an item (2)
-  dependency in disguise if it is to be durable.
-- The reboot URL carries the same credentials as the snapshot URL, so it is a
-  secret: redaction, and never logging the URL.
-- A camera that is unreachable cannot be told to reboot. The failure mode that
-  most wants this is the one where it least works.
-- **Suspect a second client first.** The last two camera-behaviour mysteries
-  here were both AgentDVR contention, not the camera.
+- **Default OFF, and generous when on.** The refusal of item 5 turns on a real
+  case: a camera rebooted every dawn by a Home Assistant automation is
+  unreachable for a minute by design. A threshold that fires on that trains
+  people to ignore the channel, which is worse than never having sent it.
+- **Once per burst, not once per failure.** At a 5-second cadence an overnight
+  outage is 5,000 ticks. The log already solved this with
+  `log_every_n_failures`; a notification has no such tolerance, so it needs
+  edge-triggering rather than throttling.
+- **Recovery must be as loud as the failure.** An alert with no all-clear
+  leaves somebody driving home to check a camera that fixed itself.
+- The capture daemon has never made an outbound connection in its life. It
+  would need `post_webhook()`, which means either importing from
+  `timelapse_encode` (breaking the daemon-independence rule that has been held
+  since 0.0.1) or a third copy of the transport. Neither is obviously right,
+  and that choice is the whole design question here.
 
 ---
 
