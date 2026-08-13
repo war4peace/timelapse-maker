@@ -30,9 +30,11 @@ it.
 **A number identifies an item; its position orders it.** Numbers are never
 reused, so that a commit or a CHANGELOG entry referring to "item 3" still means
 something a year later, and the list is therefore not in numeric order. Items
-0, 2 and 3 shipped in 0.1.6. Items 1, 4 and 5 were refused and moved to
+0, 2 and 3 shipped in 0.1.6. Items 1, 4, 5 and 7 were refused and moved to
 [decided-against.md](decided-against.md), where the arguments for them are
-recorded rather than left to be re-made.
+recorded rather than left to be re-made. Item 6 is all that remains, which is
+what a narrow scope looks like from inside a planning document: the list did
+not run out of ideas, it ran out of ideas that belong here.
 
 Item 3 shipped **narrower than it was planned**, and that is worth noting for
 the next entry that lists candidates: it proposed ntfy, gotify and email, and
@@ -43,53 +45,6 @@ A pre-plan is a starting point for the conversation, not the specification.
 Everything below is **researched against the code as of 0.1.5**, so each entry
 says where it would hook in and what is already there. None of it is designed;
 these are pre-plans, and the traps are the point.
-
----
-
-## 7. Alert on repeated snapshot failures
-
-**Effort:** small. **Prerequisites:** none; item 3 shipped the sinks and item 2
-shipped the counter this would read. **Default OFF**, and that is part of the
-design rather than a courtesy.
-
-### Where it came from
-
-It is what survived items 4 and 5. Both were refused (decided-against.md), and
-this is the part of them that was actually wanted: not detecting a frozen
-image, not restarting anything, just saying "Court180 has failed 200 times in a
-row" to whoever asked to be told.
-
-### What exists
-
-Everything except the decision to send. `consec_fail` is maintained per camera
-in the capture daemon, `capture.json` publishes it once a minute, and the
-notify sinks take a title, a body and a severity. The daemon already logs the
-first failure of every burst and the recovery line with its total.
-
-### Shape
-
-A threshold in the capture config, checked where `consec_fail` is incremented,
-firing once per burst and once more on recovery. Never from the encoder: the
-encode runs at 00:05 and an alert about a camera that died at 09:00 the
-previous morning is not an alert, it is a history lesson.
-
-### Traps
-
-- **Default OFF, and generous when on.** The refusal of item 5 turns on a real
-  case: a camera rebooted every dawn by a Home Assistant automation is
-  unreachable for a minute by design. A threshold that fires on that trains
-  people to ignore the channel, which is worse than never having sent it.
-- **Once per burst, not once per failure.** At a 5-second cadence an overnight
-  outage is 5,000 ticks. The log already solved this with
-  `log_every_n_failures`; a notification has no such tolerance, so it needs
-  edge-triggering rather than throttling.
-- **Recovery must be as loud as the failure.** An alert with no all-clear
-  leaves somebody driving home to check a camera that fixed itself.
-- The capture daemon has never made an outbound connection in its life. It
-  would need `post_webhook()`, which means either importing from
-  `timelapse_encode` (breaking the daemon-independence rule that has been held
-  since 0.0.1) or a third copy of the transport. Neither is obviously right,
-  and that choice is the whole design question here.
 
 ---
 

@@ -139,14 +139,89 @@ Three more, each sufficient on its own:
   supplementary by design, and stepping onto ground another tool already holds
   is how it starts conflicting with setups it cannot see.
 
-**What replaces it** is future-features.md item 7: an optional notification on
-repeated snapshot failures, default off. Telling someone is not the same as
-acting, it cannot fight another controller, and it needs no new credential.
+**What was proposed instead** was an optional notification on repeated snapshot
+failures, default off: telling someone is not the same as acting, it cannot
+fight another controller, and it needs no new credential. That became item 7,
+and it was refused a day later on its own merits. See the next entry.
 
 **Reopen if:** there is real demand *and* an answer to the arbitration
 question, which is not "add a config flag". Knowing that a reboot is safe means
 knowing what else touches that camera, and nothing in this program's design
 gives it that.
+
+---
+
+## Alerting when a camera stops answering
+
+**Refused on scope and duplication, 2026-08-13: a monitoring tool running on
+the same box does this better, and the one failure mode it cannot see is the
+one this alert would have missed anyway.**
+
+It was item 7, proposed as the survivor of items 4 and 5, and it lasted one
+day. The deployment target is a Linux host with a GPU capable of NVENC, so it
+is not a constrained machine: whoever runs this can also run Uptime Kuma,
+Observium or the NVR they already own, all of which bring schedules, escalation,
+maintenance windows and more delivery channels than this program will ever
+have. Building a worse one inside the encoder is not a saving.
+
+**This was already the written position**, which is the part worth noticing.
+architecture.md has said "alerting on camera health" is explicitly out of scope
+since the first version of the document, and the note beside the capture
+daemon's failure throttling says in as many words that external uptime
+monitoring is the real alerting path and that this log is for post-hoc
+diagnosis. Item 7 was proposed without either being consulted. A rejected idea
+that comes back in a new costume is exactly what this file exists to catch, and
+it caught one written by the same author who had written the rule.
+
+**What already covers it here**, none of it new work:
+
+- the nightly notification carries `Cov%` per camera, so a bad day is legible
+  the next morning;
+- the web UI shows the capture log, up to 1,000 lines, and the daemon logs the
+  first failure of every burst as well as the recovery total;
+- since 0.1.6 `capture.json` publishes `last_success` and `consec_fail` per
+  camera once a minute, and the Overview turns a silent camera's row red.
+
+### The argument that settles it
+
+The failure modes split in two, and the proposed alert lands on the wrong side
+of the split.
+
+| What happened | Can an external monitor see it? | Would item 7 have fired? |
+|---|---|---|
+| The camera is unreachable: powered off, unplugged, crashed, rebooting | Yes, within its poll interval, and it can page you | Yes, and later than the monitor, from a daemon with no escalation, no schedule and no maintenance window |
+| The camera answers HTTP but this program's fetches fail: contention, credentials rotated, snapshot endpoint moved by a firmware update | No. The monitor is checking the device; only this program knows whether *it* is getting frames | Only for the sustained version. The one real instance on record, the Court180 frame delta of August 2026, was bursts of **two** failures from Agent DVR polling the same camera in parallel, so `consec_fail` never exceeded 2 and no usable threshold fires on it |
+
+So the case where this program genuinely knows something no monitor can is
+also the case a `consec_fail` threshold is blind to, and the case the threshold
+catches is the case something else already catches better.
+
+### What is actually given up
+
+One thing, and it is real: a camera that keeps answering while every fetch
+fails, for a reason that persists. A rotated password, or an endpoint that
+moved under a firmware update. There `consec_fail` does climb into the
+thousands, an external monitor stays green, and the operator finds out at 00:05
+from `Cov%` of 0. The cost is bounded at one camera for one day, and
+`timelapse test` already exists as the thing to run after touching a camera.
+Priced, not overlooked.
+
+### The effort estimate was wrong as well
+
+Item 7 was labelled small because the counter and the notification sinks both
+exist. They do, but **the capture daemon has never made an outbound connection
+in its life**, and that is deliberate: it is a copy of the redaction rule and
+nothing else, importable from nowhere. Sending from it means either importing
+`post_webhook()` from `timelapse_encode` (breaking a daemon-independence rule
+held since 0.0.1) or a third copy of the transport. The cheapest correct
+version crosses the one boundary this project has never crossed.
+
+**Reopen if:** somebody loses a day to a camera that was up while its snapshots
+failed. Do not rebuild it as proposed. Key it on the age of `last_success`
+rather than on `consec_fail`, since that covers both shapes of failure at once,
+and put it in something that *reads* `capture.json` rather than in the daemon
+that writes it, which leaves the daemon exactly as connectionless as it is
+today.
 
 ---
 
