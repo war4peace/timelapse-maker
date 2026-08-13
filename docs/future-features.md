@@ -49,10 +49,19 @@ these are pre-plans, and the traps are the point.
 
 ---
 
-## 8. Report a camera that refuses our credentials
+## 8. Back off from a camera that refuses our credentials, and say so
 
-**Effort:** small. **Prerequisites:** none. Item 2 shipped the state file this
-would write into and item 3 shipped the sinks.
+**Effort:** small, and it is **two things**, buildable and shippable
+separately:
+
+- **(a) Stop hammering.** A back-off when a camera rejects our credentials.
+  This is a **defect fix in shipped code**. It lives entirely inside the
+  capture daemon, and needs no egress, no new unit and no sink.
+- **(b) Say so.** The notification, which was the original idea and which
+  carries all of the transport cost discussed below.
+
+**Prerequisites:** none. Item 2 shipped the state file this writes into and
+item 3 shipped the sinks.
 
 ### Where it came from
 
@@ -62,6 +71,29 @@ sharper: can a rotated password be caught from the camera's own answer? It can,
 and **a monitoring tool cannot catch it, because it holds no credentials**.
 This is the part of item 7 that survives its own refusal, and it is a much
 smaller part than item 7 was.
+
+Part (a) then arrived from the other direction and turned out to matter more.
+
+### The defect that (a) fixes, which is not hypothetical
+
+**Reported from experience, 2026-08-13.** Deploying Agent DVR for the first
+time: it asks for one *common* ONVIF credential pair and then probes every
+camera with it. The cameras that did not share that pair **locked the account
+for 30 minutes**.
+
+Now apply that to this program as it stands. Rotate a camera's credentials
+without disabling it here first, and the capture daemon presents the old ones
+every `interval_seconds`, indefinitely. On firmware that locks after a handful
+of failures, the lock is renewed faster than it expires, so **the account stays
+locked until somebody disables that camera or stops the daemon**. Entering the
+new password on the camera does not clear it, because we are still holding the
+door shut. And a camera account is commonly shared with an NVR or another
+consumer, so the collateral is not confined to us.
+
+That is this program causing an outage on a device it was only ever supposed to
+read from, and the code that does it is shipped today. It also inverts the
+priorities inside this entry: the notification is the nice half, and the
+back-off is the half that matters.
 
 ### Two shapes, and only one of them is an HTTP status
 
@@ -132,43 +164,56 @@ in a maintenance mode, answers 200 with something that is not a JPEG too.
 Calling any of that a refusal would be an invention. A 401 declares itself; a
 200 declares itself only through a code we recognise.
 
-### The trigger: ten refusals AND ten minutes, whichever comes last
+### The ladder: two strikes, ten minutes, one more, then speak
 
-Decided 2026-08-13, in two steps, because the first version was wrong at one
-end of the range.
+Proposed 2026-08-13, and it **replaces** an earlier "ten refusals AND ten
+minutes, whichever comes last" rule rather than amending it. The two cannot
+coexist: backing off is precisely a decision not to accumulate ten refusals.
 
-**A count alone is not comparable across cameras.** Per-camera
-`interval_seconds` shipped in 0.1.2, so five consecutive refusals is 25 seconds
-on one camera and 75 minutes on another; the same number on the same page would
-mean two different things. A duration is also what the message can state as an
-observed fact: "Roof has refused our credentials for the last 10 minutes."
+1. **Two consecutive `auth` ticks.** Cheap insurance against a one-off.
+2. **Stop fetching this camera for 10 minutes.**
+3. **One attempt.** Success resumes the normal cadence and the incident ends.
+4. **Still refused: notify**, once.
 
-**A duration alone breaks at the sparse end.** At a five-minute cadence, ten
-minutes is *two* responses, and two is not evidence. A camera rebooting into a
-firmware update, or dropped into a maintenance mode, can produce that much and
-then be perfectly fine.
+**Spacing beats counting, which is why the rule it replaces was worse than it
+looked.** Ten rapid refusals sample one instant of a device's life ten times
+over. Two attempts ten minutes apart sample two different conditions, and a
+camera part way through a firmware update or a reboot is in a different state
+by the second one. So the ladder is not only safer, it is *faster* where the
+old rule was slowest: at a five-minute cadence that rule needed 50 minutes to
+collect ten refusals, and this reaches a verdict in about fifteen.
 
-So both floors must be met, and the later one governs:
+**What a wrong back-off costs** is ten minutes of one camera's frames: 120 of
+roughly 17,000 in a day at a 5-second cadence, under 1% of `Cov%`. If the
+refusal was genuine, those fetches would have failed anyway, so the expected
+cost is lower still. That is what makes two strikes enough rather than five.
 
-```
-fire when (now - class_began) >= 600 AND consecutive_refusals >= 10
-```
+**Only the `auth` class backs off.** An unreachable camera must keep being
+tried at cadence: the fetch costs nothing, nobody is being locked out, and
+recovery should be immediate when it comes. Backing off there would turn a
+30-second reboot into a 10-minute hole, and it is the reboot case that
+[decided-against.md](decided-against.md) already refused a feature over.
 
-Each floor does a job the other cannot, and which one binds is decided by the
-cadence. They cross at a **one-minute interval**, where ten refusals and ten
-minutes are the same instant:
+**Suppress the intra-tick retry for `auth`.** `_retry_grab()` makes a second
+attempt inside the first failing tick, which against a rejected credential
+cannot succeed and is pure lockout fuel. Suppressing it puts the total at
+**two** authentication attempts before the daemon goes quiet, comfortably under
+the handful that firmware tends to allow.
 
-| Interval | Ten refusals takes | Fires after | Binding floor |
-|---|---|---|---|
-| 5 s | 50 s | 10 min, by which point 120 refusals | time |
-| 60 s | 10 min | 10 min | both at once |
-| 5 min | 50 min | 50 min, 10 refusals | count |
-| 15 min | 2 h 30 m | 2 h 30 m, 10 refusals | count |
+**After the notification, keep probing, slower, and never stop.** The proposal
+leaves this open and the answer matters: resuming the normal cadence would
+re-lock the account immediately. An escalating interval (10 minutes, then 30,
+then 60, capped) is what escapes a lockout window that cannot be measured from
+here, and the one measured window in evidence is **30 minutes**, which a fixed
+10-minute probe would sit inside and might keep renewing. Never stopping is
+what keeps "fix the password and walk away" true; a daemon that gave up would
+need a restart to notice the fix.
 
-The last row is not worth engineering around. A 15-minute cadence yields 96
-frames a day, below the default `encode.min_frames` of 100, so that camera
-produces **no video at all** and both the wizard and `timelapse test` already
-say so. A setup that sparse has a louder problem than a late alert.
+**A camera can reject a correct password.** Once a lockout is running, the
+right credentials fail too, so the notification can arrive after the operator
+has already fixed things. One more reason the message states the observation:
+"the camera rejected our credentials" stays true throughout, where "your
+password is wrong" would be false and infuriating.
 
 ### The transport is the open question
 
@@ -198,28 +243,19 @@ everything the check needs.
   that is not a wrong password at all: a config saying `basic` where the camera
   wants `digest` produces the same 401, and the wizard already offers to retry
   with the other scheme for exactly that reason.
-- **Our own retry loop can make a wrong password worse.** Some firmware locks
-  an account after a handful of failed authentications, for minutes at a time.
-  A daemon presenting bad credentials every five seconds can hold such an
-  account locked continuously, and the account is often shared with whatever
-  else pulls from that camera, so the damage is not confined to us. This is an
-  argument *for* telling somebody quickly, and a reason not to consider backing
-  off on `auth` an optimisation: if it is ever built, it is a correctness fix.
-- **The clock and the counter reset together**, on any success and on any
-  change of class. A tick that times out between two refusals is an
-  `unreachable`, not a refusal, so an intermittent mix never accumulates
-  towards either floor. That is the conservative direction and the right one:
-  a camera that is sometimes refusing and sometimes unreachable is not a
-  diagnosis anybody should be woken for.
-- **One tick is one refusal.** `_retry_grab()` already makes its second attempt
-  inside the same tick only on the first failure of a burst, and the tick still
-  increments `consec_fail` by one. Keep it that way, or the counter stops being
-  a count of ticks and the cadence arithmetic above stops holding.
-- **Both reset when the daemon does.** Correct, since nothing is known about a
-  fresh process's first fetch, but note it is now the *later* of two floors
-  being reset: on a slow camera an upgrade can push an alert back by ten
-  intervals rather than by ten minutes. State it rather than let someone find
-  it.
+- **The ladder resets on a success and on any change of class**, both of which
+  end the incident. A tick that times out between two refusals is an
+  `unreachable`, so an intermittent mix never climbs the ladder at all. That is
+  the conservative direction and the right one: a camera that is sometimes
+  refusing and sometimes unreachable is not a diagnosis anybody should be woken
+  for.
+- **A restart re-enters at step 1.** The ladder lives in memory, so every start
+  of the daemon spends two more authentication attempts on a camera that is
+  already refusing. Ordinarily that is nothing, but a unit in an `on-failure`
+  restart loop would be back to hammering the account through the very
+  mechanism this exists to stop, just at a slower rate. Persisting the ladder's
+  position beside the rest of the runtime state is the obvious answer, and it
+  should be decided deliberately rather than by omission.
 - **RTSP is out of scope here.** ffmpeg holds the credential and fetches the
   frames, so an auth failure arrives as process stderr, not as a response
   anyone inspects. Say so plainly rather than implying coverage.
