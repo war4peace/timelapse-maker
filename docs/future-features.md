@@ -136,6 +136,32 @@ One negative result worth keeping: `/onvif-http/snapshot?Profile_1` returns
 **404** on the Dahua, so endpoint paths are not portable between makes even
 within one fleet, and a measurement on one camera says nothing about another.
 
+**A fourth shape exists, and "ONVIF" is the trap word.** The Tapo TC40's ONVIF
+service on port 2020 was probed the same way. `GetSystemDateAndTime`, which the
+spec requires to work unauthenticated, answers 200. `GetDeviceInformation`
+answers **HTTP 400** with a SOAP fault `ter:NotAuthorized` and the reason
+`Authority failure`, *identically* whether no security header is sent or a
+correctly formed WS-Security UsernameToken carrying a wrong password.
+
+So the word names two unrelated behaviours in this very config:
+
+| Spelled | Protocol | Failed auth |
+|---|---|---|
+| `/onvif-http/snapshot?Profile_1` | plain HTTP, digest | **401** |
+| `/onvif/device_service` | SOAP over HTTP | **400** plus `ter:NotAuthorized` |
+
+Anyone reading "the ONVIF cameras" as one behaviour would be wrong about half
+of them. This program only ever fetches the first, so the SOAP shape is **out
+of scope** and is recorded only so that nobody later assumes the two are the
+same thing. It does reinforce the principle the entry already rests on: an
+authentication failure is not reliably a 401, and it is only the transport we
+actually use that makes the status trustworthy.
+
+**The wireless camera is not slower**, which is worth writing down because it
+was expected to be. Round trips of 6 to 12 ms across five runs, against 8 ms
+for the Hikvision, 38 ms for the Dahua and 26 ms for the Reolink on the same
+pass. On a LAN, wireless is not a reason to want a longer per-camera timeout.
+
 **How to measure this safely**, since the cost of getting it wrong is a locked
 account for half an hour. An unauthenticated GET presents no credential and so
 cannot count toward a lockout, yet it already reveals whether an endpoint
