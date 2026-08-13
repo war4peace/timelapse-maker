@@ -70,10 +70,19 @@ smaller part than item 7 was.
 | **401**, occasionally 403 | Anything doing digest or basic properly: Dahua, Hikvision, Axis | `raise_for_status()` in `_grab()` raises `HTTPError` naming the code |
 | **200 OK with a JSON error body**, served as `text/html` | Reolink | The `\xff\xd8` check, as `response is not a JPEG (bad SOI marker)` |
 
-A status-code-only implementation misses the second, which is the brand this
-project's own deployment runs and the one the redaction rules were written
-around. `explain_payload()` (`timelapse_setup.py:1186`) already parses that
-body and is the thing to reuse.
+A status-code-only implementation misses the second, which is the shape the
+redaction rules were written around. `explain_payload()`
+(`timelapse_setup.py:1186`) already parses that body and is the thing to reuse.
+
+**The author's own deployment is mostly the first row, not the second**, which
+is worth stating because the measured evidence below is all from the second.
+Of seven enabled cameras: three on `/onvif-http/snapshot`, two on
+`/cgi-bin/snapshot.cgi` (the Dahua and Amcrest shape), one Reolink on the query
+string, one RTSP. So **six of seven use digest**, and what a wrong password
+does on those endpoints has never been observed here. The gap that matters is
+the ONVIF one: a snapshot endpoint that answers a failed auth with a 200 and a
+SOAP fault would be the Reolink surprise in a different costume, on the most
+common endpoint in this deployment.
 
 ### What exists
 
