@@ -32,9 +32,10 @@ reused, so that a commit or a CHANGELOG entry referring to "item 3" still means
 something a year later, and the list is therefore not in numeric order. Items
 0, 2 and 3 shipped in 0.1.6. Items 1, 4, 5 and 7 were refused and moved to
 [decided-against.md](decided-against.md), where the arguments for them are
-recorded rather than left to be re-made. Item 6 is all that remains, which is
-what a narrow scope looks like from inside a planning document: the list did
-not run out of ideas, it ran out of ideas that belong here.
+recorded rather than left to be re-made. Item 8 was added the same day item 7
+was refused, and is a good illustration of why the refusals are written down
+rather than deleted: it exists *because* of the argument that killed item 7,
+and it is a fraction of the size.
 
 Item 3 shipped **narrower than it was planned**, and that is worth noting for
 the next entry that lists candidates: it proposed ntfy, gotify and email, and
@@ -45,6 +46,106 @@ A pre-plan is a starting point for the conversation, not the specification.
 Everything below is **researched against the code as of 0.1.5**, so each entry
 says where it would hook in and what is already there. None of it is designed;
 these are pre-plans, and the traps are the point.
+
+---
+
+## 8. Report a camera that refuses our credentials
+
+**Effort:** small. **Prerequisites:** none. Item 2 shipped the state file this
+would write into and item 3 shipped the sinks.
+
+### Where it came from
+
+Item 7 was refused because a monitoring tool sees an unreachable camera sooner
+and handles it better (decided-against.md). The question that followed it was
+sharper: can a rotated password be caught from the camera's own answer? It can,
+and **a monitoring tool cannot catch it, because it holds no credentials**.
+This is the part of item 7 that survives its own refusal, and it is a much
+smaller part than item 7 was.
+
+### Two shapes, and only one of them is an HTTP status
+
+| The camera says | Which cameras | Where it lands today |
+|---|---|---|
+| **401**, occasionally 403 | Anything doing digest or basic properly: Dahua, Hikvision, Axis | `raise_for_status()` in `_grab()` raises `HTTPError` naming the code |
+| **200 OK with a JSON error body** | Reolink | The `\xff\xd8` check, as `response is not a JPEG (bad SOI marker)` |
+
+A status-code-only implementation misses the second, which is the brand this
+project's own deployment runs and the one the redaction rules were written
+around. `explain_payload()` (`timelapse_setup.py:1186`) already parses that
+body and is the thing to reuse.
+
+### What exists
+
+The daemon distinguishes the two shapes already, by accident: both raise, with
+different messages. It collapses them into `err` and logs the string, and the
+string survives redaction intact, since `redact()` masks the credential *value*
+and not the status. So `401 Client Error: ... password=***` is already in
+journald, in `capture.log` and on the web log page. What does not exist is any
+structured record: `capture_state()` publishes names, timestamps and counters,
+and no error of any kind, so the Overview can say a camera is silent and can
+never say why. The wizard and `timelapse test` both special-case 401 by hand.
+
+### Shape
+
+Classify where `err` is set in `run()`, never in `_grab()`, which must stay the
+fetch and nothing else. Three classes are enough: `auth`, `unreachable`,
+`other`. Record the class and **the moment the current class began**, publish
+both in `capture.json`, and trigger on the elapsed time.
+
+### Why a duration and not a count
+
+Decided 2026-08-13, and it is the right call for a reason specific to this
+program:
+
+- **A count is not comparable across cameras.** Per-camera `interval_seconds`
+  shipped in 0.1.2, so five consecutive refusals is 25 seconds on one camera
+  and 75 minutes on another. The same number on the same page would mean two
+  different things.
+- **A duration is what a human acts on**, and it can be stated as an observed
+  fact: "Roof has refused our credentials for the last 10 minutes."
+- **It also disposes of the one caveat against this feature.** Some firmware
+  answers 401 under session or rate limits, which would make a count-based
+  trigger a guess about what a few refusals mean. A refusal that persists for
+  ten continuous minutes is a real condition whoever caused it, so the duration
+  threshold converts the ambiguous case into one still worth sending.
+
+### The transport is the open question
+
+The capture daemon has never made an outbound connection in its life, and that
+is deliberate rather than incidental. Three ways out, none free:
+
+1. **Send from the daemon**, importing `post_webhook()` from
+   `timelapse_encode`. Breaks the daemon-independence rule held since 0.0.1.
+2. **A third copy of the transport** in the daemon. Keeps independence, and the
+   redaction rule is already duplicated this way with a test pinning the copies
+   together, so there is precedent. It is still a third copy.
+3. **A timer-invoked checker** that reads `capture.json` and sends through the
+   encoder's existing `notify()`. The daemon stays connectionless and publishes
+   facts, which is exactly what item 2 built it to do. Costs a new unit, and
+   therefore `sync_units()`, the installer's restart list and a `ReadWritePaths`
+   review.
+
+Option 3 is the recommendation: it is the only one where the thing that knows
+and the thing that sends stay separate, and the state file already carries
+everything the check needs.
+
+### Traps
+
+- **Report the observation, not the diagnosis.** "The camera rejected our
+  credentials" is a fact; "your password is wrong" is an inference, and this
+  project has already shipped two checks that guessed.
+- **The clock restarts when the daemon does.** Correct (nothing is known about
+  a fresh process's first fetch) but it means an upgrade can delay an alert by
+  the threshold. State it rather than let someone find it.
+- **RTSP is out of scope here.** ffmpeg holds the credential and fetches the
+  frames, so an auth failure arrives as process stderr, not as a response
+  anyone inspects. Say so plainly rather than implying coverage.
+- **Recovery is one successful frame, and must be sent.** An alert with no
+  all-clear sends somebody to fix a thing that fixed itself.
+- **`explain_payload()` is in the wizard only**, and `timelapse test` prints
+  raw first bytes for the same Reolink response. Whatever this reuses should
+  close that drift rather than become a third copy of it.
 
 ---
 

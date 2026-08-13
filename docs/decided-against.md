@@ -216,12 +216,21 @@ nothing else, importable from nowhere. Sending from it means either importing
 held since 0.0.1) or a third copy of the transport. The cheapest correct
 version crosses the one boundary this project has never crossed.
 
-**Reopen if:** somebody loses a day to a camera that was up while its snapshots
-failed. Do not rebuild it as proposed. Key it on the age of `last_success`
-rather than on `consec_fail`, since that covers both shapes of failure at once,
-and put it in something that *reads* `capture.json` rather than in the daemon
-that writes it, which leaves the daemon exactly as connectionless as it is
-today.
+**Partly answered already.** The refusal prompted a better question the same
+day: a camera that rejects our credentials says so in its own response, so that
+half needs no threshold and no guessing, and it is invisible to an external
+monitor precisely because a monitor holds no credentials. That became
+future-features item 8, triggered on how long the refusal has lasted rather
+than on how many times it has happened. It is not this feature in disguise: it
+reports one deterministic, self-declared condition instead of inferring health
+from a counter.
+
+**Reopen the rest if:** somebody loses a day to a camera that was up while its
+snapshots failed for a reason the camera did *not* declare. Do not rebuild it
+as proposed. Key it on the age of `last_success` rather than on `consec_fail`,
+since that covers both shapes of failure at once, and put it in something that
+*reads* `capture.json` rather than in the daemon that writes it, which leaves
+the daemon exactly as connectionless as it is today.
 
 ---
 
