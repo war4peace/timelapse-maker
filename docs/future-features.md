@@ -90,25 +90,53 @@ never say why. The wizard and `timelapse test` both special-case 401 by hand.
 
 Classify where `err` is set in `run()`, never in `_grab()`, which must stay the
 fetch and nothing else. Three classes are enough: `auth`, `unreachable`,
-`other`. Record the class and **the moment the current class began**, publish
-both in `capture.json`, and trigger on the elapsed time.
+`other`. Record the class, **the moment the current class began** and **how
+many consecutive ticks it has held**; publish all three in `capture.json`.
 
-### Why a duration and not a count
+**Only a body that names an auth error may be classified `auth`.** The 200
+path is the loose one: a camera part way through a firmware update, or sitting
+in a maintenance mode, also answers 200 with something that is not a JPEG, and
+calling that a refusal would be an invention. A 401 declares itself; a 200 is a
+refusal only if `explain_payload()` finds the camera saying so, and everything
+else down that path is `other`.
 
-Decided 2026-08-13, and it is the right call for a reason specific to this
-program:
+### The trigger: ten refusals AND ten minutes, whichever comes last
 
-- **A count is not comparable across cameras.** Per-camera `interval_seconds`
-  shipped in 0.1.2, so five consecutive refusals is 25 seconds on one camera
-  and 75 minutes on another. The same number on the same page would mean two
-  different things.
-- **A duration is what a human acts on**, and it can be stated as an observed
-  fact: "Roof has refused our credentials for the last 10 minutes."
-- **It also disposes of the one caveat against this feature.** Some firmware
-  answers 401 under session or rate limits, which would make a count-based
-  trigger a guess about what a few refusals mean. A refusal that persists for
-  ten continuous minutes is a real condition whoever caused it, so the duration
-  threshold converts the ambiguous case into one still worth sending.
+Decided 2026-08-13, in two steps, because the first version was wrong at one
+end of the range.
+
+**A count alone is not comparable across cameras.** Per-camera
+`interval_seconds` shipped in 0.1.2, so five consecutive refusals is 25 seconds
+on one camera and 75 minutes on another; the same number on the same page would
+mean two different things. A duration is also what the message can state as an
+observed fact: "Roof has refused our credentials for the last 10 minutes."
+
+**A duration alone breaks at the sparse end.** At a five-minute cadence, ten
+minutes is *two* responses, and two is not evidence. A camera rebooting into a
+firmware update, or dropped into a maintenance mode, can produce that much and
+then be perfectly fine.
+
+So both floors must be met, and the later one governs:
+
+```
+fire when (now - class_began) >= 600 AND consecutive_refusals >= 10
+```
+
+Each floor does a job the other cannot, and which one binds is decided by the
+cadence. They cross at a **one-minute interval**, where ten refusals and ten
+minutes are the same instant:
+
+| Interval | Ten refusals takes | Fires after | Binding floor |
+|---|---|---|---|
+| 5 s | 50 s | 10 min, by which point 120 refusals | time |
+| 60 s | 10 min | 10 min | both at once |
+| 5 min | 50 min | 50 min, 10 refusals | count |
+| 15 min | 2 h 30 m | 2 h 30 m, 10 refusals | count |
+
+The last row is not worth engineering around. A 15-minute cadence yields 96
+frames a day, below the default `encode.min_frames` of 100, so that camera
+produces **no video at all** and both the wizard and `timelapse test` already
+say so. A setup that sparse has a louder problem than a late alert.
 
 ### The transport is the open question
 
@@ -135,9 +163,21 @@ everything the check needs.
 - **Report the observation, not the diagnosis.** "The camera rejected our
   credentials" is a fact; "your password is wrong" is an inference, and this
   project has already shipped two checks that guessed.
-- **The clock restarts when the daemon does.** Correct (nothing is known about
-  a fresh process's first fetch) but it means an upgrade can delay an alert by
-  the threshold. State it rather than let someone find it.
+- **The clock and the counter reset together**, on any success and on any
+  change of class. A tick that times out between two refusals is an
+  `unreachable`, not a refusal, so an intermittent mix never accumulates
+  towards either floor. That is the conservative direction and the right one:
+  a camera that is sometimes refusing and sometimes unreachable is not a
+  diagnosis anybody should be woken for.
+- **One tick is one refusal.** `_retry_grab()` already makes its second attempt
+  inside the same tick only on the first failure of a burst, and the tick still
+  increments `consec_fail` by one. Keep it that way, or the counter stops being
+  a count of ticks and the cadence arithmetic above stops holding.
+- **Both reset when the daemon does.** Correct, since nothing is known about a
+  fresh process's first fetch, but note it is now the *later* of two floors
+  being reset: on a slow camera an upgrade can push an alert back by ten
+  intervals rather than by ten minutes. State it rather than let someone find
+  it.
 - **RTSP is out of scope here.** ffmpeg holds the credential and fetches the
   frames, so an auth failure arrives as process stderr, not as a response
   anyone inspects. Say so plainly rather than implying coverage.
