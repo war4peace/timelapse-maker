@@ -68,7 +68,7 @@ smaller part than item 7 was.
 | The camera says | Which cameras | Where it lands today |
 |---|---|---|
 | **401**, occasionally 403 | Anything doing digest or basic properly: Dahua, Hikvision, Axis | `raise_for_status()` in `_grab()` raises `HTTPError` naming the code |
-| **200 OK with a JSON error body** | Reolink | The `\xff\xd8` check, as `response is not a JPEG (bad SOI marker)` |
+| **200 OK with a JSON error body**, served as `text/html` | Reolink | The `\xff\xd8` check, as `response is not a JPEG (bad SOI marker)` |
 
 A status-code-only implementation misses the second, which is the brand this
 project's own deployment runs and the one the redaction rules were written
@@ -93,12 +93,35 @@ fetch and nothing else. Three classes are enough: `auth`, `unreachable`,
 `other`. Record the class, **the moment the current class began** and **how
 many consecutive ticks it has held**; publish all three in `capture.json`.
 
-**Only a body that names an auth error may be classified `auth`.** The 200
-path is the loose one: a camera part way through a firmware update, or sitting
-in a maintenance mode, also answers 200 with something that is not a JPEG, and
-calling that a refusal would be an invention. A 401 declares itself; a 200 is a
-refusal only if `explain_payload()` finds the camera saying so, and everything
-else down that path is `other`.
+**Classify on the `rspCode`, and only a known auth code may be `auth`.**
+Measured against a real Reolink on 2026-08-13, with the URL shape the wizard
+builds. All three of these are HTTP **200**, all three carry `code: 1` and an
+`error` object, and only the first two are about credentials:
+
+| Request | `rspCode` | `detail` |
+|---|---|---|
+| Wrong user and password | **-7** | `login failed` |
+| No credentials at all | **-6** | `please login first` |
+| A command the camera does not have | **-9** | `not support` |
+
+So **`explain_payload()` returning a reason is not a test for authentication**:
+it returns one for `-9` as readily as for `-7`. The wizard gets away with that
+because it prints the reason to a human who can read it, and a classifier
+cannot. Key on the code, treat `detail` as display text only (the string is
+firmware and probably locale dependent; the number is not), and file anything
+outside the known auth set as `other` **while logging the code**, so the set
+grows from evidence rather than from guesses about a table nobody here has.
+
+Two more measured facts that constrain the implementation. The camera serves
+that JSON as `Content-Type: text/html`, so nothing may test the content type.
+And the camera's root page is a 21 KB HTML document, also 200: a URL typo that
+drops the query string lands there, produces no `error` object, and correctly
+falls out as `other`.
+
+The general rule behind this: a camera part way through a firmware update, or
+in a maintenance mode, answers 200 with something that is not a JPEG too.
+Calling any of that a refusal would be an invention. A 401 declares itself; a
+200 declares itself only through a code we recognise.
 
 ### The trigger: ten refusals AND ten minutes, whichever comes last
 
