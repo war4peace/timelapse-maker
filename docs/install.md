@@ -11,6 +11,7 @@ Operator guide. For how the system is built and why, see
 <frames_root>/<Camera>/<YYYY-MM-DD>/<HHMMSS>.jpg   ← deleted after a successful encode
 <video_output>/<Camera>.<YYYYMMDD>.mkv             ← emptied by transfer each night
 <log_dir>/{capture,encode}.log
+<state_dir>/{capture,encode}.json                  ← what the services are doing
 ```
 
 Filenames are zero-padded `HHMMSS`, so lexical order **is** chronological.
@@ -114,12 +115,12 @@ timelapse version
 ```
 
 ```
-  capture  0.1.5
-  encode   0.1.5
-  test     0.1.5
-  setup    0.1.5
-  update   0.1.5
-  web      0.1.5
+  capture  0.1.6
+  encode   0.1.6
+  test     0.1.6
+  setup    0.1.6
+  update   0.1.6
+  web      0.1.6
 ```
 
 If the daemon predates the installed files it says so explicitly, which is the
@@ -141,7 +142,7 @@ sudo cp config/config.example.json /etc/timelapse/config.json
 sudo chown root:timelapse /etc/timelapse/config.json
 sudo chmod 640 /etc/timelapse/config.json        # it holds camera passwords
 
-sudo mkdir -p /var/lib/timelapse/{frames,videos,logs}
+sudo mkdir -p /var/lib/timelapse/{frames,videos,logs,state}
 sudo chown -R timelapse:timelapse /var/lib/timelapse
 ```
 
@@ -152,6 +153,13 @@ put frames anywhere other than `/var/lib/timelapse`, the `paths` block.
 > match. They run with `ProtectSystem=strict`, so an unlisted path fails with a
 > confusing read-only error. The same applies to a local transfer destination
 > such as a CIFS or NFS mountpoint.
+>
+> `state_dir` has a sharper version of the same rule: it is named in
+> `ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths`
+> points at a directory that does not exist. **Create it before you start the
+> services**, or both daemons fail with an error about mount namespaces that
+> mentions neither the directory nor the setting. The installer does this for
+> you; only a hand-built install has to remember.
 
 ## 3. The setup wizard
 
@@ -180,7 +188,8 @@ default in brackets; Enter accepts it.
 
 It then covers ffmpeg paths (probing for NVENC and telling you which encoder you
 will actually get), the capture interval, a disk budget for your camera count,
-the low-space threshold, cameras, transfer, Discord and the optional web UI.
+the low-space threshold, cameras, transfer, notifications and the optional
+web UI.
 
 Two things it does that are easy to get wrong by hand:
 
@@ -245,6 +254,15 @@ budget.
 - **Reolink-style URLs** put credentials in the query string, so they need
   `"auth": "none"`. URL-encode any `&`, `#`, `+` or `%` in the password, or the
   URL silently parses wrong.
+- **You changed a camera's password**: change it here too, with
+  `timelapse config` or `timelapse cameras`. Since 0.1.6 the daemon stops
+  presenting a rejected credential rather than repeating it every few seconds,
+  which is what used to hold the camera's account locked; it retries about
+  every half hour, so capture resumes on its own once the config is right, with
+  no restart needed. If you have notifications configured you get told when
+  this starts and when it clears. Note that a camera which has already locked
+  the account will refuse a **correct** password too, until its lockout
+  expires: that is the camera's timer, not this program's.
 - **A camera that passes one test fetch but fails in service**: some cameras
   cope badly with sustained polling. Watch the first hour:
   `grep <Camera> <log_dir>/capture.log`. Raising `interval_seconds` usually
@@ -281,10 +299,13 @@ budget.
 ```bash
 sudo cp service/timelapse-capture.service \
         service/timelapse-encode.service \
-        service/timelapse-encode.timer /etc/systemd/system/
+        service/timelapse-encode.timer \
+        service/timelapse-watch.service \
+        service/timelapse-watch.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now timelapse-capture.service
 sudo systemctl enable --now timelapse-encode.timer
+sudo systemctl enable --now timelapse-watch.timer
 
 journalctl -u timelapse-capture -f
 ```
@@ -383,6 +404,42 @@ write read-only.
 Set `transfer.enabled` to `false` to keep videos on the local disk. Note that
 nothing then prunes `video_output`; add your own retention if you do this.
 
+## 6a. Notifications
+
+One summary per nightly run: what encoded, coverage, size, failures, and
+whether the transfer worked. It goes to as many places as you like, or
+nowhere, which is the default.
+
+```bash
+sudo timelapse notify
+```
+
+| Sink | What you need | Notes |
+|---|---|---|
+| **Discord** | A webhook URL from Channel Settings → Integrations | The summary arrives as an embed with a monospace table. |
+| **ntfy** | A topic name, and a server if you self-host | No account needed on `ntfy.sh`. Subscribe in the app or at `https://ntfy.sh/<topic>`. **On the public server the topic name is the only secret there is**, so pick one nobody would guess. An access token is supported for servers that require one. |
+| **Telegram** | A bot token from `@BotFather` and a chat id | Message your bot once before testing: a bot cannot open a conversation with you. For a group, add the bot and use the group's id, which starts with `-100`. |
+
+Each one is offered a test message as you configure it, and `timelapse test`
+sends one to every configured sink. It skips a sink the wizard verified in the
+last few minutes, so an install does not put two identical messages in your
+channel seconds apart; `timelapse test --force-notify` sends anyway.
+
+A failing sink can never fail the run it is reporting on, and one sink being
+down does not stop the others. Failures are logged and the encode's exit
+status is unaffected.
+
+**If you configured Discord before 0.1.6**, nothing changes and there is
+nothing to do: the old `discord` block in `config.json` still works exactly as
+it did. The moment you run `timelapse notify`, the settings move into a
+`notify` list that can hold several sinks, and the old block is switched off so
+it cannot look configured while being ignored.
+
+Notification credentials are masked by `timelapse config --redacted`: the bot
+token, the ntfy token and the secret half of a Discord webhook URL. The chat
+id, the topic and the webhook's numeric id survive, because they are what a
+fault report is about.
+
 ## 7. Sizing
 
 At a 5s interval: **17,280 frames/camera/day** → 4:48 of video at 60fps.
@@ -406,16 +463,17 @@ of it; nothing needs a reinstall.
 
 | Command | What it does |
 |---|---|
-| `timelapse status` | `systemctl status` for all four units in one shot: capture, the encode timer **and the encode service**, and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
+| `timelapse status` | `systemctl status` for every unit in one shot: capture, the encode timer **and the encode service**, the credential watch timer, and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
 | `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
-| `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and Discord. Run it after any change. |
+| `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and every notification sink. Run it after any change. |
 | `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. A menu with no options; `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` go straight to one. §9. |
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
+| `timelapse notify` | Where the nightly summary goes: a Discord webhook, ntfy, Telegram, any combination of them, or none. Offers a test message for each. Needs no restart, because the encode job reads the config when it runs. §6a. |
 | `timelapse web` | Turn the read-only web UI on or off and set its address, port, library path and whether it asks for a login. §11. |
 | `timelapse password` | Set or change the web UI's login, and nothing else: a username, a password twice, and a restart. Never asks for the old one, because this already needs root. §11. |
 | `timelapse web-serve` | Run the web UI in the foreground for a look at its log. The service normally does this. |
-| `timelapse setup` | The full wizard again: storage, capture settings, cameras, transfer, Discord. Overwrites the whole config, so prefer `cameras` or `transfer` for a single change. |
+| `timelapse setup` | The full wizard again: storage, capture settings, cameras, transfer, notifications. Overwrites the whole config, so prefer `cameras`, `transfer` or `notify` for a single change. |
 | `timelapse config` | Opens `config.json` in `$EDITOR` for anything the wizards do not cover, such as the encoder's container and quality. A backup is taken first, and the file's `0640 root:timelapse` is restored afterwards whatever your editor did to it. You are then responsible for restarting capture yourself. |
 | `timelapse config --redacted` | Prints the config with the passwords masked, for pasting into a bug report. Opens no editor and changes nothing. See below. |
 | `timelapse restore` | Put back an earlier config. One is kept before every change, five deep. §10. |
@@ -519,11 +577,19 @@ It stats every frame file, so on a busy install expect a few seconds.
 
 ```
 timelapse_encode.py [config] [--date YYYY-MM-DD] [--dry-run]
-                             [--keep-frames] [--no-transfer]
+                             [--keep-frames] [--no-transfer] [--force]
 ```
 
 Exit codes: `0` all good, `1` partial failure, `2` critical. Pass these through
 the wrapper too: `timelapse encode --date 2026-08-01 --keep-frames`.
+
+**A day is encoded once.** On success the encoder drops a small
+`.encoded.json` into the day's frame directory, and skips any day that carries
+one. You will only ever notice this if you keep your frames
+(`encode.delete_frames_on_success: false`); when they are deleted, which is
+the default, the marker goes with them. Two ways to encode a day again:
+`--date 2026-08-01`, which ignores the marker for that one day, or `--force`,
+which ignores it for the whole backlog. Deleting the marker file works too.
 
 ## 9. Adding, editing and removing cameras
 
@@ -794,10 +860,20 @@ path; it offers to restart the service so the change takes effect. Editing
 `config.json` by hand does not, so follow that with `sudo systemctl restart
 timelapse-web`: the server reads its config once, at startup.
 
-It gives you five things:
+It gives you six things:
 
 - **Where your videos actually are**: see the warning below, this is the
   question people get wrong.
+- **Whether your cameras are actually answering.** A table on the Overview,
+  one row per camera: when its last frame landed, the cadence it is running
+  at, how many frames it has taken since the service started, and how many
+  failures. This is the thing `systemctl` cannot tell you. A daemon whose
+  cameras are all refusing connections is "running", and so is one that has
+  paused itself because the disk filled up; both look perfect in the Services
+  table and neither is capturing anything.
+- **What last night's encode did**: when it ran, how long it took, which
+  encoder, how many videos, whether the transfer worked, and a row per camera
+  with the frame count and the coverage percentage.
 - **Service status and recent log**, without an SSH session. Service status is
   four rows at the foot of the Overview, saying whether each part is working
   and what to do if it is not, rather than the page of systemd internals

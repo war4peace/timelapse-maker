@@ -1,0 +1,30 @@
+[Unit]
+Description=Report cameras that are refusing our credentials
+Documentation=https://github.com/war4peace/timelapse-maker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Same account as capture and encode: it reads the state file the capture
+# daemon writes, and the config that holds the notification sinks.
+User=timelapse
+Group=timelapse
+ExecStart=/usr/bin/python3 /opt/timelapse/timelapse_encode.py --watch /etc/timelapse/config.json
+# It reads one small file and may send one notification. If that cannot be
+# done in a minute it is not going to be done at all, and the next timer tick
+# is only a few minutes away.
+TimeoutStartSec=60
+Nice=10
+
+# Hardening. This writes exactly one file, notified.json, in the state
+# directory: which incidents have already been reported, so a camera that has
+# been refusing all day is not announced every few minutes.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/timelapse
+
+[Install]
+WantedBy=multi-user.target

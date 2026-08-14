@@ -7,6 +7,138 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.1.6] - 2026-08-14
+
+### Fixed
+- **A camera that rejects our credentials is no longer hammered with them.**
+  The capture daemon presented the configured credential every
+  `interval_seconds`, for ever, whatever the camera answered. Firmware commonly
+  locks an account after a handful of failed authentications, so this renewed
+  the lock faster than it expired: rotate a camera's password without disabling
+  it here first, and the account stayed locked until the daemon was stopped.
+  Entering the correct password on the camera did not clear it, because this
+  program was still holding the door shut, and camera accounts are usually
+  shared with an NVR or another consumer, so the damage was not confined to
+  timelapse-maker.
+
+  Failed fetches are now classified as `auth`, `unreachable` or `other`, and
+  only a refusal changes anything. On one, the daemon tries once more, then
+  withholds fetches for ten minutes, tries a single time, and from then on
+  tries once every 31 minutes for ever. That last number is the observed
+  30-minute lockout window plus a margin: one attempt per 31 minutes cannot
+  reach the "N failures inside a window" threshold that lockout policies are
+  built from. Recovery is automatic and immediate, so fixing the password needs
+  no restart.
+
+  A refusal is only a refusal when the camera says so: HTTP 401 or 403, or a
+  Reolink `rspCode` of -6 or -7. The measured -9, "not support", arrives in the
+  identical 200-with-an-error-body shape and is an unknown *command* rather
+  than a rejection, so unrecognised codes are logged and treated as ordinary
+  failures. An unreachable camera never backs off, since retrying it costs
+  nothing and it should recover the instant it returns.
+
+### Added
+- **Optional notification when a camera is refusing our credentials**, and
+  another when it stops. This is the one camera fault an external uptime
+  monitor cannot see, because a monitor holds no credentials: the camera is up,
+  answering, and rejecting only us. One message per incident, one all-clear,
+  never a repeat; the message states what was observed rather than diagnosing,
+  because a camera that has locked the account rejects a *correct* password
+  too. Off if you have no notification sinks configured, and controlled by
+  `capture.notify_auth_failures` (default true) if you do.
+
+  It runs as a new `timelapse-watch.timer` every five minutes, reading the
+  capture heartbeat and sending through the existing sinks. The capture daemon
+  still makes no outbound connections of its own, which is what the runtime
+  state file was for. Existing installs pick the timer up automatically on
+  upgrade.
+
+- `capture.json` now carries a per-camera `error` object: the class, when it
+  started, how many ticks it has held, the camera's own words (redacted) and
+  whether the back-off has confirmed it. The web UI's overview uses it to say
+  "refusing our credentials" instead of leaving a camera merely silent.
+
+### Fixed
+- **A day whose frames are kept is no longer encoded again every night.**
+  Nothing in the project recorded that a day had been encoded: deleting the
+  frames *was* the record, and it works, which is why this went unnoticed for
+  five releases. Set `encode.delete_frames_on_success: false` and that record
+  disappears with it, so every night the encoder found the same days still
+  sitting there and re-encoded the newest `max_backlog_days` of them from
+  scratch, then re-transferred the results. On a seven-camera install that is
+  forty-nine camera-days of GPU work nightly to produce videos that already
+  existed, and nothing in the log said "again".
+
+  A successful encode now writes a small `.encoded.json` into the day
+  directory, naming the video, the frame count, the encoder and the time, in
+  the manner of the existing `.cadence.json`. Days carrying one are skipped and
+  counted, and the count is reported rather than left silent, because a run
+  that legitimately does nothing should not look like a broken one.
+
+  **Nothing changes if you use the defaults**: frames are deleted on success,
+  so the marker is written and removed a second later. The marker cannot be
+  inferred from the video file instead, which is the obvious alternative:
+  `transfer()` *moves* the video to the NAS, so by morning the output
+  directory is normally empty and every day would look unencoded again.
+
+### Added
+- **The nightly summary can go to ntfy and Telegram, as well as Discord, and
+  to any combination of them at once.** Configure it with `sudo timelapse
+  notify`, which offers a test message for each; `timelapse test` then checks
+  every configured sink.
+
+  ntfy needs no account: pick a topic on `ntfy.sh` and subscribe to it, or
+  point it at your own server. Telegram needs a bot token from `@BotFather`
+  and a chat id. Neither sink can fail the run it is reporting on, and one
+  being down does not stop the others.
+
+  **Nothing changes if you use Discord.** The existing `discord` block in your
+  config keeps working exactly as it did, and is what gets used until you run
+  `timelapse notify`. Then it moves into a `notify` list that can hold several
+  sinks, and the old block is switched off rather than left to look configured
+  while being ignored.
+
+  Email was considered and left out deliberately: it is a different job with a
+  different failure mode (relays, SPF, spam folders), and the two sinks above
+  cover phone notifications without any of it.
+- **The web UI can now tell you whether your cameras are actually answering.**
+  Two new panels on the Overview: one row per camera with the time its last
+  frame landed, its cadence, its frame count and its failures; and what last
+  night's encode did, with a row per camera showing frames and coverage.
+
+  This is the question `systemctl` structurally cannot answer. A capture
+  daemon whose cameras are all refusing connections is "running", and so is
+  one that has paused itself because the disk filled up. Both look perfect in
+  the Services table and neither is capturing anything. The disk-guard pause
+  now says so in as many words.
+
+  Behind it, the two daemons publish what they know into
+  `paths.state_dir` (new, default `/var/lib/timelapse/state`): capture rewrites
+  `capture.json` once a minute, and the encoder appends to `encode.json` at the
+  end of every run, keeping a fortnight. They are plain JSON and versioned, so
+  anything you want to write can read them.
+
+  They publish facts and not verdicts: there is no "healthy" field anywhere,
+  because whether 42 seconds of silence is a fault depends on that camera's
+  interval, and the page can work that out while a file that had already
+  decided could not be argued with. RTSP cameras report what they actually
+  know, which is process restarts and liveness rather than a last-frame time:
+  ffmpeg writes those frames, not us.
+
+  **Upgrading creates the directory for you.** It has to exist before the
+  services start, because it is named in their `ReadWritePaths` and systemd
+  will not start a unit whose `ReadWritePaths` points at nothing. Your existing
+  `config.json` needs no edit: the key is read with a default like every other
+  key added since 0.1.0. Both panels say plainly that they need the 0.1.6
+  services, so the gap between upgrading and restarting them reads as a
+  version skew rather than as a fault.
+- `timelapse encode --force` re-encodes days that are already marked. `--date`
+  keeps overriding the marker on its own, so re-doing a single day by hand
+  needs no new flag.
+- `timelapse test` checks the state directory exists and is writable, since a
+  missing one stops both daemons with an error that names neither the
+  directory nor the release that added it.
+
 ## [0.1.5] - 2026-08-12
 
 ### Added
@@ -951,6 +1083,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.6]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.6
 [0.1.5]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.5
 [0.1.4]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.4
 [0.1.3]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.3

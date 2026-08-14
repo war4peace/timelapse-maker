@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -34,7 +35,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 OUT = Path(os.environ.get("TIMELAPSE_TEST_DIR") or
            Path(tempfile.gettempdir()) / "timelapse-test")
@@ -107,8 +108,18 @@ def test_http(cam, cfg):
 
     data = r.content
     if data[:2] != b"\xff\xd8":
-        head = data[:80].decode(errors="replace").replace("\n", " ")
-        bad(f"{name}: 200 OK but not a JPEG. First bytes: {head!r}")
+        # The wizard has explained this shape since 0.0.1 and this check did
+        # not, so the same Reolink refusal read as helpful advice in one place
+        # and as raw bytes in the other. One implementation, both callers.
+        from timelapse_setup import explain_payload
+        head, reason = explain_payload(data)
+        if reason:
+            bad(f"{name}: 200 OK but not a JPEG. The camera said: {reason}")
+            info("Usually an authentication or permission error rather than a "
+                 "wrong URL: check the username, the password, and that the "
+                 "account may take snapshots.")
+        else:
+            bad(f"{name}: 200 OK but not a JPEG. First bytes: {head!r}")
         return None
 
     OUT.mkdir(parents=True, exist_ok=True)
@@ -442,6 +453,39 @@ def scan_camera_frames(cam_dir):
     return {"days": days, "frames": frames, "size": size, "stray": stray}
 
 
+def test_state_dir(cfg):
+    """The runtime-state directory, checked here because of how it fails.
+
+    It is named in the units' ReadWritePaths, and systemd will not start a unit
+    whose ReadWritePaths points at a directory that is not there. The error
+    talks about setting up a mount namespace, names no setting and no release,
+    and arrives on both daemons at once. Anything that says so in words is
+    worth more here than the check costs.
+    """
+    from timelapse_encode import state_dir, whoami
+
+    d = state_dir(cfg)
+    # as_posix() for display: every path this project deals with is a POSIX
+    # path, but a Path stringifies to whatever the running platform separates
+    # with, and the development box is not the deployment box.
+    shown = d.as_posix()
+    if not d.is_dir():
+        bad(f"{shown} does not exist")
+        info("The capture and encode units name it in ReadWritePaths, so they")
+        info("will not start until it is there. Fix with: sudo timelapse setup")
+        return
+    probe = d / ".preflight.tmp"
+    try:
+        probe.write_text("x", encoding="utf-8")
+        probe.unlink()
+        ok(f"{shown} exists and is writable")
+    except OSError as exc:
+        # Reported as the account running this check, which is not necessarily
+        # the account the daemons run as; say so rather than implying a verdict
+        # about them.
+        bad(f"{shown} is not writable by {whoami()}: {exc}")
+
+
 def report_usage(cfg):
     root = Path(cfg["paths"]["frames_root"])
     videos = Path(cfg["paths"]["video_output"])
@@ -671,34 +715,52 @@ def webhook_verified_age(config_path, url):
     return age if 0 <= age <= WEBHOOK_MARKER_TTL else 0
 
 
-def test_discord(cfg, config_path=None, force=False):
-    d = cfg.get("discord", {})
-    if not d.get("enabled") or not d.get("webhook_url"):
-        info("Discord disabled or no webhook configured")
+def test_notify(cfg, config_path=None, force=False):
+    """Send one test message per configured sink.
+
+    Through the encoder's own `notify()`, so what is exercised is the request
+    the nightly run will actually make. A pre-flight that proves a different
+    request is how a check comes to pass while the thing it checks is broken.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import notify, notify_sinks
+    from timelapse_setup import sink_identity
+
+    sinks = notify_sinks(cfg)
+    if not sinks:
+        info("No notification sinks configured")
         return
 
-    if not force and config_path:
-        age = webhook_verified_age(config_path, d["webhook_url"])
-        if age:
-            ok(f"Discord webhook verified during setup {int(age)}s ago")
-            info("not sending a second test message; --force-discord to re-send")
-            return
-    payload = {"username": d.get("username", "Timelapse Bot"),
-               "embeds": [{"title": "Timelapse pre-flight test",
-                           "description": "If you can read this, the webhook works.",
-                           "color": 0x3498DB}]}
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from timelapse_encode import post_webhook
-    try:
-        post_webhook(d["webhook_url"], payload)
-        ok("Discord webhook accepted the test message")
-    except Exception as exc:
-        bad(f"Discord webhook failed: {exc}")
-        if "403" in str(exc):
+    for sink in sinks:
+        kind = (sink.get("type") or "discord").lower()
+        if not force and config_path:
+            age = webhook_verified_age(config_path, sink_identity(sink))
+            if age:
+                ok(f"{kind} verified during setup {int(age)}s ago")
+                info("not sending a second test message; "
+                     "--force-notify to re-send")
+                continue
+        sent, _ = notify({"notify": [dict(sink, enabled=True)]},
+                         "Timelapse pre-flight test",
+                         "If you can read this, notifications work.",
+                         "info", [("Host", socket.gethostname())])
+        if sent:
+            ok(f"{kind} accepted the test message")
+            continue
+        bad(f"{kind} did not accept the test message")
+        if kind == "discord":
             info("403 usually means the webhook URL was deleted or regenerated;")
             info("check it in Discord under Channel Settings -> Integrations.")
-        elif "404" in str(exc):
-            info("404 means the webhook no longer exists at that URL.")
+        elif kind == "ntfy":
+            info("Check the topic, and the token if the server requires one.")
+        else:
+            info("Check the bot token and chat id, and that you have messaged")
+            info("the bot at least once: a bot cannot start the conversation.")
+
+
+def test_discord(cfg, config_path=None, force=False):
+    """Kept as the old name for anything that calls it."""
+    return test_notify(cfg, config_path, force)
 
 
 def main():
@@ -706,9 +768,13 @@ def main():
     ap.add_argument("config", nargs="?", default="/etc/timelapse/config.json")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("--camera", help="test only this camera")
-    ap.add_argument("--no-discord", action="store_true",
-                    help="skip the webhook check entirely")
-    ap.add_argument("--force-discord", action="store_true",
+    # The --*-discord spellings are kept as aliases: they are in the docs, in
+    # install.sh and in whatever anyone has scripted since 0.0.1.
+    ap.add_argument("--no-notify", "--no-discord", dest="no_notify",
+                    action="store_true",
+                    help="skip the notification check entirely")
+    ap.add_argument("--force-notify", "--force-discord", dest="force_notify",
+                    action="store_true",
                     help="send a test message even if setup just verified it")
     ap.add_argument("--probe-profiles", action="store_true",
                     help="for ONVIF snapshot URLs, compare Profile_1..4 resolutions")
@@ -758,13 +824,14 @@ def main():
     print("\n=== Disk ===")
     avg = sum(sizes) / len(sizes) if sizes else 0
     test_disk(cfg, avg, len(cams))
+    test_state_dir(cfg)
 
     print("\n=== Transfer destination ===")
     test_transfer(cfg)
 
-    if not args.no_discord:
-        print("\n=== Discord ===")
-        test_discord(cfg, args.config, args.force_discord)
+    if not args.no_notify:
+        print("\n=== Notifications ===")
+        test_notify(cfg, args.config, args.force_notify)
 
     print(f"\nSample images: {OUT}\n")
 

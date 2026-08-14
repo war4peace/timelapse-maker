@@ -7,13 +7,14 @@ each to a 60 fps AV1 video, deletes the frames on success, sends a Discord
 summary, then rsyncs the videos to the configured destination (moving them,
 not copying) - a NAS share, another host, or any local path.
 
-"Completed" means any date directory strictly older than today, so a missed
-run (host down, crash) is picked up automatically on the next pass rather
-than silently leaving frames behind.
+"Completed" means any date directory strictly older than today that does not
+already carry an .encoded.json marker, so a missed run (host down, crash) is
+picked up automatically on the next pass rather than silently leaving frames
+behind, and a day whose frames were kept is not encoded a second time.
 
 Usage:
     timelapse_encode.py [config.json] [--date YYYY-MM-DD] [--dry-run]
-                        [--keep-frames] [--no-transfer]
+                        [--keep-frames] [--no-transfer] [--force]
 """
 
 import argparse
@@ -32,7 +33,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -454,6 +455,212 @@ def day_cadence(day_dir):
         return None
 
 
+# Written into a day directory once its video exists. Until 0.1.6 nothing
+# recorded that a day had been encoded: deleting the frames *was* the record,
+# and it still is whenever `delete_frames_on_success` is left at its default,
+# because the directory goes away and the next run cannot find it.
+#
+# Turn that off and the record goes with it. The directory stays, so the same
+# day is found again the next night, and every night after, and re-encoded
+# from scratch over a video that already exists.
+#
+# It cannot be inferred from the output file instead: transfer() *moves* the
+# video to the NAS, so by morning video_output is normally empty and every day
+# would look unencoded again.
+ENCODED_FILE = ".encoded.json"
+
+
+def day_encoded(day_dir):
+    """What a day's marker says was produced, or None if it has none.
+
+    None for a marker that is unreadable or malformed as well as for one that
+    is absent. Unreadable has to mean "encode it again": the wasteful answer
+    costs one night of GPU time and is self-correcting, where trusting a
+    damaged marker loses the day silently and permanently.
+    """
+    try:
+        with open(Path(day_dir) / ENCODED_FILE, encoding="utf-8") as fh:
+            d = json.load(fh)
+        return d if isinstance(d, dict) and d.get("video") else None
+    except (OSError, ValueError):
+        return None
+
+
+def mark_encoded(day_dir, out_file, result, encoder_name):
+    """Record that this day has been encoded. Never raises.
+
+    Never raises for the same reason write_cadence() does not: a marker that
+    could not be written costs a re-encode next night, which is exactly the
+    behaviour this project had before markers existed, and that is not worth
+    turning a successful run into a failed one over.
+
+    This says the day was *encoded*, not that it was delivered. A transfer
+    that failed leaves the video in video_output and the next run ships it;
+    re-encoding it would not have helped that.
+    """
+    day_dir = Path(day_dir)
+    path = day_dir / ENCODED_FILE
+    try:
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"encoded_at": datetime.now().replace(
+                           microsecond=0).isoformat(),
+                       "video": out_file.name,
+                       "frames": result["frames"],
+                       "size": result["size"],
+                       "encoder": encoder_name,
+                       "version": __version__}, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        log.warning("  %s: could not mark the day encoded (%s); it will be "
+                    "encoded again next run", day_dir.name, exc)
+        return False
+
+
+# ----------------------------------------------------------------------------
+# Runtime state
+#
+# systemd knows whether a process is alive. It cannot know whether the cameras
+# are answering: a capture daemon whose every camera is refusing connections is
+# `active (running)`, and looks perfect on the status page. These files are how
+# the programs that *do* know say so.
+#
+# This is a second on-disk contract and it will outlive whatever reads it
+# first, so it carries a version and every reader uses .get(key, default).
+#
+# `/var/lib/timelapse/state` rather than anywhere derived from the config's
+# other paths. The base directory the wizard asks about exists because frames
+# are enormous and may want their own disk; a few KB of JSON does not, and
+# /var/lib is where FHS puts exactly this. Deriving it from log_dir's parent
+# was considered and is a trap: log_dir may be /var/log/timelapse, whose
+# parent is /var/log.
+#
+# NOT `web.state_dir`. That belongs to the web UI's index, which is disposable
+# and is the one directory that service may write; this is written by the
+# daemons and only read by the UI.
+# ----------------------------------------------------------------------------
+
+STATE_DIR_DEFAULT = "/var/lib/timelapse/state"
+CAPTURE_STATE = "capture.json"
+ENCODE_STATE = "encode.json"
+STATE_VERSION = 1
+
+# Runs kept in encode.json. Two weeks is enough to see a pattern and small
+# enough that the file stays a few KB, which matters because the web UI reads
+# the whole thing on every page view.
+MAX_RUNS = 14
+
+
+def state_dir(cfg):
+    """Where the daemons publish runtime state.
+
+    Absent from every config written before 0.1.6, so it is read with a
+    default like every other added key. The directory must exist before the
+    units start: it is named in ReadWritePaths, and systemd refuses to start a
+    unit whose ReadWritePaths points at nothing. install.sh creates it.
+    """
+    return Path((cfg.get("paths", {}).get("state_dir") or "").strip()
+                or STATE_DIR_DEFAULT)
+
+
+def stamp(epoch):
+    """Epoch to a local ISO string, or None. None means "never", not "now"."""
+    if not epoch:
+        return None
+    return datetime.fromtimestamp(epoch).replace(microsecond=0).isoformat()
+
+
+def coverage_pct(result, interval):
+    """Frames as a percentage of a full day at the cadence this day ran at.
+
+    Shared by the Discord table and the run record so the two cannot disagree.
+    Using the *global* interval made a camera at one frame a minute read as 8%
+    every night, which is a full day of frames reported as a near-outage.
+    """
+    expected = int(86400 / (result.get("interval") or interval))
+    if not expected or not result.get("frames"):
+        return None
+    return round(100.0 * result["frames"] / expected, 1)
+
+
+def run_record(started, encoder, results, xfer, interval, error=""):
+    """One night's work, as facts. No verdict beyond what the run itself
+    already decided by its exit code.
+
+    `error` is set only by the critical-failure path, where the run aborted
+    before it could finish. An empty string there and no days at all is a run
+    that found nothing to do, which is an entirely different night.
+    """
+    finished = time.time()
+    return {
+        "started": stamp(started),
+        "finished": stamp(finished),
+        "seconds": round(finished - started, 1),
+        "encoder": (encoder or {}).get("name", ""),
+        "error": error,
+        "ok": sum(1 for r in results if r["status"] == "OK"),
+        "skipped": sum(1 for r in results if r["status"] == "SKIP"),
+        "failed": sum(1 for r in results if r["status"] == "FAIL"),
+        "bytes": sum(r["size"] for r in results),
+        "transfer": None if xfer is None else {
+            "ok": bool(xfer.get("ok")),
+            "moved": xfer.get("moved", 0),
+            "detail": xfer.get("detail", ""),
+        },
+        "days": [{
+            "camera": r["camera"],
+            "date": r["date"],
+            "status": r["status"],
+            "frames": r["frames"],
+            "bad": r["bad"],
+            "size": r["size"],
+            "seconds": round(r["seconds"], 1),
+            "interval": r.get("interval"),
+            "coverage": coverage_pct(r, interval),
+            "note": r["note"],
+        } for r in results],
+    }
+
+
+def write_run_state(cfg, record):
+    """Prepend one run to encode.json, keeping the newest MAX_RUNS. Never
+    raises: a run that encoded seven days successfully has not failed because
+    its history file could not be updated.
+
+    An unreadable or malformed history starts a new one rather than aborting.
+    The alternative loses tonight's record to protect a file that is already
+    damaged, which is the wrong way round.
+    """
+    path = state_dir(cfg) / ENCODE_STATE
+    runs = []
+    try:
+        with open(path, encoding="utf-8") as fh:
+            old = json.load(fh)
+        if isinstance(old, dict) and isinstance(old.get("runs"), list):
+            runs = old["runs"]
+    except (OSError, ValueError):
+        runs = []
+
+    now = time.time()
+    payload = {
+        "version": STATE_VERSION,
+        "kind": "encode",
+        "updated": stamp(now),
+        "updated_epoch": int(now),
+        "runs": ([record] + runs)[:MAX_RUNS],
+    }
+    try:
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        log.warning("could not update %s: %s", path, exc)
+        return False
+
+
 def camera_entry(cfg, name):
     """The config entry for a camera name, or {}.
 
@@ -579,6 +786,14 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
         result["status"] = "OK"
         if bad:
             result["note"] = f"{bad} bad frame(s) skipped"
+
+        # After the file is closed and checked, and only on OK, so a day that
+        # failed can never look finished. Written even when the frames are
+        # about to be deleted (the usual case, where it is redundant and gone
+        # a second later), because the caller's rmtree runs with
+        # ignore_errors=True: a deletion that quietly failed would otherwise
+        # leave an unmarked directory to be encoded all over again.
+        mark_encoded(day_dir, out_file, result, encoder["name"])
 
     except Exception as exc:
         result["note"] = str(exc)[:300]
@@ -802,48 +1017,366 @@ def transfer(cfg, dry_run):
 
 
 # ----------------------------------------------------------------------------
-# Discord
+# Notifications
+#
+# One nightly summary, delivered to any number of sinks. The transport is the
+# same POST for all of them; what differs is the payload shape and the limits.
+#
+# Every sink obeys two rules that are not negotiable. **A failed notification
+# must never fail the run it is reporting on**, so each is wrapped
+# individually and one sink being down cannot stop the next. And **an explicit
+# User-Agent, always**: Discord sits behind Cloudflare, which answers urllib's
+# default "Python-urllib/3.x" with a 403 before the request ever reaches the
+# webhook. GitHub refuses one outright in `timelapse_update.py`. Assume any
+# service will.
 # ----------------------------------------------------------------------------
 
-# Discord sits behind Cloudflare, which rejects urllib's default
-# "Python-urllib/3.x" User-Agent with HTTP 403 before the request ever reaches
-# the webhook. This is the format Discord documents for API clients.
+# The format Discord documents for API clients. Discord only; sending this to
+# ntfy or Telegram would be claiming to be something we are not.
 USER_AGENT = ("DiscordBot (https://github.com/war4peace/timelapse-maker, "
               f"{__version__})")
 
+PROJECT_AGENT = f"timelapse-maker/{__version__} (+https://github.com/war4peace/timelapse-maker)"
 
-def post_webhook(url, payload, timeout=20):
-    """POST a JSON payload to a webhook. Raises on transport or HTTP error."""
+# Severity, chosen at the call site, translated per sink. The call sites used
+# to pass a Discord colour, which meant a Discord concept travelled through
+# code that had no business knowing about Discord.
+LEVEL_COLOR = {"ok": 0x2ECC71, "info": 0x95A5A6,
+               "warn": 0xF1C40F, "error": 0xE74C3C}
+# ntfy's 1-5 scale. A summary nobody needs to act on should not buzz a phone
+# the same way a failed run does.
+LEVEL_PRIORITY = {"ok": 3, "info": 2, "warn": 4, "error": 5}
+
+DISCORD_DESC_LIMIT = 4000
+DISCORD_FIELD_LIMIT = 1024
+TELEGRAM_LIMIT = 4096
+NTFY_LIMIT = 4000
+
+
+def post_webhook(url, payload, timeout=20, headers=None, agent=USER_AGENT):
+    """POST a JSON payload. Raises on transport or HTTP error.
+
+    Kept exactly this callable because the wizard and the pre-flight both
+    import it to send their test messages.
+    """
+    head = {"Content-Type": "application/json", "User-Agent": agent}
+    head.update(headers or {})
     req = urlrequest.Request(
         url, data=json.dumps(payload).encode("utf-8"), method="POST",
-        headers={"Content-Type": "application/json",
-                 "User-Agent": USER_AGENT})
+        headers=head)
     with urlrequest.urlopen(req, timeout=timeout) as resp:
         return resp.status, resp.read()
 
 
-def send_discord(cfg, title, description, color, fields):
-    d = cfg.get("discord", {})
-    if not d.get("enabled") or not d.get("webhook_url"):
-        log.info("Discord disabled or no webhook set; skipping notification.")
-        return
-    payload = {
-        "username": d.get("username", "Timelapse Bot"),
+def clip(text, limit):
+    """Trim to a limit and say so, rather than slicing mid-sentence.
+
+    Same lesson as the release notes at 0.1.0: text that stops without saying
+    it stopped reads as this program having lost the rest.
+    """
+    text = text or ""
+    if len(text) <= limit:
+        return text
+    return text[:limit - 20].rstrip() + "\n... (truncated)"
+
+
+def notify_sinks(cfg):
+    """Every configured sink, newest config shape first.
+
+    `notify` is a list of sinks and is authoritative when present. The legacy
+    `discord` block is what every config written before 0.1.6 has, and it goes
+    on working untouched: upgrades keep the existing config, so a key read any
+    other way would break every install that has one.
+    """
+    sinks = cfg.get("notify")
+    if isinstance(sinks, list) and sinks:
+        if cfg.get("discord", {}).get("enabled"):
+            # Quietly, and once: an operator who hand-edits the old block
+            # after the wizard has written the new one deserves to find out
+            # here rather than by wondering why nothing arrived.
+            log.info("Using the 'notify' sinks; the legacy 'discord' block is "
+                     "ignored while it is present.")
+        return [s for s in sinks if isinstance(s, dict) and s.get("enabled")]
+
+    legacy = cfg.get("discord", {})
+    if legacy.get("enabled") and legacy.get("webhook_url"):
+        return [dict(legacy, type="discord")]
+    return []
+
+
+def discord_payload(sink, title, description, level, fields):
+    return {
+        "username": sink.get("username", "Timelapse Bot"),
         "embeds": [{
             "title": title,
-            "description": description[:4000],
-            "color": color,
-            "fields": [{"name": n, "value": (v or "-")[:1024], "inline": False}
+            "description": clip(description, DISCORD_DESC_LIMIT),
+            "color": LEVEL_COLOR.get(level, LEVEL_COLOR["info"]),
+            "fields": [{"name": n,
+                        "value": clip(v or "-", DISCORD_FIELD_LIMIT),
+                        "inline": False}
                        for n, v in fields][:25],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }],
     }
+
+
+def plain_text(title, description, fields):
+    """The summary as one block of text, for sinks with no embed concept."""
+    parts = [title, ""]
+    if description:
+        parts.append(description)
+    for name, value in fields:
+        parts.append(f"\n{name}: {value or '-'}")
+    return "\n".join(parts).strip()
+
+
+def send_discord_sink(sink, title, description, level, fields):
+    url = sink.get("webhook_url", "")
+    if not url:
+        raise ValueError("no webhook_url configured")
+    post_webhook(url, discord_payload(sink, title, description, level, fields))
+
+
+def send_ntfy(sink, title, description, level, fields):
+    """ntfy.sh or a self-hosted ntfy server.
+
+    JSON to the server root rather than text to /topic, deliberately: the
+    other form carries the title in an HTTP *header*, headers are ASCII, and
+    every title this program sends starts with an emoji.
+    """
+    server = (sink.get("server") or "https://ntfy.sh").rstrip("/")
+    topic = (sink.get("topic") or "").strip().lstrip("/")
+    if not topic:
+        raise ValueError("no topic configured")
+    body = {
+        "topic": topic,
+        "title": clip(title, 250),
+        "message": clip(plain_text("", description, fields), NTFY_LIMIT),
+        "priority": int(sink.get("priority")
+                        or LEVEL_PRIORITY.get(level, 3)),
+    }
+    if sink.get("tags"):
+        body["tags"] = [t.strip() for t in str(sink["tags"]).split(",")
+                        if t.strip()]
+    headers = {}
+    token = (sink.get("token") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    post_webhook(server, body, headers=headers, agent=PROJECT_AGENT)
+
+
+def telegram_escape(text):
+    """Telegram HTML mode understands exactly these three."""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;") \
+                       .replace(">", "&gt;")
+
+
+def send_telegram(sink, title, description, level, fields):
+    """Telegram Bot API sendMessage.
+
+    HTML rather than MarkdownV2: the summary is a monospace table, and a
+    proportional font turns it into rubble, so it has to be wrapped in
+    something. MarkdownV2 would mean escaping fourteen characters correctly
+    everywhere, including inside camera names, where getting it wrong is a 400
+    rather than a wrong-looking message.
+    """
+    token = (sink.get("token") or "").strip()
+    chat = str(sink.get("chat_id") or "").strip()
+    if not token or not chat:
+        raise ValueError("token and chat_id are both required")
+    body = telegram_escape(plain_text("", description, fields))
+    text = f"<b>{telegram_escape(title)}</b>\n<pre>{body}</pre>"
+    post_webhook(
+        f"https://api.telegram.org/bot{token}/sendMessage",
+        {"chat_id": chat, "text": clip(text, TELEGRAM_LIMIT),
+         "parse_mode": "HTML", "disable_web_page_preview": True},
+        agent=PROJECT_AGENT)
+
+
+SINKS = {
+    "discord": send_discord_sink,
+    "ntfy": send_ntfy,
+    "telegram": send_telegram,
+}
+
+
+def notify(cfg, title, description, level, fields):
+    """Deliver one summary to every configured sink.
+
+    Returns (sent, failed) counts, for the caller that wants to log them; the
+    run's own exit status never depends on either.
+    """
+    sinks = notify_sinks(cfg)
+    if not sinks:
+        log.info("No notification sinks configured; skipping.")
+        return 0, 0
+
+    sent = failed = 0
+    for sink in sinks:
+        kind = (sink.get("type") or "discord").lower()
+        handler = SINKS.get(kind)
+        if handler is None:
+            log.warning("Unknown notification type %r; skipping it. "
+                        "Known types: %s", kind, ", ".join(sorted(SINKS)))
+            failed += 1
+            continue
+        try:
+            handler(sink, title, description, level, fields)
+            sent += 1
+            log.info("Notified %s.", kind)
+        except Exception as exc:
+            # Deliberately broad, and deliberately per sink: a socket timeout
+            # is not a URLError, one sink being down must not stop the next,
+            # and none of it may take down the run being reported on.
+            failed += 1
+            log.warning("%s notification failed: %s", kind, exc)
+    return sent, failed
+
+
+# ----------------------------------------------------------------------------
+# Credential watch
+#
+# The capture daemon publishes what it knows and never opens a socket. This
+# reads that file and does the talking, which keeps the thing that knows and
+# the thing that sends in separate processes: exactly what the state file
+# introduced in 0.1.6 was for. Run from a timer, every few minutes.
+#
+# It notifies once per incident and once when the incident ends. The incident's
+# identity is the `since` timestamp the daemon publishes, so "the same failure"
+# needs no definition of its own here.
+# ----------------------------------------------------------------------------
+
+WATCH_STATE = "notified.json"
+
+# A heartbeat older than this describes a moment that has passed. Neither an
+# alarm nor an all-clear may be sent from it: a stopped daemon is not a camera
+# that recovered, and a file from this morning is not evidence about now.
+CAPTURE_STALE = 300
+
+
+def read_capture_state(cfg):
+    """capture.json if it is fresh and the daemon is running, else None."""
+    path = state_dir(cfg) / CAPTURE_STATE
     try:
-        post_webhook(d["webhook_url"], payload)
-    except Exception as exc:
-        # Deliberately broad: a socket timeout is not a URLError, and a failed
-        # notification must never take down the run that it is reporting on.
-        log.warning("Discord notification failed: %s", exc)
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError) as exc:
+        log.debug("no usable capture state at %s (%s)", path, exc)
+        return None
+    if not isinstance(state, dict) or not state.get("running"):
+        return None
+    age = time.time() - (state.get("updated_epoch") or 0)
+    if age > CAPTURE_STALE:
+        log.debug("capture state is %.0fs old; too old to act on", age)
+        return None
+    return state
+
+
+def load_notified(cfg):
+    """Which camera incidents have already been reported. {name: since}."""
+    try:
+        with open(state_dir(cfg) / WATCH_STATE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data.get("incidents", {}) if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_notified(cfg, incidents):
+    path = state_dir(cfg) / WATCH_STATE
+    try:
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": STATE_VERSION, "incidents": incidents}, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        # Losing this file means the next run repeats a notification, which is
+        # a great deal better than the run failing.
+        log.warning("cannot record what was notified (%s); a repeat is "
+                    "possible on the next check", exc)
+        return False
+
+
+def refusal_fields(cam, err):
+    return [
+        ("Camera", cam.get("name", "?")),
+        ("Since", err.get("since") or "?"),
+        ("Camera said", err.get("detail") or "-"),
+        ("Next attempt", err.get("quiet_until") or "-"),
+    ]
+
+
+def watch_credentials(cfg):
+    """Notify about cameras that are refusing our credentials. Returns a count.
+
+    Only `confirmed` refusals: the daemon reaches that verdict after two
+    refusals, ten minutes of silence and one more attempt, so anything short of
+    it is still a camera that might merely have been rebooting.
+    """
+    if not cfg.get("capture", {}).get("notify_auth_failures", True):
+        return 0
+    # Before anything is recorded, not after. Marking an incident as reported
+    # when there was nowhere to report it would mean that configuring a sink
+    # tomorrow leaves today's refusal permanently unannounced.
+    if not notify_sinks(cfg):
+        return 0
+    state = read_capture_state(cfg)
+    if state is None:
+        return 0
+
+    known = load_notified(cfg)
+    changed = 0
+    for cam in state.get("cameras", []):
+        name = cam.get("name")
+        if not name:
+            continue
+        err = cam.get("error") or {}
+        refusing = err.get("class") == "auth" and err.get("confirmed")
+        since = err.get("since") if refusing else None
+
+        if refusing and known.get(name) != since:
+            # The observation, never the diagnosis. A camera that has locked
+            # the account refuses a correct password too, so "your password is
+            # wrong" would be false exactly when it is least welcome.
+            sent, _failed = notify(
+                cfg, "⚠️ Timelapse - camera refused our credentials",
+                f"{name} has been rejecting our credentials since "
+                f"{err.get('since')}. Capture from it is paused apart from "
+                f"an occasional retry, so this program is not holding the "
+                f"camera's account locked. Other cameras are unaffected.",
+                "error", refusal_fields(cam, err))
+            # Nothing delivered is not "already told them". The next tick is
+            # minutes away, and a sink that was briefly unreachable must not
+            # swallow the single message this whole feature exists to send.
+            if not sent:
+                continue
+            known[name] = since
+            changed += 1
+        elif not refusing and known.get(name):
+            sent, _failed = notify(
+                cfg, "✅ Timelapse - camera credentials accepted again",
+                f"{name} is answering again; normal capture has resumed.",
+                "ok", [("Camera", name)])
+            if not sent:
+                continue
+            known.pop(name, None)
+            changed += 1
+
+    if changed:
+        save_notified(cfg, known)
+    return changed
+
+
+def send_discord(cfg, title, description, color, fields):
+    """Backwards-compatible shim: colour in, level out.
+
+    Nothing in this project calls it any more. It stays because it was the
+    only notification entry point for six releases, and a fork or a local
+    patch may still use it.
+    """
+    level = next((k for k, v in LEVEL_COLOR.items() if v == color), "info")
+    return notify(cfg, title, description, level, fields)
 
 
 NAME_COL = 12
@@ -876,15 +1409,14 @@ def build_summary(results, interval):
         for r in results:
             if r["date"] != date:
                 continue
-            # Against the cadence this camera ran at. Using the global interval
-            # made a camera at one frame a minute read as 8% coverage every
-            # night, which is a full day of frames reported as a near-outage.
-            expected = int(86400 / (r.get("interval") or interval))
+            # Against the cadence this camera ran at, via the same helper the
+            # run record uses, so the table and the file cannot disagree.
+            cov = coverage_pct(r, interval)
             rows.append((
                 str(r["camera"])[:NAME_COL],
                 r["status"],
                 str(r["frames"] or "-"),
-                f"{100.0 * r['frames'] / expected:.0f}" if r["frames"] else "-",
+                f"{cov:.0f}" if cov is not None else "-",
                 human_size(r["size"]) if r["size"] else "-",
                 human_duration(r["seconds"])))
         widths = [max([len(h)] + [len(row[i]) for row in rows])
@@ -925,10 +1457,22 @@ def load_config(path):
         sys.exit(f"Cannot read {path}: {exc}")
 
 
-def find_pending(frames_root, cameras, only_date, max_backlog):
-    """Every date dir older than today, oldest first, capped at max_backlog."""
+def find_pending(frames_root, cameras, only_date, max_backlog, force=False):
+    """(jobs, done): date dirs older than today that still need encoding.
+
+    Oldest first, capped at max_backlog, which is a count of the newest
+    distinct dates still pending rather than an age cutoff.
+
+    `done` counts the camera-days left out because they already carry a marker.
+    They are dropped *before* the cap, so a pile of finished days cannot push a
+    pending one out of the window; that is the whole point of applying the two
+    in this order.
+
+    An explicit --date overrides a marker, because re-encoding one day by hand
+    has to stay possible; --force overrides it for the whole backlog.
+    """
     today = date.today().isoformat()
-    jobs = []
+    jobs, done = [], 0
     for cam in cameras:
         cam_dir = frames_root / cam
         if not cam_dir.is_dir():
@@ -940,11 +1484,14 @@ def find_pending(frames_root, cameras, only_date, max_backlog):
                 if d.name == only_date:
                     jobs.append((cam, d))
             elif d.name < today:
-                jobs.append((cam, d))
+                if not force and day_encoded(d):
+                    done += 1
+                else:
+                    jobs.append((cam, d))
     if not only_date and max_backlog:
         keep = sorted({d.name for _, d in jobs})[-max_backlog:]
         jobs = [(c, d) for c, d in jobs if d.name in keep]
-    return sorted(jobs, key=lambda j: (j[1].name, j[0]))
+    return sorted(jobs, key=lambda j: (j[1].name, j[0])), done
 
 
 def main():
@@ -955,10 +1502,31 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--keep-frames", action="store_true")
     ap.add_argument("--no-transfer", action="store_true")
+    ap.add_argument("--force", action="store_true",
+                    help="re-encode days that are already marked encoded")
+    ap.add_argument("--watch", action="store_true",
+                    help="check capture state for cameras refusing our "
+                         "credentials, notify, and exit (run from a timer)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    setup_logging(cfg["paths"].get("log_dir"))
+    # The watch runs from a timer every few minutes and logs to the journal
+    # only. Two reasons, and the first one is fatal rather than aesthetic: its
+    # unit may write exactly one directory, the state directory, so opening
+    # encode.log under ProtectSystem=strict kills the process at startup with
+    # a read-only filesystem error. Verified on real systemd. The second is
+    # that 288 heartbeat entries a day do not belong in the encoder's log.
+    setup_logging(None if args.watch else cfg["paths"].get("log_dir"))
+
+    if args.watch:
+        # Deliberately silent when there is nothing to say: this runs every few
+        # minutes, and a line per run would bury the nightly encode in its own
+        # log within a week.
+        changed = watch_credentials(cfg)
+        if changed:
+            log.info("Credential watch: %d camera state change(s) reported.",
+                     changed)
+        return 0
 
     run_start = time.time()
     frames_root = Path(cfg["paths"]["frames_root"])
@@ -971,6 +1539,11 @@ def main():
     log.info(" Timelapse encode run - %s", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
     log.info("=" * 62)
 
+    # Bound before the try so the critical-failure path can still record what
+    # it got through. An aborted run is the single most useful thing a status
+    # page can show, and it is the one a crash would otherwise take with it.
+    encoder, results, xfer = None, [], None
+
     try:
         log.info("Encoder detection:")
         encoder = select_encoder(cfg["paths"]["ffmpeg"], cfg["encode"])
@@ -979,8 +1552,12 @@ def main():
                                "(tried av1_nvenc, hevc_nvenc, libx264)")
         log.info("Selected: %s", encoder["name"])
 
-        jobs = find_pending(frames_root, cameras, args.date,
-                            cfg["encode"].get("max_backlog_days", 7))
+        jobs, done = find_pending(frames_root, cameras, args.date,
+                                  cfg["encode"].get("max_backlog_days", 7),
+                                  args.force)
+        if done:
+            log.info("Skipping %d day(s) already encoded; --force re-does them.",
+                     done)
         if not jobs:
             log.info("Nothing to process.")
             # Still ship the backlog. A transfer that failed last night leaves
@@ -997,11 +1574,21 @@ def main():
                                ("OK - %d file(s) moved" % xfer["moved"])
                                if xfer["ok"] else "FAILED - " + xfer["detail"]))
             good = xfer is None or xfer["ok"]
-            send_discord(cfg,
-                         "Timelapse - nothing to do" if good
-                         else "⚠️ Timelapse - transfer failed",
-                         "No completed day folders were found.",
-                         0x95A5A6 if good else 0xF1C40F, fields)
+            # Recorded even though nothing was encoded. "The timer fired at
+            # 00:05 and there was nothing to do" is an answer; a status page
+            # that cannot tell that from "the timer never fired" is not.
+            write_run_state(cfg, run_record(run_start, encoder, [], xfer,
+                                            interval))
+            # "None found" and "all of them are already done" look identical
+            # from here and are very different things to read at breakfast,
+            # so say which one it was.
+            notify(cfg,
+                   "Timelapse - nothing to do" if good
+                   else "⚠️ Timelapse - transfer failed",
+                   (f"{done} completed day folder(s) were already "
+                    f"encoded; nothing new." if done else
+                    "No completed day folders were found."),
+                   "info" if good else "warn", fields)
             return 0 if good else 1
 
         log.info("Found %d job(s) across %d camera(s).", len(jobs), len(cameras))
@@ -1056,19 +1643,26 @@ def main():
                 f"{r['camera']} {r['date']}: {r['note']}" for r in skipped)))
 
         all_good = not failed and (xfer is None or xfer["ok"])
-        send_discord(
+        # Before the notification, deliberately: Discord is the part that can
+        # be disabled, unreachable or rate-limited, and the local record of
+        # what happened should not depend on any of that.
+        write_run_state(cfg, run_record(run_start, encoder, results, xfer,
+                                        interval))
+        notify(
             cfg,
             ("\u2705 " if all_good else "\u26a0\ufe0f ") + "Timelapse Generation",
             build_summary(results, interval),
-            0x2ECC71 if all_good else 0xF1C40F,
+            "ok" if all_good else "warn",
             fields)
         return 0 if all_good else 1
 
     except Exception as exc:
         log.exception("Critical failure")
-        send_discord(cfg, "\u274c Timelapse - Critical Failure",
+        write_run_state(cfg, run_record(run_start, encoder, results, xfer,
+                                        interval, error=str(exc)[:300]))
+        notify(cfg, "\u274c Timelapse - Critical Failure",
                      f"The run aborted before completing.\n```\n{exc}\n```",
-                     0xE74C3C,
+                     "error",
                      [("Host", platform.node()),
                       ("Run time", human_duration(time.time() - run_start))])
         return 2

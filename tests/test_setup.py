@@ -249,12 +249,40 @@ class TestWritablePaths(unittest.TestCase):
     def cfg(self, transfer=None):
         return {"paths": {"frames_root": "/srv/tl/frames",
                           "video_output": "/srv/tl/videos",
-                          "log_dir": "/srv/tl/logs"},
+                          "log_dir": "/srv/tl/logs",
+                          "state_dir": "/srv/tl/state"},
                 "transfer": transfer or {"enabled": False}}
 
-    def test_lists_the_three_data_directories(self):
+    def test_lists_the_four_data_directories(self):
         self.assertEqual(setup.writable_paths(self.cfg()),
-                         ["/srv/tl/frames", "/srv/tl/logs", "/srv/tl/videos"])
+                         ["/srv/tl/frames", "/srv/tl/logs", "/srv/tl/state",
+                          "/srv/tl/videos"])
+
+    def test_the_state_directory_is_included(self):
+        """The daemons cannot publish state into a read-only directory.
+
+        ProtectSystem=strict means an unlisted path is read-only, and the
+        failure is a mount namespace error rather than anything naming the
+        setting. Note this is a *sibling* of the others on a default install
+        (/var/lib/timelapse/state), so the parent-collapse below never absorbs
+        it and it genuinely has to be named.
+        """
+        self.assertIn("/srv/tl/state", setup.writable_paths(self.cfg()))
+
+    def test_the_state_directory_defaults_when_the_key_is_absent(self):
+        # Every config written before 0.1.6 has no such key.
+        cfg = self.cfg()
+        del cfg["paths"]["state_dir"]
+        self.assertIn("/var/lib/timelapse/state", setup.writable_paths(cfg))
+
+    def test_the_state_directory_is_not_the_web_index_directory(self):
+        # Two different directories with confusable names. The web UI's is the
+        # one directory that service may write; this one the daemons write and
+        # the UI only reads.
+        cfg = self.cfg()
+        cfg["web"] = {"state_dir": "/var/lib/timelapse/web"}
+        self.assertNotIn("/var/lib/timelapse/web", setup.writable_paths(cfg))
+        self.assertNotIn("/srv/tl/state", setup.web_writable_paths(cfg))
 
     def test_includes_a_local_transfer_destination(self):
         # Trailing slash on purpose: the shipped example config writes the
@@ -266,14 +294,16 @@ class TestWritablePaths(unittest.TestCase):
     def test_normalises_trailing_and_duplicate_separators(self):
         cfg = {"paths": {"frames_root": "/srv/tl/frames/",
                          "video_output": "/srv/tl//videos",
-                         "log_dir": "/srv/tl/logs/"},
+                         "log_dir": "/srv/tl/logs/",
+                         "state_dir": "/srv/tl/state/"},
                "transfer": {"enabled": False}}
         self.assertEqual(setup.writable_paths(cfg),
-                         ["/srv/tl/frames", "/srv/tl/logs", "/srv/tl/videos"])
+                         ["/srv/tl/frames", "/srv/tl/logs", "/srv/tl/state",
+                          "/srv/tl/videos"])
 
     def test_a_trailing_slash_does_not_defeat_deduplication(self):
         cfg = {"paths": {"frames_root": "/srv/tl", "video_output": "/srv/tl/",
-                         "log_dir": "/srv/tl"},
+                         "log_dir": "/srv/tl", "state_dir": "/srv/tl/"},
                "transfer": {"enabled": False}}
         self.assertEqual(setup.writable_paths(cfg), ["/srv/tl"])
 
@@ -281,7 +311,7 @@ class TestWritablePaths(unittest.TestCase):
         # rsync over SSH writes nothing locally, so systemd needs no permission.
         paths = setup.writable_paths(
             self.cfg({"enabled": True, "destination": "user@nas:/mnt/tl"}))
-        self.assertEqual(len(paths), 3)
+        self.assertEqual(len(paths), 4)
 
     def test_ignores_a_destination_when_transfer_is_disabled(self):
         paths = setup.writable_paths(
@@ -296,13 +326,13 @@ class TestWritablePaths(unittest.TestCase):
     def test_deduplicates_identical_paths(self):
         cfg = self.cfg()
         cfg["paths"]["video_output"] = cfg["paths"]["frames_root"]
-        self.assertEqual(len(setup.writable_paths(cfg)), 2)
+        self.assertEqual(len(setup.writable_paths(cfg)), 3)
 
     def test_a_similar_prefix_is_not_treated_as_a_parent(self):
         # /srv/tl-old must not be swallowed by /srv/tl.
         cfg = {"paths": {"frames_root": "/srv/tl",
                          "video_output": "/srv/tl-old",
-                         "log_dir": "/srv/tl"},
+                         "log_dir": "/srv/tl", "state_dir": "/srv/tl"},
                "transfer": {"enabled": False}}
         self.assertEqual(setup.writable_paths(cfg), ["/srv/tl", "/srv/tl-old"])
 
@@ -2012,6 +2042,101 @@ class TestLoadExistingConfig(unittest.TestCase):
         self.assertIn("Cannot read", out)
 
 
+class TestRuntimeStateDir(unittest.TestCase):
+    """The directory the daemons publish runtime state into.
+
+    Its whole hazard is that it is named in ReadWritePaths: if it does not
+    exist when the units start, systemd refuses to start them, and the error
+    talks about a mount namespace rather than about a directory or a release.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_created_from_the_config(self):
+        target = Path(self.tmp) / "state"
+        cfg = setup.default_config()
+        cfg["paths"]["state_dir"] = str(target)
+        setup.create_state_dir(cfg)
+        self.assertTrue(target.is_dir())
+
+    def test_parents_are_created_too(self):
+        target = Path(self.tmp) / "a" / "b" / "state"
+        cfg = setup.default_config()
+        cfg["paths"]["state_dir"] = str(target)
+        setup.create_state_dir(cfg)
+        self.assertTrue(target.is_dir())
+
+    def test_create_directories_makes_it_as_well(self):
+        # The wizard's own path. A state directory made only by install.sh
+        # would be missing on any install that reconfigured without upgrading.
+        cfg = setup.default_config()
+        for key, sub in (("frames_root", "f"), ("video_output", "v"),
+                         ("log_dir", "l"), ("state_dir", "s")):
+            cfg["paths"][key] = str(Path(self.tmp) / sub)
+        cfg["web"] = {"state_dir": str(Path(self.tmp) / "w")}
+        setup.create_directories(cfg)
+        self.assertTrue((Path(self.tmp) / "s").is_dir())
+
+    def test_an_unwritable_location_is_reported_not_raised(self):
+        cfg = setup.default_config()
+        cfg["paths"]["state_dir"] = str(Path(self.tmp) / "nope")
+        buf = io.StringIO()
+        with mock.patch.object(Path, "mkdir",
+                               side_effect=PermissionError(13, "denied")):
+            with contextlib.redirect_stdout(buf):
+                setup.create_state_dir(cfg)
+        self.assertIn("Could not create", buf.getvalue())
+
+    def test_print_state_path_is_what_install_sh_reads(self):
+        """install.sh derives the directory it creates from this flag.
+
+        A flag that prints the wrong thing, or prints nothing, sends the
+        installer to its /var/lib/timelapse/state fallback while the units are
+        templated from the config: the directory made and the directory
+        required would then be different ones.
+        """
+        cfg = setup.default_config()
+        cfg["paths"]["state_dir"] = "/srv/tl/state"
+        path = Path(self.tmp) / "config.json"
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv",
+                               ["timelapse_setup.py", "--print-state-path",
+                                str(path)]), \
+                contextlib.redirect_stdout(buf):
+            rc = setup.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue().strip(), "/srv/tl/state")
+
+    def test_print_state_path_answers_for_a_config_without_the_key(self):
+        cfg = setup.default_config()
+        del cfg["paths"]["state_dir"]
+        path = Path(self.tmp) / "old.json"
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv",
+                               ["timelapse_setup.py", "--print-state-path",
+                                str(path)]), \
+                contextlib.redirect_stdout(buf):
+            setup.main()
+        self.assertEqual(buf.getvalue().strip(), "/var/lib/timelapse/state")
+
+    def test_the_default_is_named_in_exactly_one_place(self):
+        """Two copies of this string is how the unit and the directory drift.
+
+        The wizard's template, the config example and install.sh's fallback all
+        say /var/lib/timelapse/state, but only one of them is consulted at run
+        time.
+        """
+        import timelapse_encode as enc
+
+        cfg = setup.default_config()
+        del cfg["paths"]["state_dir"]
+        self.assertEqual(enc.state_dir(cfg).as_posix(), enc.STATE_DIR_DEFAULT)
+
+
 class TestWebStateDir(unittest.TestCase):
 
     def setUp(self):
@@ -2701,6 +2826,180 @@ class TestRedactedDump(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertNotIn(self.S, out.getvalue())
         json.loads(out.getvalue())
+
+
+class TestChooseNotify(unittest.TestCase):
+    """The notification sinks, driven one section at a time.
+
+    Whole-wizard driving would renumber every keystroke here whenever a
+    question moves, which is why the login tests do the same thing.
+    """
+
+    def drive(self, func, keystrokes, cfg=None):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        # A list of answers is easier to read and to comment than one long
+        # string, and the prompts here are numerous enough to need it.
+        setup._TTY = FakeTTY("\n".join(list(keystrokes) + [""]), tty=False)
+        cfg = {"discord": {"enabled": False, "webhook_url": "",
+                           "username": "Timelapse Bot"}} if cfg is None else cfg
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                func(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return cfg, buf.getvalue()
+
+    def sink(self, cfg, kind):
+        return setup.existing_sink(cfg, kind)
+
+    # -- discord ------------------------------------------------------------
+
+    def test_declining_leaves_nothing_enabled(self):
+        cfg, _ = self.drive(setup.choose_discord_sink, ["n"])
+        self.assertFalse(self.sink(cfg, "discord").get("enabled"))
+
+    def test_a_webhook_becomes_a_sink(self):
+        cfg, _ = self.drive(setup.choose_discord_sink,
+                            ["y", "https://discord.com/api/webhooks/1/x", "n"])
+        sink = self.sink(cfg, "discord")
+        self.assertTrue(sink["enabled"])
+        self.assertEqual(sink["webhook_url"],
+                         "https://discord.com/api/webhooks/1/x")
+        self.assertEqual(sink["type"], "discord")
+
+    def test_an_existing_legacy_webhook_is_offered_as_the_default(self):
+        """Re-running this against a pre-0.1.6 config must not present a blank
+        prompt for a webhook that is already configured."""
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://old/x",
+                           "username": "Bot"}}
+        cfg, _ = self.drive(setup.choose_discord_sink, ["", "", "n"], cfg)
+        self.assertEqual(self.sink(cfg, "discord")["webhook_url"],
+                         "https://old/x")
+
+    # -- ntfy ---------------------------------------------------------------
+
+    def test_ntfy_defaults_to_the_public_server(self):
+        cfg, _ = self.drive(setup.choose_ntfy_sink,
+                            ["y", "", "mytopic", "", "n"])
+        sink = self.sink(cfg, "ntfy")
+        self.assertEqual(sink["server"], "https://ntfy.sh")
+        self.assertEqual(sink["topic"], "mytopic")
+        self.assertTrue(sink["enabled"])
+
+    def test_ntfy_says_a_public_topic_is_the_only_secret(self):
+        _, out = self.drive(setup.choose_ntfy_sink,
+                            ["y", "", "mytopic", "", "n"])
+        self.assertIn("only secret", out)
+
+    def test_a_self_hosted_ntfy_is_not_lectured_about_public_topics(self):
+        _, out = self.drive(setup.choose_ntfy_sink,
+                            ["y", "https://ntfy.lan", "t", "", "n"])
+        self.assertNotIn("only secret", out)
+
+    def test_an_ntfy_token_is_kept(self):
+        cfg, _ = self.drive(setup.choose_ntfy_sink,
+                            ["y", "", "t", "tk_abc", "n"])
+        self.assertEqual(self.sink(cfg, "ntfy")["token"], "tk_abc")
+
+    # -- telegram -----------------------------------------------------------
+
+    def test_telegram_needs_both_halves_to_be_enabled(self):
+        cfg, _ = self.drive(setup.choose_telegram_sink,
+                            ["y", "123:ABC", "", "n"])
+        self.assertFalse(self.sink(cfg, "telegram")["enabled"])
+
+    def test_telegram_with_both_halves(self):
+        cfg, _ = self.drive(setup.choose_telegram_sink,
+                            ["y", "123:ABC", "-100200", "n"])
+        sink = self.sink(cfg, "telegram")
+        self.assertEqual((sink["token"], sink["chat_id"]),
+                         ("123:ABC", "-100200"))
+        self.assertTrue(sink["enabled"])
+
+    def test_telegram_explains_where_the_token_comes_from(self):
+        _, out = self.drive(setup.choose_telegram_sink, ["n"])
+        self.assertIn("BotFather", out)
+
+    # -- the section as a whole ---------------------------------------------
+
+    def test_several_sinks_can_be_on_at_once(self):
+        cfg, _ = self.drive(
+            setup.choose_notify,
+            ["y", "https://d/x", "n",          # discord, no test message
+             "y", "", "topic", "", "n",        # ntfy
+             "y", "123:ABC", "-100", "n"])     # telegram
+        kinds = [(s.get("type"), s.get("enabled")) for s in cfg["notify"]]
+        self.assertEqual(kinds, [("discord", True), ("ntfy", True),
+                                 ("telegram", True)])
+
+    def test_the_legacy_block_is_turned_off_once_notify_exists(self):
+        """It is ignored while `notify` is present, so leaving it enabled
+        would be a webhook that looks configured and never fires."""
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://old/x",
+                           "username": "Bot"}}
+        cfg, _ = self.drive(setup.choose_notify,
+                            ["y", "https://new/x", "n", "n", "n"], cfg)
+        self.assertFalse(cfg["discord"]["enabled"])
+        self.assertEqual(cfg["discord"]["webhook_url"], "")
+        self.assertEqual(self.sink(cfg, "discord")["webhook_url"],
+                         "https://new/x")
+
+    def test_declining_everything_leaves_nothing_to_send_to(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+        import timelapse_encode as enc_mod
+        cfg, _ = self.drive(setup.choose_notify, ["n", "n", "n"])
+        self.assertEqual(enc_mod.notify_sinks(cfg), [])
+
+    def test_the_order_of_sinks_is_stable_across_runs(self):
+        # A list that reshuffles itself makes a config diff unreadable.
+        cfg, _ = self.drive(setup.choose_notify,
+                            ["y", "https://d/x", "n", "y", "", "t", "", "n",
+                             "n"])
+        first = [s.get("type") for s in cfg["notify"]]
+        cfg, _ = self.drive(setup.choose_notify,
+                            ["y", "", "n", "y", "", "", "", "n", "n"], cfg)
+        self.assertEqual([s.get("type") for s in cfg["notify"]], first)
+
+
+class TestSinkIdentity(unittest.TestCase):
+    """What the "already verified" marker hashes.
+
+    Every one of these strings is or contains a credential, which is why only
+    a digest of it is ever written to disk.
+    """
+
+    def test_each_type_has_its_own_identity(self):
+        seen = {
+            setup.sink_identity({"type": "discord",
+                                 "webhook_url": "https://d/x"}),
+            setup.sink_identity({"type": "ntfy", "server": "https://ntfy.sh",
+                                 "topic": "t"}),
+            setup.sink_identity({"type": "telegram", "token": "T",
+                                 "chat_id": "1"}),
+        }
+        self.assertEqual(len(seen), 3)
+
+    def test_changing_the_topic_changes_the_identity(self):
+        a = setup.sink_identity({"type": "ntfy", "topic": "one"})
+        b = setup.sink_identity({"type": "ntfy", "topic": "two"})
+        self.assertNotEqual(a, b)
+
+    def test_a_sink_with_no_type_is_a_discord_webhook(self):
+        self.assertEqual(setup.sink_identity({"webhook_url": "https://d/x"}),
+                         "https://d/x")
+
+    def test_only_a_digest_reaches_the_disk(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg_path = tmp / "config.json"
+        cfg_path.write_text("{}", encoding="utf-8")
+        setup.record_notify_verified(str(cfg_path),
+                                     {"type": "telegram", "token": "SECRET",
+                                      "chat_id": "1"})
+        written = (tmp / setup.WEBHOOK_MARKER).read_text(encoding="utf-8")
+        self.assertNotIn("SECRET", written)
 
 
 if __name__ == "__main__":

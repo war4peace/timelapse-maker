@@ -92,8 +92,11 @@ This is the integration point. Treat it as an API.
 ```
 ${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/<HHMMSS>.jpg
 ${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/.cadence.json
+${paths.frames_root}/<CameraName>/<YYYY-MM-DD>/.encoded.json
 ${paths.video_output}/<CameraName>.<YYYYMMDD>.<container>
 ${paths.log_dir}/{capture,encode}.log
+${paths.state_dir}/capture.json
+${paths.state_dir}/encode.json
 ```
 
 Invariants that both sides depend on:
@@ -106,9 +109,37 @@ Invariants that both sides depend on:
 | Dot-prefixed files are not frames | Temp files start with `.`; `glob("*.jpg")` skips them. Don't add non-frame files to a day directory without a dot prefix. |
 | A day directory older than today is complete and owned by the encoder | Capture never writes to a past date. The encoder is free to delete it. |
 | **A day has one cadence, start to finish** | `.cadence.json` records the interval and frame rate the day began at, and both programs obey it over the config. That is what lets a cadence edit take effect at the next midnight and not before, whatever restarts happen in between. Absent for days captured before 0.1.2, so both sides fall back to the config. |
+| **A day is encoded once** | `.encoded.json` records what was produced and when. Until 0.1.6, deleting the frames *was* that record, so `delete_frames_on_success: false` meant the newest `max_backlog_days` were re-encoded from scratch every night. The marker is what makes keeping frames a supportable configuration. It cannot be inferred from the video instead: `transfer()` moves that to the NAS. |
 
 Adding a camera means adding a directory. Nothing else in either program needs
 to know.
+
+### 3a. Runtime state (0.1.6)
+
+A **second** on-disk contract, and it will outlive whatever reads it first, so
+it is versioned and every reader uses `.get(key, default)`. It exists because
+systemd cannot answer the question anybody actually has: a capture daemon whose
+every camera is refusing connections is `active (running)`, and so is one the
+disk guard has paused with nothing being written at all.
+
+| File | Written by | Contains |
+|---|---|---|
+| `capture.json` | the capture daemon, once a minute, plus once at startup and once on clean shutdown | pid, start time, `running`, `paused`, and a per-camera block: cadence, last attempt, last success, an `error` object (0.1.6) and either frame counters (HTTP) or restarts and process liveness (RTSP) |
+| `encode.json` | the encoder, at the end of every run including one that found nothing to do | the newest `MAX_RUNS` (14) run records: times, encoder, counts, bytes, transfer outcome, and a per-camera-day list with frames and coverage |
+| `notified.json` | the credential watch, when it reports a change | `{camera: incident_start}` for refusals already announced, so a timer that fires every five minutes says each thing once |
+
+Rules that hold this together:
+
+| Rule | Why |
+|---|---|
+| **Facts, never verdicts** | There is deliberately no "healthy" or "state" field. Whether 42 seconds of silence is a fault depends on that camera's interval and on whether capture is paused; a reader can work that out, and a writer that had already decided could not be overruled. The cadence each number should be read against travels beside it for exactly this reason. |
+| **`error` is a classification, not a verdict** | It says what the camera answered (`auth`, `unreachable`, `other`), when that started, and whether the daemon's own back-off has confirmed it. `confirmed` is not a health judgement: it means "two refusals, ten minutes, one more attempt", which is a statement about what was tried. A reader still decides what to do about it, and the web UI and the credential watch decide differently. |
+| **`error.since` is the incident's identity** | Anything that must act once per incident compares that timestamp rather than inventing its own notion of when one failure stops being the same failure. It is stable while the incident lasts and moves when the class changes or the daemon restarts. |
+| **The RTSP path publishes different fields, marked `supervised`** | ffmpeg writes those frames and the thread only supervises the process, so `last_success` stays `null` rather than being filled in from something that is not a frame. Reading the day directory's mtime would have produced a plausible number and taught readers to trust it everywhere. |
+| **Writing it can never fail the job** | A daemon that cannot write its status file must keep capturing, and a run that encoded seven days has not failed because a history file could not be updated. Capture complains once, not once a minute. |
+| **Written atomically** | `os.replace`, like every other file this project writes. A reader gets the previous snapshot or the next one, never half of either. |
+| **The daemons write it; the web UI only reads it** | Not `web.state_dir`, which is the UI's own index directory and the single path that service may write. Verified under systemd: a process with the web unit's `ReadWritePaths` gets `Read-only file system` here. |
+| **`paths.state_dir` must exist before the units start** | It is named in `ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths` points at nothing, with an error about mount namespaces that names neither the directory nor the release that added it. `install.sh` creates it in `sync_units()`, which is what makes the upgrade path safe for an install that answers "don't reconfigure" and never runs the wizard. |
 
 ---
 
@@ -124,6 +155,15 @@ Long-running daemon. `systemd` `Type=simple`, `Restart=always`.
 |---|---|
 | `STOP` | `threading.Event`, set by SIGTERM/SIGINT. Every loop uses `STOP.wait(n)` rather than `time.sleep(n)` so shutdown is immediate. |
 | `PAUSED` | `threading.Event`, set by `DiskGuard`. Capture threads check it and skip, but keep their scheduling loop running. |
+
+The same once-a-minute tick in `main()` that calls `record_cadences()` also
+calls `write_state()` (§3a). It is the main thread, so there is one writer and
+no lock: every value it reads off a camera thread is a single int or float,
+and a counter one tick old is not worth taking a lock in the capture path for.
+It also writes **immediately at startup**, or a restart leaves the previous
+run's file in place for a minute, which reads as a live daemon that has
+stopped taking pictures, and **once more on clean shutdown** with
+`running: false`, so a stopped daemon and a wedged one stay tellable apart.
 
 **`HttpCamera(threading.Thread)`**: one per `method: "http"` camera.
 
@@ -190,6 +230,42 @@ Long-running daemon. `systemd` `Type=simple`, `Restart=always`.
   720. Recovery logs once. External uptime monitoring is the real alerting path
   for camera reachability; this log is for post-hoc diagnosis.
 
+**Authentication back-off (0.1.6).** A camera that rejects our credentials will
+reject them again next tick, and firmware commonly locks the account after a
+handful of failures, so fetching every few seconds renews that lock faster than
+it expires. Before this, rotating a camera's password without disabling it here
+first left the account locked until the daemon stopped, a correct password did
+not clear it, and the account is usually shared with an NVR.
+
+`classify(exc)` sorts a failed tick into `auth`, `unreachable` or `other`, in
+`run()` rather than in `_grab()`, which stays the fetch. It is deliberately
+conservative, because only `auth` withholds fetches and so costs frames:
+
+| Answer | Class | Notes |
+|---|---|---|
+| HTTP 401 or 403 | `auth` | Measured on Dahua and Hikvision: the status settles it and the body is different on every make, so nothing reads the body |
+| HTTP 200 with `rspCode` -6 or -7 | `auth` | The Reolink shape. -6 is "please login first", -7 is "login failed" |
+| HTTP 200 with `rspCode` -9 | `other` | "not support": an unknown *command*, in the identical shape. This is why the classifier reads the code and not the presence of an error object, and why unknown codes are logged rather than guessed at |
+| `ConnectionError`, `Timeout` | `unreachable` | Powered off, rebooting, unplugged. None of it is our credentials' fault |
+| anything else | `other` | Changes nothing |
+
+`_grab()` raises `NotAJpeg` carrying the body, because **`min_bytes` (4096) is
+larger than a Reolink refusal (~140 bytes)**, so the size check fires first and
+the SOI check is never reached for the one shape that most needs recognising.
+
+The ladder, on `HttpCamera`, in memory: **two consecutive refusals, ten minutes
+of withheld fetches, one attempt, then one attempt every 31 minutes for ever.**
+Flat rather than escalating, because the observed lockout window is 30 minutes
+and one attempt per 31 cannot reach the "N failures inside a window" threshold
+that lockout policies are built from. The tick itself keeps running while
+fetches are withheld, so the day rollover and the cadence marker are unaffected
+and a back-off spanning midnight still starts the new day correctly. The
+intra-tick retry is suppressed for `auth`: it cannot succeed and does count
+against the camera's lockout. A success or **any change of class** ends the
+incident, so a camera alternating between refusing and unreachable never climbs
+to a verdict. A restart re-enters at step one, deliberately: a fresh process
+knows nothing and two attempts settle it again.
+
 **`RtspCamera(threading.Thread)`**: one per `method: "rtsp"` camera, for devices
 with no HTTP snapshot endpoint (e.g. TP-Link Tapo).
 
@@ -233,14 +309,33 @@ Pipeline, in `main()`:
    earlier version guessed from the codec name and told an RTX 4060 owner their
    GPU was too old for AV1.
 2. `find_pending()` → every date directory across all enabled cameras whose name
-   sorts `< today`, oldest first, capped to the newest `max_backlog_days`
-   distinct dates.
-3. `encode_day()` per job, sequentially.
+   sorts `< today` **and carries no `.encoded.json`**, oldest first, capped to
+   the newest `max_backlog_days` distinct dates. It returns `(jobs, done)`;
+   `done` counts the camera-days already encoded, which the log reports so a
+   run that legitimately does nothing cannot be mistaken for a broken one.
+   The marker check happens *before* the cap, or a week of finished days would
+   push the one day that still needs encoding out of the window. `--date`
+   overrides a marker (re-encoding one day by hand has to stay possible) and
+   `--force` overrides it for the whole backlog.
+3. `encode_day()` per job, sequentially. On `OK`, and only on `OK`, after the
+   output file is closed and size-checked, `mark_encoded()` writes
+   `.encoded.json`. It never raises: a marker that could not be written costs
+   a re-encode next night, which is the behaviour the project had for five
+   releases, and that is not worth failing a good run over.
 4. `rmtree` the day directory on `OK` (unless `--keep-frames` or config says
-   otherwise).
+   otherwise). The marker is written even when this is about to delete it,
+   because `rmtree` runs with `ignore_errors=True`: a deletion that quietly
+   failed would otherwise leave an unmarked directory to encode again.
 5. `transfer()` → rsync.
-6. `send_discord()` → embed with a monospace summary table plus fields.
-7. Exit `0` all-good, `1` partial failure, `2` critical.
+6. `write_run_state()` → one record appended to `encode.json` (§3a), **before**
+   the notification: Discord is the part that can be disabled, unreachable or
+   rate-limited, and the local record of what happened should not depend on
+   any of it. Every exit path records, including "nothing to do" and the
+   critical-failure handler, because a status page that cannot tell "the timer
+   fired and there was nothing to do" from "the timer never fired" is not
+   answering the question.
+7. `notify()` → one summary to every configured sink.
+8. Exit `0` all-good, `1` partial failure, `2` critical.
 
 **`encode_day()`** is the core. Notable choices:
 
@@ -294,16 +389,80 @@ failure must not turn a successful encode into a critical abort**, because the
 encode result and the Discord summary are still valid and the videos are still
 on disk. This was a real bug found in testing.
 
-**`send_discord()`** uses `urllib` only, no dependency. Posts through
-`post_webhook()`, which sets an explicit `User-Agent`. This is not cosmetic:
-Discord is behind Cloudflare, which rejects urllib's default
-`Python-urllib/3.x` with **HTTP 403, Cloudflare error 1010**, before the
-request reaches Discord at all. With the documented
-`DiscordBot ($url, $version)` form the same request reaches the API. Truncates
-to Discord's limits (4096 description, 1024 per field value, 25 fields). Failure is logged and
-swallowed, catching `Exception` deliberately: a socket timeout is not a
-`URLError`, and notification is never load-bearing, least of all in the
-critical-failure handler, where an exception would mask the original error.
+**`notify()`** delivers one summary to any number of sinks: `discord`, `ntfy`
+and `telegram` at 0.1.6, from a `notify` list in the config. `urllib` only, no
+dependency. Everything goes through `post_webhook()`, which sets an explicit
+`User-Agent`. This is not cosmetic: Discord is behind Cloudflare, which rejects
+urllib's default `Python-urllib/3.x` with **HTTP 403, Cloudflare error 1010**,
+before the request reaches Discord at all. With the documented
+`DiscordBot ($url, $version)` form the same request reaches the API. The other
+sinks send a project agent instead, because claiming to be a Discord bot to
+somebody's ntfy server is a lie that would eventually cost an afternoon.
+
+Each sink is wrapped separately, catching `Exception` deliberately: a socket
+timeout is not a `URLError`, one sink being down must not stop the next, and
+notification is never load-bearing, least of all in the critical-failure
+handler where an exception would mask the original error. `notify()` returns
+`(sent, failed)` for callers that want to report it; the run's exit status
+never depends on either.
+
+Three things the sinks do not share, and each is a trap in its own right:
+
+- **Limits.** Discord takes 4096 for a description, 1024 per field and 25
+  fields; Telegram takes 4096 for the entire message; ntfy's default is around
+  4KB. `clip()` trims and *says* it trimmed, the same lesson as the release
+  notes at 0.1.0: text that stops without saying so reads as this program
+  having lost the rest.
+- **ntfy is sent as JSON to the server root**, not as text to `/topic`. The
+  other form carries the title in an HTTP *header*, headers are ASCII, and
+  every title this program sends begins with an emoji.
+- **Telegram is sent as HTML, not MarkdownV2.** The summary is a monospace
+  table, and a proportional font turns it into rubble, so it has to be wrapped
+  in `<pre>`. MarkdownV2 would mean escaping fourteen characters correctly
+  everywhere, including inside camera names, where a miss is a 400 rather than
+  a message that merely looks wrong. HTML mode needs three: `&`, `<`, `>`.
+
+**`--watch`: the credential watch (0.1.6).** A second entry point into this
+script, run from `timelapse-watch.timer` every five minutes. It reads
+`capture.json`, and for every camera whose `error` is a **confirmed** `auth`
+refusal it sends one notification, then one all-clear when the refusal ends.
+It exists in this file rather than in the capture daemon because that daemon
+has never made an outbound connection and the state file was built precisely so
+the thing that knows and the thing that sends could be separate processes.
+
+Five rules, four of which are about not lying:
+
+- **Once per incident.** Keyed on `error.since`, recorded in `notified.json`.
+  A camera refusing all day produces one message, not 288.
+- **Nothing delivered is not "already told them".** `notify()` returns
+  `(sent, failed)`; the record is only written when at least one sink accepted,
+  so a sink that was briefly unreachable does not swallow the single message
+  this whole feature exists to send.
+- **No sinks means no record either**, checked before anything is written.
+  Marking an incident as reported when there was nowhere to report it would
+  leave today's refusal permanently unannounced if a sink were added tomorrow.
+- **A stale heartbeat is not acted on**, in either direction. A file older than
+  `CAPTURE_STALE` (300s), or one whose `running` is false, describes a moment
+  that has passed: a stopped daemon is not a camera that recovered, and an
+  all-clear sent from that would be an invention.
+- **It logs to the journal only.** Its unit may write exactly one directory,
+  the state directory, so opening `encode.log` under `ProtectSystem=strict`
+  kills the process at startup with a read-only filesystem error. Found on real
+  systemd, not in a test, which is the second time that has been true of a
+  `ReadWritePaths` assumption in this release.
+
+**Severity, not colour.** Call sites pass `"ok"`, `"info"`, `"warn"` or
+`"error"`; each sink maps that to its own vocabulary (a Discord embed colour,
+an ntfy priority, nothing at all for Telegram). They used to pass a hex colour,
+which meant a Discord concept travelling through code with no business knowing
+what Discord is.
+
+**The legacy `discord` block still works and is still read.** Every config
+written before 0.1.6 has one, upgrades keep the existing config, and
+`notify_sinks()` falls back to it when no `notify` list is present. When both
+exist the list wins and the old block is logged as ignored, because a webhook
+that looks configured and never fires is worse than one that is plainly off;
+the wizard turns it off when it writes the list, for the same reason.
 
 **`build_summary()`** writes the table inside that embed, and **the embed is
 narrower than a message**. Roughly 50 columns survive; past that Discord wraps,
@@ -331,7 +490,7 @@ logic cannot drift between the two).
 | `test_encoders` | ffmpeg built without NVENC |
 | `test_disk` | projects daily usage from *measured* snapshot sizes against actual free space |
 | `test_transfer` | unmounted CIFS path, missing SSH key |
-| `test_discord` | bad webhook URL |
+| `test_notify` | a bad webhook URL, a wrong ntfy topic, a Telegram bot nobody has messaged. It sends through the encoder's own `notify()`, so what is proven is the request the nightly run will make; a pre-flight that builds its own payload is how a check passes while the thing it checks is broken |
 
 It also hosts `--usage` (`timelapse usage`), which is a report rather than a
 check but belongs to the same "inspect this installation" job and reuses
@@ -509,6 +668,16 @@ Keep that list to one entry. Reusing the capture/encode `ReadWritePaths` would
 hand a network-facing service write access to every captured frame in exchange
 for nothing, which is why `sync_units()` templates the web unit separately and
 `timelapse_setup.py` has a separate `--print-web-paths`.
+
+The runtime-state files (§3a) are the newest test of that rule and they pass
+it: the daemons write them, this service only reads them, and `state_dir` was
+added to the *daemons'* `ReadWritePaths` and not to this one. Re-verified under
+systemd at 0.1.6 by running a process with this unit's properties against
+`/var/lib/timelapse/state`, which gets `Read-only file system`. Note the name
+collision that makes this easy to get wrong: `web.state_dir` is the UI's index
+directory and `paths.state_dir` is the daemons' runtime state. Two different
+directories, two different owners, one word. The module imports the second one
+as `runtime_state_dir` for that reason.
 
 It logs only to journald: a rotating log file would be a second writable path
 for no benefit.
@@ -950,6 +1119,28 @@ deliberate price of dropping a tab.
     back would otherwise shift every later unit onto the wrong row.
   The one state that looks healthy and is not gets called out: enabled=no
   while running means it will not come back after a reboot.
+- **The Cameras and Last encode panels answer what that table structurally
+  cannot** (0.1.6). Every row above comes from systemd, and systemd's opinion
+  of a capture daemon whose cameras are all refusing connections is `active
+  (running)`. These two read §3a instead, and the judgement lives here rather
+  than in the daemon: `camera_verdict()` allows two intervals of silence and
+  never less than fifteen seconds, so a camera at one frame a minute is not
+  measured by a five-second camera's clock. Four details worth keeping:
+  - **Silence is measured against the snapshot, not against now.** The
+    heartbeat lands once a minute, so measuring against now would add up to a
+    minute of the file's own age to every camera and paint a healthy
+    five-second camera as a minute quiet.
+  - **A stopped or stale daemon is announced above the table**, because it
+    explains every quiet row beneath it and leaving the reader to infer that
+    from eight red rows is not an explanation. `paused` gets its own line for
+    the same reason: it is the one state systemd gets actively wrong.
+  - **A missing state file is a sentence, not a fault.** It is what every
+    install shows between upgrading and restarting the units, and the panel
+    says so in those words rather than reporting an error.
+  - **A file claiming a newer format is refused rather than guessed at.** The
+    units restart on upgrade and this service may not have; reading an unknown
+    format would put invented numbers on a page whose entire value is being
+    true.
 - **The logs page drops the 54rem reading column.** That width suits prose and
   tables and is wrong for raw command output, whose line length journald
   decides, not us. `_render()` adds `pane-page` to `<body>` for it
@@ -1064,6 +1255,23 @@ replaced on disk and keeps serving the old build while the installer reports
 success**: the bug this function exists to fix. The encoder is deliberately
 absent: it is oneshot, so a run in flight finishes on the code it started with.
 
+`timelapse-watch.service` is templated separately too, and **must be**: the
+loop that rewrites `ExecStart` matches any line mentioning `timelapse_encode.py`,
+which would silently strip the `--watch` flag and turn a five-minute timer into
+a five-minute encode run. Its `ReadWritePaths` is the state directory alone, on
+the same reasoning as the web UI's: it reads the capture heartbeat and writes
+one small file, and has no business near the frames or the videos. Verified
+under systemd, where a process with that unit's writable set gets
+`Read-only file system` on the frames, the videos and `/etc/timelapse`.
+
+`adopt_new_timers()` enables a timer that did not exist at the previous
+install. Without it a companion unit added in a later release would sit on disk,
+installed and inert, on every existing deployment: the wizard is skipped on an
+upgrade that answers "don't reconfigure", and `offer_enable()` only runs when
+the operator says yes to a question about capture. It is gated on
+`timelapse-encode.timer` already being enabled, which is what distinguishes a
+live install from a files-only one.
+
 Prompts read from `/dev/tty` for the same reason the wizard's do. `--uninstall`
 removes programs and units but never captured data.
 
@@ -1096,7 +1304,9 @@ Four things follow from it that are not obvious:
 - **`Cov%` is measured against the camera's interval.** Each result row
   carries the interval it ran at. Against the global, a camera at one frame a
   minute reads as 8% coverage: a complete day reported as a near-total outage,
-  every night.
+  every night. Since 0.1.6 that arithmetic is `coverage_pct()`, shared by the
+  Discord table and the run record. It was inline in the table, and the file
+  would have been the copy that drifted.
 - **The disk projection sums, it does not multiply.** One camera at 60s and
   five at 5s is not six times any single figure.
 
@@ -1279,6 +1489,7 @@ take an optional path as their first positional argument. See
 | `frames_root` | Must be on a filesystem with room for ~2 days of frames. Temp files are created here, so it must be one mount. |
 | `video_output` | Emptied by `transfer()` each night. |
 | `log_dir` | Rotating logs, 8 MB × 3 (capture) / × 5 (encode). |
+| `state_dir` | Runtime state (§3a), a few KB. Defaults to `/var/lib/timelapse/state` and is not asked by the wizard. Deliberately not derived from the base directory the wizard asks about: that exists because frames are enormous and may want their own disk, and this does not. Absent from every config written before 0.1.6, so it is read with the default; changing it means `install.sh` must run again, because the directory has to exist before the units start. |
 | `ffmpeg`, `ffprobe` | Absolute paths. Point at a BtbN static build if the distro build lacks NVENC. |
 
 ### `capture`
@@ -1290,6 +1501,7 @@ take an optional path as their first positional argument. See
 | `min_free_gb` | 60 | `0` disables DiskGuard. |
 | `log_every_n_failures` | 60 | At 5s intervals, 60 = one log line per 5 minutes of downtime. |
 | `retry_within_tick` | true | One retry per tick when the budget allows. Set false for a camera that degrades under a second request. |
+| `notify_auth_failures` | true | Send one notification when a camera is confirmed to be refusing our credentials, and one when it recovers. Needs a configured sink; the back-off itself is unconditional. |
 
 ### `encode`
 | Key | Default | Notes |
@@ -1300,8 +1512,8 @@ take an optional path as their first positional argument. See
 | `av1_preset` / `av1_cq` | `p6` / 26 | p1 fastest … p7 slowest. Lower cq = higher quality. |
 | `hevc_cq`, `x264_crf` | 24, 20 | Fallback encoders only. |
 | `min_frames` | 100 | Below this, `SKIP` rather than produce a 2-second video. |
-| `delete_frames_on_success` | true | |
-| `max_backlog_days` | 7 | Bounds a catch-up run after long downtime. |
+| `delete_frames_on_success` | true | Off keeps the day directory. Safe since 0.1.6: `.encoded.json` is what stops the day being encoded again. There is no age-based sweeper and there is not going to be one (decided-against.md), so kept frames are kept forever, one directory per camera per day. |
+| `max_backlog_days` | 7 | Bounds a catch-up run after long downtime. A count of the newest distinct dates *still pending*, not an age cutoff: downtime produces fewer date directories, never more, so it cannot strand a day. |
 
 ### `transfer`
 | Key | Notes |
@@ -1309,6 +1521,17 @@ take an optional path as their first positional argument. See
 | `destination` | A local directory or an rsync remote spec; one code path serves both. |
 | `rsync_args` | Defaults include `--remove-source-files`; if you drop that, set `delete_local_after_transfer` accordingly or files accumulate. On a CIFS mount `-a` may exit 23 because owner/group cannot be set; the wizard measures which flags your share accepts and writes those. |
 | `require_mountpoint` | `false` (default), `true`, or an explicit mount path. Refuses to transfer when the destination is not on a mounted filesystem. Only meaningful for a local destination; ignored for a remote spec. |
+
+### `notify`
+A list, not a block. Each entry has a `type` and an `enabled`, plus its own
+keys: `webhook_url` and `username` for `discord`; `server`, `topic`, optional
+`token`, `priority` and `tags` for `ntfy`; `token` and `chat_id` for
+`telegram`. An entry with no `type` is a Discord webhook, which is what the
+legacy block becomes when the wizard moves it.
+
+Absent from every config written before 0.1.6, and the fallback is the old
+top-level `discord` block rather than "no notifications". When this list is
+present it is authoritative and that block is ignored.
 
 ### `web`
 Optional; absent from configs written before the feature existed, so every key
@@ -1343,6 +1566,8 @@ is read with `.get(key, default)`.
 |---|---|
 | One camera unreachable | That thread logs (throttled) and keeps trying. Others unaffected. Nightly `Cov%` shows the gap. |
 | Camera returns non-JPEG / truncated | Frame rejected at capture; nothing written. |
+| Camera rejects our credentials | Classified `auth`. Two refusals, then fetches are withheld for 10 minutes, one attempt, then one every 31 minutes for ever, so this program never holds the camera's account locked. One notification, one all-clear. Other cameras unaffected. |
+| A camera's password is rotated without reconfiguring here | Same path. Before 0.1.6 the daemon presented the old credential every tick and the account stayed locked until capture stopped. |
 | Disk fills | DiskGuard pauses all capture at threshold, logs ERROR, resumes with hysteresis. |
 | Capture process crashes | systemd restarts after 15s. Frames already written are intact. |
 | Host down over midnight | `Persistent=true` runs the timer on boot; `find_pending` picks up every missed day. |
@@ -1371,18 +1596,30 @@ resolution and quality would follow the same shape. The camera dict is passed
 whole to the thread constructor, so it is `cam.get(key) or <global>` and
 nothing structural.
 
-**Different notification sink**: `send_discord()` is the only
-outbound-notification function and takes `(title, description, color, fields)`.
-Add a sibling and call both from `main()`; keep failures swallowed.
+**Another notification sink**: add a function taking
+`(sink, title, description, level, fields)` and register it in `SINKS`. The
+dispatch, the per-sink error isolation and the config plumbing are already
+there. What is not automatic is the wizard: a sink type the wizard cannot
+configure is one nobody finds, so `choose_notify()` needs a section too, and
+`sink_identity()` needs to know what makes two of them different.
 
-**Camera restart on hang**: natural home is a new module invoked by the capture
-daemon's failure path, gated on consecutive-failure count, with a cooldown so it
-can't reboot-loop a camera. Detection already exists (`consec_fail`); this is
-remediation only.
+**Camera restart on hang**: **decided against at 0.1.6**, see
+decided-against.md. Two independent control loops acting on one camera with no
+arbitration will eventually fight, and this one could not tell a fault from a
+scheduled reboot. If you fork it anyway, the natural home is a new module
+invoked by the capture daemon's failure path, gated on consecutive-failure
+count, with a cooldown; detection already exists (`consec_fail`), and note that
+it would need an admin credential where the config today needs only one that
+can fetch a JPEG.
 
-**Frame retention beyond encode**: set `delete_frames_on_success: false` and add
-a separate age-based sweeper. Do not add retention logic to `encode_day()`; keep
-"encode" and "delete" separable.
+**Frame retention beyond encode**: **decided against on scope at 0.1.6**, see
+decided-against.md; this paragraph describes the extension point, not a plan.
+Set `delete_frames_on_success: false` and add a separate age-based sweeper. Do
+not put retention logic in `encode_day()`; keep "encode" and "delete"
+separable. The marker makes the hard half free, since a kept day carries
+`.encoded.json` and is not encoded again, so a sweeper decides only *when* to
+delete and never *whether* the work was done. It must take the whole day
+directory, markers included, rather than leaving either dotfile behind.
 
 **Parallel encoding**: currently sequential and deliberately so. NVENC session
 limits on consumer GeForce cards are low, and the real bottleneck is CPU JPEG
@@ -1401,7 +1638,10 @@ help.
 - **Cameras are polled independently**, so frames across cameras are not
   synchronised to the same instant.
 - **A frozen-but-reachable camera** produces a full frame count and a static
-  video. No automatic detection; the tell is a suspiciously small output file.
+  video. No automatic detection, and that is now a decision rather than an
+  omission (decided-against.md): nobody has observed the fault, the cheap
+  detector cannot see a painted lens, and the one that could would have to
+  guess. The tell is a suspiciously small output file.
 - **Video length varies with capture coverage**: a camera down for 6 hours
   produces a shorter video, not a video with gaps.
 - `Cov%` is computed against a nominal `86400/interval` and will read ~104% or
@@ -1416,7 +1656,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 936 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,118 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -1438,6 +1678,23 @@ name resolved in the *other* module's namespace and the tests silently started
 hitting api.github.com for real. They passed, against the live repo. Patch the
 module that owns the function, not the one that re-exports it.
 
+`test_grammar.py` holds the Python floor, and exists for one specific gap.
+`ast.parse(feature_version=(3, 9))` sounds like it settles the question and
+does not: it parses with the *running* interpreter's tokenizer, so PEP 701
+f-strings, which are 3.12, sail through it. That is the one 3.10+ construct
+this project can realistically write by accident, and it fails at **import**,
+which means not a broken panel but a service that does not start, on the
+distributions this project most expects (RHEL 9, Debian 11) and never on the
+machine it was written on. It caught a real one on the day it was added, in
+`timelapse_web.py`:
+
+```python
+f'<td{" class=\'bad\'" if bad else ""}>'      # SyntaxError on 3.9
+```
+
+Build the value on its own line instead. The test was confirmed to fail on
+that line before being kept: a guard nobody has seen fail is not a guard.
+
 Three seams exist purely for testability, and should be preserved:
 `scan_filesystems(mounts_path, statvfs, rotational)` and
 `_base_device(source, sys_block)` take injectable inputs, so the awkward cases
@@ -1450,6 +1707,13 @@ corrupt ones, named as real captures), runs `timelapse_encode.py` over it, and
 asserts what has actually broken before: bad frames rejected, exact output
 duration, `color_range=tv`, `color_space=bt709`, `pix_fmt=yuv420p`, frames
 deleted afterwards. Needs ffmpeg but no GPU; it falls back to libx264.
+
+It then runs a **second night with `delete_frames_on_success` off**, because
+that is the configuration the encode-once marker exists for and the one a
+regression would hide in: the day is encoded, the frames stay, the marker
+appears, a re-run encodes nothing and says why, the video's mtime and size are
+untouched, and `--force` encodes it again. The unit tests can assert about the
+marker; only this can assert that a real run leaves the video alone.
 
 **The suite was mutation-checked** when written: 18 deliberate breakages
 introduced one at a time, 16 caught. The two misses were tests passing for the
@@ -1466,6 +1730,26 @@ changes:
   and one 404. Confirmed: files land on exact interval boundaries, correct
   directory layout, no leftover `.tmp`, failure throttling works, clean SIGTERM
   shutdown.
+- **Runtime state** (0.1.6): Ubuntu 24.04 under real systemd, and this one had
+  to be measured because the plan for it was wrong on paper. `future-features`
+  claimed no unit change was needed since both units carry
+  `ReadWritePaths=/var/lib/timelapse`; that is the shipped *template*, while
+  `sync_units()` overwrites the line from the config with three sibling
+  directories, so a new sibling would have been read-only on every real
+  install while passing every test here. Confirmed after the fix: the
+  installer creates `state/` at 0750 `timelapse:timelapse`, both units carry it
+  in `ReadWritePaths` and `systemd-analyze verify` is clean, capture publishes
+  `capture.json` **from inside the sandbox** and records `running: false` on
+  stop, the encoder writes `encode.json` for a run that found nothing to do,
+  the pre-flight passes, and the overview renders both panels over HTTP.
+  A real disk-guard pause (`min_free_gb` set absurdly high) produced
+  `paused: true` and the PAUSED banner. The **upgrade path** was exercised
+  separately: v0.1.5 installed from the published tag (no state directory, no
+  state in `ReadWritePaths`), then this tree over the top, after which the
+  directory exists, the units carry it, and a config that still has no
+  `state_dir` key publishes to the default location. That is the hazard worth
+  re-testing on any future change here: a `ReadWritePaths` entry that does not
+  exist stops **both** daemons, with an error about mount namespaces.
 - **Installer and wizard**: Ubuntu 24.04 with real systemd. Confirmed: package
   detection and dependency install, service account creation, unit templating
   (`systemd-analyze verify` clean), a live capture run against a local HTTP
@@ -1566,19 +1850,101 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 
 ---
 
+## 9a. Appendix: the destination library, surveyed 2026-08-07
+
+Reference data, not a plan. This is the measurement `parse_name()` was built
+against, and the reason it is a chain of six patterns rather than one regex.
+It lived in `future-features.md` until that file was trimmed back to being a
+plan; the numbers are a record of one real library at one moment, and are not
+re-measured.
+
+A read-only survey of the author's own destination (`U:\TL`, an Unraid share
+over SMB), the only real library this has ever been measured against. 6,848
+files, 2.78 TiB, 2021-06-26 to 2026-08-06, in 55 `YYYY-MM/` folders plus two
+named event folders and 1,247 loose files at the root.
+
+**The destination is not a timelapse-maker output directory.** It is five
+years of accumulated history from three predecessor systems, and this is the
+single most important fact about the index: a parser written against the
+native filename format handles **64% of it**.
+
+| Pattern | Files | Era |
+|---|---|---|
+| `Camera.YYYYMMDD.mkv`, native | 4,384 | 2024-04 → now |
+| `YYYY-MM-DD_Camera.mp4` | 1,594 | 2022-09 → 2024-02 |
+| `YYYY-MM-DD.mp4`, **no camera name** | 449 | 2021-06 → 2022-09 |
+| `Camera_YYYY-MM-DD.mp4` | 415 | 2021-07 → 2022-09 |
+| `Camera<date>_<timestamp>.mkv` | 3 | 2024-04 |
+| `YYYY-MM-DDTHH-MM-SS[_cam].mp4` | 2 | event folders |
+
+A chain of patterns, tried most-specific first, parses 6,847 of 6,848. The one
+failure is `MakeTLALL_backup.ps1`, the PowerShell predecessor still sitting in
+the root, which is also the proof that "not a directory" is not a sufficient
+test for "is a video".
+
+Constraints this survey establishes, each of which breaks a naive index:
+
+- **`Workshop` (723) and `workshop` (446) stay two entries.** They are almost
+  certainly one place typed two ways, but see the rule below: the index does
+  not decide that. Sort case-insensitively so they sit adjacent and the reader
+  can see it for themselves.
+- **449 files have no camera name.** They need a real bucket, not an
+  exception. (This is also where `keep_blank_values=True` earns its place: the
+  group's key is the empty string, and a `?camera=` link to it is a real
+  link.)
+- **`(camera, date)` is not unique**: 6,844 keys for 6,848 files. The primary
+  key is the relative path. Nothing else is safe.
+- **Extension allow-list**, not a directory test. See the `.ps1`.
+- **Container changes with era**: mp4 through 2024, mkv after. Do not infer it.
+- **Human-made folders carry meaning.** `2023-05-10 - Renovări` and
+  `2023-05-12 - Dubios la poartă` are events, not clutter. Keep the folder as
+  a label rather than flattening it away.
+- **Never merge two names.** `garaj`/`Garage` and `street4k`/`StreetPTZ` look
+  like renames and are not: a camera name is a **place**, cameras get
+  repurposed over the years, and the same device may cover a different area
+  while a new device covers the old one. The name is a location label, not a
+  device identity, and the two drift apart deliberately. Corrected by the user
+  2026-08-07; do not regress this. Deciding whether `garaj` and `Garage` are
+  the same place is the *user's* call, not the index's. Show what is on disk.
+- **Some files are broken.** 11 are implausibly small: `Gate.20240727.mkv` at
+  17 KB, `Gate.20251109.mkv` at 86 KB, almost certainly failed encodes. List
+  them with their **full path**, so they can be checked and removed by other
+  means. The UI is read-only and does not delete; naming the path is the whole
+  service it can offer.
+
+Two findings make reconciliation cheap:
+
+- **mtime is exact.** Across all 4,384 native files, mtime is precisely one
+  day after the filename date: min, median, p95 and max all equal 1. That is
+  the 00:05 encode timer. `(size, mtime)` is a dependable change key.
+- **The folder never disagrees with the filename.** Zero mismatches in 5,601
+  filed files, so `YYYY-MM/` is redundant and the index can key entirely on
+  filenames.
+
+**On scan duration: there is no baseline, and the design must not need one.**
+A full recursive enumeration measured 1.7 s, but that was from a workstation
+with 10G to the server, and the deployment reads over CIFS from Linux on a
+different stack. The work is latency-bound rather than bandwidth-bound (size
+and mtime arrive with the directory entries, so it is round-trips, not
+megabytes), but that only means the number moves for reasons that are hard to
+predict. Treat 1.7 s as a floor observed once, never as a budget.
+
+---
+
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 761 lines
-scripts/timelapse_capture.py     daemon, 742 lines
-scripts/timelapse_encode.py      batch job, 1078 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 773 lines
-scripts/timelapse_setup.py       configuration wizard, 2920 lines
+install.sh                       bootstrap installer, 836 lines
+scripts/timelapse_capture.py     daemon, 1083 lines
+scripts/timelapse_encode.py      batch job, 1672 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 840 lines
+scripts/timelapse_setup.py       configuration wizard, 3167 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 2821 lines
+scripts/timelapse_web.py         read-only web UI, 3123 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
+tests/test_grammar.py            the 3.9 floor, incl. the PEP 701 gap
 tests/test_setup.py              unit tests
 tests/test_update.py             unit tests
 tests/test_usage.py              unit tests
@@ -1588,11 +1954,27 @@ config/config.example.json       template; the real config.json is gitignored
 service/timelapse-capture.service
 service/timelapse-encode.service
 service/timelapse-encode.timer
+service/timelapse-watch.service   credential watch, oneshot
+service/timelapse-watch.timer     every 5 minutes
 service/timelapse-web.service
 docs/architecture.md             this file
 docs/install.md                  operator guide
 docs/future-features.md          planned work, in build order
+docs/decided-against.md          considered and refused, and why
 ```
+
+**The Python floor is 3.9 and is a deliberate, machine-checked property**, not
+an accident of when this was written. RHEL 9 and its rebuilds ship 3.9 as the
+system `python3` and are supported to 2032, and, more to the point, that is the
+interpreter their packaged `python3-requests` is built for: pointing the units
+at a newer AppStream python would mean pip and a venv on one distro family, in
+exchange for syntax this project does not need. It costs nothing to hold, since
+stdlib-only with no type hints avoids nearly everything 3.10+ added, and it is
+enforced rather than asserted by the CI 3.9 leg and by `tests/test_grammar.py`.
+Debian 11 was the other justification and its LTS ends in August 2026, so the
+floor now rests on RHEL 9 alone; revisit it if that stops mattering, if anyone
+reports friction it actually causes, or if it ever stops being machine-checked,
+because it is only cheap while it is automatic.
 
 Dependencies: Python 3.9+ stdlib, `requests`, `ffmpeg`/`ffprobe` (NVENC for
 AV1/HEVC), `rsync`. No virtualenv required, one pip package, no database. The

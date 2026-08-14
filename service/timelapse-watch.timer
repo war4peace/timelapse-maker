@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodic check for cameras refusing our credentials
+Documentation=https://github.com/war4peace/timelapse-maker
+
+[Timer]
+# The daemon needs about ten minutes to reach a verdict, so checking every
+# five adds little to the delay and keeps the process count negligible.
+OnBootSec=5min
+OnUnitActiveSec=5min
+# Deliberately NOT Persistent: a missed check is not worth catching up on,
+# because the thing it reports is read live from the capture heartbeat and a
+# stale heartbeat is refused anyway.
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

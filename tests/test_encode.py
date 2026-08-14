@@ -3,11 +3,13 @@
 The end-to-end encode is covered separately by tests/smoke_test.py.
 """
 
+import inspect
 import json
 import logging
 import os
 import shutil
 import tempfile
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -162,28 +164,39 @@ class TestFindPending(unittest.TestCase):
         p.mkdir(parents=True, exist_ok=True)
         return d
 
+    def mark(self, camera, offset, video="Cam.mkv"):
+        """Mark a day encoded, the way a successful run leaves it."""
+        d = (self.today + timedelta(days=offset)).isoformat()
+        (self.root / camera / d / enc.ENCODED_FILE).write_text(
+            json.dumps({"video": video}), encoding="utf-8")
+        return d
+
+    def pending(self, *a, **kw):
+        """The job list only; the skipped count is asserted where it matters."""
+        return enc.find_pending(*a, **kw)[0]
+
     def test_todays_directory_is_left_alone(self):
         # Capture is still writing to it.
         self.day("Cam", 0)
-        self.assertEqual(enc.find_pending(self.root, ["Cam"], None, 7), [])
+        self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
 
     def test_finds_completed_days(self):
         self.day("Cam", -1)
         self.day("Cam", -2)
-        jobs = enc.find_pending(self.root, ["Cam"], None, 7)
+        jobs = self.pending(self.root, ["Cam"], None, 7)
         self.assertEqual(len(jobs), 2)
 
     def test_returns_oldest_first(self):
         self.day("Cam", -1)
         self.day("Cam", -3)
         self.day("Cam", -2)
-        names = [d.name for _, d in enc.find_pending(self.root, ["Cam"], None, 7)]
+        names = [d.name for _, d in self.pending(self.root, ["Cam"], None, 7)]
         self.assertEqual(names, sorted(names))
 
     def test_backlog_cap_keeps_the_newest_dates(self):
         for off in range(-10, 0):
             self.day("Cam", off)
-        jobs = enc.find_pending(self.root, ["Cam"], None, 3)
+        jobs = self.pending(self.root, ["Cam"], None, 3)
         names = [d.name for _, d in jobs]
         expected = [(self.today + timedelta(days=o)).isoformat()
                     for o in (-3, -2, -1)]
@@ -195,40 +208,199 @@ class TestFindPending(unittest.TestCase):
         for cam in ("A", "B"):
             self.day(cam, -1)
             self.day(cam, -2)
-        self.assertEqual(len(enc.find_pending(self.root, ["A", "B"], None, 2)), 4)
+        self.assertEqual(len(self.pending(self.root, ["A", "B"], None, 2)), 4)
 
     def test_only_date_selects_exactly_one(self):
         target = self.day("Cam", -2)
         self.day("Cam", -1)
-        jobs = enc.find_pending(self.root, ["Cam"], target, 7)
+        jobs = self.pending(self.root, ["Cam"], target, 7)
         self.assertEqual([d.name for _, d in jobs], [target])
 
     def test_only_date_ignores_the_backlog_cap(self):
         target = self.day("Cam", -9)
         for off in range(-8, 0):
             self.day("Cam", off)
-        jobs = enc.find_pending(self.root, ["Cam"], target, 3)
+        jobs = self.pending(self.root, ["Cam"], target, 3)
         self.assertEqual([d.name for _, d in jobs], [target])
 
     def test_only_date_may_be_today(self):
         # --date is an explicit override, so it can encode a day still in use.
         target = self.day("Cam", 0)
-        jobs = enc.find_pending(self.root, ["Cam"], target, 7)
+        jobs = self.pending(self.root, ["Cam"], target, 7)
         self.assertEqual([d.name for _, d in jobs], [target])
 
     def test_non_date_directories_are_skipped(self):
         (self.root / "Cam").mkdir(parents=True)
         (self.root / "Cam" / "scratch").mkdir()
         (self.root / "Cam" / "2026-8-4").mkdir()
-        self.assertEqual(enc.find_pending(self.root, ["Cam"], None, 7), [])
+        self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
 
     def test_unconfigured_cameras_are_not_touched(self):
         self.day("Ghost", -1)
-        self.assertEqual(enc.find_pending(self.root, ["Cam"], None, 7), [])
+        self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
 
     def test_missing_camera_directory_is_not_an_error(self):
         self.root.mkdir(parents=True)
-        self.assertEqual(enc.find_pending(self.root, ["Cam"], None, 7), [])
+        self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
+
+
+class TestFindPendingSkipsEncoded(unittest.TestCase):
+    """The whole point of the marker: kept frames are not encoded twice.
+
+    Before 0.1.6 nothing recorded that a day had been encoded, so with
+    `delete_frames_on_success` off the encoder re-encoded the newest N days
+    from scratch every single night, and re-transferred the results.
+    """
+
+    setUp = TestFindPending.setUp
+    tearDown = TestFindPending.tearDown
+    day = TestFindPending.day
+    mark = TestFindPending.mark
+    pending = TestFindPending.pending
+
+    def test_a_marked_day_is_not_offered_again(self):
+        self.day("Cam", -1)
+        self.mark("Cam", -1)
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7)
+        self.assertEqual(jobs, [])
+        self.assertEqual(done, 1)
+
+    def test_an_unmarked_day_beside_a_marked_one_still_runs(self):
+        self.day("Cam", -1)
+        self.day("Cam", -2)
+        self.mark("Cam", -2)
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7)
+        self.assertEqual([d.name for _, d in jobs],
+                         [(self.today + timedelta(days=-1)).isoformat()])
+        self.assertEqual(done, 1)
+
+    def test_the_marker_is_per_camera_not_per_date(self):
+        # Two cameras share a date; marking one must not excuse the other.
+        for cam in ("A", "B"):
+            self.day(cam, -1)
+        self.mark("A", -1)
+        jobs, done = enc.find_pending(self.root, ["A", "B"], None, 7)
+        self.assertEqual([c for c, _ in jobs], ["B"])
+        self.assertEqual(done, 1)
+
+    def test_force_re_encodes_a_marked_day(self):
+        self.day("Cam", -1)
+        self.mark("Cam", -1)
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7, force=True)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(done, 0)
+
+    def test_only_date_overrides_the_marker(self):
+        # Re-encoding one day by hand has to stay possible without --force.
+        target = self.day("Cam", -2)
+        self.mark("Cam", -2)
+        jobs, _ = enc.find_pending(self.root, ["Cam"], target, 7)
+        self.assertEqual([d.name for _, d in jobs], [target])
+
+    def test_marked_days_do_not_consume_the_backlog_window(self):
+        # Dropped before the cap, or a week of finished days would push the
+        # one day that still needs encoding straight out of the window.
+        for off in range(-10, 0):
+            self.day("Cam", off)
+            if off != -10:
+                self.mark("Cam", off)
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 3)
+        self.assertEqual([d.name for _, d in jobs],
+                         [(self.today + timedelta(days=-10)).isoformat()])
+        self.assertEqual(done, 9)
+
+    def test_a_damaged_marker_means_encode_it_again(self):
+        self.day("Cam", -1)
+        (self.root / "Cam" / (self.today + timedelta(days=-1)).isoformat()
+         / enc.ENCODED_FILE).write_text("{ truncated", encoding="utf-8")
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(done, 0)
+
+    def test_a_cadence_marker_is_not_an_encoded_marker(self):
+        # Two dotfiles in the same directory, and only one of them means done.
+        self.day("Cam", -1)
+        (self.root / "Cam" / (self.today + timedelta(days=-1)).isoformat()
+         / enc.CADENCE_FILE).write_text(
+            json.dumps({"interval_seconds": 5, "framerate": 60}),
+            encoding="utf-8")
+        jobs, done = enc.find_pending(self.root, ["Cam"], None, 7)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(done, 0)
+
+
+class TestEncodedMarker(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.day = self.tmp / "2026-08-11"
+        self.day.mkdir()
+        self.result = {"frames": 10896, "size": 612345678}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_it_is_hidden_like_the_cadence_marker(self):
+        # Both live in a directory otherwise full of frames; neither should
+        # show up in a casual listing, and neither is a *.jpg.
+        self.assertTrue(enc.ENCODED_FILE.startswith("."))
+        self.assertNotEqual(enc.ENCODED_FILE, enc.CADENCE_FILE)
+
+    def test_round_trip(self):
+        enc.mark_encoded(self.day, Path("/out/Cam.20260811.mkv"),
+                         self.result, "av1_nvenc (NVIDIA AV1)")
+        got = enc.day_encoded(self.day)
+        self.assertEqual(got["video"], "Cam.20260811.mkv")
+        self.assertEqual(got["frames"], 10896)
+        self.assertEqual(got["size"], 612345678)
+        self.assertEqual(got["encoder"], "av1_nvenc (NVIDIA AV1)")
+        self.assertEqual(got["version"], enc.__version__)
+
+    def test_it_records_when(self):
+        enc.mark_encoded(self.day, Path("Cam.mkv"), self.result, "libx264")
+        stamp = enc.day_encoded(self.day)["encoded_at"]
+        self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$")
+
+    def test_no_marker_reads_as_none(self):
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_a_missing_directory_reads_as_none(self):
+        self.assertIsNone(enc.day_encoded(self.tmp / "nope"))
+
+    def test_malformed_json_reads_as_none(self):
+        (self.day / enc.ENCODED_FILE).write_text("{ nope", encoding="utf-8")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_json_that_is_not_an_object_reads_as_none(self):
+        (self.day / enc.ENCODED_FILE).write_text("[1, 2]", encoding="utf-8")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_a_marker_naming_no_video_reads_as_none(self):
+        # An empty {} is what a half-written or hand-made file looks like, and
+        # it is not evidence that anything was produced.
+        (self.day / enc.ENCODED_FILE).write_text("{}", encoding="utf-8")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_it_overwrites_an_earlier_marker(self):
+        # --force re-encodes; the marker must then describe the new video, not
+        # keep pointing at the one that was just replaced.
+        enc.mark_encoded(self.day, Path("old.mkv"), self.result, "libx264")
+        enc.mark_encoded(self.day, Path("new.mkv"), self.result, "av1_nvenc")
+        self.assertEqual(enc.day_encoded(self.day)["video"], "new.mkv")
+
+    def test_it_leaves_no_temporary_file_behind(self):
+        enc.mark_encoded(self.day, Path("Cam.mkv"), self.result, "libx264")
+        self.assertEqual([p.name for p in self.day.iterdir()],
+                         [enc.ENCODED_FILE])
+
+    def test_an_unwritable_directory_is_not_an_error(self):
+        # Failing to annotate a day costs a re-encode next run, which is what
+        # the project did for five releases. It is not worth failing over.
+        missing = self.tmp / "gone" / "2026-08-11"
+        with self.assertLogs("encode", level="WARNING") as cm:
+            self.assertFalse(
+                enc.mark_encoded(missing, Path("Cam.mkv"), self.result, "x"))
+        self.assertIn("encoded again", "\n".join(cm.output))
 
 
 class TestEncoderCandidates(unittest.TestCase):
@@ -1025,6 +1197,601 @@ class TestPerCameraEncodeSettings(unittest.TestCase):
         self.assertNotIn("120", args)
 
 
+class TestEncodeDayMarksTheDay(unittest.TestCase):
+    """`day_encoded()` answering correctly is worth nothing if nothing writes.
+
+    Same reasoning as the cadence test above: the helpers are cheap to test in
+    isolation and that is exactly why the wiring is the part that breaks.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.day = self.tmp / "frames" / "Roof" / "2026-08-10"
+        for i in range(5):
+            make_frame(self.day / ("%06d.jpg" % (i * 5)))
+        self.out = self.tmp / "videos"
+        self.out.mkdir()
+        self.cfg = {"capture": {"interval_seconds": 5, "min_bytes": 100},
+                    "encode": {"framerate": 60, "gop": 120, "min_frames": 1,
+                               "container": "mkv"},
+                    "paths": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+                    "cameras": [{"name": "Roof"}]}
+
+    def run_day(self, rc=0, produce=True, dry_run=False):
+        """encode_day() with ffmpeg replaced by something that writes a file."""
+        def fake_run(cmd, **kw):
+            if produce:
+                Path(cmd[-1]).write_bytes(b"\0" * 4096)
+            return mock.Mock(returncode=rc, stdout="", stderr="boom")
+
+        with mock.patch.object(enc, "probe_dimensions", return_value=(512, 512)), \
+                mock.patch.object(enc.subprocess, "run", side_effect=fake_run):
+            return enc.encode_day(self.cfg, {"codec": "libx264", "args": [],
+                                             "name": "libx264 (CPU)"},
+                                  "Roof", self.day, self.out, dry_run)
+
+    def test_a_successful_day_is_marked(self):
+        r = self.run_day()
+        self.assertEqual(r["status"], "OK")
+        marker = enc.day_encoded(self.day)
+        self.assertIsNotNone(marker)
+        self.assertEqual(marker["video"], "Roof.20260810.mkv")
+        self.assertEqual(marker["frames"], 5)
+        self.assertEqual(marker["encoder"], "libx264 (CPU)")
+
+    def test_a_marked_day_is_the_one_find_pending_then_skips(self):
+        # The round trip through both halves, because each half passing its
+        # own test proves nothing about the pair.
+        self.run_day()
+        jobs, done = enc.find_pending(self.tmp / "frames", ["Roof"],
+                                      None, 7, force=False)
+        self.assertEqual(jobs, [])
+        self.assertEqual(done, 1)
+
+    def test_a_failed_encode_is_not_marked(self):
+        r = self.run_day(rc=1, produce=False)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_an_output_that_never_appeared_is_not_marked(self):
+        # ffmpeg exiting 0 having written nothing usable is a failure too, and
+        # marking it would strand the day permanently.
+        r = self.run_day(rc=0, produce=False)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_a_skipped_day_is_not_marked(self):
+        self.cfg["encode"]["min_frames"] = 100
+        r = self.run_day()
+        self.assertEqual(r["status"], "SKIP")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_a_dry_run_is_not_marked(self):
+        # --dry-run must be able to answer "what would run tonight" twice.
+        r = self.run_day(dry_run=True)
+        self.assertEqual(r["status"], "DRY")
+        self.assertIsNone(enc.day_encoded(self.day))
+
+    def test_the_marker_is_not_mistaken_for_a_frame(self):
+        self.run_day()
+        good, bad = enc.valid_frames(self.day, 100)
+        self.assertEqual((len(good), bad), (5, 0))
+
+
+class SinkHarness(unittest.TestCase):
+    """Captures every request a notification attempt would make.
+
+    No network, ever. urlopen is replaced, and a test that reached the wire
+    would be a test that fails on a build machine with no internet and posts
+    to somebody's real channel on the machine that does.
+    """
+
+    def setUp(self):
+        self.sent = []
+        self.fail_with = None
+
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return b'{"ok":true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            self.sent.append(req)
+            if self.fail_with:
+                raise self.fail_with
+            return FakeResponse()
+
+        original = enc.urlrequest.urlopen
+        enc.urlrequest.urlopen = fake_urlopen
+        self.addCleanup(setattr, enc.urlrequest, "urlopen", original)
+
+    def body(self, index=0):
+        return json.loads(self.sent[index].data.decode("utf-8"))
+
+    def url(self, index=0):
+        return self.sent[index].full_url
+
+
+class TestNotifySinkSelection(SinkHarness):
+
+    def test_no_configuration_sends_nothing(self):
+        sent, failed = enc.notify({}, "t", "d", "ok", [])
+        self.assertEqual((sent, failed, self.sent), (0, 0, []))
+
+    def test_the_legacy_discord_block_still_works(self):
+        """Every config written before 0.1.6 has this shape, and upgrades keep
+        the existing config, so it has to go on working untouched."""
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://d/x",
+                           "username": "Bot"}}
+        sent, failed = enc.notify(cfg, "Title", "Desc", "ok", [])
+        self.assertEqual((sent, failed), (1, 0))
+        self.assertEqual(self.url(), "https://d/x")
+
+    def test_a_disabled_legacy_block_sends_nothing(self):
+        cfg = {"discord": {"enabled": False, "webhook_url": "https://d/x"}}
+        self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (0, 0))
+
+    def test_a_legacy_block_with_no_url_sends_nothing(self):
+        cfg = {"discord": {"enabled": True, "webhook_url": ""}}
+        self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (0, 0))
+
+    def test_the_notify_list_is_authoritative_when_present(self):
+        # Both configured; the legacy block must not produce a second message.
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://old/x"},
+               "notify": [{"type": "discord", "enabled": True,
+                           "webhook_url": "https://new/x"}]}
+        enc.notify(cfg, "t", "d", "ok", [])
+        self.assertEqual([self.url(i) for i in range(len(self.sent))],
+                         ["https://new/x"])
+
+    def test_disabled_sinks_are_skipped(self):
+        cfg = {"notify": [
+            {"type": "discord", "enabled": False, "webhook_url": "https://a/x"},
+            {"type": "discord", "enabled": True, "webhook_url": "https://b/x"}]}
+        enc.notify(cfg, "t", "d", "ok", [])
+        self.assertEqual([self.url(i) for i in range(len(self.sent))],
+                         ["https://b/x"])
+
+    def test_several_sinks_all_get_it(self):
+        cfg = {"notify": [
+            {"type": "discord", "enabled": True, "webhook_url": "https://d/x"},
+            {"type": "ntfy", "enabled": True, "topic": "tl"},
+            {"type": "telegram", "enabled": True, "token": "T", "chat_id": "1"}]}
+        self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (3, 0))
+        self.assertEqual(len(self.sent), 3)
+
+    def test_one_sink_failing_does_not_stop_the_others(self):
+        """The hard requirement. A failed notification must never take down
+        the run it is reporting on, nor the sink after it."""
+        cfg = {"notify": [
+            {"type": "discord", "enabled": True, "webhook_url": ""},
+            {"type": "ntfy", "enabled": True, "topic": "tl"}]}
+        with self.assertLogs("encode", level="WARNING"):
+            sent, failed = enc.notify(cfg, "t", "d", "ok", [])
+        self.assertEqual((sent, failed), (1, 1))
+
+    def test_a_transport_error_is_caught_not_raised(self):
+        self.fail_with = OSError("connection reset")
+        cfg = {"notify": [{"type": "ntfy", "enabled": True, "topic": "tl"}]}
+        with self.assertLogs("encode", level="WARNING") as cm:
+            self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (0, 1))
+        self.assertIn("connection reset", "\n".join(cm.output))
+
+    def test_an_unknown_type_says_what_it_knows(self):
+        cfg = {"notify": [{"type": "carrier-pigeon", "enabled": True}]}
+        with self.assertLogs("encode", level="WARNING") as cm:
+            enc.notify(cfg, "t", "d", "ok", [])
+        out = "\n".join(cm.output)
+        self.assertIn("carrier-pigeon", out)
+        self.assertIn("discord", out)
+        self.assertIn("ntfy", out)
+        self.assertIn("telegram", out)
+
+    def test_a_sink_with_no_type_is_a_discord_webhook(self):
+        # What the legacy block looks like once it is moved into the list.
+        cfg = {"notify": [{"enabled": True, "webhook_url": "https://d/x"}]}
+        self.assertEqual(enc.notify(cfg, "t", "d", "ok", []), (1, 0))
+
+    def test_the_old_entry_point_still_works(self):
+        # send_discord() was the only one for six releases; a fork may use it.
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://d/x"}}
+        enc.send_discord(cfg, "t", "d", 0x2ECC71, [])
+        self.assertEqual(self.body()["embeds"][0]["color"], 0x2ECC71)
+
+
+class TestDiscordSink(SinkHarness):
+
+    def send(self, level="ok", description="body", fields=()):
+        cfg = {"notify": [{"type": "discord", "enabled": True,
+                           "webhook_url": "https://d/x", "username": "Bot"}]}
+        enc.notify(cfg, "Title", description, level, list(fields))
+        return self.body()
+
+    def test_the_embed_shape_is_unchanged(self):
+        got = self.send(fields=[("Encoder", "AV1")])
+        embed = got["embeds"][0]
+        self.assertEqual(got["username"], "Bot")
+        self.assertEqual(embed["title"], "Title")
+        self.assertEqual(embed["description"], "body")
+        self.assertEqual(embed["fields"][0], {"name": "Encoder",
+                                              "value": "AV1", "inline": False})
+        self.assertIn("timestamp", embed)
+
+    def test_levels_map_to_the_colours_that_were_hardcoded_before(self):
+        for level, colour in (("ok", 0x2ECC71), ("info", 0x95A5A6),
+                              ("warn", 0xF1C40F), ("error", 0xE74C3C)):
+            self.sent.clear()
+            self.assertEqual(self.send(level)["embeds"][0]["color"], colour)
+
+    def test_an_empty_field_value_becomes_a_dash(self):
+        # Discord rejects an empty field value with a 400.
+        self.assertEqual(self.send(fields=[("Note", "")])["embeds"][0]
+                         ["fields"][0]["value"], "-")
+
+    def test_long_text_is_trimmed_and_says_so(self):
+        embed = self.send(description="x" * 5000)["embeds"][0]
+        self.assertLessEqual(len(embed["description"]), enc.DISCORD_DESC_LIMIT)
+        self.assertIn("truncated", embed["description"])
+
+    def test_at_most_25_fields(self):
+        embed = self.send(fields=[(f"f{i}", "v") for i in range(40)])["embeds"][0]
+        self.assertEqual(len(embed["fields"]), 25)
+
+    def test_it_keeps_the_discord_user_agent(self):
+        self.send()
+        self.assertTrue(self.sent[0].get_header("User-agent")
+                        .startswith("DiscordBot ("))
+
+
+class TestNtfySink(SinkHarness):
+
+    def send(self, sink=None, title="Title", description="body", level="ok",
+             fields=()):
+        base = {"type": "ntfy", "enabled": True, "topic": "timelapse"}
+        base.update(sink or {})
+        enc.notify({"notify": [base]}, title, description, level, list(fields))
+
+    def test_it_posts_json_to_the_server_root(self):
+        """Not text to /topic, deliberately: that form carries the title in an
+        HTTP header, headers are ASCII, and every title here starts with an
+        emoji."""
+        self.send(title="✅ Timelapse")
+        self.assertEqual(self.url(), "https://ntfy.sh")
+        self.assertEqual(self.body()["topic"], "timelapse")
+        self.assertEqual(self.body()["title"], "✅ Timelapse")
+
+    def test_a_self_hosted_server_is_honoured(self):
+        self.send({"server": "https://ntfy.example.lan/"})
+        self.assertEqual(self.url(), "https://ntfy.example.lan")
+
+    def test_the_message_carries_the_summary_and_the_fields(self):
+        self.send(description="TABLE HERE", fields=[("Encoder", "AV1")])
+        msg = self.body()["message"]
+        self.assertIn("TABLE HERE", msg)
+        self.assertIn("Encoder: AV1", msg)
+
+    def test_severity_becomes_priority(self):
+        for level, priority in (("ok", 3), ("info", 2), ("warn", 4),
+                                ("error", 5)):
+            self.sent.clear()
+            self.send(level=level)
+            self.assertEqual(self.body()["priority"], priority, level)
+
+    def test_a_configured_priority_wins(self):
+        self.send({"priority": 1}, level="error")
+        self.assertEqual(self.body()["priority"], 1)
+
+    def test_a_token_becomes_a_bearer_header(self):
+        self.send({"token": "tk_secret"})
+        self.assertEqual(self.sent[0].get_header("Authorization"),
+                         "Bearer tk_secret")
+
+    def test_no_token_means_no_authorization_header(self):
+        self.send()
+        self.assertIsNone(self.sent[0].get_header("Authorization"))
+
+    def test_tags_are_split_on_commas(self):
+        self.send({"tags": "camera, night"})
+        self.assertEqual(self.body()["tags"], ["camera", "night"])
+
+    def test_no_topic_is_a_configuration_error_not_a_crash(self):
+        with self.assertLogs("encode", level="WARNING") as cm:
+            self.send({"topic": ""})
+        self.assertIn("topic", "\n".join(cm.output))
+        self.assertEqual(self.sent, [])
+
+    def test_it_does_not_claim_to_be_a_discord_bot(self):
+        self.send()
+        agent = self.sent[0].get_header("User-agent")
+        self.assertIn("timelapse-maker", agent)
+        self.assertNotIn("DiscordBot", agent)
+
+    def test_a_long_message_is_trimmed(self):
+        self.send(description="x" * 6000)
+        self.assertLessEqual(len(self.body()["message"]), enc.NTFY_LIMIT)
+
+
+class TestTelegramSink(SinkHarness):
+
+    def send(self, sink=None, title="Title", description="body", fields=()):
+        base = {"type": "telegram", "enabled": True,
+                "token": "123:ABC", "chat_id": "-100200"}
+        base.update(sink or {})
+        enc.notify({"notify": [base]}, title, description, "ok", list(fields))
+
+    def test_it_calls_sendmessage_with_the_bot_token_in_the_path(self):
+        self.send()
+        self.assertEqual(self.url(),
+                         "https://api.telegram.org/bot123:ABC/sendMessage")
+        self.assertEqual(self.body()["chat_id"], "-100200")
+
+    def test_the_table_is_wrapped_in_pre_so_it_stays_monospace(self):
+        """A proportional font turns the summary table into rubble, which is
+        the whole reason this uses HTML rather than plain text."""
+        self.send(description="Camera  St  Frames")
+        text = self.body()["text"]
+        self.assertIn("<pre>", text)
+        self.assertIn("Camera  St  Frames", text)
+        self.assertEqual(self.body()["parse_mode"], "HTML")
+
+    def test_html_special_characters_are_escaped(self):
+        # An unescaped < is a 400 from the API, not a wrong-looking message.
+        self.send(title="A & B", description="1 < 2 > 0 & <b>x</b>")
+        text = self.body()["text"]
+        self.assertIn("A &amp; B", text)
+        self.assertIn("1 &lt; 2 &gt; 0 &amp; &lt;b&gt;x&lt;/b&gt;", text)
+
+    def test_the_title_is_bold_and_outside_the_pre_block(self):
+        self.send(title="Timelapse")
+        self.assertTrue(self.body()["text"].startswith("<b>Timelapse</b>"))
+
+    def test_fields_are_included(self):
+        self.send(fields=[("Transfer", "OK")])
+        self.assertIn("Transfer: OK", self.body()["text"])
+
+    def test_it_is_trimmed_to_telegrams_limit(self):
+        self.send(description="x" * 9000)
+        self.assertLessEqual(len(self.body()["text"]), enc.TELEGRAM_LIMIT)
+
+    def test_link_previews_are_off(self):
+        self.send()
+        self.assertTrue(self.body()["disable_web_page_preview"])
+
+    def test_missing_credentials_are_a_configuration_error(self):
+        for sink in ({"token": ""}, {"chat_id": ""}):
+            self.sent.clear()
+            with self.assertLogs("encode", level="WARNING") as cm:
+                self.send(sink)
+            self.assertIn("chat_id", "\n".join(cm.output))
+            self.assertEqual(self.sent, [])
+
+    def test_it_does_not_claim_to_be_a_discord_bot(self):
+        self.send()
+        self.assertNotIn("DiscordBot", self.sent[0].get_header("User-agent"))
+
+
+class TestSinkCredentialsAreRedacted(unittest.TestCase):
+    """Three new places a credential can now sit in the config.
+
+    `timelapse config --redacted` exists to be pasted into a bug report, and
+    the existing key rules happen to cover all of these. "Happen to" is why
+    this is pinned: the next sink type may not be so lucky.
+    """
+
+    def redact(self, sink):
+        return enc.redact_config({"notify": [sink]})["notify"][0]
+
+    def test_a_telegram_bot_token_is_masked(self):
+        # Whoever holds it controls the bot.
+        got = self.redact({"type": "telegram", "token": "123456:SECRET",
+                           "chat_id": "-100"})
+        self.assertEqual(got["token"], enc.MASK)
+        self.assertEqual(got["chat_id"], "-100")   # not a secret, and useful
+
+    def test_an_ntfy_token_is_masked(self):
+        got = self.redact({"type": "ntfy", "topic": "t", "token": "tk_SECRET"})
+        self.assertEqual(got["token"], enc.MASK)
+        self.assertEqual(got["topic"], "t")
+
+    def test_a_discord_webhook_keeps_its_id_and_loses_its_secret(self):
+        got = self.redact({"type": "discord",
+                           "webhook_url": "https://discord.com/api/webhooks/17/SECRET"})
+        self.assertIn("17", got["webhook_url"])
+        self.assertNotIn("SECRET", got["webhook_url"])
+
+    def test_an_empty_token_stays_empty(self):
+        # "" answers "did you set one?", which is what a bug report needs.
+        self.assertEqual(self.redact({"type": "ntfy", "token": ""})["token"], "")
+
+
+class TestStateDir(unittest.TestCase):
+
+    def test_the_configured_directory_wins(self):
+        self.assertEqual(
+            enc.state_dir({"paths": {"state_dir": "/srv/tl/state"}}).as_posix(),
+            "/srv/tl/state")
+
+    def test_absent_falls_back_to_the_default(self):
+        # Every config written before 0.1.6 lacks the key, and upgrades keep
+        # the existing config, so this is the normal case for a while.
+        self.assertEqual(enc.state_dir({"paths": {}}).as_posix(),
+                         enc.STATE_DIR_DEFAULT)
+
+    def test_an_empty_or_blank_value_falls_back_too(self):
+        for value in ("", "   ", None):
+            self.assertEqual(
+                enc.state_dir({"paths": {"state_dir": value}}).as_posix(),
+                enc.STATE_DIR_DEFAULT)
+
+    def test_a_config_with_no_paths_block_at_all(self):
+        self.assertEqual(enc.state_dir({}).as_posix(), enc.STATE_DIR_DEFAULT)
+
+    def test_it_is_not_the_web_index_directory(self):
+        # The web UI's state_dir lives under web, not paths, and means
+        # something else entirely: the one directory that service may write.
+        cfg = {"paths": {}, "web": {"state_dir": "/var/lib/timelapse/web"}}
+        self.assertEqual(enc.state_dir(cfg).as_posix(), enc.STATE_DIR_DEFAULT)
+
+    def test_the_state_files_are_named_once(self):
+        self.assertEqual((enc.CAPTURE_STATE, enc.ENCODE_STATE),
+                         ("capture.json", "encode.json"))
+        self.assertEqual(enc.STATE_VERSION, 1)
+
+
+class TestRunRecord(unittest.TestCase):
+    """What the nightly job leaves behind for anything that wants to know.
+
+    The numbers all existed already: they were formatted into a Discord table
+    and thrown away, so a status page could say nothing about last night.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = {"paths": {"state_dir": str(self.tmp)}}
+        self.enc = {"name": "H.265 (hevc_nvenc)", "codec": "hevc_nvenc"}
+
+    def result(self, **kw):
+        base = {"camera": "Roof", "date": "2026-08-11", "status": "OK",
+                "frames": 17280, "bad": 0, "size": 1024, "seconds": 12.34,
+                "note": "", "interval": 5, "fps": 60}
+        base.update(kw)
+        return base
+
+    def read(self):
+        return json.loads((self.tmp / enc.ENCODE_STATE)
+                          .read_text(encoding="utf-8"))
+
+    def test_a_run_is_recorded_with_its_days(self):
+        enc.write_run_state(self.cfg, enc.run_record(
+            time.time() - 90, self.enc, [self.result()], None, 5))
+        got = self.read()
+        self.assertEqual(got["version"], enc.STATE_VERSION)
+        self.assertEqual(got["kind"], "encode")
+        run = got["runs"][0]
+        self.assertEqual(run["ok"], 1)
+        self.assertEqual(run["encoder"], "H.265 (hevc_nvenc)")
+        self.assertEqual(run["days"][0]["camera"], "Roof")
+        self.assertGreaterEqual(run["seconds"], 90)
+
+    def test_coverage_is_computed_against_the_cameras_own_cadence(self):
+        # A camera at one frame a minute is not at 8% because the global
+        # interval is 5s. This is the bug the Discord table already had.
+        run = enc.run_record(time.time(), self.enc,
+                             [self.result(frames=1440, interval=60)], None, 5)
+        self.assertEqual(run["days"][0]["coverage"], 100.0)
+
+    def test_coverage_matches_what_the_discord_table_says(self):
+        """One formula, two consumers. They used to be one formula in one
+        consumer, and the file would have been the copy that drifted."""
+        r = self.result(frames=8640, interval=5)
+        run = enc.run_record(time.time(), self.enc, [r], None, 5)
+        self.assertEqual(run["days"][0]["coverage"], 50.0)
+        self.assertIn("50", enc.build_summary([r], 5))
+
+    def test_a_day_with_no_frames_has_no_coverage_rather_than_zero(self):
+        run = enc.run_record(time.time(), self.enc,
+                             [self.result(status="SKIP", frames=0)], None, 5)
+        self.assertIsNone(run["days"][0]["coverage"])
+        self.assertEqual(run["skipped"], 1)
+
+    def test_the_transfer_outcome_is_carried(self):
+        run = enc.run_record(time.time(), self.enc, [self.result()],
+                             {"ok": False, "moved": 0, "detail": "exit 23"}, 5)
+        self.assertFalse(run["transfer"]["ok"])
+        self.assertEqual(run["transfer"]["detail"], "exit 23")
+
+    def test_no_transfer_is_null_not_a_failed_one(self):
+        # --no-transfer and "the transfer failed" must not look alike.
+        run = enc.run_record(time.time(), self.enc, [self.result()], None, 5)
+        self.assertIsNone(run["transfer"])
+
+    def test_a_run_that_found_nothing_is_still_a_run(self):
+        # Otherwise "the timer fired and there was nothing to do" is
+        # indistinguishable from "the timer never fired".
+        run = enc.run_record(time.time(), self.enc, [], None, 5)
+        self.assertEqual((run["ok"], run["failed"], run["days"]), (0, 0, []))
+        self.assertEqual(run["error"], "")
+
+    def test_an_aborted_run_carries_its_error(self):
+        run = enc.run_record(time.time(), None, [], None, 5,
+                             error="No usable encoder found")
+        self.assertIn("No usable encoder", run["error"])
+        self.assertEqual(run["encoder"], "")
+
+    def test_runs_accumulate_newest_first(self):
+        for n in range(3):
+            enc.write_run_state(self.cfg, enc.run_record(
+                time.time(), self.enc, [self.result(camera=f"C{n}")], None, 5))
+        cams = [r["days"][0]["camera"] for r in self.read()["runs"]]
+        self.assertEqual(cams, ["C2", "C1", "C0"])
+
+    def test_history_is_bounded(self):
+        for n in range(enc.MAX_RUNS + 5):
+            enc.write_run_state(self.cfg, enc.run_record(
+                time.time(), self.enc, [], None, 5))
+        self.assertEqual(len(self.read()["runs"]), enc.MAX_RUNS)
+
+    def test_a_damaged_history_starts_a_new_one_rather_than_losing_tonight(self):
+        (self.tmp / enc.ENCODE_STATE).write_text("{ truncated",
+                                                 encoding="utf-8")
+        self.assertTrue(enc.write_run_state(self.cfg, enc.run_record(
+            time.time(), self.enc, [self.result()], None, 5)))
+        self.assertEqual(len(self.read()["runs"]), 1)
+
+    def test_a_history_of_the_wrong_shape_is_replaced_not_appended_to(self):
+        (self.tmp / enc.ENCODE_STATE).write_text('{"runs": "nope"}',
+                                                 encoding="utf-8")
+        enc.write_run_state(self.cfg, enc.run_record(
+            time.time(), self.enc, [], None, 5))
+        self.assertEqual(len(self.read()["runs"]), 1)
+
+    def test_an_unwritable_state_directory_does_not_fail_the_run(self):
+        cfg = {"paths": {"state_dir": str(self.tmp / "gone")}}
+        with self.assertLogs("encode", level="WARNING"):
+            self.assertFalse(enc.write_run_state(
+                cfg, enc.run_record(time.time(), self.enc, [], None, 5)))
+
+    def test_it_leaves_no_temporary_file_behind(self):
+        enc.write_run_state(self.cfg, enc.run_record(
+            time.time(), self.enc, [], None, 5))
+        self.assertEqual([p.name for p in self.tmp.iterdir()],
+                         [enc.ENCODE_STATE])
+
+    def test_main_records_before_it_notifies(self):
+        """A notification sink is the part that can be disabled, unreachable
+        or rate-limited; the local record must not depend on it."""
+        source = inspect.getsource(enc.main)
+        self.assertLess(source.index("write_run_state"),
+                        source.index("notify("))
+
+    def test_main_records_on_every_exit_path(self):
+        # Nothing to do, ordinary completion, and the critical-failure handler.
+        self.assertEqual(inspect.getsource(enc.main).count("write_run_state"), 3)
+
+
+class TestForceIsWiredUp(unittest.TestCase):
+    """main() is not unit-testable here, and this is the part that rots."""
+
+    def test_main_passes_force_through_to_find_pending(self):
+        source = inspect.getsource(enc.main)
+        self.assertIn("--force", source)
+        self.assertIn("args.force", source)
+
+    def test_main_reports_what_it_skipped(self):
+        # A run that quietly does nothing because every day is marked looks
+        # identical to a broken one from the log.
+        self.assertIn("already encoded", inspect.getsource(enc.main))
+
+
 class TestRedact(unittest.TestCase):
     """The canonical rule. Every camera password in this project reaches a log
     or a page through one of these four shapes."""
@@ -1261,6 +2028,312 @@ class TestRedactConfig(unittest.TestCase):
         # It must still be JSON-serialisable afterwards, with the types intact.
         out = enc.redact_config({"a": 1, "b": True, "c": None, "d": 1.5})
         self.assertEqual(out, {"a": 1, "b": True, "c": None, "d": 1.5})
+
+
+class TestCredentialWatch(unittest.TestCase):
+    """Notify once per incident, once when it ends, and never from stale facts.
+
+    The daemon publishes; this decides. Everything here drives that decision
+    through real capture.json files, because the file is the contract between
+    two processes and a mocked dict would not exercise it.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = {"paths": {"state_dir": str(self.tmp)},
+                    "notify": [{"type": "discord", "enabled": True,
+                                "webhook_url": "https://example.invalid/w"}]}
+        self.sent = []
+        patcher = mock.patch.object(
+            enc, "notify",
+            side_effect=lambda cfg, title, desc, level, fields:
+                self.sent.append((title, level)) or (1, 0))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_capture(self, cameras, running=True, age=0):
+        state = {"version": 1, "kind": "capture", "running": running,
+                 "updated_epoch": int(time.time()) - age,
+                 "cameras": cameras}
+        (self.tmp / enc.CAPTURE_STATE).write_text(json.dumps(state),
+                                                  encoding="utf-8")
+
+    def camera(self, name="Roof", cls="auth", confirmed=True,
+               since="2026-08-14T09:00:00"):
+        err = None
+        if cls:
+            err = {"class": cls, "since": since, "ticks": 3,
+                   "detail": "401 Client Error", "confirmed": confirmed,
+                   "quiet_until": "2026-08-14T09:41:00"}
+        return {"name": name, "supervised": False, "error": err}
+
+    def titles(self):
+        return [t for t, _ in self.sent]
+
+    # -- the happy path -----------------------------------------------------
+
+    def test_a_confirmed_refusal_is_reported(self):
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("refused our credentials", self.titles()[0])
+        self.assertEqual(self.sent[0][1], "error")
+
+    def test_the_same_incident_is_not_reported_twice(self):
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        for _ in range(5):
+            self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_recovery_sends_one_all_clear(self):
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertIn("accepted again", self.titles()[1])
+        self.assertEqual(self.sent[1][1], "ok")
+
+    def test_the_all_clear_is_not_repeated_either(self):
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)])
+        enc.watch_credentials(self.cfg)
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_a_second_incident_is_reported_again(self):
+        # Same camera, a new refusal after a recovery. The incident's identity
+        # is its start time, so this must not be mistaken for the old one.
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(since="2026-08-14T18:30:00")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 3)
+
+    def test_a_refusal_that_restarts_without_recovering_is_still_new(self):
+        # A daemon restart re-enters the ladder, so `since` moves even though
+        # nobody saw an all-clear. That is a genuinely new incident.
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(since="2026-08-14T11:00:00")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    # -- what must stay quiet ------------------------------------------------
+
+    def test_an_unconfirmed_refusal_says_nothing(self):
+        # Two refusals in ten seconds is a camera that might be rebooting.
+        self.write_capture([self.camera(confirmed=False)])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(self.sent, [])
+
+    def test_an_unreachable_camera_says_nothing(self):
+        # That is what an uptime monitor is for, and it sees it sooner.
+        self.write_capture([self.camera(cls="unreachable")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_some_other_failure_says_nothing(self):
+        self.write_capture([self.camera(cls="other")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_a_stale_heartbeat_is_not_acted_on(self):
+        # A file from an hour ago describes an hour ago. Sending an alarm from
+        # it would be guessing, and so would sending an all-clear.
+        self.write_capture([self.camera()], age=enc.CAPTURE_STALE + 60)
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_a_stopped_daemon_produces_no_all_clear(self):
+        # The trap this guards: capture stops, the error disappears from the
+        # file with it, and a naive reader announces that the camera recovered.
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)], running=False)
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_no_capture_state_at_all_is_harmless(self):
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_a_corrupt_capture_state_is_harmless(self):
+        (self.tmp / enc.CAPTURE_STATE).write_text("{not json",
+                                                  encoding="utf-8")
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_it_can_be_switched_off(self):
+        self.cfg["capture"] = {"notify_auth_failures": False}
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_no_sinks_means_no_record_either(self):
+        # The trap: recording the incident here would mean that configuring a
+        # sink tomorrow leaves today's refusal permanently unannounced.
+        self.cfg["notify"] = []
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertFalse((self.tmp / enc.WATCH_STATE).exists())
+        self.cfg["notify"] = [{"type": "discord", "enabled": True,
+                               "webhook_url": "https://example.invalid/w"}]
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    def test_it_is_on_when_the_key_is_absent(self):
+        # Every config written before this release lacks the key, and the
+        # feature is worth having by default on all of them.
+        self.assertNotIn("capture", self.cfg)
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    def test_a_failed_delivery_is_retried_next_tick(self):
+        # A sink that was briefly unreachable must not swallow the message.
+        self.write_capture([self.camera()])
+        with mock.patch.object(enc, "notify", return_value=(0, 1)):
+            self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertFalse((self.tmp / enc.WATCH_STATE).exists())
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_failed_all_clear_is_retried_too(self):
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)])
+        with mock.patch.object(enc, "notify", return_value=(0, 1)):
+            self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(enc.load_notified(self.cfg),
+                         {"Roof": "2026-08-14T09:00:00"})
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    def test_one_sink_succeeding_is_enough(self):
+        self.write_capture([self.camera()])
+        with mock.patch.object(enc, "notify", return_value=(1, 2)):
+            self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    # -- several cameras -----------------------------------------------------
+
+    def test_cameras_are_tracked_independently(self):
+        self.write_capture([self.camera("Roof"),
+                            self.camera("Gate", cls=None),
+                            self.camera("Yard", cls="unreachable")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.write_capture([self.camera("Roof"), self.camera("Gate"),
+                            self.camera("Yard", cls="unreachable")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_one_camera_recovering_leaves_the_others_alone(self):
+        self.write_capture([self.camera("Roof"), self.camera("Gate")])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera("Roof"), self.camera("Gate", cls=None)])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        record = json.loads((self.tmp / enc.WATCH_STATE)
+                            .read_text(encoding="utf-8"))
+        self.assertIn("Roof", record["incidents"])
+        self.assertNotIn("Gate", record["incidents"])
+
+    # -- the record itself ---------------------------------------------------
+
+    def test_the_record_survives_a_restart_of_this_checker(self):
+        # Each run is a fresh process, so "already told them" has to be on
+        # disk. Without this the timer would send the same alarm every five
+        # minutes for as long as the camera stayed broken.
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.assertTrue((self.tmp / enc.WATCH_STATE).exists())
+        self.assertEqual(enc.load_notified(self.cfg),
+                         {"Roof": "2026-08-14T09:00:00"})
+
+    def test_an_unwritable_record_still_notifies(self):
+        # Losing the record risks a repeat; failing to warn risks silence.
+        self.write_capture([self.camera()])
+        with mock.patch.object(enc, "save_notified", return_value=False):
+            self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_corrupt_record_is_treated_as_empty(self):
+        (self.tmp / enc.WATCH_STATE).write_text("nonsense", encoding="utf-8")
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    def test_the_message_names_the_camera_and_carries_no_credential(self):
+        cam = self.camera()
+        cam["error"]["detail"] = "401 for url: http://c/s?password=***"
+        self.write_capture([cam])
+        with mock.patch.object(enc, "notify") as spy:
+            spy.return_value = (1, 0)
+            enc.watch_credentials(self.cfg)
+        _cfg, title, desc, level, fields = spy.call_args[0]
+        self.assertIn("Roof", desc)
+        self.assertEqual(level, "error")
+        self.assertIn(("Camera", "Roof"), fields)
+        self.assertNotIn("hunter2", json.dumps(fields))
+
+
+class TestWatchUnitWiring(unittest.TestCase):
+    """The shipped unit and the installer that rewrites it must agree.
+
+    None of this is reachable from Python at runtime, and all of it was found
+    on real systemd rather than here, which is exactly why it is pinned: the
+    failure is silent and expensive in both directions.
+    """
+
+    def setUp(self):
+        self.repo = _support.REPO
+        self.unit = (self.repo / "service" / "timelapse-watch.service"
+                     ).read_text(encoding="utf-8")
+        self.installer = (self.repo / "install.sh").read_text(encoding="utf-8")
+
+    def test_the_unit_asks_for_watch_mode(self):
+        self.assertIn("timelapse_encode.py --watch", self.unit)
+
+    def test_the_installer_rewrites_it_with_the_flag_intact(self):
+        # The loop that templates capture and encode matches any ExecStart
+        # mentioning timelapse_encode.py. If the watch unit went through it,
+        # --watch would be stripped and a five-minute timer would become a
+        # five-minute *encode run*, silently, on every install.
+        self.assertIn("timelapse_encode.py --watch $CONFIG", self.installer)
+
+    def test_the_shared_loop_does_not_touch_the_watch_unit(self):
+        loop = self.installer.split("for unit in timelapse-capture.service "
+                                    "timelapse-encode.service; do")[1]
+        loop = loop.split("done")[0]
+        self.assertNotIn("watch", loop)
+
+    def test_it_is_installed_and_removed_with_the_others(self):
+        for phase in ("install -m 0644", "rm -f"):
+            self.assertIn("timelapse-watch.service", self.installer)
+            self.assertIn("timelapse-watch.timer", self.installer)
+        self.assertIn("disable --now timelapse-watch.timer", self.installer)
+
+    def test_its_writable_set_is_the_state_directory_alone(self):
+        # It reads the capture heartbeat and writes one small record. Giving it
+        # $rw would hand a five-minutely job write access to every frame.
+        self.assertIn("ReadWritePaths=$staterw", self.installer)
+
+    def test_new_timers_are_adopted_on_upgrade(self):
+        # A unit that did not exist at the previous install is enabled by
+        # nobody: the wizard is skipped when an upgrade says "don't
+        # reconfigure", and offer_enable only runs on a fresh setup.
+        self.assertIn("adopt_new_timers", self.installer)
+        self.assertIn("enable --now timelapse-watch.timer", self.installer)
+
+    def test_the_timer_does_not_catch_up_missed_runs(self):
+        timer = (self.repo / "service" / "timelapse-watch.timer"
+                 ).read_text(encoding="utf-8")
+        # Persistent=true would fire a burst at boot to make up for downtime,
+        # and every one of those would read the same live heartbeat.
+        self.assertNotIn("Persistent=true", timer)
+        self.assertIn("OnUnitActiveSec=", timer)
+
+    def test_watch_mode_does_not_open_the_encode_log(self):
+        # Its unit may write one directory, the state directory, so a file
+        # handler under ProtectSystem=strict kills the process at startup.
+        # Verified on systemd 255; the symptom is a read-only filesystem error
+        # naming encode.log, from a service that never encodes anything.
+        src = (self.repo / "scripts" / "timelapse_encode.py").read_text(
+            encoding="utf-8")
+        self.assertIn("None if args.watch else", src)
 
 
 if __name__ == "__main__":

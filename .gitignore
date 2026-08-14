@@ -6,6 +6,10 @@ config/*.local.json
 # Local assistant working notes, not shipped to contributors.
 CLAUDE.md
 
+# Throwaway scripts and probe output. Local only: nothing here is part of the
+# project, and some of it touches real cameras.
+temp/
+
 # Python
 __pycache__/
 *.py[cod]

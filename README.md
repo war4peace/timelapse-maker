@@ -3,7 +3,7 @@
 > [!WARNING]
 > ## ⚠️ EXPERIMENTAL: IN DEVELOPMENT
 >
-> **Version 0.1.5.** This is early software that has run on exactly one machine.
+> **Version 0.1.6.** This is early software that has run on exactly one machine.
 > It has not been tested across different distributions, camera makes, GPUs or
 > disk layouts, and it almost certainly has rough edges nobody has hit yet.
 >
@@ -23,7 +23,7 @@
 Unattended daily timelapses from IP cameras. Pulls a full-resolution snapshot
 from each camera on a fixed interval, encodes each finished day into one video
 per camera overnight, and optionally ships the results to a NAS and posts a
-summary to Discord.
+nightly summary to Discord, ntfy or Telegram.
 
 It exists because NVR timelapse features are generally built around *clips*,
 not around one contiguous file per camera per day. Agent DVR, for instance, is
@@ -62,9 +62,10 @@ Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 | `timelapse logs` | Follow the capture journal live | |
 | `timelapse version` | What is installed, and whether the daemon is still running an older build | |
 | `timelapse usage` | Frames, bytes and date range per camera, and which folders nothing will ever encode | **sudo** |
-| `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, Discord | **sudo** |
+| `timelapse test` | Pre-flight: every camera, the encoders, disk, transfer, notifications | **sudo** |
 | `timelapse cameras` | Add, edit, remove or disable a camera, set its own interval and frame rate, then restart capture. `-l` lists; `-a`, `-e:NAME`, `-x:NAME`, `-t:NAME`, `-r:NAME` skip the menu | **sudo** |
 | `timelapse transfer` | Reconfigure the destination, mounting an SMB share if needed | **sudo** |
+| `timelapse notify` | Where the nightly summary goes: Discord, ntfy, Telegram, any combination, with a test message for each | **sudo** |
 | `timelapse web` | Turn the read-only web UI on or off, set its address, library path and whether it asks for a login | **sudo** |
 | `timelapse password` | Set or change the web UI's login; `--disable` removes it. Never asks for the old one: this needs root, and root can read the config anyway | **sudo** |
 | `timelapse encode` | Run tonight's encode now | **sudo** |
@@ -110,6 +111,13 @@ so either can be stopped, replaced or rewritten without touching the other.
 - **Correct colour.** JPEGs are full-range; the pipeline converts to
   limited-range BT.709 and tags it, so output isn't washed out or crushed
   depending on the player.
+- **Answers "are my cameras actually working?"** The web UI shows a row per
+  camera with the time its last frame landed, its cadence, its frame count and
+  its failures, plus what last night's encode produced. `systemctl` cannot
+  answer this: a capture daemon whose cameras are all refusing connections is
+  "running", and so is one that has paused itself because the disk filled up.
+  The daemons publish it as plain versioned JSON, so anything else you want to
+  read it with can.
 - **Optional read-only web UI.** Service status, an index of your finished
   videos by camera and by day, and a *Play* link that hands each one to VLC,
   including one playlist per day, so reviewing a day means opening a single
@@ -131,7 +139,12 @@ so either can be stopped, replaced or rewritten without touching the other.
 ## Requirements
 
 - Linux with systemd (developed on Ubuntu Server; nothing is distro-specific)
-- Python 3.9+ and `requests`
+- **Python 3.9 or newer.** The floor is deliberate and machine-checked: RHEL 9
+  and its rebuilds ship 3.9 as the system `python3`, and that is the
+  interpreter their packaged `requests` is built for, so a newer one would mean
+  pip and a venv on one distro family for no gain. It costs this project
+  nothing to hold: stdlib only, no type hints, no compatibility shims, no
+  version-gated code. CI runs the suite on 3.9, 3.12 and 3.14.
 - `ffmpeg` / `ffprobe`, with NVENC if you want AV1 or HEVC hardware encoding
 - `rsync`, only if you enable transfer
 - Cameras exposing an HTTP snapshot URL (Dahua, Hikvision/ONVIF, Reolink and
@@ -234,10 +247,20 @@ encoders, and projects real disk usage from your actual snapshot sizes.
 - **Cameras are polled independently**, so frames are not synchronised to the
   same instant across cameras.
 - **A frozen-but-reachable camera** produces a full frame count and a static
-  video. The tell is a suspiciously small output file.
-- **Thin test coverage.** ~115 unit tests plus one end-to-end encode test,
-  covering the pure logic; the RTSP path, transfer and installer behaviour on
-  non-apt distros have no automated coverage. See §9 of the architecture doc.
+  video. There is no automatic detection and this is deliberate, not an
+  oversight: see [docs/decided-against.md](docs/decided-against.md). The tell
+  is a suspiciously small output file.
+- **It never touches your cameras.** It reads snapshots and nothing else: no
+  reboots, no settings, no PTZ. If a camera hangs, something else on your
+  network is better placed to deal with it, and would only end up fighting
+  this one over the same device. The one thing it does do is *stop*
+  reading: a camera that rejects the configured credentials is left alone
+  apart from an occasional retry, because repeating a rejected password is how
+  you get an account locked, and camera accounts are usually shared.
+- **Test coverage is uneven.** 1,184 unit tests plus one end-to-end encode
+  test, covering the pure logic; the RTSP path, transfer and installer
+  behaviour on non-apt distros still have no automated coverage. See §9 of the
+  architecture doc.
 
 ## License
 

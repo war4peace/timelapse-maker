@@ -26,7 +26,7 @@ import time
 from datetime import date
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -2119,20 +2119,159 @@ def choose_web(cfg):
                                   web.get("update_check", True))
 
 
-def choose_discord(cfg, config_path=None):
+def existing_sink(cfg, kind):
+    """The configured sink of this type, or {}.
+
+    Looks in `notify` first and falls back to the legacy `discord` block, so
+    re-running this against a config written before 0.1.6 offers the webhook
+    that is already in it rather than a blank prompt.
+    """
+    for sink in cfg.get("notify") or []:
+        if isinstance(sink, dict) and (sink.get("type") or "discord") == kind:
+            return sink
+    if kind == "discord" and cfg.get("discord", {}).get("webhook_url"):
+        return dict(cfg["discord"], type="discord")
+    return {}
+
+
+def put_sink(cfg, kind, sink):
+    """Replace or append one sink, keeping the order stable.
+
+    Order matters only for the log, but a list that reshuffles itself every
+    time the wizard runs makes a config diff unreadable.
+    """
+    sinks = [s for s in (cfg.get("notify") or []) if isinstance(s, dict)]
+    for i, existing in enumerate(sinks):
+        if (existing.get("type") or "discord") == kind:
+            sinks[i] = sink
+            break
+    else:
+        sinks.append(sink)
+    cfg["notify"] = sinks
+
+
+def choose_notify(cfg, config_path=None):
+    """Configure any number of notification sinks.
+
+    Straight-line questions rather than a menu, one per service, which is how
+    the rest of this wizard reads and which handles "I want both" without any
+    extra machinery. Nothing here needs a service restart: the encoder is a
+    oneshot and reads the config at the start of each run.
+    """
     heading("Notifications (optional)")
-    note("A nightly Discord summary: what encoded, coverage, size, failures.")
+    note("A nightly summary: what encoded, coverage, size, failures.")
+    note("Any number of these can be on at once; all of them are optional.")
     print()
-    if not ask_yes("Send a nightly summary to a Discord webhook?", False):
+
+    choose_discord_sink(cfg, config_path)
+    choose_ntfy_sink(cfg, config_path)
+    choose_telegram_sink(cfg, config_path)
+
+    # The legacy block is ignored once `notify` exists, so leaving it enabled
+    # would be a webhook that looks configured and never fires. It is emptied
+    # rather than deleted: a key that vanishes from a config is harder to
+    # recognise than one that is plainly turned off.
+    if cfg.get("notify") and cfg.get("discord", {}).get("enabled"):
         cfg["discord"]["enabled"] = False
         cfg["discord"]["webhook_url"] = ""
+
+
+def choose_discord_sink(cfg, config_path=None):
+    current = existing_sink(cfg, "discord")
+    on = ask_yes("Send the summary to a Discord webhook?",
+                 bool(current.get("enabled") and current.get("webhook_url")))
+    if not on:
+        if current:
+            put_sink(cfg, "discord", dict(current, type="discord",
+                                          enabled=False))
         return
-    url = ask("Webhook URL", "")
-    cfg["discord"]["enabled"] = bool(url)
-    cfg["discord"]["webhook_url"] = url
+    url = ask("Webhook URL", current.get("webhook_url", ""))
+    sink = {"type": "discord", "enabled": bool(url), "webhook_url": url,
+            "username": current.get("username", "Timelapse Bot")}
+    put_sink(cfg, "discord", sink)
     if url and ask_yes("Send a test message now?", True):
-        send_test_webhook(url, cfg["discord"].get("username", "Timelapse Bot"),
-                          config_path)
+        send_test_notification(sink, config_path)
+
+
+def choose_ntfy_sink(cfg, config_path=None):
+    current = existing_sink(cfg, "ntfy")
+    print()
+    note("ntfy delivers to a phone or desktop from a topic name, with no")
+    note("account: pick a topic nobody else would guess and subscribe to it.")
+    on = ask_yes("Send the summary to ntfy?", bool(current.get("enabled")))
+    if not on:
+        if current:
+            put_sink(cfg, "ntfy", dict(current, type="ntfy", enabled=False))
+        return
+    server = ask("Server", current.get("server") or "https://ntfy.sh")
+    topic = ask("Topic", current.get("topic", ""))
+    # Anyone who knows a public topic can read it, so this is worth saying
+    # once rather than leaving as a surprise.
+    if topic and "ntfy.sh" in server:
+        note("On the public server a topic is the only secret there is.")
+    token = ask("Access token (blank for none)", current.get("token", ""))
+    sink = {"type": "ntfy", "enabled": bool(topic), "server": server,
+            "topic": topic, "token": token}
+    put_sink(cfg, "ntfy", sink)
+    if topic and ask_yes("Send a test message now?", True):
+        send_test_notification(sink, config_path)
+
+
+def choose_telegram_sink(cfg, config_path=None):
+    current = existing_sink(cfg, "telegram")
+    print()
+    note("Telegram needs a bot token from @BotFather and a chat id. Message")
+    note("your bot once, then read the id from @userinfobot or getUpdates.")
+    on = ask_yes("Send the summary to Telegram?", bool(current.get("enabled")))
+    if not on:
+        if current:
+            put_sink(cfg, "telegram", dict(current, type="telegram",
+                                           enabled=False))
+        return
+    token = ask("Bot token", current.get("token", ""))
+    chat = ask("Chat id", str(current.get("chat_id", "")))
+    sink = {"type": "telegram", "enabled": bool(token and chat),
+            "token": token, "chat_id": chat}
+    put_sink(cfg, "telegram", sink)
+    if token and chat and ask_yes("Send a test message now?", True):
+        send_test_notification(sink, config_path)
+
+
+def send_test_notification(sink, config_path=None):
+    """Send one test message through the real sink code.
+
+    Through `notify()` rather than a hand-built payload, so what is tested is
+    what the nightly run will actually do. The wizard proving a webhook with a
+    request the encoder would never make is how a check comes to pass while
+    the thing it checks is broken.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import notify
+
+    kind = (sink.get("type") or "discord").lower()
+    sent, _ = notify({"notify": [dict(sink, enabled=True)]},
+                     "timelapse-maker",
+                     "Setup test: notifications are working.", "info",
+                     [("Host", socket.gethostname())])
+    if sent:
+        good(f"{kind} accepted the test message.")
+        record_notify_verified(config_path, sink)
+        return True
+    fail(f"{kind} did not accept the test message; see the message above.")
+    if kind == "discord":
+        note("403 usually means the webhook was deleted or regenerated.")
+        note("Re-copy it from Channel Settings -> Integrations -> Webhooks.")
+    elif kind == "ntfy":
+        note("Check the topic name, and the token if the server needs one.")
+    else:
+        note("Check the bot token, and that you have messaged the bot at")
+        note("least once: a bot cannot open a conversation with you.")
+    return False
+
+
+def choose_discord(cfg, config_path=None):
+    """Kept as the old name for anything that calls it."""
+    return choose_notify(cfg, config_path)
 
 
 def send_test_webhook(url, username, config_path=None):
@@ -2166,6 +2305,25 @@ def webhook_fingerprint(url):
     """
     import hashlib
     return hashlib.sha256(url.encode("utf-8")).hexdigest()[:16]
+
+
+def sink_identity(sink):
+    """What makes one configured sink distinguishable from another.
+
+    Hashed, never stored: every one of these strings is or contains a
+    credential. The webhook URL *is* the authority to post; so is a bot token.
+    """
+    kind = (sink.get("type") or "discord").lower()
+    if kind == "ntfy":
+        return f"ntfy {sink.get('server', '')} {sink.get('topic', '')}"
+    if kind == "telegram":
+        return f"telegram {sink.get('token', '')} {sink.get('chat_id', '')}"
+    return sink.get("webhook_url", "")
+
+
+def record_notify_verified(config_path, sink):
+    """Note a successful test so the pre-flight need not repeat it."""
+    return record_webhook_verified(config_path, sink_identity(sink))
 
 
 def record_webhook_verified(config_path, url):
@@ -2217,10 +2375,12 @@ def default_config(template_path=None):
         return cfg
     return {
         "paths": {"frames_root": "", "video_output": "", "log_dir": "",
+                  "state_dir": "/var/lib/timelapse/state",
                   "ffmpeg": "/usr/bin/ffmpeg", "ffprobe": "/usr/bin/ffprobe"},
         "capture": {"interval_seconds": 5, "timeout_seconds": 4,
                     "min_bytes": 4096, "min_free_gb": 60,
-                    "log_every_n_failures": 60, "retry_within_tick": True},
+                    "log_every_n_failures": 60, "retry_within_tick": True,
+                    "notify_auth_failures": True},
         "encode": {"framerate": 60, "container": "mkv", "gop": 120,
                    "av1_preset": "p6", "av1_cq": 26, "hevc_cq": 24,
                    "x264_crf": 20, "min_frames": 100,
@@ -2240,8 +2400,18 @@ def writable_paths(cfg):
     PurePosixPath, not Path: the output goes into a systemd unit, so it is a
     POSIX path whatever platform normalises it.
     """
+    from timelapse_encode import state_dir
+
     paths = [cfg["paths"][k] for k in ("frames_root", "video_output", "log_dir")
              if cfg["paths"].get(k)]
+    # Both daemons publish runtime state here. It is usually /var/lib/timelapse
+    # /state, a sibling of the others rather than a child, so the collapse
+    # below does not absorb it and it genuinely needs naming.
+    #
+    # as_posix(), not str(): state_dir() hands back a Path, and on Windows that
+    # stringifies with backslashes, which PurePosixPath below then treats as
+    # one long filename rather than a path. Same reason as the docstring above.
+    paths.append(state_dir(cfg).as_posix())
     t = cfg.get("transfer", {})
     dest = t.get("destination", "")
     if t.get("enabled") and dest.startswith("/"):
@@ -2567,7 +2737,33 @@ def create_directories(cfg, owner=None):
                 shutil.chown(p, user=owner, group=owner)
             except (OSError, LookupError):
                 pass
+    create_state_dir(cfg, owner)
     create_web_state_dir(cfg, owner)
+
+
+def create_state_dir(cfg, owner=None):
+    """The directory the daemons publish runtime state into.
+
+    Same reasoning as create_web_state_dir() below, and the same failure if it
+    is skipped: ReadWritePaths names this directory, so a unit whose
+    ReadWritePaths points at something absent does not start at all, and the
+    error names a mount namespace rather than a missing directory. The daemons
+    cannot create it themselves either, because inside the sandbox its parent
+    is read-only to them.
+    """
+    from timelapse_encode import state_dir
+
+    p = state_dir(cfg)
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        fail(f"Could not create {p}: {exc}")
+        return
+    if owner:
+        try:
+            shutil.chown(p, user=owner, group=owner)
+        except (OSError, LookupError):
+            pass
 
 
 def create_web_state_dir(cfg, owner=None):
@@ -2595,6 +2791,28 @@ def create_web_state_dir(cfg, owner=None):
             shutil.chown(p, user=owner, group=owner)
         except (OSError, LookupError):
             pass
+
+
+def summarise_notify(cfg):
+    """One line per sink, with nothing secret on any of them."""
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import notify_sinks
+
+    sinks = notify_sinks(cfg)
+    if not sinks:
+        note("No notifications configured; the nightly summary goes nowhere.")
+        return
+    print()
+    for sink in sinks:
+        kind = (sink.get("type") or "discord").lower()
+        if kind == "ntfy":
+            where = f"{sink.get('server', '')}/{sink.get('topic', '')}"
+        elif kind == "telegram":
+            # The token is the credential; the chat id is not.
+            where = f"chat {sink.get('chat_id', '')}"
+        else:
+            where = "webhook set"
+        note(f"{kind:<10}{where}")
 
 
 def summarise_web(cfg):
@@ -2668,6 +2886,8 @@ def main():
                     help="accept every default without prompting")
     ap.add_argument("--stdin", action="store_true",
                     help="read answers from stdin instead of the terminal")
+    ap.add_argument("--notify-only", action="store_true",
+                    help="reconfigure notifications only")
     ap.add_argument("--transfer-only", action="store_true",
                     help="reconfigure just the transfer destination")
     ap.add_argument("--cameras-only", action="store_true",
@@ -2711,6 +2931,8 @@ def main():
                     help="print the paths systemd must be allowed to write")
     ap.add_argument("--print-web-paths", metavar="CONFIG",
                     help="print the one path the web UI must be allowed to write")
+    ap.add_argument("--print-state-path", metavar="CONFIG",
+                    help="print the directory the daemons publish state into")
     ap.add_argument("--version", action="version",
                     version=f"%(prog)s {__version__}")
     args = ap.parse_args()
@@ -2755,6 +2977,16 @@ def main():
             print(" ".join(web_writable_paths(json.load(fh))))
         return 0
 
+    if args.print_state_path:
+        from timelapse_encode import state_dir
+
+        with open(args.print_state_path, encoding="utf-8") as fh:
+            # as_posix() for the same reason writable_paths() uses it: this is
+            # read by install.sh to make a directory on the target, and a Path
+            # stringifies to whatever the *running* platform separates with.
+            print(state_dir(json.load(fh)).as_posix())
+        return 0
+
     init_tty(force_defaults=args.defaults, use_stdin=args.stdin)
 
     # A shortcut is a command, not a wizard. Announcing the setup wizard and
@@ -2797,6 +3029,21 @@ def main():
         enabled = [c for c in cfg["cameras"] if c.get("enabled", True)]
         note(f"{len(cfg['cameras'])} camera(s), {len(enabled)} enabled")
         restart_capture_if_running()
+        print()
+        return 0
+
+    # Re-run just the notifications. Nothing to restart afterwards: the
+    # encoder is a oneshot and reads the config at the start of each run, so
+    # tonight's summary already uses whatever this writes.
+    if args.notify_only:
+        cfg = load_existing_config(args.output)
+        if cfg is None:
+            return 1
+        choose_notify(cfg, args.output)
+        heading("Writing configuration")
+        write_config(cfg, args.output, args.owner)
+        good(f"Updated {args.output}")
+        summarise_notify(cfg)
         print()
         return 0
 
@@ -2904,7 +3151,7 @@ def main():
     n_cams = choose_capture(cfg, disk)
     choose_cameras(cfg, n_cams)
     choose_transfer(cfg, args.owner)
-    choose_discord(cfg, args.output)
+    choose_notify(cfg, args.output)
     choose_web(cfg)
 
     heading("Writing configuration")

@@ -278,6 +278,11 @@ CONFIGURING
   transfer     [sudo]  Reconfigure where finished videos are sent, including
                        mounting an SMB/CIFS share and re-deriving the
                        ReadWritePaths= the systemd units need.
+  notify       [sudo]  Where the nightly summary goes: a Discord webhook,
+                       ntfy (ntfy.sh or your own server), Telegram, any
+                       combination, or none. Offers a test message for each.
+                       Needs no restart: the encode job reads the config when
+                       it runs.
   web          [sudo]  Turn the read-only web UI on or off and set its
                        address, port and library path, including whether it
                        asks for a login. Offers to restart it.
@@ -372,6 +377,8 @@ case "\${1:-}" in
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     password)  shift; exec python3 $PREFIX/timelapse_setup.py --password-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
+    notify)    shift; exec python3 $PREFIX/timelapse_setup.py --notify-only \\
+                          --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     web-serve) shift; exec python3 $PREFIX/timelapse_web.py "$CONFIG" "\$@" ;;
     # No "$CONFIG": updating neither reads nor writes it, which is why
     # 'timelapse update --check' is the one configuring command that needs
@@ -452,7 +459,8 @@ EOF
 
 install_units() {
     for unit in timelapse-capture.service timelapse-encode.service \
-                timelapse-encode.timer timelapse-web.service; do
+                timelapse-encode.timer timelapse-web.service \
+                timelapse-watch.service timelapse-watch.timer; do
         install -m 0644 "$SRC/service/$unit" "$UNITDIR/$unit"
     done
     sync_units
@@ -479,6 +487,20 @@ sync_units() {
             || webrw="/var/lib/timelapse/web"
         [ -z "$webrw" ] && webrw="/var/lib/timelapse/web"
     fi
+    # Where the daemons publish runtime state, and now part of $rw above. It is
+    # made HERE rather than only by the wizard, because an upgrade that answers
+    # "don't reconfigure" never runs the wizard: without this, ReadWritePaths
+    # would name a directory that does not exist and BOTH daemons would stop
+    # starting, reporting a mount namespace error that names neither the
+    # directory nor the release that added it.
+    local staterw="/var/lib/timelapse/state"
+    if [ -f "$CONFIG" ]; then
+        staterw="$(python3 "$PREFIX/timelapse_setup.py" --print-state-path "$CONFIG" 2>/dev/null)" \
+            || staterw="/var/lib/timelapse/state"
+        [ -z "$staterw" ] && staterw="/var/lib/timelapse/state"
+    fi
+    install -d -m 0750 "$staterw" 2>/dev/null || true
+    chown "$SVCUSER:$SVCUSER" "$staterw" 2>/dev/null || true
 
     for unit in timelapse-capture.service timelapse-encode.service; do
         local f="$UNITDIR/$unit"
@@ -506,6 +528,24 @@ sync_units() {
         chown "$SVCUSER:$SVCUSER" "$webrw" 2>/dev/null || true
     fi
 
+    # The credential watch gets the state directory and nothing else, for the
+    # same reason the web UI gets its index directory and nothing else: it
+    # reads the capture heartbeat and writes one small file recording what it
+    # has already reported. It has no business near the frames or the videos.
+    #
+    # Its ExecStart is rewritten separately too, and must be: the loop above
+    # matches any line mentioning timelapse_encode.py, which would silently
+    # strip the --watch flag and turn this timer into an encode run every five
+    # minutes.
+    if [ -f "$UNITDIR/timelapse-watch.service" ]; then
+        sed -i \
+            -e "s|^User=.*|User=$user_line|" \
+            -e "s|^Group=.*|Group=$user_line|" \
+            -e "s|^ReadWritePaths=.*|ReadWritePaths=$staterw|" \
+            -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_encode.py --watch $CONFIG|" \
+            "$UNITDIR/timelapse-watch.service"
+    fi
+
     # SupplementaryGroups naming a group that does not exist stops the unit
     # from starting outright, so it is cheaper to drop the line than to have
     # the web UI fail to boot on a distro we have never tried. The cost of
@@ -521,6 +561,22 @@ sync_units() {
     [ -d /run/systemd/system ] && systemctl daemon-reload || true
     note "ReadWritePaths=$rw"
     note "Web index dir=$webrw"
+}
+
+# A unit that did not exist at the last install is enabled by nobody: the
+# wizard is skipped on an upgrade that answers "don't reconfigure", and
+# `enable --now` in offer_enable only runs when the operator says yes to a
+# question about capture. So a companion timer added in a later release would
+# sit on disk, installed and inert, on every existing deployment. Anything
+# introduced alongside an already-enabled unit has to be adopted here.
+adopt_new_timers() {
+    [ -d /run/systemd/system ] || return 0
+    systemctl is-enabled --quiet timelapse-encode.timer 2>/dev/null || return 0
+    if ! systemctl is-enabled --quiet timelapse-watch.timer 2>/dev/null; then
+        systemctl enable --now timelapse-watch.timer >/dev/null 2>&1 \
+            && ok "Credential watch timer enabled." \
+            || warn "Could not enable timelapse-watch.timer; enable it by hand."
+    fi
 }
 
 run_wizard() {
@@ -607,6 +663,7 @@ offer_enable() {
         say "2. Verify:      timelapse test"
         say "3. Enable:      systemctl enable --now timelapse-capture.service"
         say "                systemctl enable --now timelapse-encode.timer"
+        say "                systemctl enable --now timelapse-watch.timer"
         return
     fi
 
@@ -633,6 +690,7 @@ offer_enable() {
     if ask_yn "Enable capture and the nightly encode now?" y; then
         systemctl enable --now timelapse-capture.service
         systemctl enable --now timelapse-encode.timer
+        systemctl enable --now timelapse-watch.timer
         sleep 2
         if systemctl is-active --quiet timelapse-capture.service; then
             ok "Capture is running."
@@ -643,6 +701,7 @@ offer_enable() {
         say "Enable later with:"
         say "  systemctl enable --now timelapse-capture.service"
         say "  systemctl enable --now timelapse-encode.timer"
+        say "  systemctl enable --now timelapse-watch.timer"
     fi
 
     # Separate from the pair above: the web UI is optional, off by default, and
@@ -686,6 +745,8 @@ do_uninstall() {
         systemctl disable --now timelapse-encode.timer 2>/dev/null || true
         systemctl disable --now timelapse-encode.service 2>/dev/null || true
         systemctl disable --now timelapse-web.service 2>/dev/null || true
+        systemctl disable --now timelapse-watch.timer 2>/dev/null || true
+        systemctl disable --now timelapse-watch.service 2>/dev/null || true
     fi
     rm -f "$UNITDIR"/timelapse-capture.service \
           "$UNITDIR"/timelapse-encode.service \
@@ -752,7 +813,7 @@ main() {
   ╚══════════════════════════════════════════════════════════╝
 BANNER
     printf '%s' "$N"
-    printf '  %sEXPERIMENTAL (v0.1.5)%s - early software, tested on one machine.\n' "$Y$B" "$N"
+    printf '  %sEXPERIMENTAL (v0.1.6)%s - early software, tested on one machine.\n' "$Y$B" "$N"
     note "Config format may change between versions. Not for production use."
 
     if [ "$DO_UNINSTALL" = "1" ]; then
@@ -767,6 +828,7 @@ BANNER
     install_units
     [ "$RUN_WIZARD" = "1" ] && run_wizard
     restart_upgraded_services       # after sync_units, before the pre-flight
+    adopt_new_timers                # units added by this release, on upgrades
     offer_enable
     printf '\n'
 }
