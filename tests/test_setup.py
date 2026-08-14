@@ -14,6 +14,7 @@ import socket
 import sys
 import tempfile
 import unittest
+import xml.etree.ElementTree as ET
 from datetime import date
 from pathlib import Path
 from unittest import mock
@@ -495,8 +496,10 @@ class TestCameraCounter(unittest.TestCase):
             setup.test_camera = prev_test
         return cfg["cameras"], buf.getvalue()
 
-    # configure? / type / name / ip / user / pass / test? / add another?
-    ONE = "y\n1\nGate\n10.0.0.1\nadmin\npw\nn\n"
+    # configure? / scan? / type / name / ip / user / pass / test? / add another?
+    # The scan is offered once for the whole section, not once per camera,
+    # which is why TWO does not answer it a second time.
+    ONE = "y\nn\n1\nGate\n10.0.0.1\nadmin\npw\nn\n"
     TWO = ONE + "y\n1\nYard\n10.0.0.2\nadmin\npw\nn\n"
 
     def test_prompt_names_the_next_camera_not_the_count(self):
@@ -3000,6 +3003,258 @@ class TestSinkIdentity(unittest.TestCase):
                                       "chat_id": "1"})
         written = (tmp / setup.WEBHOOK_MARKER).read_text(encoding="utf-8")
         self.assertNotIn("SECRET", written)
+
+
+def probe_match(uuid_str, xaddrs, types, scopes):
+    """A ProbeMatch in the shape real cameras send.
+
+    Vendors differ in prefix and in namespace declaration style, which is the
+    whole reason the parser matches on local names. These bodies are modelled
+    on the four makes measured on 2026-08-14.
+    """
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<SOAP-ENV:Envelope'
+        ' xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope"'
+        ' xmlns:wsa="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+        ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+        '<SOAP-ENV:Header>'
+        '<wsa:MessageID>uuid:abc</wsa:MessageID>'
+        '</SOAP-ENV:Header><SOAP-ENV:Body><d:ProbeMatches><d:ProbeMatch>'
+        f'<wsa:EndpointReference><wsa:Address>{uuid_str}</wsa:Address>'
+        '</wsa:EndpointReference>'
+        f'<d:Types>{types}</d:Types>'
+        f'<d:Scopes>{scopes}</d:Scopes>'
+        f'<d:XAddrs>{xaddrs}</d:XAddrs>'
+        '<d:MetadataVersion>1</d:MetadataVersion>'
+        '</d:ProbeMatch></d:ProbeMatches></SOAP-ENV:Body></SOAP-ENV:Envelope>'
+    ).encode("utf-8")
+
+
+DAHUA = probe_match(
+    "uuid:0e3cec9c-8515-54c3-c170-79b445c58515",
+    "http://192.168.2.202/onvif/device_service",
+    "dn:NetworkVideoTransmitter tds:Device",
+    "onvif://www.onvif.org/type/Network_Video_Transmitter "
+    "onvif://www.onvif.org/name/Dahua "
+    "onvif://www.onvif.org/hardware/IPC-HFW5442E-SE")
+
+HIKVISION = probe_match(
+    "urn:uuid:a2ba0000-ff84-11b3-8265-bc9b5e7022ac",
+    "http://192.168.2.204/onvif/device_service "
+    "http://[fdd2:49bd:6a04:a0b:be9b:5eff:fe70:22ac]/onvif/device_service",
+    "dn:NetworkVideoTransmitter tds:Device",
+    "onvif://www.onvif.org/type/video_encoder "
+    "onvif://www.onvif.org/name/HIKVISION%20DS-2DE2A404IW-DE3 "
+    "onvif://www.onvif.org/hardware/DS-2DE2A404IW-DE3")
+
+REOLINK = probe_match(
+    "urn:uuid:05140407-0104-0002-0400-ec71db196f62",
+    "http://192.168.2.208:8000/onvif/device_service",
+    "tds:Device tdn:NetworkVideoTransmitter",
+    "onvif://www.onvif.org/type/video_encoder "
+    "onvif://www.onvif.org/name/IPC-BO "
+    "onvif://www.onvif.org/hardware/D340P")
+
+# A Windows PC. Answers the same protocol on the same group and port.
+WINDOWS_PC = probe_match(
+    "urn:uuid:2c5ccd51-b091-4ff5-9a2c-8d36d7676716",
+    "http://192.168.2.86:5357/2c5ccd51/",
+    "wsdp:Device pub:Computer", "")
+
+
+class TestDiscoveryParsing(unittest.TestCase):
+    """Everything here is pinned to shapes measured from real cameras."""
+
+    def test_a_probe_match_is_parsed(self):
+        got = setup.wsd_parse(DAHUA)
+        self.assertEqual(got["uuid"], "uuid:0e3cec9c-8515-54c3-c170-79b445c58515")
+        self.assertEqual(got["xaddrs"],
+                         ["http://192.168.2.202/onvif/device_service"])
+
+    def test_junk_is_not_a_probe_match(self):
+        self.assertIsNone(setup.wsd_parse(b"not xml at all <<<"))
+        self.assertIsNone(setup.wsd_parse(b"<html><body>hello</body></html>"))
+
+    def test_scopes_are_unquoted(self):
+        got = setup.wsd_parse(HIKVISION)
+        self.assertEqual(setup.wsd_scope(got_dev(got), "name"),
+                         "HIKVISION DS-2DE2A404IW-DE3")
+
+    def test_the_types_field_classifies_not_the_type_scope(self):
+        # The measured trap: Dahua's type scope says
+        # Network_Video_Transmitter, Hikvision's and Reolink's say
+        # video_encoder. Classifying on the scope called six of eight real
+        # cameras not-cameras.
+        for body in (DAHUA, HIKVISION, REOLINK):
+            self.assertTrue(setup.wsd_is_camera(setup.wsd_parse(body)["types"]))
+
+    def test_a_windows_pc_is_not_a_camera(self):
+        self.assertFalse(
+            setup.wsd_is_camera(setup.wsd_parse(WINDOWS_PC)["types"]))
+
+    def test_the_types_prefix_may_be_dn_or_tdn(self):
+        self.assertTrue(setup.wsd_is_camera("dn:NetworkVideoTransmitter"))
+        self.assertTrue(setup.wsd_is_camera("tds:Device tdn:NetworkVideoTransmitter"))
+        self.assertTrue(setup.wsd_is_camera("Network_Video_Transmitter"))
+        self.assertFalse(setup.wsd_is_camera("wsdp:Device pub:Computer"))
+
+    def test_an_xaddr_that_is_not_a_url_does_not_raise(self):
+        # A real Dahua advertises exactly this, and urlparse raises
+        # ValueError on it under Python 3.12+.
+        self.assertEqual(setup.wsd_host("http://[]/onvif/device_service"), "")
+
+    def test_the_address_preferred_is_one_it_answered_from(self):
+        dev = {"xaddrs": ["http://[]/onvif/device_service",
+                          "http://10.0.0.9/onvif/device_service"],
+               "sources": ["192.168.2.205"]}
+        # Neither advertised host was the source, so the parseable one wins
+        # over the unusable one.
+        self.assertEqual(setup.wsd_address(dev), "10.0.0.9")
+
+    def test_a_confirmed_address_beats_an_advertised_one(self):
+        dev = {"xaddrs": ["http://10.0.0.9/onvif/device_service",
+                          "http://192.168.2.204/onvif/device_service"],
+               "sources": ["192.168.2.204"]}
+        self.assertEqual(setup.wsd_address(dev), "192.168.2.204")
+
+    def test_ipv4_is_preferred_over_ipv6(self):
+        dev = {"xaddrs": ["http://[fdd2::1]/onvif/device_service",
+                          "http://192.168.2.204/onvif/device_service"],
+               "sources": ["fdd2::1", "192.168.2.204"]}
+        self.assertEqual(setup.wsd_address(dev), "192.168.2.204")
+
+    def test_a_device_with_no_usable_xaddr_falls_back_to_its_source(self):
+        dev = {"xaddrs": ["http://[]/x"], "sources": ["192.168.2.205"]}
+        self.assertEqual(setup.wsd_address(dev), "192.168.2.205")
+
+    def test_the_probe_is_typed_and_well_formed(self):
+        packet = setup.wsd_probe()
+        root = ET.fromstring(packet)
+        types = [e for e in root.iter()
+                 if setup.wsd_localname(e.tag) == "Types"]
+        self.assertEqual(len(types), 1)
+        self.assertEqual(types[0].text, "dn:NetworkVideoTransmitter")
+
+    def test_each_probe_carries_a_fresh_message_id(self):
+        # Some firmware suppresses a MessageID it has already answered.
+        self.assertNotEqual(setup.wsd_probe(), setup.wsd_probe())
+
+    def test_addresses_sort_numerically(self):
+        got = sorted(["192.168.2.10", "192.168.2.9", "192.168.2.100"],
+                     key=setup.sort_key_for_address)
+        self.assertEqual(got, ["192.168.2.9", "192.168.2.10", "192.168.2.100"])
+
+
+def collect(*bodies_and_sources):
+    """Feed replies through the same merge discover_cameras() uses."""
+    devices = {}
+    for body, source in bodies_and_sources:
+        reply = setup.wsd_parse(body)
+        key = reply["uuid"] or f"addr:{source}"
+        dev = devices.setdefault(key, {"uuid": reply["uuid"], "xaddrs": [],
+                                       "sources": [], "scopes": [],
+                                       "types": ""})
+        dev["types"] = dev["types"] or reply["types"]
+        for x in reply["xaddrs"]:
+            if x not in dev["xaddrs"]:
+                dev["xaddrs"].append(x)
+        if source not in dev["sources"]:
+            dev["sources"].append(source)
+        for pair in reply["scopes"]:
+            if pair not in dev["scopes"]:
+                dev["scopes"].append(pair)
+    return setup.wsd_finalise(devices)
+
+
+class TestDiscoveryResults(unittest.TestCase):
+    """The whole path from response bodies to what the wizard offers."""
+
+    def test_a_camera_whose_scope_says_encoder_is_still_a_camera(self):
+        # Hikvision's type scope reads "video_encoder". This is the wiring
+        # test: classifying on the scope would drop it from the list.
+        found = collect((HIKVISION, "192.168.2.204"))
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0]["camera"])
+        self.assertEqual(found[0]["address"], "192.168.2.204")
+        self.assertEqual(found[0]["hardware"], "DS-2DE2A404IW-DE3")
+
+    def test_one_device_answering_twice_is_one_entry(self):
+        # The same camera on both stacks, which is what an operator sees as
+        # duplicates in other tools.
+        found = collect((HIKVISION, "192.168.2.204"),
+                        (HIKVISION, "fe80::be9b:5eff:fe70:22ac"))
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0]["address"], "192.168.2.204")
+
+    def test_cameras_sort_before_other_devices(self):
+        found = collect((WINDOWS_PC, "192.168.2.86"),
+                        (REOLINK, "192.168.2.208"))
+        self.assertEqual([d["camera"] for d in found], [True, False])
+
+    def test_the_reolink_port_is_not_carried_into_the_address(self):
+        # Its ONVIF service is on :8000 and its snapshot is on :80. Taking
+        # the port would build a URL that cannot work.
+        found = collect((REOLINK, "192.168.2.208"))
+        self.assertEqual(found[0]["address"], "192.168.2.208")
+
+    def test_addresses_come_out_in_numeric_order(self):
+        d1 = probe_match("uuid:1", "http://192.168.2.9/x", "dn:NetworkVideoTransmitter", "")
+        d2 = probe_match("uuid:2", "http://192.168.2.10/x", "dn:NetworkVideoTransmitter", "")
+        found = collect((d2, "192.168.2.10"), (d1, "192.168.2.9"))
+        self.assertEqual([d["address"] for d in found],
+                         ["192.168.2.9", "192.168.2.10"])
+
+
+class TestVendorPreselection(unittest.TestCase):
+
+    def test_a_vendor_in_the_name_selects_its_preset(self):
+        self.assertEqual(
+            setup.wsd_preset({"name": "Dahua", "hardware": "IPC-HFW5442E-SE"}),
+            "Dahua / Amcrest")
+        self.assertEqual(
+            setup.wsd_preset({"name": "HIKVISION DS-2CD1723G0-IZ",
+                              "hardware": "DS-2CD1723G0-IZ"}),
+            "Hikvision (ISAPI)")
+
+    def test_an_unrecognised_device_selects_nothing(self):
+        # Measured: a Reolink calls itself IPC-BO and a TP-Link Tapo calls
+        # itself TC40. Neither names its maker, and a wrong preselection is
+        # worse than none because it is a wrong URL that looks deliberate.
+        self.assertEqual(setup.wsd_preset({"name": "IPC-BO",
+                                           "hardware": "D340P"}), "")
+        self.assertEqual(setup.wsd_preset({"name": "TC40",
+                                           "hardware": "TC40"}), "")
+
+    def test_every_hint_names_a_preset_that_exists(self):
+        labels = [p[0] for p in setup.CAMERA_PRESETS]
+        for _needle, label in setup.VENDOR_HINTS:
+            self.assertIn(label, labels)
+
+
+class TestDiscoveryIsNeverFatal(unittest.TestCase):
+    """Discovery is an offer. Nothing it does may stop a camera being added."""
+
+    def test_no_socket_means_no_devices_not_an_exception(self):
+        with mock.patch.object(setup, "wsd_open_sockets", return_value=[]):
+            self.assertEqual(setup.discover_cameras(), [])
+
+    def test_a_failing_scan_still_lets_the_wizard_continue(self):
+        with mock.patch.object(setup, "ask_yes", return_value=True), \
+             mock.patch.object(setup, "discover_cameras",
+                               side_effect=OSError("no route to host")):
+            self.assertEqual(setup.offer_discovery(), [])
+
+    def test_declining_the_scan_probes_nothing(self):
+        with mock.patch.object(setup, "ask_yes", return_value=False), \
+             mock.patch.object(setup, "discover_cameras") as scan:
+            self.assertEqual(setup.offer_discovery(), [])
+        scan.assert_not_called()
+
+
+def got_dev(parsed):
+    """Adapt a parsed reply to the shape wsd_scope() reads."""
+    return {"scopes": parsed["scopes"]}
 
 
 class TestIPv6CameraAddresses(unittest.TestCase):

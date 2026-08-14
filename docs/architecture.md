@@ -537,6 +537,72 @@ not obvious:
   and earlier wrote parses to `("", 0)` and therefore sorts first, which is
   correct: it is older than anything written since.
 
+#### 4.4a Camera discovery (WS-Discovery)
+
+`discover_cameras()` sends a UDP multicast Probe to `239.255.255.250:3702` and
+collects ProbeMatch replies for a fixed window. Stdlib sockets and
+ElementTree: no SOAP stack, no WSDL, no dependency, which is what made this
+worth having after the ONVIF client library was refused (decided-against.md).
+Offered in the wizard, in `timelapse cameras`, and standalone as
+`timelapse discover`, which needs no root and touches no config.
+
+It lives in the wizard rather than in a daemon on purpose. The wizard runs as
+root and outside a unit; the daemons run under `RestrictAddressFamilies`,
+where a multicast bind is exactly the thing that works in development and
+fails in production. The web UI's bind probe is here for the same reason.
+
+Measured against eight cameras from four vendors on 2026-08-14, which settled
+more than it confirmed:
+
+- **Only the typed Probe is sent** (`dn:NetworkVideoTransmitter`). An untyped
+  one found no camera the typed one missed and pulled in a network printer and
+  two Windows PCs, because **Windows WSD shares this group and port**. It is
+  not symmetric either: the Reolink and the Tapo answer the typed probe alone,
+  so an untyped-only client misses two of eight. Replies were attributed to
+  their probe by giving each a distinct MessageID and reading `RelatesTo` back.
+- **`Types` classifies, never the `type` scope.** The scope is vendor free
+  text: Dahua writes `Network_Video_Transmitter`, Hikvision and Reolink write
+  `video_encoder`, TP-Link writes `NetworkVideoTransmitter`. Classifying on it
+  called six of the eight real cameras not-cameras. Even in `Types` the prefix
+  moves (`dn:` on five, `tdn:` on two), so `wsd_is_camera()` strips
+  punctuation and compares on the local name.
+- **Deduplication is on the device id, never the address.** One device answers
+  several times and an NVR proxies the cameras behind it. Two spellings exist,
+  `urn:uuid:<x>` and bare `uuid:<x>`; a device is consistent, so the string
+  works as a key, but the prefix is not something to assume.
+- **`wsd_address()` prefers an address the device answered *from*** over one it
+  merely advertised. That is a cheaper answer to "the advertisement may be
+  unreachable" than fetching it: the reply proves the source works from here,
+  and the wizard then tests the real snapshot URL, which is the thing that has
+  to work. IPv4 before IPv6, because that is what the camera was configured
+  with.
+- **An XAddr is not necessarily a URL.** One Dahua advertises
+  `http://[]/onvif/device_service`, and `urlparse` raises `ValueError` on it
+  under Python 3.12+. `wsd_host()` returns `""` instead of raising.
+- **Only the host is taken, never the port.** The device service and the
+  snapshot endpoint are different things: the Reolink answers ONVIF on `:8000`
+  and serves snapshots on `:80`. Discovery's value is the address and the
+  model, not a port to paste into a template.
+- **The name scope is a model, not a place.** It returns `Dahua` on three
+  different cameras, so `wsd_preset()` uses it only to preselect a vendor
+  template, and the operator still names the camera. `wsd_preset()` returns
+  `""` rather than guessing when nothing matches, which is the honest answer
+  for the Reolink (`IPC-BO`) and the Tapo (`TC40`), neither of which names its
+  maker. **A wrong preselection is worse than none**, because it is a wrong
+  URL that looks deliberate.
+- **IPv6 is not probed.** All three plausible destinations were measured;
+  every camera answered the IPv4 probe, `ff05::c` (site-local) got no reply at
+  all, and `ff02::c` found only this workstation's own loopback WSD service.
+  IPv6 would double the replies to deduplicate and add a Windows PC.
+
+Two properties are load-bearing and easy to erode. **Discovery is an offer**:
+`offer_discovery()` catches every exception, returns `[]` on any failure, and
+is skipped entirely without a terminal, because a network that cannot be
+probed must leave the operator typing an address rather than reading a
+traceback. And **finding nothing is never reported as "there are no
+cameras"**: multicast does not cross subnets or VLANs, and a dedicated camera
+VLAN is common in exactly the deployments that have the most cameras.
+
 **`url_host()` brackets an IPv6 address before it reaches a preset template.**
 The presets are `http://{ip}/...` strings and the wizard used to format
 whatever was typed, so an IPv6-only camera produced
@@ -1993,11 +2059,11 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 950 lines
+install.sh                       bootstrap installer, 958 lines
 scripts/timelapse_capture.py     daemon, 1083 lines
 scripts/timelapse_encode.py      batch job, 1727 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 840 lines
-scripts/timelapse_setup.py       configuration wizard, 3190 lines
+scripts/timelapse_setup.py       configuration wizard, 3670 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_web.py         read-only web UI, 3160 lines
 tests/_support.py                path setup and fakes

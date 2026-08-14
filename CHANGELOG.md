@@ -10,6 +10,17 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Added
+- **The wizard can find your cameras for you.** Adding a camera now offers a
+  scan of the local network; ONVIF cameras answer with their address and model,
+  and the vendor template is preselected from what they report. Also available
+  on its own as **`timelapse discover`**, which needs no root, writes nothing
+  and sends no credentials, so it cannot lock a camera account.
+
+  Typing an address by hand is unchanged and always works. Discovery uses
+  multicast, which does not cross subnets or VLANs, so cameras on a separate
+  network will not appear even though they work perfectly; the wizard says so
+  rather than reporting "no cameras found".
+
 - **The web UI can listen on an IPv6 address.** `web.bind` accepts `::1`, `::`
   or any address this host holds, and the wizard offers them. `::` accepts IPv4
   connections as well, so it is the IPv6 answer to `0.0.0.0`. Nothing changes

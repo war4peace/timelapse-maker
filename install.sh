@@ -309,6 +309,11 @@ CONFIGURING
                        'timelapse restore -l' just lists them.
 
 CHECKING
+  discover             List ONVIF cameras answering on this network, with
+                       their address and model. Needs no root and sends no
+                       credentials, so it cannot lock a camera account.
+                       Finds nothing across a subnet or a VLAN boundary,
+                       which is a property of multicast, not a fault.
   test         [sudo]  Pre-flight, and the thing to run after any change.
                        Fetches one snapshot per enabled camera and reports
                        resolution, size, latency and authentication; probes
@@ -379,6 +384,9 @@ case "\${1:-}" in
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
     notify)    shift; exec python3 $PREFIX/timelapse_setup.py --notify-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;
+    # No "$CONFIG" and no root: it neither reads nor writes the config, and
+    # it presents no credentials to anything, so it cannot lock an account.
+    discover)  shift; exec python3 $PREFIX/timelapse_setup.py --discover "\$@" ;;
     web-serve) shift; exec python3 $PREFIX/timelapse_web.py "$CONFIG" "\$@" ;;
     # No "$CONFIG": updating neither reads nor writes it, which is why
     # 'timelapse update --check' is the one configuring command that needs

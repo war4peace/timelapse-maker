@@ -485,6 +485,7 @@ of it; nothing needs a reinstall.
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and every notification sink. Run it after any change. |
 | `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. A menu with no options; `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` go straight to one. §9. |
+| `timelapse discover` | Lists ONVIF cameras answering on this network, with address and model. Needs no root, writes nothing and sends no credentials. Multicast does not cross subnets or VLANs, so an empty result is not proof there are no cameras. §9. |
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
 | `timelapse notify` | Where the nightly summary goes: a Discord webhook, ntfy, Telegram, any combination of them, or none. Offers a test message for each. Needs no restart, because the encode job reads the config when it runs. §6a. |
 | `timelapse web` | Turn the read-only web UI on or off and set its address, port, library path and whether it asks for a login. §11. |
@@ -629,6 +630,52 @@ loops on single-key actions:
 Adding uses the same preset list and live test as the installer. Passwords in
 the query string are masked in the listing; `ask_secret` keeps them out of
 scroll-back when you type them, so printing them back would defeat it.
+
+### Letting it find the cameras
+
+The first time you add a camera in a session, the wizard offers to look for
+them:
+
+```
+  Scan this network for cameras? (Y/n):
+
+  OK    8 camera(s) answered.
+
+    Found on this network:
+          ADDRESS          MODEL                    TYPE
+       1  192.168.2.202    IPC-HFW5442E-SE          Dahua / Amcrest
+       2  192.168.2.204    DS-2DE2A404IW-DE3        Hikvision (ISAPI)
+       3  192.168.2.208    D340P                    ? choose below
+       0  none of these, enter an address by hand
+```
+
+Picking one fills in the address and preselects the camera type. You still
+choose the **name**, because what a camera reports is its model, not where it
+is pointing, and three cameras from one maker report the same thing.
+
+The same list on its own, without starting the wizard:
+
+```bash
+timelapse discover
+```
+
+That needs no root, writes nothing and sends no credentials, so it cannot lock
+a camera account no matter how often you run it.
+
+Two things it cannot do, both worth knowing before you conclude something is
+broken:
+
+- **It will not see a camera on another subnet or VLAN.** Discovery is
+  multicast, which stops at the first router. A camera VLAN is common in
+  exactly the setups that have the most cameras, so an empty result is normal
+  there and means nothing about whether the cameras work. Type the address in.
+- **It will not find a camera with ONVIF turned off**, which some ship as the
+  default and which is a per-camera setting in its own web interface.
+
+Cameras that report nothing about their maker (a Reolink calls itself
+`IPC-BO`, a TP-Link Tapo calls itself `TC40`) show `? choose below` and you
+pick the type from the list. That is deliberate: a wrong guess would be a
+wrong URL that looks like it was chosen on purpose.
 
 ### Skipping the menu
 
