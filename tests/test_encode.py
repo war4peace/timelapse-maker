@@ -14,6 +14,7 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlparse
 
 import _support
 from _support import make_frame
@@ -2359,6 +2360,60 @@ class TestWatchUnitWiring(unittest.TestCase):
         src = (self.repo / "scripts" / "timelapse_encode.py").read_text(
             encoding="utf-8")
         self.assertIn("None if args.watch else", src)
+
+
+class TestAddressFormatting(unittest.TestCase):
+    """url_host/is_ipv6/hostport, the shared rule for emitting an address.
+
+    It lives in timelapse_encode because the wizard, the installer and the web
+    UI all need it, and two copies is two chances to emit a URL nothing can
+    open.
+    """
+
+    def test_a_hostname_is_not_ipv6(self):
+        self.assertFalse(enc.is_ipv6("nas.local"))
+
+    def test_an_ipv4_address_is_not_ipv6(self):
+        self.assertFalse(enc.is_ipv6("192.168.2.16"))
+
+    def test_a_literal_is_ipv6_bracketed_or_not(self):
+        self.assertTrue(enc.is_ipv6("::1"))
+        self.assertTrue(enc.is_ipv6("[::1]"))
+        self.assertTrue(enc.is_ipv6("fdd2:49bd::1"))
+
+    def test_the_wildcard_is_ipv6(self):
+        # "::" is the address most likely to be typed at the wizard's prompt,
+        # and the one where getting the family wrong fails at startup.
+        self.assertTrue(enc.is_ipv6("::"))
+
+    def test_a_zone_id_does_not_defeat_detection(self):
+        self.assertTrue(enc.is_ipv6("fe80::1%eth0"))
+
+    def test_hostport_leaves_ipv4_alone(self):
+        self.assertEqual(enc.hostport("127.0.0.1", 8787), "127.0.0.1:8787")
+
+    def test_hostport_brackets_ipv6(self):
+        self.assertEqual(enc.hostport("::1", 8787), "[::1]:8787")
+
+    def test_hostport_survives_a_port_given_as_a_string(self):
+        # The config is JSON and nothing coerces it, so both arrive.
+        self.assertEqual(enc.hostport("::", "8787"), "[::]:8787")
+
+    def test_a_url_built_from_hostport_parses(self):
+        url = "http://%s/video/3" % enc.hostport("fdd2::1", 8787)
+        parsed = urlparse(url)
+        self.assertEqual(parsed.hostname, "fdd2::1")
+        self.assertEqual(parsed.port, 8787)
+        self.assertEqual(parsed.path, "/video/3")
+
+    def test_the_installer_uses_the_shared_rule(self):
+        # install.sh prints the web URL in the prompt that offers to enable
+        # the service, and used to build it with a bare format string.
+        src = (self.repo() / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("from timelapse_encode import hostport", src)
+
+    def repo(self):
+        return Path(__file__).resolve().parent.parent
 
 
 if __name__ == "__main__":

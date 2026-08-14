@@ -9,7 +9,22 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Added
+- **The web UI can listen on an IPv6 address.** `web.bind` accepts `::1`, `::`
+  or any address this host holds, and the wizard offers them. `::` accepts IPv4
+  connections as well, so it is the IPv6 answer to `0.0.0.0`. Nothing changes
+  for an existing install: the default bind is unchanged.
+
+  This was a real trap rather than a missing feature. The wizard's bind check
+  probes the address for real and reported an IPv6 one as usable, and the
+  service then refused to start with `Cannot listen on ::1:8787`.
+
 ### Fixed
+- Addresses printed by the installer, the wizard and the web UI are bracketed
+  when they are IPv6, so the URLs they offer can be opened. The one that
+  mattered was inside `.m3u` playlists generated when a player sends no usable
+  `Host` header: those contained `http://::1:8787/...`, which no player can
+  open.
 - **A camera reachable only over IPv6 can now be added with the wizard's
   vendor presets.** Typing an IPv6 address at "IP address or hostname" built a
   URL whose colons were read as a port number, so the camera could not be

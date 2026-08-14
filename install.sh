@@ -818,7 +818,9 @@ offer_enable() {
     local web_on web_url
     web_on="$(python3 -c "import json;c=json.load(open('$CONFIG')).get('web',{});print('1' if c.get('enabled') else '0')" 2>/dev/null || echo 0)"
     if [ "$web_on" = "1" ]; then
-        web_url="$(python3 -c "import json;c=json.load(open('$CONFIG')).get('web',{});print('http://%s:%s/' % (c.get('bind','127.0.0.1'), c.get('port',8787)))" 2>/dev/null)"
+        # hostport() rather than a format string, so an IPv6 bind is printed
+        # bracketed and the URL offered here can actually be opened.
+        web_url="$(python3 -c "import json,sys;sys.path.insert(0,'$PREFIX');from timelapse_encode import hostport;c=json.load(open('$CONFIG')).get('web',{});print('http://%s/' % hostport(c.get('bind','127.0.0.1'), c.get('port',8787)))" 2>/dev/null)"
         if ask_yn "Enable the web UI now ($web_url)?" y; then
             systemctl enable --now timelapse-web.service
             sleep 2

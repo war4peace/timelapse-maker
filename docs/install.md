@@ -960,6 +960,11 @@ That is the right trade on a trusted home LAN and the wrong one anywhere else.
 Answer `127.0.0.1` to keep it to this machine. Put a reverse proxy with TLS and
 authentication in front of it for anything wider, and do not port-forward it.
 
+**IPv6 works here too.** Any address this host holds is accepted, `::1` is the
+IPv6 loopback, and `::` accepts IPv4 connections as well, so it is the IPv6
+equivalent of `0.0.0.0`. A link-local address (`fe80::`) is not offered,
+because it cannot be bound without naming the interface it belongs to.
+
 ### The optional login
 
 `timelapse web` offers a single username and password. Leave it off and

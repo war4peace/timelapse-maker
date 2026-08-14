@@ -15,7 +15,6 @@ Every question has a default in [brackets]; pressing Enter accepts it.
 
 import argparse
 import errno
-import ipaddress
 import json
 import os
 import re
@@ -557,28 +556,15 @@ CAMERA_PRESETS = [
 
 
 def url_host(raw):
-    """An address as it must appear inside a URL.
+    """Bracket an IPv6 literal so it can go inside a URL.
 
-    An IPv6 literal has to be bracketed, or the colons are read as the port
-    separator. Both failure modes are misleading: requests raises
-    `InvalidURL: Failed to parse`, and ffmpeg reports "Failed to resolve
-    hostname fdd2", which sends an operator to look at DNS for a camera whose
-    address they typed correctly. Measured against a real Hikvision over its
-    ULA address, 2026-08-14: bracketed works on both, bare fails on both.
-
-    Hostnames and IPv4 addresses pass through untouched, so this is safe to
-    apply to whatever was typed.
+    The rule lives in timelapse_encode, which is where the wizard, the
+    pre-flight and the web UI all read shared rules from; this is the name the
+    wizard calls it by. Same arrangement as redact_url() above, and for the
+    same reason: one rule, not one copy per caller.
     """
-    host = raw.strip()
-    if host.startswith("[") and host.endswith("]"):
-        return host                        # already bracketed by the operator
-    try:
-        # Split the zone id off before validating: 3.9 is the floor, and a
-        # scoped address is only accepted by ipaddress from 3.9 onwards.
-        ipaddress.IPv6Address(host.split("%")[0])
-    except ValueError:
-        return host
-    return "[%s]" % host
+    from timelapse_encode import url_host as shared
+    return shared(raw)
 
 
 def choose_cameras(cfg, expected):
@@ -2083,6 +2069,8 @@ def choose_web(cfg):
         warn(f"This is currently {web['bind']}, reachable only from this host.")
         warn(f"Accepting {suggested} below opens it to your network.")
 
+    note("An IPv6 address works too; :: is the IPv6 answer to 0.0.0.0 and")
+    note("accepts IPv4 as well.")
     while True:
         chosen = ask("Listen on", suggested).strip()
         # Port 0 asks the kernel only whether this host holds the address,
@@ -2488,7 +2476,8 @@ def summarise(cfg, out_path):
     # needs PEP 701, which is Python 3.12. This project supports 3.9.
     web_line = "disabled"
     if w.get("enabled"):
-        web_line = "http://{}:{}/".format(w.get("bind"), w.get("port"))
+        from timelapse_encode import hostport
+        web_line = "http://{}/".format(hostport(w.get("bind"), w.get("port")))
     print(f"  {'Web UI':<12}{web_line}")
     print(f"  {'Config':<12}{out_path}")
 
@@ -2854,8 +2843,9 @@ def summarise_web(cfg):
         note("Web UI disabled.")
         return
     where, why = web_library_preview(cfg)
+    from timelapse_encode import hostport
     print()
-    note(f"listen        http://{web.get('bind')}:{web.get('port')}/")
+    note(f"listen        http://{hostport(web.get('bind'), web.get('port'))}/")
     note(f"library       {where or '(not set)'}  ({why})")
     note(f"index         {web.get('state_dir')}")
     note(f"update check  {'on' if web.get('update_check', True) else 'off'}")

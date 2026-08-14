@@ -785,22 +785,33 @@ usual holder is the web UI itself being reconfigured. A port below 1024 is
 refused without probing at all: the wizard normally runs as root and the
 service does not, so that probe would pass and prove nothing.
 
-**The web UI is IPv4 only, and the cameras are not.** `Server` extends
-`ThreadingHTTPServer`, whose `address_family` is `AF_INET`, so `bind` cannot be
-an IPv6 address: the service exits with `Cannot listen on ::1:8787`. That is a
-real limitation on an IPv6-only network and no limitation at all elsewhere,
-since the default bind is loopback. It does **not** extend to cameras: capture
-reaches an IPv6 camera today, verified against real hardware (§4.4).
+**`bind` may be an IPv6 address (0.1.7).** `ThreadingHTTPServer`'s
+`address_family` is `AF_INET`, so `Server.__init__` sets it from the configured
+address before calling `super().__init__()`, which is where the socket is
+created. Until then the service exited with `Cannot listen on ::1:8787` while
+**`check_bind()` had already called that address usable**: it calls
+`getaddrinfo()` and walks every family returned, so `::1` and `::` both probed
+`ok`. That was the actual defect, and it is the same shape as any check that
+guesses: a probe is only as honest as its agreement with the thing it predicts.
 
-**`check_bind()` does not share the restriction, and that is the actual
-defect.** It calls `getaddrinfo()` and walks every family returned, so `::1`
-and `::` both probe `ok` (measured 2026-08-14) and the wizard accepts an
-address the service will then refuse. The one check written to catch a bind
-that looks fine and does not work is waving this one through, which is the same
-shape as any check that guesses. Recorded as item 10 in future-features.md
-rather than half-fixed here, because the fix is one line and the decisions
-around it (`IPV6_V6ONLY` on a `::` bind, four unbracketed `host:port` strings,
-what the wizard suggests) are not.
+**`IPV6_V6ONLY` is set explicitly, not inherited.** `server_bind()` sets it to
+0 for any `AF_INET6` socket, so a `::` bind accepts IPv4 as v4-mapped
+addresses. Linux defaults `net.ipv6.bindv6only` to 0 and Windows does not, and
+a hardened host may have changed it; inheriting would make one config mean two
+things. A kernel that refuses the option is warned about, not fatal, because
+serving IPv6 alone beats not starting. Verified under systemd 255: `::1` serves
+200 and listens on `[::1]:8787`, and with `::` both an IPv6 and an IPv4 client
+get 200 from the same socket.
+
+**Every emitted `host:port` goes through `hostport()`.** There were five, all
+latent bugs for an IPv6 bind, and the one that mattered was `_base_url()`'s
+fallback: it is what lands in a `.m3u` when the `Host` header is missing or
+malformed, so it would have handed VLC `http://::1:8787/video/...` and arrived
+as a bug report about video playback. The others are the startup log line, the
+bind-failure message, two wizard summaries and the URL `install.sh` offers.
+`HOST_RE` already accepted a bracketed authority, so the ordinary path, where
+the origin comes from the request, always worked. Verified live over IPv6 that
+both the per-file and the day playlist carry `http://[::1]:8787/video/...`.
 
 `lan_address()` asks the routing table for the source address it would use to
 reach TEST-NET-1. No packets are sent; a UDP `connect()` only fixes the peer
@@ -1588,7 +1599,7 @@ is read with `.get(key, default)`.
 | Key | Notes |
 |---|---|
 | `enabled` | `false` by default. The program exits 0 when false, so the unit may be enabled without the server running. |
-| `bind` | `127.0.0.1` by default. There is no TLS, and the optional login below is a door lock rather than a safe; any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup, worded according to whether a login is configured. |
+| `bind` | `127.0.0.1` by default. There is no TLS, and the optional login below is a door lock rather than a safe; any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup, worded according to whether a login is configured. IPv4 or IPv6; `::` is dual-stack and accepts both. |
 | `port` | `8787` by default. |
 | `auth` | Optional single login: `{username, password_hash}`. Absent, or either field blank, means no login and the pages behave exactly as they did before it existed. The hash is PBKDF2-SHA256 and self-describing (`pbkdf2_sha256$iters$salt$key`), so the iteration count can rise later without locking anyone out. A username with an unparseable hash **refuses to start**, rather than serving the pages to everyone because the check could not be made. |
 | `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path, typically a remote rsync destination that is *also* mounted locally. Not `/tmp` or `/var/tmp`: `PrivateTmp=true` hides those from the unit. |
@@ -1982,13 +1993,13 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 836 lines
+install.sh                       bootstrap installer, 950 lines
 scripts/timelapse_capture.py     daemon, 1083 lines
-scripts/timelapse_encode.py      batch job, 1672 lines
+scripts/timelapse_encode.py      batch job, 1727 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 840 lines
-scripts/timelapse_setup.py       configuration wizard, 3167 lines
+scripts/timelapse_setup.py       configuration wizard, 3190 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 3123 lines
+scripts/timelapse_web.py         read-only web UI, 3160 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
