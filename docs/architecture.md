@@ -537,6 +537,23 @@ not obvious:
   and earlier wrote parses to `("", 0)` and therefore sorts first, which is
   correct: it is older than anything written since.
 
+**`url_host()` brackets an IPv6 address before it reaches a preset template.**
+The presets are `http://{ip}/...` strings and the wizard used to format
+whatever was typed, so an IPv6-only camera produced
+`http://fdd2:49bd:...:22ac/ISAPI/...`, whose colons are read as a port. Both
+consumers fail, and neither says so usefully: `requests` raises
+`InvalidURL: Failed to parse`, and ffmpeg reports **"Failed to resolve hostname
+fdd2"**, which sends an operator to look at DNS for an address they typed
+correctly. Measured against a real Hikvision over its ULA address on
+2026-08-14: bracketed, both `requests` and ffmpeg reach the camera and get its
+401; bare, both fail. Hostnames and IPv4 pass through untouched, an address the
+operator already bracketed is not bracketed twice, and a zone id stays inside
+the brackets (`[fe80::1%eth0]`) because it is part of the address. The wizard
+additionally warns on a bare `fe80:` address, since link-local needs a zone and
+moves with the interface. **Nothing in the daemons needed changing**: the URL
+reaches `session.get()` and ffmpeg's `-i` verbatim, which is what made this a
+wizard-only fix.
+
 `timelapse config` hands the file to `$EDITOR` and so does not pass through
 `write_config()` at all; the wrapper calls `--backup-now` first for exactly
 that reason. **A new write path means adding a backup call, or that path
@@ -767,6 +784,16 @@ naming the cause. A port already in use is accepted with a note, since the
 usual holder is the web UI itself being reconfigured. A port below 1024 is
 refused without probing at all: the wizard normally runs as root and the
 service does not, so that probe would pass and prove nothing.
+
+**The web UI is IPv4 only, and the cameras are not.** `Server` extends
+`ThreadingHTTPServer`, whose `address_family` is `AF_INET`, and `check_bind()`
+probes with an `AF_INET` socket to match it, so `bind` cannot be an IPv6
+address. That is a real limitation on an IPv6-only network and a deliberate
+non-limitation everywhere else, since the default bind is loopback. It does
+**not** extend to cameras: capture reaches an IPv6 camera today, verified
+against real hardware (see §2). Anyone lifting the restriction has to move
+`address_family`, `check_bind()` and `lan_address()` together, and decide what
+the wizard offers, which is why it is recorded here rather than half-done.
 
 `lan_address()` asks the routing table for the source address it would use to
 reach TEST-NET-1. No packets are sent; a UDP `connect()` only fixes the peer

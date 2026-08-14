@@ -3002,5 +3002,60 @@ class TestSinkIdentity(unittest.TestCase):
         self.assertNotIn("SECRET", written)
 
 
+class TestIPv6CameraAddresses(unittest.TestCase):
+    """A camera reachable only over IPv6 must be configurable.
+
+    The daemon itself needs no change: requests and ffmpeg both fetch a
+    bracketed IPv6 URL, measured against a real camera. The wizard was the
+    gap, because it formats whatever was typed straight into a template.
+    """
+
+    def test_a_hostname_is_untouched(self):
+        self.assertEqual(setup.url_host("cam.example.net"), "cam.example.net")
+
+    def test_an_ipv4_address_is_untouched(self):
+        self.assertEqual(setup.url_host("192.168.2.204"), "192.168.2.204")
+
+    def test_an_ipv6_literal_is_bracketed(self):
+        self.assertEqual(setup.url_host("fdd2:49bd:6a04:a0b::1"),
+                         "[fdd2:49bd:6a04:a0b::1]")
+
+    def test_an_already_bracketed_address_is_not_double_bracketed(self):
+        self.assertEqual(setup.url_host("[fdd2::1]"), "[fdd2::1]")
+
+    def test_a_zone_id_survives(self):
+        # The zone is part of the address, not a separator, so it belongs
+        # inside the brackets.
+        self.assertEqual(setup.url_host("fe80::1%eth0"), "[fe80::1%eth0]")
+
+    def test_surrounding_whitespace_does_not_defeat_detection(self):
+        self.assertEqual(setup.url_host("  fdd2::1  "), "[fdd2::1]")
+
+    def test_every_preset_builds_a_parseable_url(self):
+        # The failure this pins is silent: an unbracketed literal produces a
+        # URL whose colons read as a port, and the error surfaces later as
+        # "failed to resolve hostname fdd2".
+        host = setup.url_host("fdd2:49bd:6a04:a0b:be9b:5eff:fe70:22ac")
+        for label, _method, _auth, template in setup.CAMERA_PRESETS:
+            if not template:
+                continue                      # the custom-URL entry
+            url = template.format(ip=host, user="admin", password="x")
+            parsed = urlparse(url)
+            self.assertEqual(parsed.hostname,
+                             "fdd2:49bd:6a04:a0b:be9b:5eff:fe70:22ac",
+                             "%s built an unusable URL: %s" % (label, url))
+
+    def test_the_rtsp_preset_keeps_its_port(self):
+        # rtsp://user:pass@[addr]:554/... is the shape that goes wrong first,
+        # because it has userinfo and a port either side of the address.
+        template = dict((p[0], p[3]) for p in setup.CAMERA_PRESETS)[
+            "RTSP only (no snapshot URL)"]
+        url = template.format(ip=setup.url_host("fdd2::1"), user="admin",
+                              password="x")
+        parsed = urlparse(url)
+        self.assertEqual(parsed.hostname, "fdd2::1")
+        self.assertEqual(parsed.port, 554)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -15,6 +15,7 @@ Every question has a default in [brackets]; pressing Enter accepts it.
 
 import argparse
 import errno
+import ipaddress
 import json
 import os
 import re
@@ -555,6 +556,31 @@ CAMERA_PRESETS = [
 ]
 
 
+def url_host(raw):
+    """An address as it must appear inside a URL.
+
+    An IPv6 literal has to be bracketed, or the colons are read as the port
+    separator. Both failure modes are misleading: requests raises
+    `InvalidURL: Failed to parse`, and ffmpeg reports "Failed to resolve
+    hostname fdd2", which sends an operator to look at DNS for a camera whose
+    address they typed correctly. Measured against a real Hikvision over its
+    ULA address, 2026-08-14: bracketed works on both, bare fails on both.
+
+    Hostnames and IPv4 addresses pass through untouched, so this is safe to
+    apply to whatever was typed.
+    """
+    host = raw.strip()
+    if host.startswith("[") and host.endswith("]"):
+        return host                        # already bracketed by the operator
+    try:
+        # Split the zone id off before validating: 3.9 is the floor, and a
+        # scoped address is only accepted by ipaddress from 3.9 onwards.
+        ipaddress.IPv6Address(host.split("%")[0])
+    except ValueError:
+        return host
+    return "[%s]" % host
+
+
 def choose_cameras(cfg, expected):
     heading("Cameras")
     cfg["cameras"] = []
@@ -614,11 +640,18 @@ def add_one_camera(cfg, n):
             pwd = ask_secret("Password")
     else:
         ip = ask("IP address or hostname", "192.168.1.100")
+        host = url_host(ip)
+        if host != ip.strip():
+            note(f"IPv6 address bracketed for the URL: {host}")
+            if ip.strip().lower().startswith("fe80:") and "%" not in ip:
+                warn("A link-local address needs a zone id (fe80::1%eth0),")
+                note("and it moves with the interface. Prefer the camera's")
+                note("stable address if it has one.")
         user = pwd = ""
         if auth in ("digest", "basic") or method == "rtsp" or "{user}" in template:
             user = ask("Username", "admin")
             pwd = ask_secret("Password")
-        url = template.format(ip=ip, user=quote(user), password=quote(pwd))
+        url = template.format(ip=host, user=quote(user), password=quote(pwd))
 
     cam = {"name": name, "enabled": True, "method": method, "url": url}
     if method == "http":

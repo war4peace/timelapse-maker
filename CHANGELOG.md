@@ -9,6 +9,16 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+- **A camera reachable only over IPv6 can now be added with the wizard's
+  vendor presets.** Typing an IPv6 address at "IP address or hostname" built a
+  URL whose colons were read as a port number, so the camera could not be
+  fetched. The address is bracketed automatically now, and a link-local one
+  (`fe80::`) is flagged as needing a zone id. Capture itself always worked over
+  IPv6; if you already added such a camera by hand with the "Custom URL"
+  option, nothing changes and nothing needs redoing. The web UI still binds
+  IPv4 only.
+
 ### Changed
 - **Upgrading no longer asks four questions.** Re-running the installer, or
   `sudo timelapse update`, used to ask whether to reconfigure, whether to run
