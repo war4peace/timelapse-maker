@@ -75,6 +75,7 @@ from timelapse_encode import hostport, is_ipv6, redact    # noqa: E402
 # file is how the wrong directory ends up in a hardening claim.
 from timelapse_encode import (                            # noqa: E402
     CAPTURE_STATE, ENCODE_STATE, STATE_VERSION,
+    coverage_of, day_cadence,
     state_dir as runtime_state_dir,
 )
 
@@ -1286,6 +1287,82 @@ def read_state(cfg, filename):
     return data, ""
 
 
+# How long a frame count is reused before the directory is walked again. The
+# page is read by a person, so a count up to this old is indistinguishable
+# from a live one, and it bounds the cost of somebody holding down refresh.
+COUNT_TTL = 20
+
+_counts = {}                    # (path, day) -> (counted_at, frames)
+_counts_lock = threading.Lock()
+
+
+def count_frames(day_dir):
+    """How many frames are on disk for a day, or None if it cannot be read.
+
+    Counted from the directory rather than taken from the daemon's own
+    counter, which resets on every restart and so answers a question nobody
+    asked: "48 frames" since a restart at 17:55 tells an operator nothing
+    about whether today has been captured. The directory is the record.
+
+    It also works for RTSP cameras, where the daemon *cannot* count: ffmpeg
+    writes those frames and this program never sees them. Counting on disk is
+    method-agnostic, which is what lets that column stop saying "-".
+
+    None, not 0, when the directory is missing: "no directory" and "a
+    directory with nothing in it" are the same thing to an operator, but
+    "cannot read this" is a different claim and must not be dressed as zero.
+    """
+    key = (str(day_dir), int(time.time() // COUNT_TTL))
+    with _counts_lock:
+        hit = _counts.get(key)
+    if hit is not None:
+        return hit
+    try:
+        with os.scandir(day_dir) as it:
+            # scandir over listdir: the name is enough, so this never stats a
+            # single file, which is what keeps a 17,000-frame day cheap.
+            frames = sum(1 for e in it if e.name.endswith(".jpg"))
+    except FileNotFoundError:
+        frames = 0
+    except OSError:
+        return None
+    with _counts_lock:
+        # Bounded by construction: keys carry a TTL bucket, so old ones can
+        # never be looked up again. Clearing wholesale beats an LRU here.
+        if len(_counts) > 512:
+            _counts.clear()
+        _counts[key] = frames
+    return frames
+
+
+def seconds_elapsed_today(now=None):
+    """Seconds since local midnight. The denominator for today's coverage."""
+    now = datetime.datetime.now() if now is None else now
+    return (now - now.replace(hour=0, minute=0, second=0,
+                              microsecond=0)).total_seconds()
+
+
+def today_progress(cfg, cam, now=None):
+    """(frames, coverage) for one camera so far today.
+
+    The cadence comes from the day's own `.cadence.json` first, because a
+    cadence edit lands at midnight and today may still be running on
+    yesterday's answer; the heartbeat's value is the fallback. This is the
+    same precedence the encoder uses, and for the same reason.
+    """
+    root = cfg.get("paths", {}).get("frames_root")
+    if not root or not cam.get("name"):
+        return None, None
+    now = datetime.datetime.now() if now is None else now
+    day_dir = Path(root) / str(cam["name"]) / now.strftime("%Y-%m-%d")
+    frames = count_frames(day_dir)
+    if frames is None:
+        return None, None
+    recorded = day_cadence(day_dir)
+    interval = recorded[0] if recorded else cam.get("interval")
+    return frames, coverage_of(frames, interval, seconds_elapsed_today(now))
+
+
 def parse_stamp(text):
     """One of our own ISO stamps back to epoch seconds, or None."""
     if not text:
@@ -1318,11 +1395,16 @@ def camera_verdict(cam, snapshot_epoch):
     could not be overruled by a reader that knows better.
     """
     if cam.get("supervised"):
-        # ffmpeg owns the frames on this path, so there is no last-frame time
-        # to judge. Liveness of the process is the honest answer.
+        # An RTSP camera's frames are written by a separate process, so this
+        # daemon has no last-frame time to judge and the honest answer is
+        # whether that process is alive. Say that in the reader's terms: the
+        # old wording named the program doing the work, which is an
+        # implementation detail nobody reading a status page has asked about.
+        # The Frames and Coverage columns now answer "is it working", counted
+        # from disk, which is what that question was really standing in for.
         if cam.get("alive"):
-            return "ok", "supervised by ffmpeg"
-        return "bad", "grabber not running"
+            return "ok", "recording"
+        return "bad", "not recording"
 
     # A camera that is refusing our credentials is silent for a reason this
     # page can state, and "3h ago" would send somebody looking at the network.
@@ -2773,35 +2855,66 @@ class Handler(BaseHTTPRequestHandler):
             return "".join(parts)
 
         parts.append("<table><tr><th>Camera</th><th>Last frame</th>"
-                     "<th>Cadence</th><th>Frames</th><th>Failures</th></tr>")
+                     "<th>Cadence</th><th>Frames today</th>"
+                     "<th>Coverage</th><th>Problems</th></tr>")
+        unreadable = False
         for cam in cams:
             cls, phrase = camera_verdict(cam, snap)
             interval = cam.get("interval")
             cadence = f"1 / {interval}s" if interval else "-"
+            # Empty when there is nothing wrong. A column that says "0 failed"
+            # on every healthy row trains the eye to skip it, which is the
+            # opposite of what a problems column is for.
             if cam.get("supervised"):
-                # ffmpeg writes these frames, so a count here would be a
-                # number nobody could account for. Restarts are what this
-                # thread actually knows.
-                frames = "-"
-                fails = f'{cam.get("restarts", 0)} restart(s)'
+                # This camera's frames are written by a separate process, so
+                # the daemon has no fetch count. Restarts are what it knows.
+                restarts = cam.get("restarts", 0)
+                fails = f'{restarts} restart(s)' if restarts else ""
             else:
-                frames = f'{cam.get("ok", 0):,}'
                 consec = cam.get("consec_fail", 0)
-                fails = f'{cam.get("fail", 0):,}'
+                failed = cam.get("fail", 0)
+                fails = f'{failed:,} failed fetch(es)' if failed else ""
                 if consec:
                     fails += f' ({consec} in a row)'
+
+            # Counted on disk, so this is the same number for an RTSP camera
+            # as for an HTTP one, and survives a restart of the daemon.
+            frames, cov = today_progress(self.server.cfg, cam)
+            if frames is None:
+                unreadable = True
+                shown, cov_txt, cov_cls = "?", "?", "dim"
+            else:
+                shown = f"{frames:,}"
+                if cov is None:
+                    cov_txt, cov_cls = "-", "dim"
+                else:
+                    cov_txt = f"{cov:.0f}%"
+                    # 98 rather than 100: a frame is written at the start of
+                    # each tick, so the current tick is always outstanding
+                    # and a perfect camera reads a shade under 100.
+                    cov_cls = "dim" if cov >= 98 else "warn"
             parts.append(
                 f'<tr><td>{escape(str(cam.get("name", "?")))}</td>'
                 f'<td class="{cls}">{escape(phrase)}</td>'
                 f'<td class="dim">{escape(cadence)}</td>'
-                f'<td class="dim">{escape(frames)}</td>'
+                f'<td class="num dim">{escape(shown)}</td>'
+                f'<td class="num {cov_cls}">{escape(cov_txt)}</td>'
                 f'<td class="dim">{escape(fails)}</td></tr>')
         parts.append("</table>")
-        parts.append('<p class="quiet">Counted since the capture service last '
-                     'started, not since midnight. Updated once a minute'
-                     + (f', last at {escape(state.get("updated"))}.'
-                        if state.get("updated") else ".")
-                     + '</p></section>')
+        parts.append(
+            '<p class="quiet">Frames and coverage are counted from the files '
+            'on disk since midnight, against the cadence each camera is '
+            'running at today; under 100% means frames are missing, including '
+            'any part of today before capture started. The rest of each row '
+            'comes from the capture service, updated once a minute'
+            + (f', last at {escape(state.get("updated"))}.'
+               if state.get("updated") else ".")
+            + '</p>')
+        if unreadable:
+            parts.append('<p class="note">A "?" means this service could not '
+                         'read that camera\'s frames directory. It is not a '
+                         'statement about the camera.</p>')
+        parts.append("</section>")
         return "".join(parts)
 
     def _last_encode(self):

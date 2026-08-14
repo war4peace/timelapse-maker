@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [Unreleased]
+
+### Changed
+- **The web UI now counts today's frames from disk, and shows coverage per
+  camera.** The Cameras panel used to report a counter that reset every time
+  the capture service restarted, which said nothing about whether today had
+  actually been captured, and showed nothing at all for RTSP cameras. It now
+  counts the files in each camera's folder for today and shows that beside a
+  **Coverage** percentage measured against the cadence that camera is running
+  at. Under 100% means frames are missing, including any part of today before
+  capture was started.
+
+  RTSP and HTTP cameras are counted the same way, so the column that read `-`
+  for an RTSP camera now shows real numbers.
+
+- An RTSP camera's status reads **"recording"** or **"not recording"** instead
+  of "supervised by ffmpeg", and the failure column is left empty when there is
+  nothing wrong rather than saying "0 failed" on every healthy row.
+
 ## [0.1.7] - 2026-08-14
 
 ### Added

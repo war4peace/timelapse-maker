@@ -626,17 +626,40 @@ def stamp(epoch):
     return datetime.fromtimestamp(epoch).replace(microsecond=0).isoformat()
 
 
-def coverage_pct(result, interval):
-    """Frames as a percentage of a full day at the cadence this day ran at.
+def coverage_of(frames, interval, seconds):
+    """Frames as a percentage of `seconds` captured at one every `interval`.
 
-    Shared by the Discord table and the run record so the two cannot disagree.
+    The one place this arithmetic lives. The nightly summary measures a whole
+    day (86400s) and the web UI measures the part of today that has happened
+    so far, and they must not be able to drift apart, because an operator
+    comparing "94% at 18:00" with "94% overnight" is entitled to assume the
+    two words mean the same thing.
+    """
+    if not interval or seconds <= 0 or frames is None:
+        return None
+    expected = int(seconds / interval)
+    if not expected:
+        return None
+    # Zero frames is 0%, not "unknown". A camera that captured nothing today
+    # is the case an operator most needs stated, and "-" invites reading it as
+    # "not measured".
+    return round(100.0 * frames / expected, 1)
+
+
+def coverage_pct(result, interval):
+    """A finished day's coverage, against the cadence that day ran at.
+
     Using the *global* interval made a camera at one frame a minute read as 8%
     every night, which is a full day of frames reported as a near-outage.
+
+    Keeps its own "no frames means no answer" rule rather than inheriting the
+    live panel's 0%: a nightly row exists because a day was processed, so zero
+    frames there means the day is not measurable, not that it scored nothing.
     """
-    expected = int(86400 / (result.get("interval") or interval))
-    if not expected or not result.get("frames"):
+    if not result.get("frames"):
         return None
-    return round(100.0 * result["frames"] / expected, 1)
+    return coverage_of(result["frames"],
+                       result.get("interval") or interval, 86400)
 
 
 def run_record(started, encoder, results, xfer, interval, error=""):
