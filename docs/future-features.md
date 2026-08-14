@@ -104,6 +104,43 @@ and port**, so every Windows machine on the LAN is a ProbeMatch. It is not
 free either way round: **the Reolink and the Tapo answer the typed probe
 only**, so a client that sends just an untyped probe misses two of eight.
 
+### IPv6 was measured too, and buys nothing here
+
+The prototype's `--ipv6` sends to all three plausible destinations, with each
+reply attributed to the group that provoked it. On this network:
+
+| destination | scope | devices | found by it alone |
+| --- | --- | --- | --- |
+| `239.255.255.250` | IPv4 | 11 | 5 |
+| `ff02::c` | link-local | 7 | 1, this PC's own loopback WSD service |
+| `ff02::1` | all-nodes | 4 | none |
+| `ff05::c` | site-local | 0 | none |
+
+**Every one of the eight cameras answered the IPv4 probe**, so IPv6 found no
+camera IPv4 missed. Four of them (three Hikvisions and one Dahua) answer on
+both stacks, which is exactly where the duplicate replies come from; the other
+four answer IPv4 only. So a shipped implementation should **send IPv4 only**:
+IPv6 doubles the replies to dedupe and adds a Windows PC to the list.
+
+Two things worth knowing before anyone re-opens this:
+
+- **`ff02::1` (all-nodes) works and is pointless.** It is not a WS-Discovery
+  group, but devices bind the wildcard address, so they receive it anyway. It
+  found four devices, none of them unique.
+- **`ff05::c` (site-local) is the only one that could cross a subnet**, and
+  nothing answered it. It is also the one with a real portability trap: the
+  scope id in an IPv6 destination identifies a *link*, so passing an interface
+  index alongside an `ff05::` address makes Windows refuse the send with
+  `WSAEADDRNOTAVAIL`, which reads as "no such group" and is really "wrong kind
+  of scope id". Zero is correct there, with `IPV6_MULTICAST_IF` choosing the
+  interface. Once fixed, the sends succeed and are simply never answered.
+
+**There is no IPv6 equivalent of the `--expect 192.168.2.202-210` sweep**, and
+that is not a gap in the tool. A /64 holds 2**64 addresses, so enumeration by
+unicast is not merely slow, it is impossible; multicast is how IPv6 does
+discovery, by design. The IPv4 sweep is only usable here as a cross-check
+against a range the operator already knows.
+
 ### Traps
 
 - **Multicast does not cross subnets, and rarely crosses VLANs.** A dedicated
