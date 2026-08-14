@@ -888,5 +888,329 @@ class TestRtspStateIsHonest(unittest.TestCase):
         self.assertNotIn("consec_fail", self.entry())
 
 
+class FakeResponse:
+    """Enough of a requests.Response for _grab() and raise_for_status()."""
+
+    def __init__(self, content=b"", status=200):
+        self.content = content
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise cap.requests.HTTPError(
+                "%d Client Error: for url: http://192.0.2.1/snap?password=hunt"
+                % self.status_code, response=self)
+
+
+# The three bodies below are the real ones, copied from a Reolink on
+# 2026-08-14. -9 is the important one: it is the same shape as a refusal and
+# is not a refusal, which is why the classifier reads the code and not the
+# presence of an error object.
+REOLINK_WRONG_PW = (b'[{"cmd":"Snap","code":1,'
+                    b'"error":{"detail":"login failed","rspCode":-7}}]')
+REOLINK_NO_CREDS = (b'[{"cmd":"Snap","code":1,'
+                    b'"error":{"detail":"please login first","rspCode":-6}}]')
+REOLINK_BAD_CMD = (b'[{"cmd":"Unknown","code":1,'
+                   b'"error":{"detail":"not support","rspCode":-9}}]')
+
+
+class TestFailureClassification(unittest.TestCase):
+    """Which failures are a refusal, and which only look like one."""
+
+    def http_error(self, status):
+        return cap.requests.HTTPError("boom", response=FakeResponse(b"", status))
+
+    def test_401_is_a_refusal(self):
+        self.assertEqual(cap.classify(self.http_error(401)), "auth")
+
+    def test_403_is_a_refusal_too(self):
+        # Some firmware separates "who are you" from "not you". Both mean the
+        # same thing to a program holding one credential.
+        self.assertEqual(cap.classify(self.http_error(403)), "auth")
+
+    def test_500_is_not(self):
+        self.assertEqual(cap.classify(self.http_error(500)), "other")
+
+    def test_404_is_not(self):
+        # A wrong URL is a config error, but not one more attempts can worsen.
+        self.assertEqual(cap.classify(self.http_error(404)), "other")
+
+    def test_reolink_wrong_password_is_a_refusal(self):
+        exc = cap.NotAJpeg("too small", REOLINK_WRONG_PW)
+        self.assertEqual(cap.classify(exc), "auth")
+
+    def test_reolink_missing_credentials_is_a_refusal(self):
+        exc = cap.NotAJpeg("too small", REOLINK_NO_CREDS)
+        self.assertEqual(cap.classify(exc), "auth")
+
+    def test_reolink_unknown_command_is_not_a_refusal(self):
+        # Measured: -9 arrives as HTTP 200 with an error object, exactly like
+        # -7 does. Treating "the camera said something" as "the camera refused
+        # us" would back off from a malformed request for ever.
+        exc = cap.NotAJpeg("too small", REOLINK_BAD_CMD)
+        self.assertEqual(cap.classify(exc), "other")
+
+    def test_an_html_page_is_not_a_refusal(self):
+        # A URL typo that drops the query string lands on the camera's own web
+        # page: 200, not a JPEG, no error object.
+        exc = cap.NotAJpeg("bad SOI", b"<html><head><title>Login</title>")
+        self.assertEqual(cap.classify(exc), "other")
+
+    def test_an_empty_body_is_not_a_refusal(self):
+        self.assertEqual(cap.classify(cap.NotAJpeg("empty", b"")), "other")
+
+    def test_connection_refused_is_unreachable(self):
+        self.assertEqual(cap.classify(cap.requests.ConnectionError("no route")),
+                         "unreachable")
+
+    def test_timeout_is_unreachable(self):
+        self.assertEqual(cap.classify(cap.requests.Timeout("timed out")),
+                         "unreachable")
+
+    def test_anything_else_is_other(self):
+        self.assertEqual(cap.classify(ValueError("who knows")), "other")
+
+
+class TestRefusalReachesTheClassifier(unittest.TestCase):
+    """The refusal body has to survive _grab() to be classifiable at all."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cam = cap.HttpCamera(
+            {"name": "Gate", "url": "http://192.0.2.1/snap"},
+            make_config(self.tmp))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def grab(self, response):
+        self.cam.session.get = lambda url, timeout=None: response
+        try:
+            self.cam._grab(datetime(2026, 8, 14, 9, 0, 0))
+        except Exception as exc:            # noqa: BLE001
+            return exc
+        return None
+
+    def test_a_short_refusal_is_caught_by_the_size_check_not_the_soi_check(self):
+        # The trap: min_bytes is 4096 and a Reolink refusal is ~140 bytes, so
+        # the branch that fires for the shape we most need to recognise is the
+        # size one. If only the SOI branch carried the payload, every Reolink
+        # refusal would classify as 'other'.
+        exc = self.grab(FakeResponse(REOLINK_WRONG_PW))
+        self.assertIsInstance(exc, cap.NotAJpeg)
+        self.assertIn("too small", str(exc))
+        self.assertEqual(cap.classify(exc), "auth")
+
+    def test_a_long_non_jpeg_keeps_its_body_too(self):
+        exc = self.grab(FakeResponse(b"<html>" + b"x" * 9000))
+        self.assertIsInstance(exc, cap.NotAJpeg)
+        self.assertIn("SOI", str(exc))
+        self.assertEqual(cap.classify(exc), "other")
+
+    def test_a_401_never_reaches_the_body_checks(self):
+        exc = self.grab(FakeResponse(b"Invalid Authority!", 401))
+        self.assertIsInstance(exc, cap.requests.HTTPError)
+        self.assertEqual(cap.classify(exc), "auth")
+
+    def test_a_real_jpeg_still_works(self):
+        jpeg = b"\xff\xd8" + b"j" * 9000
+        self.assertIsNone(self.grab(FakeResponse(jpeg)))
+
+
+class TestAuthBackOff(unittest.TestCase):
+    """Two strikes, ten minutes, one more attempt, then every 31 minutes.
+
+    Driven by calling _note_failure with an explicit clock: the ladder is
+    arithmetic on wall-clock times, and sleeping through it in a test would
+    prove the same thing 40 minutes more slowly.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cam = cap.HttpCamera(
+            {"name": "Roof", "url": "http://192.0.2.1/snap"},
+            make_config(self.tmp))
+        # The ladder logs on purpose; this suite is not the place to read it.
+        self.cam.log.setLevel(logging.CRITICAL)
+        self.t = 1_000_000.0
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def refuse(self, at=None):
+        exc = cap.requests.HTTPError("401", response=FakeResponse(b"", 401))
+        self.cam._note_failure(exc, self.t if at is None else at)
+
+    def unreachable(self, at=None):
+        self.cam._note_failure(cap.requests.ConnectionError("down"),
+                               self.t if at is None else at)
+
+    def test_one_refusal_does_not_stop_anything(self):
+        self.refuse()
+        self.assertEqual(self.cam.err_class, "auth")
+        self.assertEqual(self.cam.err_ticks, 1)
+        self.assertFalse(self.cam.auth_backed_off)
+        self.assertEqual(self.cam.auth_quiet_until, 0.0)
+
+    def test_two_refusals_buy_ten_minutes_of_silence(self):
+        self.refuse()
+        self.refuse(self.t + 5)
+        self.assertTrue(self.cam.auth_backed_off)
+        self.assertFalse(self.cam.auth_confirmed)
+        self.assertEqual(self.cam.auth_quiet_until, self.t + 5 + cap.AUTH_PAUSE)
+
+    def test_the_attempt_after_the_pause_confirms_it(self):
+        self.refuse()
+        self.refuse(self.t + 5)
+        later = self.t + 5 + cap.AUTH_PAUSE
+        self.refuse(later)
+        self.assertTrue(self.cam.auth_confirmed)
+        self.assertEqual(self.cam.auth_quiet_until, later + cap.AUTH_RETRY)
+
+    def test_a_confirmed_refusal_re_arms_at_31_minutes_for_ever(self):
+        self.refuse()
+        self.refuse(self.t + 5)
+        self.refuse(self.t + 5 + cap.AUTH_PAUSE)
+        for n in range(1, 6):
+            at = self.t + 5 + cap.AUTH_PAUSE + n * cap.AUTH_RETRY
+            self.refuse(at)
+            self.assertEqual(self.cam.auth_quiet_until, at + cap.AUTH_RETRY)
+        self.assertTrue(self.cam.auth_confirmed)
+
+    def test_31_minutes_clears_the_measured_30_minute_lockout(self):
+        # The number is not arbitrary: the observed window is 30 minutes, and
+        # a probe inside it can renew the lock rather than escape it.
+        self.assertGreater(cap.AUTH_RETRY, 30 * 60)
+
+    def test_a_success_ends_the_incident(self):
+        self.refuse()
+        self.refuse(self.t + 5)
+        self.cam._end_incident()
+        self.assertIsNone(self.cam.err_class)
+        self.assertEqual(self.cam.err_ticks, 0)
+        self.assertFalse(self.cam.auth_backed_off)
+        self.assertFalse(self.cam.auth_confirmed)
+        self.assertEqual(self.cam.auth_quiet_until, 0.0)
+
+    def test_an_unreachable_tick_between_refusals_resets_the_ladder(self):
+        # A camera that is sometimes refusing and sometimes unreachable is not
+        # a diagnosis, and must never climb to a verdict.
+        self.refuse()
+        self.unreachable(self.t + 5)
+        self.refuse(self.t + 10)
+        self.assertEqual(self.cam.err_ticks, 1)
+        self.assertFalse(self.cam.auth_backed_off)
+
+    def test_an_unreachable_camera_never_backs_off(self):
+        # Backing off here would turn a 30-second reboot into a 10-minute hole.
+        for n in range(20):
+            self.unreachable(self.t + n * 5)
+        self.assertEqual(self.cam.err_class, "unreachable")
+        self.assertEqual(self.cam.err_ticks, 20)
+        self.assertEqual(self.cam.auth_quiet_until, 0.0)
+
+    def test_the_incident_start_is_stable_while_it_lasts(self):
+        # It is the incident's identity downstream, so it must not move.
+        self.refuse()
+        began = self.cam.err_since
+        self.refuse(self.t + 5)
+        self.refuse(self.t + 5 + cap.AUTH_PAUSE)
+        self.assertEqual(self.cam.err_since, began)
+
+    def test_the_detail_is_redacted(self):
+        exc = cap.requests.HTTPError(
+            "401 Client Error for url: http://cam/snap?password=hunter2",
+            response=FakeResponse(b"", 401))
+        self.cam._note_failure(exc, self.t)
+        self.assertNotIn("hunter2", self.cam.err_detail)
+        self.assertIn("401", self.cam.err_detail)
+
+
+class TestRefusalIsNotRetriedInsideTheTick(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cam = cap.HttpCamera(
+            {"name": "Gate", "url": "http://192.0.2.1/snap"},
+            make_config(self.tmp))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+        cap.STOP.clear()
+
+    def test_a_401_is_not_retried(self):
+        # The second attempt cannot succeed and does count towards the
+        # camera's lockout, so it is the one failure worth not repeating.
+        called = []
+        self.cam._grab = lambda dt, timeout=None: called.append(dt)
+        first = cap.requests.HTTPError("401", response=FakeResponse(b"", 401))
+        err = self.cam._retry_grab(datetime(2026, 8, 14, 9, 0, 0),
+                                   time.time() + 5.0, first)
+        self.assertEqual(called, [])
+        self.assertIs(err, first)
+
+    def test_a_500_still_is_retried(self):
+        called = []
+        self.cam._grab = lambda dt, timeout=None: called.append(dt)
+        first = cap.requests.HTTPError("500", response=FakeResponse(b"", 500))
+        err = self.cam._retry_grab(datetime(2026, 8, 14, 9, 0, 0),
+                                   time.time() + 5.0, first)
+        self.assertEqual(len(called), 1)
+        self.assertIsNone(err)
+
+
+class TestErrorReachesTheStateFile(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cam = cap.HttpCamera(
+            {"name": "Roof", "url": "http://192.0.2.1/snap"},
+            make_config(self.tmp))
+        self.cam.log.setLevel(logging.CRITICAL)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def entry(self):
+        return cap.capture_state([self.cam], time.time())["cameras"][0]
+
+    def test_a_healthy_camera_reports_no_error(self):
+        self.assertIsNone(self.entry()["error"])
+
+    def test_a_refusal_is_published_with_its_class_and_start(self):
+        exc = cap.requests.HTTPError("401", response=FakeResponse(b"", 401))
+        self.cam._note_failure(exc, 1_000_000.0)
+        err = self.entry()["error"]
+        self.assertEqual(err["class"], "auth")
+        self.assertEqual(err["ticks"], 1)
+        self.assertFalse(err["confirmed"])
+        self.assertIsNotNone(err["since"])
+        self.assertIsNone(err["quiet_until"])
+
+    def test_a_confirmed_refusal_says_so_and_names_the_next_attempt(self):
+        exc = cap.requests.HTTPError("401", response=FakeResponse(b"", 401))
+        for at in (0, 5, 5 + cap.AUTH_PAUSE):
+            self.cam._note_failure(exc, 1_000_000.0 + at)
+        err = self.entry()["error"]
+        self.assertTrue(err["confirmed"])
+        self.assertIsNotNone(err["quiet_until"])
+
+    def test_the_published_detail_carries_no_credential(self):
+        exc = cap.requests.HTTPError(
+            "401 for url: http://cam/s?user=admin&password=hunter2",
+            response=FakeResponse(b"", 401))
+        self.cam._note_failure(exc, 1_000_000.0)
+        self.assertNotIn("hunter2", json.dumps(self.entry()))
+
+    def test_rtsp_cameras_carry_no_error_field(self):
+        # ffmpeg holds the credential and fetches the frames there, so nothing
+        # in this process ever sees the camera's answer. Publishing a null
+        # would read as "fine", which is a claim this daemon cannot make.
+        rtsp = cap.RtspCamera({"name": "Hallway", "url": "rtsp://192.0.2.9/s1"},
+                              make_config(self.tmp))
+        entry = cap.capture_state([rtsp], time.time())["cameras"][0]
+        self.assertNotIn("error", entry)
+
+
 if __name__ == "__main__":
     unittest.main()

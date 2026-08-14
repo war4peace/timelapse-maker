@@ -63,6 +63,101 @@ RETRY_DELAY = 0.25          # let a camera that just said "busy" breathe
 RETRY_GUARD = 0.5           # a retry must never run into the next tick
 RETRY_MIN_BUDGET = 1.0      # below this a retry would only time out again
 
+# ----------------------------------------------------------------------------
+# Authentication back-off
+#
+# A camera that rejects our credentials will reject them again on the next
+# tick, and firmware commonly locks the account after a handful of failures.
+# Fetching every few seconds therefore renews that lock faster than it expires,
+# so rotating a camera's password without disabling it here first would leave
+# the account locked until the daemon stopped - and camera accounts are usually
+# shared with an NVR, so the damage is not confined to us.
+#
+# The ladder: two consecutive refusals, ten minutes of silence, one more
+# attempt, and from then on one attempt every 31 minutes, for ever. Flat rather
+# than escalating because the observed lockout window is 30 minutes and a
+# single attempt every 31 will never reach the "N failures inside a window"
+# threshold that lockout policies are built from. See docs/future-features.md
+# item 8 for the measurements behind each number.
+AUTH_STRIKES = 2            # consecutive refusals before withholding fetches
+AUTH_PAUSE = 600            # then say nothing for ten minutes
+AUTH_RETRY = 1860           # 31 min: the measured 30-minute lock, plus margin
+
+# 403 as well as 401: some firmware distinguishes "who are you" from "not you",
+# and both mean the same thing to us.
+AUTH_STATUS = (401, 403)
+
+# Reolink answers 200 with a JSON error rather than a status. Measured on real
+# hardware 2026-08-14: -7 is "login failed", -6 is "please login first", and
+# -9 is "not support", which is an unknown *command* and not a refusal at all.
+# So the presence of an error object proves nothing; only a known code counts,
+# and anything else is logged rather than guessed at.
+AUTH_RSPCODES = (-6, -7)
+
+# Connection-level failures. A camera that is off, rebooting or unplugged looks
+# exactly like this, and none of it is our credentials' fault.
+UNREACHABLE_ERRORS = (requests.ConnectionError, requests.Timeout)
+
+
+class NotAJpeg(ValueError):
+    """The response arrived but was not an image.
+
+    Carries the payload, because the camera's own words are the only evidence
+    for the 200-with-an-error-body shape, and `_grab()` must not be the thing
+    that decides what they mean.
+    """
+
+    def __init__(self, message, payload=b""):
+        super().__init__(message)
+        self.payload = payload
+
+
+def payload_rspcode(data):
+    """The vendor error code in a snapshot response, or None.
+
+    Deliberately narrow. It reads one number out of the Reolink shape and does
+    not try to explain anything: `timelapse_setup.explain_payload()` produces
+    prose for a human who can weigh it, and a classifier cannot.
+    """
+    try:
+        doc = json.loads(data.decode("utf-8", errors="replace"))
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(doc, list) and doc and isinstance(doc[0], dict):
+        doc = doc[0]
+    if not isinstance(doc, dict):
+        return None
+    err = doc.get("error")
+    if isinstance(err, dict):
+        code = err.get("rspCode")
+        return code if isinstance(code, int) else None
+    return None
+
+
+def classify(exc):
+    """One of 'auth', 'unreachable', 'other' for a failed grab.
+
+    Conservative on purpose: only a camera that *declares* a credential problem
+    is called 'auth', because that verdict withholds fetches and so costs
+    frames. Everything unrecognised falls to 'other', which changes nothing.
+    """
+    if isinstance(exc, requests.HTTPError):
+        resp = getattr(exc, "response", None)
+        status = getattr(resp, "status_code", None)
+        return "auth" if status in AUTH_STATUS else "other"
+    if isinstance(exc, NotAJpeg):
+        code = payload_rspcode(exc.payload)
+        if code in AUTH_RSPCODES:
+            return "auth"
+        if code is not None:
+            # Not a refusal, but the camera did say something. Naming the code
+            # is how the known set grows from evidence rather than guesswork.
+            log.debug("camera reported rspCode %s (not treated as auth)", code)
+        return "other"
+    if isinstance(exc, UNREACHABLE_ERRORS):
+        return "unreachable"
+    return "other"
+
 
 def load_config(path):
     """Deliberately duplicated rather than imported from timelapse_encode: the
@@ -395,6 +490,19 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
         self.last_attempt = None
         self.last_success = None
 
+        # What is currently going wrong, if anything, and since when. The class
+        # is what the back-off keys on; `err_since` is also the incident's
+        # identity for anything downstream that must notify exactly once.
+        self.err_class = None
+        self.err_since = None
+        self.err_ticks = 0
+        self.err_detail = ""
+        # The authentication ladder. In memory on purpose: a fresh process
+        # knows nothing about this camera, and two attempts settle it again.
+        self.auth_backed_off = False    # the ten-minute pause has happened
+        self.auth_confirmed = False     # it survived that pause: a real refusal
+        self.auth_quiet_until = 0.0     # withhold fetches until this wall clock
+
     # -- helpers ------------------------------------------------------------
 
     def _dest_path(self, dt):
@@ -438,6 +546,11 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
         otherwise the exception to report."""
         if not self.retry:
             return first_exc
+        # A rejected credential will be rejected again 250ms later. The only
+        # thing a second attempt can buy is a second entry on the camera's
+        # lockout counter, which is the opposite of what this daemon wants.
+        if classify(first_exc) == "auth":
+            return first_exc
         # The previous tick failed too, so this is an outage lasting longer than
         # one interval - and the next tick already *is* a retry. Measured: a
         # camera busy for a fixed 2.6s window (2 ticks) recovers 0% from a retry
@@ -457,15 +570,73 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
         self.retried += 1
         return None
 
+    def _end_incident(self):
+        """Forget whatever was going wrong. Called on a success and on any
+        change of class, both of which mean the previous diagnosis is over."""
+        self.err_class = None
+        self.err_since = None
+        self.err_ticks = 0
+        self.err_detail = ""
+        self.auth_backed_off = False
+        self.auth_confirmed = False
+        self.auth_quiet_until = 0.0
+
+    def _note_failure(self, exc, now):
+        """Classify a failed tick and advance the back-off if it is a refusal."""
+        kind = classify(exc)
+        if kind != self.err_class:
+            # A change of class ends the incident and starts a new one. A tick
+            # that times out between two refusals is an 'unreachable', so an
+            # intermittent mix never climbs the ladder: a camera that is
+            # sometimes refusing and sometimes unreachable is not a diagnosis.
+            self._end_incident()
+            self.err_class = kind
+            self.err_since = now
+        self.err_ticks += 1
+        self.err_detail = redact(str(exc))[:200]
+        if kind == "auth":
+            self._advance_auth_ladder(now)
+
+    def _advance_auth_ladder(self, now):
+        """Two strikes, ten minutes, one more attempt, then every 31 minutes.
+
+        Only the fetching stops. The tick itself keeps running, so the day
+        boundary and the cadence marker are unaffected.
+        """
+        if self.auth_confirmed:
+            self.auth_quiet_until = now + AUTH_RETRY
+        elif self.auth_backed_off:
+            # This was the single attempt after the pause, and it was refused
+            # too. Ten minutes apart is two different moments in the camera's
+            # life, which is the evidence a rapid count could never provide.
+            self.auth_confirmed = True
+            self.auth_quiet_until = now + AUTH_RETRY
+            self.log.error("still refusing our credentials %d minutes later; "
+                           "trying once every %d minutes from now on. Check the "
+                           "username and password, and note that a camera which "
+                           "has locked the account refuses a correct password "
+                           "too", AUTH_PAUSE // 60, AUTH_RETRY // 60)
+        elif self.err_ticks >= AUTH_STRIKES:
+            self.auth_backed_off = True
+            self.auth_quiet_until = now + AUTH_PAUSE
+            self.log.warning("refused our credentials %d times in a row; not "
+                             "fetching for %d minutes, because repeating a "
+                             "rejected credential can lock the account on the "
+                             "camera", self.err_ticks, AUTH_PAUSE // 60)
+
     def _grab(self, dt, timeout=None):
         resp = self.session.get(self.url, timeout=timeout or self.timeout)
         resp.raise_for_status()
         data = resp.content
 
+        # Both carry the body, and the size check is the one that matters:
+        # min_bytes is 4096 by default and a Reolink refusal is ~140 bytes of
+        # JSON, so the shape this program most needs to recognise fails *here*
+        # and never reaches the SOI test below.
         if len(data) < self.min_bytes:
-            raise ValueError(f"response too small ({len(data)} bytes)")
+            raise NotAJpeg(f"response too small ({len(data)} bytes)", data)
         if data[:2] != b"\xff\xd8":
-            raise ValueError("response is not a JPEG (bad SOI marker)")
+            raise NotAJpeg("response is not a JPEG (bad SOI marker)", data)
 
         final = self._dest_path(dt)
         tmp = final.parent / f".{final.stem}.tmp"
@@ -509,6 +680,13 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
             if PAUSED.is_set():
                 continue
 
+            # Withholding a fetch during the authentication back-off. The tick
+            # is otherwise ordinary, which is deliberate: the day rollover above
+            # has already run, so a back-off spanning midnight still starts the
+            # new day correctly.
+            if self.auth_quiet_until and time.time() < self.auth_quiet_until:
+                continue
+
             dt = datetime.fromtimestamp(fire_t)
             self.last_attempt = fire_t
             try:
@@ -523,6 +701,9 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
                 if self.consec_fail:
                     self.log.info("recovered after %d consecutive failures",
                                   self.consec_fail)
+                if self.auth_confirmed:
+                    self.log.info("credentials accepted again")
+                self._end_incident()
                 self.ok += 1
                 self.consec_fail = 0
                 # Wall clock, not fire_t: this is "when did a frame last land",
@@ -532,6 +713,7 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
             else:
                 self.fail += 1
                 self.consec_fail += 1
+                self._note_failure(err, time.time())
                 # Log the first failure, then throttle to avoid flooding journald
                 # when a camera is offline for hours.
                 if self.consec_fail == 1 or self.consec_fail % self.log_every == 0:
@@ -738,6 +920,29 @@ def stamp(epoch):
     return datetime.fromtimestamp(epoch).replace(microsecond=0).isoformat()
 
 
+def error_state(cam):
+    """What is currently going wrong with one camera, or None.
+
+    `since` doubles as the incident's identity. Anything downstream that must
+    act exactly once per incident can compare that value instead of keeping its
+    own notion of when one failure stops being the same failure.
+    """
+    if not cam.err_class:
+        return None
+    return {
+        "class": cam.err_class,
+        "since": stamp(cam.err_since),
+        "ticks": cam.err_ticks,
+        "detail": cam.err_detail,
+        # Only 'auth' ever withholds a fetch. `confirmed` is what separates
+        # "still deciding" from "the camera meant it", and it is the flag a
+        # notifier should key on: acting on the first refusal would page
+        # somebody for a camera that was rebooting.
+        "confirmed": cam.auth_confirmed,
+        "quiet_until": stamp(cam.auth_quiet_until),
+    }
+
+
 def capture_state(cams, started, running=True):
     """The snapshot published to capture.json.
 
@@ -764,7 +969,8 @@ def capture_state(cams, started, running=True):
                          alive=bool(c.proc and c.proc.poll() is None))
         else:
             entry.update(supervised=False, ok=c.ok, fail=c.fail,
-                         retried=c.retried, consec_fail=c.consec_fail)
+                         retried=c.retried, consec_fail=c.consec_fail,
+                         error=error_state(c))
         cameras.append(entry)
     return {
         "version": STATE_VERSION,
