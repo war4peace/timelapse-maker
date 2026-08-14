@@ -39,7 +39,11 @@ how it arrived, because it is the argument for keeping refusals rather than
 deleting them: it existed *because* of the reasoning that killed item 7, and it
 turned out to be a defect fix rather than a feature. Item 9 came the same way,
 out of the decision against an ONVIF library: it is the part of that idea which
-needs no dependency.
+needs no dependency. **Item 10 is the same story a third time**: it is what was
+left over after the IPv6 camera fix in 0.1.7, which is why it is written as the
+last piece of a job rather than as a feature. Every one of these arrived as the
+residue of a decision about something else, which is the argument for writing
+the decisions down at all.
 
 Item 3 shipped **narrower than it was planned**, and that is worth noting for
 the next entry that lists candidates: it proposed ntfy, gotify and email, and
@@ -50,6 +54,84 @@ A pre-plan is a starting point for the conversation, not the specification.
 Everything below is **researched against the code as of 0.1.5**, so each entry
 says where it would hook in and what is already there. None of it is designed;
 these are pre-plans, and the traps are the point.
+
+---
+
+## 10. Let the web UI bind an IPv6 address
+
+**Effort:** small. **Prerequisites:** none.
+
+### What is wrong
+
+`web.bind` cannot be an IPv6 address. `Server` extends `ThreadingHTTPServer`,
+whose `address_family` is `AF_INET`, so the socket is IPv4 whatever the config
+says, and `timelapse_web.py` exits with `Cannot listen on ::1:8787: ...`. On a
+network with no IPv4 at all, the whole web UI is unreachable.
+
+This is the one part of the project that IPv6 still stops. **Capture is fine**:
+0.1.7 brackets an IPv6 camera address in the wizard, and `requests` and ffmpeg
+were both measured fetching from a real camera over its ULA address
+(architecture.md §4.4). So this is the last piece, not the first.
+
+### Why it is small
+
+Really one call site:
+
+- `Server.address_family`, chosen from the configured bind rather than fixed.
+  `ipaddress.ip_address()` settles it, and `url_host()` in `timelapse_setup.py`
+  already exists for the display half of the same problem.
+- `lan_address()` does a UDP `connect()` to TEST-NET-1 to learn the source
+  address the routing table would pick, over `AF_INET`. The IPv6 equivalent is
+  `2001:db8::1` (RFC 3849, the documentation prefix, never routed), and on a
+  dual-stack host it should probably offer both. This only affects the address
+  the wizard *suggests*, so it is cosmetic rather than blocking.
+
+**`check_bind()` needs no change at all**, which was worth checking rather than
+assuming: it calls `getaddrinfo()` and walks every family it returns, so it
+binds an IPv6 address correctly today. Measured 2026-08-14: `::1` and `::`
+both return `ok`, and an address this host does not hold returns `unavailable`
+with the right reason.
+
+That makes the current state worse than "unsupported", and is the real argument
+for doing this. **The wizard accepts `::1` and the service then refuses to
+start**, so the one check built specifically to catch a bind that looks fine
+and does not work is itself the thing that waves it through. Whoever picks this
+up should reproduce that first; it is the bug, and the `address_family` line is
+merely the fix.
+
+**Binding `::` may be all most people need.** Linux defaults
+`net.ipv6.bindv6only` to 0, so a socket bound to `::` accepts IPv4 connections
+as v4-mapped addresses and one socket serves both stacks. Decide that
+deliberately and set `IPV6_V6ONLY` explicitly either way, rather than
+inheriting a sysctl that a hardened host may well have changed.
+
+### Already done, which is why this is not larger
+
+- **`HOST_RE` accepts a bracketed IPv6 authority.** `_base_url()` builds the
+  origin for a `.m3u` from the request's own `Host` header, so a playlist
+  generated from an IPv6 request already carries a usable URL.
+- `::1` is already treated as loopback by the non-loopback warning at startup,
+  so turning this on does not start warning people about a local bind.
+
+### Traps
+
+- **Every place that prints `host:port` needs brackets.** There are four, and
+  all four are wrong today for an IPv6 bind: the startup log line
+  (`Serving on http://%s:%d/`), the wizard's summary, its `listen` line, and
+  **`_base_url()`'s fallback**, which is the one that matters, because it is
+  what a `.m3u` gets when the `Host` header is missing or malformed. That
+  fallback would hand VLC `http://::1:8787/video/3`, and a playlist that does
+  not play is a bug report about video, not about binding.
+- **A check that passes what the service then refuses is worse than no check.**
+  That is this project's own rule (the rsync flag probe, architecture.md §4.2)
+  and `check_bind()` is currently breaking it for IPv6, not through a bug in
+  itself but because the server it speaks for is narrower than it is. A probe
+  is only as honest as its agreement with the thing it predicts.
+- **A link-local bind needs a zone id**, and the wizard should say so, exactly
+  as `add_one_camera()` now does for a camera at `fe80::`.
+- Do not extend this to the transfer destination without checking rsync's own
+  syntax, which is `user@[::1]:/path`. That is a separate question and no part
+  of this item.
 
 ---
 

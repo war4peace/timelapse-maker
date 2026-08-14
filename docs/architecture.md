@@ -786,14 +786,21 @@ refused without probing at all: the wizard normally runs as root and the
 service does not, so that probe would pass and prove nothing.
 
 **The web UI is IPv4 only, and the cameras are not.** `Server` extends
-`ThreadingHTTPServer`, whose `address_family` is `AF_INET`, and `check_bind()`
-probes with an `AF_INET` socket to match it, so `bind` cannot be an IPv6
-address. That is a real limitation on an IPv6-only network and a deliberate
-non-limitation everywhere else, since the default bind is loopback. It does
-**not** extend to cameras: capture reaches an IPv6 camera today, verified
-against real hardware (see §2). Anyone lifting the restriction has to move
-`address_family`, `check_bind()` and `lan_address()` together, and decide what
-the wizard offers, which is why it is recorded here rather than half-done.
+`ThreadingHTTPServer`, whose `address_family` is `AF_INET`, so `bind` cannot be
+an IPv6 address: the service exits with `Cannot listen on ::1:8787`. That is a
+real limitation on an IPv6-only network and no limitation at all elsewhere,
+since the default bind is loopback. It does **not** extend to cameras: capture
+reaches an IPv6 camera today, verified against real hardware (§4.4).
+
+**`check_bind()` does not share the restriction, and that is the actual
+defect.** It calls `getaddrinfo()` and walks every family returned, so `::1`
+and `::` both probe `ok` (measured 2026-08-14) and the wizard accepts an
+address the service will then refuse. The one check written to catch a bind
+that looks fine and does not work is waving this one through, which is the same
+shape as any check that guesses. Recorded as item 10 in future-features.md
+rather than half-fixed here, because the fix is one line and the decisions
+around it (`IPV6_V6ONLY` on a `::` bind, four unbracketed `host:port` strings,
+what the wizard suggests) are not.
 
 `lan_address()` asks the routing table for the source address it would use to
 reach TEST-NET-1. No packets are sent; a UDP `connect()` only fixes the peer
