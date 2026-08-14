@@ -830,6 +830,7 @@ STATUS_UNITS = (
     ("timelapse-capture.service", "Capture", "daemon"),
     ("timelapse-encode.timer", "Nightly encode", "timer"),
     ("timelapse-encode.service", "Last encode run", "oneshot"),
+    ("timelapse-watch.timer", "Credential watch", "timer"),
     ("timelapse-web.service", "Web interface", "daemon"),
 )
 
@@ -1322,6 +1323,14 @@ def camera_verdict(cam, snapshot_epoch):
         if cam.get("alive"):
             return "ok", "supervised by ffmpeg"
         return "bad", "grabber not running"
+
+    # A camera that is refusing our credentials is silent for a reason this
+    # page can state, and "3h ago" would send somebody looking at the network.
+    # Only a confirmed refusal is shown: before that the daemon is still
+    # deciding, and a camera part way through a reboot would be libelled.
+    err = cam.get("error") or {}
+    if err.get("class") == "auth" and err.get("confirmed"):
+        return "bad", "refusing our credentials"
 
     quiet = silence_seconds(cam, snapshot_epoch)
     if quiet is None:

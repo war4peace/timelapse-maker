@@ -2030,5 +2030,311 @@ class TestRedactConfig(unittest.TestCase):
         self.assertEqual(out, {"a": 1, "b": True, "c": None, "d": 1.5})
 
 
+class TestCredentialWatch(unittest.TestCase):
+    """Notify once per incident, once when it ends, and never from stale facts.
+
+    The daemon publishes; this decides. Everything here drives that decision
+    through real capture.json files, because the file is the contract between
+    two processes and a mocked dict would not exercise it.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = {"paths": {"state_dir": str(self.tmp)},
+                    "notify": [{"type": "discord", "enabled": True,
+                                "webhook_url": "https://example.invalid/w"}]}
+        self.sent = []
+        patcher = mock.patch.object(
+            enc, "notify",
+            side_effect=lambda cfg, title, desc, level, fields:
+                self.sent.append((title, level)) or (1, 0))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_capture(self, cameras, running=True, age=0):
+        state = {"version": 1, "kind": "capture", "running": running,
+                 "updated_epoch": int(time.time()) - age,
+                 "cameras": cameras}
+        (self.tmp / enc.CAPTURE_STATE).write_text(json.dumps(state),
+                                                  encoding="utf-8")
+
+    def camera(self, name="Roof", cls="auth", confirmed=True,
+               since="2026-08-14T09:00:00"):
+        err = None
+        if cls:
+            err = {"class": cls, "since": since, "ticks": 3,
+                   "detail": "401 Client Error", "confirmed": confirmed,
+                   "quiet_until": "2026-08-14T09:41:00"}
+        return {"name": name, "supervised": False, "error": err}
+
+    def titles(self):
+        return [t for t, _ in self.sent]
+
+    # -- the happy path -----------------------------------------------------
+
+    def test_a_confirmed_refusal_is_reported(self):
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("refused our credentials", self.titles()[0])
+        self.assertEqual(self.sent[0][1], "error")
+
+    def test_the_same_incident_is_not_reported_twice(self):
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        for _ in range(5):
+            self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_recovery_sends_one_all_clear(self):
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertIn("accepted again", self.titles()[1])
+        self.assertEqual(self.sent[1][1], "ok")
+
+    def test_the_all_clear_is_not_repeated_either(self):
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)])
+        enc.watch_credentials(self.cfg)
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_a_second_incident_is_reported_again(self):
+        # Same camera, a new refusal after a recovery. The incident's identity
+        # is its start time, so this must not be mistaken for the old one.
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(since="2026-08-14T18:30:00")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 3)
+
+    def test_a_refusal_that_restarts_without_recovering_is_still_new(self):
+        # A daemon restart re-enters the ladder, so `since` moves even though
+        # nobody saw an all-clear. That is a genuinely new incident.
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(since="2026-08-14T11:00:00")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    # -- what must stay quiet ------------------------------------------------
+
+    def test_an_unconfirmed_refusal_says_nothing(self):
+        # Two refusals in ten seconds is a camera that might be rebooting.
+        self.write_capture([self.camera(confirmed=False)])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(self.sent, [])
+
+    def test_an_unreachable_camera_says_nothing(self):
+        # That is what an uptime monitor is for, and it sees it sooner.
+        self.write_capture([self.camera(cls="unreachable")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_some_other_failure_says_nothing(self):
+        self.write_capture([self.camera(cls="other")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_a_stale_heartbeat_is_not_acted_on(self):
+        # A file from an hour ago describes an hour ago. Sending an alarm from
+        # it would be guessing, and so would sending an all-clear.
+        self.write_capture([self.camera()], age=enc.CAPTURE_STALE + 60)
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_a_stopped_daemon_produces_no_all_clear(self):
+        # The trap this guards: capture stops, the error disappears from the
+        # file with it, and a naive reader announces that the camera recovered.
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)], running=False)
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_no_capture_state_at_all_is_harmless(self):
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_a_corrupt_capture_state_is_harmless(self):
+        (self.tmp / enc.CAPTURE_STATE).write_text("{not json",
+                                                  encoding="utf-8")
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_it_can_be_switched_off(self):
+        self.cfg["capture"] = {"notify_auth_failures": False}
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    def test_no_sinks_means_no_record_either(self):
+        # The trap: recording the incident here would mean that configuring a
+        # sink tomorrow leaves today's refusal permanently unannounced.
+        self.cfg["notify"] = []
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertFalse((self.tmp / enc.WATCH_STATE).exists())
+        self.cfg["notify"] = [{"type": "discord", "enabled": True,
+                               "webhook_url": "https://example.invalid/w"}]
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    def test_it_is_on_when_the_key_is_absent(self):
+        # Every config written before this release lacks the key, and the
+        # feature is worth having by default on all of them.
+        self.assertNotIn("capture", self.cfg)
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    def test_a_failed_delivery_is_retried_next_tick(self):
+        # A sink that was briefly unreachable must not swallow the message.
+        self.write_capture([self.camera()])
+        with mock.patch.object(enc, "notify", return_value=(0, 1)):
+            self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertFalse((self.tmp / enc.WATCH_STATE).exists())
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_failed_all_clear_is_retried_too(self):
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera(cls=None)])
+        with mock.patch.object(enc, "notify", return_value=(0, 1)):
+            self.assertEqual(enc.watch_credentials(self.cfg), 0)
+        self.assertEqual(enc.load_notified(self.cfg),
+                         {"Roof": "2026-08-14T09:00:00"})
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    def test_one_sink_succeeding_is_enough(self):
+        self.write_capture([self.camera()])
+        with mock.patch.object(enc, "notify", return_value=(1, 2)):
+            self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(enc.watch_credentials(self.cfg), 0)
+
+    # -- several cameras -----------------------------------------------------
+
+    def test_cameras_are_tracked_independently(self):
+        self.write_capture([self.camera("Roof"),
+                            self.camera("Gate", cls=None),
+                            self.camera("Yard", cls="unreachable")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.write_capture([self.camera("Roof"), self.camera("Gate"),
+                            self.camera("Yard", cls="unreachable")])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_one_camera_recovering_leaves_the_others_alone(self):
+        self.write_capture([self.camera("Roof"), self.camera("Gate")])
+        enc.watch_credentials(self.cfg)
+        self.write_capture([self.camera("Roof"), self.camera("Gate", cls=None)])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        record = json.loads((self.tmp / enc.WATCH_STATE)
+                            .read_text(encoding="utf-8"))
+        self.assertIn("Roof", record["incidents"])
+        self.assertNotIn("Gate", record["incidents"])
+
+    # -- the record itself ---------------------------------------------------
+
+    def test_the_record_survives_a_restart_of_this_checker(self):
+        # Each run is a fresh process, so "already told them" has to be on
+        # disk. Without this the timer would send the same alarm every five
+        # minutes for as long as the camera stayed broken.
+        self.write_capture([self.camera()])
+        enc.watch_credentials(self.cfg)
+        self.assertTrue((self.tmp / enc.WATCH_STATE).exists())
+        self.assertEqual(enc.load_notified(self.cfg),
+                         {"Roof": "2026-08-14T09:00:00"})
+
+    def test_an_unwritable_record_still_notifies(self):
+        # Losing the record risks a repeat; failing to warn risks silence.
+        self.write_capture([self.camera()])
+        with mock.patch.object(enc, "save_notified", return_value=False):
+            self.assertEqual(enc.watch_credentials(self.cfg), 1)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_corrupt_record_is_treated_as_empty(self):
+        (self.tmp / enc.WATCH_STATE).write_text("nonsense", encoding="utf-8")
+        self.write_capture([self.camera()])
+        self.assertEqual(enc.watch_credentials(self.cfg), 1)
+
+    def test_the_message_names_the_camera_and_carries_no_credential(self):
+        cam = self.camera()
+        cam["error"]["detail"] = "401 for url: http://c/s?password=***"
+        self.write_capture([cam])
+        with mock.patch.object(enc, "notify") as spy:
+            spy.return_value = (1, 0)
+            enc.watch_credentials(self.cfg)
+        _cfg, title, desc, level, fields = spy.call_args[0]
+        self.assertIn("Roof", desc)
+        self.assertEqual(level, "error")
+        self.assertIn(("Camera", "Roof"), fields)
+        self.assertNotIn("hunter2", json.dumps(fields))
+
+
+class TestWatchUnitWiring(unittest.TestCase):
+    """The shipped unit and the installer that rewrites it must agree.
+
+    None of this is reachable from Python at runtime, and all of it was found
+    on real systemd rather than here, which is exactly why it is pinned: the
+    failure is silent and expensive in both directions.
+    """
+
+    def setUp(self):
+        self.repo = _support.REPO
+        self.unit = (self.repo / "service" / "timelapse-watch.service"
+                     ).read_text(encoding="utf-8")
+        self.installer = (self.repo / "install.sh").read_text(encoding="utf-8")
+
+    def test_the_unit_asks_for_watch_mode(self):
+        self.assertIn("timelapse_encode.py --watch", self.unit)
+
+    def test_the_installer_rewrites_it_with_the_flag_intact(self):
+        # The loop that templates capture and encode matches any ExecStart
+        # mentioning timelapse_encode.py. If the watch unit went through it,
+        # --watch would be stripped and a five-minute timer would become a
+        # five-minute *encode run*, silently, on every install.
+        self.assertIn("timelapse_encode.py --watch $CONFIG", self.installer)
+
+    def test_the_shared_loop_does_not_touch_the_watch_unit(self):
+        loop = self.installer.split("for unit in timelapse-capture.service "
+                                    "timelapse-encode.service; do")[1]
+        loop = loop.split("done")[0]
+        self.assertNotIn("watch", loop)
+
+    def test_it_is_installed_and_removed_with_the_others(self):
+        for phase in ("install -m 0644", "rm -f"):
+            self.assertIn("timelapse-watch.service", self.installer)
+            self.assertIn("timelapse-watch.timer", self.installer)
+        self.assertIn("disable --now timelapse-watch.timer", self.installer)
+
+    def test_its_writable_set_is_the_state_directory_alone(self):
+        # It reads the capture heartbeat and writes one small record. Giving it
+        # $rw would hand a five-minutely job write access to every frame.
+        self.assertIn("ReadWritePaths=$staterw", self.installer)
+
+    def test_new_timers_are_adopted_on_upgrade(self):
+        # A unit that did not exist at the previous install is enabled by
+        # nobody: the wizard is skipped when an upgrade says "don't
+        # reconfigure", and offer_enable only runs on a fresh setup.
+        self.assertIn("adopt_new_timers", self.installer)
+        self.assertIn("enable --now timelapse-watch.timer", self.installer)
+
+    def test_the_timer_does_not_catch_up_missed_runs(self):
+        timer = (self.repo / "service" / "timelapse-watch.timer"
+                 ).read_text(encoding="utf-8")
+        # Persistent=true would fire a burst at boot to make up for downtime,
+        # and every one of those would read the same live heartbeat.
+        self.assertNotIn("Persistent=true", timer)
+        self.assertIn("OnUnitActiveSec=", timer)
+
+    def test_watch_mode_does_not_open_the_encode_log(self):
+        # Its unit may write one directory, the state directory, so a file
+        # handler under ProtectSystem=strict kills the process at startup.
+        # Verified on systemd 255; the symptom is a read-only filesystem error
+        # naming encode.log, from a service that never encodes anything.
+        src = (self.repo / "scripts" / "timelapse_encode.py").read_text(
+            encoding="utf-8")
+        self.assertIn("None if args.watch else", src)
+
+
 if __name__ == "__main__":
     unittest.main()

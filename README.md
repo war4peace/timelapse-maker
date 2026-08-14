@@ -253,8 +253,11 @@ encoders, and projects real disk usage from your actual snapshot sizes.
 - **It never touches your cameras.** It reads snapshots and nothing else: no
   reboots, no settings, no PTZ. If a camera hangs, something else on your
   network is better placed to deal with it, and would only end up fighting
-  this one over the same device.
-- **Test coverage is uneven.** 1,118 unit tests plus one end-to-end encode
+  this one over the same device. The one thing it does do is *stop*
+  reading: a camera that rejects the configured credentials is left alone
+  apart from an occasional retry, because repeating a rejected password is how
+  you get an account locked, and camera accounts are usually shared.
+- **Test coverage is uneven.** 1,184 unit tests plus one end-to-end encode
   test, covering the pure logic; the RTSP path, transfer and installer
   behaviour on non-apt distros still have no automated coverage. See §9 of the
   architecture doc.

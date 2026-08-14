@@ -17,7 +17,8 @@
     "min_bytes": 4096,
     "min_free_gb": 60,
     "log_every_n_failures": 60,
-    "retry_within_tick": true
+    "retry_within_tick": true,
+    "notify_auth_failures": true
   },
   "encode": {
     "_comment": "av1_preset p1 fastest .. p7 slowest. Lower cq/crf = higher quality, bigger files.",

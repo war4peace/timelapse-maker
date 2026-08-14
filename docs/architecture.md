@@ -124,14 +124,17 @@ disk guard has paused with nothing being written at all.
 
 | File | Written by | Contains |
 |---|---|---|
-| `capture.json` | the capture daemon, once a minute, plus once at startup and once on clean shutdown | pid, start time, `running`, `paused`, and a per-camera block: cadence, last attempt, last success, and either frame counters (HTTP) or restarts and process liveness (RTSP) |
+| `capture.json` | the capture daemon, once a minute, plus once at startup and once on clean shutdown | pid, start time, `running`, `paused`, and a per-camera block: cadence, last attempt, last success, an `error` object (0.1.6) and either frame counters (HTTP) or restarts and process liveness (RTSP) |
 | `encode.json` | the encoder, at the end of every run including one that found nothing to do | the newest `MAX_RUNS` (14) run records: times, encoder, counts, bytes, transfer outcome, and a per-camera-day list with frames and coverage |
+| `notified.json` | the credential watch, when it reports a change | `{camera: incident_start}` for refusals already announced, so a timer that fires every five minutes says each thing once |
 
 Rules that hold this together:
 
 | Rule | Why |
 |---|---|
 | **Facts, never verdicts** | There is deliberately no "healthy" or "state" field. Whether 42 seconds of silence is a fault depends on that camera's interval and on whether capture is paused; a reader can work that out, and a writer that had already decided could not be overruled. The cadence each number should be read against travels beside it for exactly this reason. |
+| **`error` is a classification, not a verdict** | It says what the camera answered (`auth`, `unreachable`, `other`), when that started, and whether the daemon's own back-off has confirmed it. `confirmed` is not a health judgement: it means "two refusals, ten minutes, one more attempt", which is a statement about what was tried. A reader still decides what to do about it, and the web UI and the credential watch decide differently. |
+| **`error.since` is the incident's identity** | Anything that must act once per incident compares that timestamp rather than inventing its own notion of when one failure stops being the same failure. It is stable while the incident lasts and moves when the class changes or the daemon restarts. |
 | **The RTSP path publishes different fields, marked `supervised`** | ffmpeg writes those frames and the thread only supervises the process, so `last_success` stays `null` rather than being filled in from something that is not a frame. Reading the day directory's mtime would have produced a plausible number and taught readers to trust it everywhere. |
 | **Writing it can never fail the job** | A daemon that cannot write its status file must keep capturing, and a run that encoded seven days has not failed because a history file could not be updated. Capture complains once, not once a minute. |
 | **Written atomically** | `os.replace`, like every other file this project writes. A reader gets the previous snapshot or the next one, never half of either. |
@@ -226,6 +229,42 @@ stopped taking pictures, and **once more on clean shutdown** with
   `log_every_n_failures`-th. An offline camera produces 2 log lines per hour, not
   720. Recovery logs once. External uptime monitoring is the real alerting path
   for camera reachability; this log is for post-hoc diagnosis.
+
+**Authentication back-off (0.1.6).** A camera that rejects our credentials will
+reject them again next tick, and firmware commonly locks the account after a
+handful of failures, so fetching every few seconds renews that lock faster than
+it expires. Before this, rotating a camera's password without disabling it here
+first left the account locked until the daemon stopped, a correct password did
+not clear it, and the account is usually shared with an NVR.
+
+`classify(exc)` sorts a failed tick into `auth`, `unreachable` or `other`, in
+`run()` rather than in `_grab()`, which stays the fetch. It is deliberately
+conservative, because only `auth` withholds fetches and so costs frames:
+
+| Answer | Class | Notes |
+|---|---|---|
+| HTTP 401 or 403 | `auth` | Measured on Dahua and Hikvision: the status settles it and the body is different on every make, so nothing reads the body |
+| HTTP 200 with `rspCode` -6 or -7 | `auth` | The Reolink shape. -6 is "please login first", -7 is "login failed" |
+| HTTP 200 with `rspCode` -9 | `other` | "not support": an unknown *command*, in the identical shape. This is why the classifier reads the code and not the presence of an error object, and why unknown codes are logged rather than guessed at |
+| `ConnectionError`, `Timeout` | `unreachable` | Powered off, rebooting, unplugged. None of it is our credentials' fault |
+| anything else | `other` | Changes nothing |
+
+`_grab()` raises `NotAJpeg` carrying the body, because **`min_bytes` (4096) is
+larger than a Reolink refusal (~140 bytes)**, so the size check fires first and
+the SOI check is never reached for the one shape that most needs recognising.
+
+The ladder, on `HttpCamera`, in memory: **two consecutive refusals, ten minutes
+of withheld fetches, one attempt, then one attempt every 31 minutes for ever.**
+Flat rather than escalating, because the observed lockout window is 30 minutes
+and one attempt per 31 cannot reach the "N failures inside a window" threshold
+that lockout policies are built from. The tick itself keeps running while
+fetches are withheld, so the day rollover and the cadence marker are unaffected
+and a back-off spanning midnight still starts the new day correctly. The
+intra-tick retry is suppressed for `auth`: it cannot succeed and does count
+against the camera's lockout. A success or **any change of class** ends the
+incident, so a camera alternating between refusing and unreachable never climbs
+to a verdict. A restart re-enters at step one, deliberately: a fresh process
+knows nothing and two attempts settle it again.
 
 **`RtspCamera(threading.Thread)`**: one per `method: "rtsp"` camera, for devices
 with no HTTP snapshot endpoint (e.g. TP-Link Tapo).
@@ -382,6 +421,35 @@ Three things the sinks do not share, and each is a trap in its own right:
   in `<pre>`. MarkdownV2 would mean escaping fourteen characters correctly
   everywhere, including inside camera names, where a miss is a 400 rather than
   a message that merely looks wrong. HTML mode needs three: `&`, `<`, `>`.
+
+**`--watch`: the credential watch (0.1.6).** A second entry point into this
+script, run from `timelapse-watch.timer` every five minutes. It reads
+`capture.json`, and for every camera whose `error` is a **confirmed** `auth`
+refusal it sends one notification, then one all-clear when the refusal ends.
+It exists in this file rather than in the capture daemon because that daemon
+has never made an outbound connection and the state file was built precisely so
+the thing that knows and the thing that sends could be separate processes.
+
+Five rules, four of which are about not lying:
+
+- **Once per incident.** Keyed on `error.since`, recorded in `notified.json`.
+  A camera refusing all day produces one message, not 288.
+- **Nothing delivered is not "already told them".** `notify()` returns
+  `(sent, failed)`; the record is only written when at least one sink accepted,
+  so a sink that was briefly unreachable does not swallow the single message
+  this whole feature exists to send.
+- **No sinks means no record either**, checked before anything is written.
+  Marking an incident as reported when there was nowhere to report it would
+  leave today's refusal permanently unannounced if a sink were added tomorrow.
+- **A stale heartbeat is not acted on**, in either direction. A file older than
+  `CAPTURE_STALE` (300s), or one whose `running` is false, describes a moment
+  that has passed: a stopped daemon is not a camera that recovered, and an
+  all-clear sent from that would be an invention.
+- **It logs to the journal only.** Its unit may write exactly one directory,
+  the state directory, so opening `encode.log` under `ProtectSystem=strict`
+  kills the process at startup with a read-only filesystem error. Found on real
+  systemd, not in a test, which is the second time that has been true of a
+  `ReadWritePaths` assumption in this release.
 
 **Severity, not colour.** Call sites pass `"ok"`, `"info"`, `"warn"` or
 `"error"`; each sink maps that to its own vocabulary (a Discord embed colour,
@@ -1187,6 +1255,23 @@ replaced on disk and keeps serving the old build while the installer reports
 success**: the bug this function exists to fix. The encoder is deliberately
 absent: it is oneshot, so a run in flight finishes on the code it started with.
 
+`timelapse-watch.service` is templated separately too, and **must be**: the
+loop that rewrites `ExecStart` matches any line mentioning `timelapse_encode.py`,
+which would silently strip the `--watch` flag and turn a five-minute timer into
+a five-minute encode run. Its `ReadWritePaths` is the state directory alone, on
+the same reasoning as the web UI's: it reads the capture heartbeat and writes
+one small file, and has no business near the frames or the videos. Verified
+under systemd, where a process with that unit's writable set gets
+`Read-only file system` on the frames, the videos and `/etc/timelapse`.
+
+`adopt_new_timers()` enables a timer that did not exist at the previous
+install. Without it a companion unit added in a later release would sit on disk,
+installed and inert, on every existing deployment: the wizard is skipped on an
+upgrade that answers "don't reconfigure", and `offer_enable()` only runs when
+the operator says yes to a question about capture. It is gated on
+`timelapse-encode.timer` already being enabled, which is what distinguishes a
+live install from a files-only one.
+
 Prompts read from `/dev/tty` for the same reason the wizard's do. `--uninstall`
 removes programs and units but never captured data.
 
@@ -1416,6 +1501,7 @@ take an optional path as their first positional argument. See
 | `min_free_gb` | 60 | `0` disables DiskGuard. |
 | `log_every_n_failures` | 60 | At 5s intervals, 60 = one log line per 5 minutes of downtime. |
 | `retry_within_tick` | true | One retry per tick when the budget allows. Set false for a camera that degrades under a second request. |
+| `notify_auth_failures` | true | Send one notification when a camera is confirmed to be refusing our credentials, and one when it recovers. Needs a configured sink; the back-off itself is unconditional. |
 
 ### `encode`
 | Key | Default | Notes |
@@ -1480,6 +1566,8 @@ is read with `.get(key, default)`.
 |---|---|
 | One camera unreachable | That thread logs (throttled) and keeps trying. Others unaffected. Nightly `Cov%` shows the gap. |
 | Camera returns non-JPEG / truncated | Frame rejected at capture; nothing written. |
+| Camera rejects our credentials | Classified `auth`. Two refusals, then fetches are withheld for 10 minutes, one attempt, then one every 31 minutes for ever, so this program never holds the camera's account locked. One notification, one all-clear. Other cameras unaffected. |
+| A camera's password is rotated without reconfiguring here | Same path. Before 0.1.6 the daemon presented the old credential every tick and the account stayed locked until capture stopped. |
 | Disk fills | DiskGuard pauses all capture at threshold, logs ERROR, resumes with hysteresis. |
 | Capture process crashes | systemd restarts after 15s. Frames already written are intact. |
 | Host down over midnight | `Persistent=true` runs the timer on boot; `find_pending` picks up every missed day. |
@@ -1846,13 +1934,13 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 795 lines
-scripts/timelapse_capture.py     daemon, 877 lines
-scripts/timelapse_encode.py      batch job, 1518 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 830 lines
-scripts/timelapse_setup.py       configuration wizard, 3166 lines
+install.sh                       bootstrap installer, 836 lines
+scripts/timelapse_capture.py     daemon, 1083 lines
+scripts/timelapse_encode.py      batch job, 1672 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 840 lines
+scripts/timelapse_setup.py       configuration wizard, 3167 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 3114 lines
+scripts/timelapse_web.py         read-only web UI, 3123 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
@@ -1866,6 +1954,8 @@ config/config.example.json       template; the real config.json is gitignored
 service/timelapse-capture.service
 service/timelapse-encode.service
 service/timelapse-encode.timer
+service/timelapse-watch.service   credential watch, oneshot
+service/timelapse-watch.timer     every 5 minutes
 service/timelapse-web.service
 docs/architecture.md             this file
 docs/install.md                  operator guide

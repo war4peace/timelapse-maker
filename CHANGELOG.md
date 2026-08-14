@@ -10,6 +10,55 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Fixed
+- **A camera that rejects our credentials is no longer hammered with them.**
+  The capture daemon presented the configured credential every
+  `interval_seconds`, for ever, whatever the camera answered. Firmware commonly
+  locks an account after a handful of failed authentications, so this renewed
+  the lock faster than it expired: rotate a camera's password without disabling
+  it here first, and the account stayed locked until the daemon was stopped.
+  Entering the correct password on the camera did not clear it, because this
+  program was still holding the door shut, and camera accounts are usually
+  shared with an NVR or another consumer, so the damage was not confined to
+  timelapse-maker.
+
+  Failed fetches are now classified as `auth`, `unreachable` or `other`, and
+  only a refusal changes anything. On one, the daemon tries once more, then
+  withholds fetches for ten minutes, tries a single time, and from then on
+  tries once every 31 minutes for ever. That last number is the observed
+  30-minute lockout window plus a margin: one attempt per 31 minutes cannot
+  reach the "N failures inside a window" threshold that lockout policies are
+  built from. Recovery is automatic and immediate, so fixing the password needs
+  no restart.
+
+  A refusal is only a refusal when the camera says so: HTTP 401 or 403, or a
+  Reolink `rspCode` of -6 or -7. The measured -9, "not support", arrives in the
+  identical 200-with-an-error-body shape and is an unknown *command* rather
+  than a rejection, so unrecognised codes are logged and treated as ordinary
+  failures. An unreachable camera never backs off, since retrying it costs
+  nothing and it should recover the instant it returns.
+
+### Added
+- **Optional notification when a camera is refusing our credentials**, and
+  another when it stops. This is the one camera fault an external uptime
+  monitor cannot see, because a monitor holds no credentials: the camera is up,
+  answering, and rejecting only us. One message per incident, one all-clear,
+  never a repeat; the message states what was observed rather than diagnosing,
+  because a camera that has locked the account rejects a *correct* password
+  too. Off if you have no notification sinks configured, and controlled by
+  `capture.notify_auth_failures` (default true) if you do.
+
+  It runs as a new `timelapse-watch.timer` every five minutes, reading the
+  capture heartbeat and sending through the existing sinks. The capture daemon
+  still makes no outbound connections of its own, which is what the runtime
+  state file was for. Existing installs pick the timer up automatically on
+  upgrade.
+
+- `capture.json` now carries a per-camera `error` object: the class, when it
+  started, how many ticks it has held, the camera's own words (redacted) and
+  whether the back-off has confirmed it. The web UI's overview uses it to say
+  "refusing our credentials" instead of leaving a camera merely silent.
+
+### Fixed
 - **A day whose frames are kept is no longer encoded again every night.**
   Nothing in the project recorded that a day had been encoded: deleting the
   frames *was* the record, and it works, which is why this went unnoticed for

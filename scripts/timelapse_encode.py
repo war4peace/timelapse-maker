@@ -1233,6 +1233,141 @@ def notify(cfg, title, description, level, fields):
     return sent, failed
 
 
+# ----------------------------------------------------------------------------
+# Credential watch
+#
+# The capture daemon publishes what it knows and never opens a socket. This
+# reads that file and does the talking, which keeps the thing that knows and
+# the thing that sends in separate processes: exactly what the state file
+# introduced in 0.1.6 was for. Run from a timer, every few minutes.
+#
+# It notifies once per incident and once when the incident ends. The incident's
+# identity is the `since` timestamp the daemon publishes, so "the same failure"
+# needs no definition of its own here.
+# ----------------------------------------------------------------------------
+
+WATCH_STATE = "notified.json"
+
+# A heartbeat older than this describes a moment that has passed. Neither an
+# alarm nor an all-clear may be sent from it: a stopped daemon is not a camera
+# that recovered, and a file from this morning is not evidence about now.
+CAPTURE_STALE = 300
+
+
+def read_capture_state(cfg):
+    """capture.json if it is fresh and the daemon is running, else None."""
+    path = state_dir(cfg) / CAPTURE_STATE
+    try:
+        with open(path, encoding="utf-8") as fh:
+            state = json.load(fh)
+    except (OSError, ValueError) as exc:
+        log.debug("no usable capture state at %s (%s)", path, exc)
+        return None
+    if not isinstance(state, dict) or not state.get("running"):
+        return None
+    age = time.time() - (state.get("updated_epoch") or 0)
+    if age > CAPTURE_STALE:
+        log.debug("capture state is %.0fs old; too old to act on", age)
+        return None
+    return state
+
+
+def load_notified(cfg):
+    """Which camera incidents have already been reported. {name: since}."""
+    try:
+        with open(state_dir(cfg) / WATCH_STATE, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data.get("incidents", {}) if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_notified(cfg, incidents):
+    path = state_dir(cfg) / WATCH_STATE
+    try:
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": STATE_VERSION, "incidents": incidents}, fh)
+        os.replace(tmp, path)
+        return True
+    except OSError as exc:
+        # Losing this file means the next run repeats a notification, which is
+        # a great deal better than the run failing.
+        log.warning("cannot record what was notified (%s); a repeat is "
+                    "possible on the next check", exc)
+        return False
+
+
+def refusal_fields(cam, err):
+    return [
+        ("Camera", cam.get("name", "?")),
+        ("Since", err.get("since") or "?"),
+        ("Camera said", err.get("detail") or "-"),
+        ("Next attempt", err.get("quiet_until") or "-"),
+    ]
+
+
+def watch_credentials(cfg):
+    """Notify about cameras that are refusing our credentials. Returns a count.
+
+    Only `confirmed` refusals: the daemon reaches that verdict after two
+    refusals, ten minutes of silence and one more attempt, so anything short of
+    it is still a camera that might merely have been rebooting.
+    """
+    if not cfg.get("capture", {}).get("notify_auth_failures", True):
+        return 0
+    # Before anything is recorded, not after. Marking an incident as reported
+    # when there was nowhere to report it would mean that configuring a sink
+    # tomorrow leaves today's refusal permanently unannounced.
+    if not notify_sinks(cfg):
+        return 0
+    state = read_capture_state(cfg)
+    if state is None:
+        return 0
+
+    known = load_notified(cfg)
+    changed = 0
+    for cam in state.get("cameras", []):
+        name = cam.get("name")
+        if not name:
+            continue
+        err = cam.get("error") or {}
+        refusing = err.get("class") == "auth" and err.get("confirmed")
+        since = err.get("since") if refusing else None
+
+        if refusing and known.get(name) != since:
+            # The observation, never the diagnosis. A camera that has locked
+            # the account refuses a correct password too, so "your password is
+            # wrong" would be false exactly when it is least welcome.
+            sent, _failed = notify(
+                cfg, "⚠️ Timelapse - camera refused our credentials",
+                f"{name} has been rejecting our credentials since "
+                f"{err.get('since')}. Capture from it is paused apart from "
+                f"an occasional retry, so this program is not holding the "
+                f"camera's account locked. Other cameras are unaffected.",
+                "error", refusal_fields(cam, err))
+            # Nothing delivered is not "already told them". The next tick is
+            # minutes away, and a sink that was briefly unreachable must not
+            # swallow the single message this whole feature exists to send.
+            if not sent:
+                continue
+            known[name] = since
+            changed += 1
+        elif not refusing and known.get(name):
+            sent, _failed = notify(
+                cfg, "✅ Timelapse - camera credentials accepted again",
+                f"{name} is answering again; normal capture has resumed.",
+                "ok", [("Camera", name)])
+            if not sent:
+                continue
+            known.pop(name, None)
+            changed += 1
+
+    if changed:
+        save_notified(cfg, known)
+    return changed
+
+
 def send_discord(cfg, title, description, color, fields):
     """Backwards-compatible shim: colour in, level out.
 
@@ -1369,10 +1504,29 @@ def main():
     ap.add_argument("--no-transfer", action="store_true")
     ap.add_argument("--force", action="store_true",
                     help="re-encode days that are already marked encoded")
+    ap.add_argument("--watch", action="store_true",
+                    help="check capture state for cameras refusing our "
+                         "credentials, notify, and exit (run from a timer)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
-    setup_logging(cfg["paths"].get("log_dir"))
+    # The watch runs from a timer every few minutes and logs to the journal
+    # only. Two reasons, and the first one is fatal rather than aesthetic: its
+    # unit may write exactly one directory, the state directory, so opening
+    # encode.log under ProtectSystem=strict kills the process at startup with
+    # a read-only filesystem error. Verified on real systemd. The second is
+    # that 288 heartbeat entries a day do not belong in the encoder's log.
+    setup_logging(None if args.watch else cfg["paths"].get("log_dir"))
+
+    if args.watch:
+        # Deliberately silent when there is nothing to say: this runs every few
+        # minutes, and a line per run would bury the nightly encode in its own
+        # log within a week.
+        changed = watch_credentials(cfg)
+        if changed:
+            log.info("Credential watch: %d camera state change(s) reported.",
+                     changed)
+        return 0
 
     run_start = time.time()
     frames_root = Path(cfg["paths"]["frames_root"])

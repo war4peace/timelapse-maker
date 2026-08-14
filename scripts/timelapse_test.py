@@ -108,8 +108,18 @@ def test_http(cam, cfg):
 
     data = r.content
     if data[:2] != b"\xff\xd8":
-        head = data[:80].decode(errors="replace").replace("\n", " ")
-        bad(f"{name}: 200 OK but not a JPEG. First bytes: {head!r}")
+        # The wizard has explained this shape since 0.0.1 and this check did
+        # not, so the same Reolink refusal read as helpful advice in one place
+        # and as raw bytes in the other. One implementation, both callers.
+        from timelapse_setup import explain_payload
+        head, reason = explain_payload(data)
+        if reason:
+            bad(f"{name}: 200 OK but not a JPEG. The camera said: {reason}")
+            info("Usually an authentication or permission error rather than a "
+                 "wrong URL: check the username, the password, and that the "
+                 "account may take snapshots.")
+        else:
+            bad(f"{name}: 200 OK but not a JPEG. First bytes: {head!r}")
         return None
 
     OUT.mkdir(parents=True, exist_ok=True)

@@ -254,6 +254,15 @@ budget.
 - **Reolink-style URLs** put credentials in the query string, so they need
   `"auth": "none"`. URL-encode any `&`, `#`, `+` or `%` in the password, or the
   URL silently parses wrong.
+- **You changed a camera's password**: change it here too, with
+  `timelapse config` or `timelapse cameras`. Since 0.1.6 the daemon stops
+  presenting a rejected credential rather than repeating it every few seconds,
+  which is what used to hold the camera's account locked; it retries about
+  every half hour, so capture resumes on its own once the config is right, with
+  no restart needed. If you have notifications configured you get told when
+  this starts and when it clears. Note that a camera which has already locked
+  the account will refuse a **correct** password too, until its lockout
+  expires: that is the camera's timer, not this program's.
 - **A camera that passes one test fetch but fails in service**: some cameras
   cope badly with sustained polling. Watch the first hour:
   `grep <Camera> <log_dir>/capture.log`. Raising `interval_seconds` usually
@@ -290,10 +299,13 @@ budget.
 ```bash
 sudo cp service/timelapse-capture.service \
         service/timelapse-encode.service \
-        service/timelapse-encode.timer /etc/systemd/system/
+        service/timelapse-encode.timer \
+        service/timelapse-watch.service \
+        service/timelapse-watch.timer /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now timelapse-capture.service
 sudo systemctl enable --now timelapse-encode.timer
+sudo systemctl enable --now timelapse-watch.timer
 
 journalctl -u timelapse-capture -f
 ```
@@ -451,7 +463,7 @@ of it; nothing needs a reinstall.
 
 | Command | What it does |
 |---|---|
-| `timelapse status` | `systemctl status` for all four units in one shot: capture, the encode timer **and the encode service**, and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
+| `timelapse status` | `systemctl status` for every unit in one shot: capture, the encode timer **and the encode service**, the credential watch timer, and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
 | `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and every notification sink. Run it after any change. |
