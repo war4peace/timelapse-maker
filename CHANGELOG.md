@@ -26,6 +26,13 @@ While the version is `0.x`, the configuration format may change in any release.
   of "supervised by ffmpeg", and the failure column is left empty when there is
   nothing wrong rather than saying "0 failed" on every healthy row.
 
+### Fixed
+- **The credential watch row now says when it next runs.** It read "Scheduled"
+  with an empty Detail, which looked like something was wrong with it. It runs
+  on a five-minute interval rather than at a fixed time of day, and systemd
+  reports those two kinds of schedule in different places; only one of them was
+  being read. Timer rows also say when they last ran.
+
 ## [0.1.7] - 2026-08-14
 
 ### Added

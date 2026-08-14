@@ -1252,6 +1252,23 @@ deliberate price of dropping a tab.
     exists to answer is whether last night's encode worked. A failed run does
     not reach here (systemd leaves it `failed`), but the green line is
     conditioned on `Result` anyway rather than on the timestamp alone.
+  - **A timer's next run lives in one of two properties, and which one depends
+    on how it is scheduled** (0.1.8). A calendar timer (`OnCalendar`, the
+    nightly encode) fills `NextElapseUSecRealtime` with a timestamp. A
+    monotonic one (`OnBootSec`/`OnUnitActiveSec`, the credential watch) leaves
+    that **empty** and answers in `NextElapseUSecMonotonic` as a timespan
+    since boot, e.g. `5min 1.016502s`. Reading only the realtime property left
+    the credential watch row saying "Scheduled" with an empty Detail, which an
+    operator reasonably read as something being wrong with it; reported
+    2026-08-14. `next_run_detail()` reads both and renders "next run in 4m",
+    and `LastTriggerUSec` is appended when the timer has ever fired, because
+    that is the half that proves it works. Three notes: the timespan format is
+    documented in systemd.time(7), which is what makes parsing it safe where
+    parsing `systemctl status` is not; `infinity` means the timer will not
+    fire again and is said in words rather than treated as a duration; and the
+    subtraction against `time.monotonic()` is exact because both are
+    `CLOCK_MONOTONIC` on Linux. **No timer row may ever have an empty Detail**,
+    and a test pins that as the invariant rather than as one case.
   - **Rows are matched by `Id`, never by position.** A block that does not come
     back would otherwise shift every later unit onto the wrong row.
   The one state that looks healthy and is not gets called out: enabled=no

@@ -841,7 +841,13 @@ STATUS_UNITS = (
 # whether capture is running.
 STATUS_PROPS = ("Id", "LoadState", "ActiveState", "SubState", "UnitFileState",
                 "ActiveEnterTimestamp", "InactiveEnterTimestamp",
-                "InactiveExitTimestamp", "Result", "NextElapseUSecRealtime")
+                "InactiveExitTimestamp", "Result", "NextElapseUSecRealtime",
+                # A monotonic timer (OnBootSec/OnUnitActiveSec, which is what
+                # the credential watch uses) leaves NextElapseUSecRealtime
+                # empty and reports here instead. Reading only the realtime
+                # one left that row with a blank Detail, which reads as though
+                # something were wrong with it.
+                "NextElapseUSecMonotonic", "LastTriggerUSec")
 
 # Request values pick a key; the *value* is what reaches the command line. No
 # string from a request is ever interpolated into an argv, so there is no
@@ -1173,9 +1179,14 @@ def describe_unit(label, kind, props, name):
             when = props.get("ActiveEnterTimestamp", "")
             return (label, "", "Finished", f"ran at {when}" if when else "")
         if kind == "timer":
-            nxt = props.get("NextElapseUSecRealtime", "")
-            return (label, "ok", "Scheduled",
-                    f"next run {nxt}" if nxt else "")
+            detail = next_run_detail(props)
+            last = (props.get("LastTriggerUSec") or "").strip()
+            if last:
+                # A repeating timer's last run is as reassuring as its next
+                # one, and it is the half that proves it has ever worked.
+                detail = f"{detail}; last ran {last}" if detail \
+                    else f"last ran {last}"
+            return (label, "ok", "Scheduled", detail)
         detail = ""
         since = props.get("ActiveEnterTimestamp", "")
         if since:
@@ -1435,6 +1446,67 @@ def human_age(seconds):
     if seconds < 86400:
         return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
     return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+
+# systemd prints a monotonic timestamp as a timespan since boot, e.g.
+# "5min 1.016502s" or "1h 2min 3s". Documented in systemd.time(7), which is
+# what makes this safe to parse where `systemctl status` output is not.
+TIMESPAN_UNITS = {
+    "us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3,
+    "s": 1, "sec": 1, "second": 1, "seconds": 1,
+    "min": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "week": 604800, "weeks": 604800,
+}
+TIMESPAN_TOKEN = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]+)")
+
+
+def parse_timespan(text):
+    """A systemd timespan to seconds, or None if it says nothing useful.
+
+    None for "infinity" as well as for junk: a timer whose next elapse is
+    infinity will not fire again, which is a real answer but not a duration,
+    and the caller says so in words.
+    """
+    text = (text or "").strip().lower()
+    if not text or text == "infinity":
+        return None
+    total = 0.0
+    matched = 0
+    for value, unit in TIMESPAN_TOKEN.findall(text):
+        if unit in TIMESPAN_UNITS:
+            total += float(value) * TIMESPAN_UNITS[unit]
+            matched += 1
+    return total if matched else None
+
+
+def next_run_detail(props, now_monotonic=None):
+    """When a timer fires next, in whichever form systemd offers it.
+
+    A calendar timer (`OnCalendar`, the nightly encode) answers with a real
+    timestamp. A monotonic one (`OnBootSec`/`OnUnitActiveSec`, the credential
+    watch) answers with a span since boot and leaves the realtime property
+    empty, so a reader of only that saw an empty cell and reasonably wondered
+    whether the unit was broken. Reported by the operator 2026-08-14.
+    """
+    stamp = (props.get("NextElapseUSecRealtime") or "").strip()
+    if stamp:
+        return f"next run {stamp}"
+
+    raw = (props.get("NextElapseUSecMonotonic") or "").strip()
+    if raw.lower() == "infinity":
+        return "no further runs scheduled"
+    since_boot = parse_timespan(raw)
+    if since_boot is None:
+        return ""
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    left = since_boot - now
+    # Both properties are CLOCK_MONOTONIC on Linux, so this subtraction is
+    # exact. A tiny negative is a timer about to fire, not an error.
+    if left <= 1:
+        return "due now"
+    return f"next run in {human_age(left)}"
 
 
 def journal_report(unit_key, lines_key):

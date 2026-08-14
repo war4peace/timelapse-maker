@@ -521,6 +521,56 @@ class TestUnitStates(unittest.TestCase):
         self.assertEqual(row[1:3], ("ok", "Scheduled"))
         self.assertIn("next run Wed 2026-08-12 00:05:00", row[3])
 
+    def test_a_monotonic_timer_shows_its_next_run_too(self):
+        """The credential watch fires on OnBootSec/OnUnitActiveSec, so
+        systemd leaves NextElapseUSecRealtime empty and answers in a timespan
+        since boot instead. Reading only the realtime property left that row
+        with an empty Detail, which reads as though the unit were broken.
+        These are the exact strings systemd 255 produced, measured
+        2026-08-14."""
+        with mock.patch.object(web.time, "monotonic", return_value=15.463836):
+            row = self.rows(self.show(self.daemon(
+                "timelapse-watch.timer",
+                NextElapseUSecRealtime="",
+                NextElapseUSecMonotonic="5min 1.016502s",
+            )))["Credential watch"]
+        self.assertEqual(row[1:3], ("ok", "Scheduled"))
+        self.assertIn("next run in 4m", row[3])
+
+    def test_a_timer_that_has_run_says_when(self):
+        row = self.rows(self.show(self.daemon(
+            "timelapse-watch.timer",
+            NextElapseUSecMonotonic="infinity",
+            LastTriggerUSec="Fri 2026-08-14 22:50:12 EEST",
+        )))["Credential watch"]
+        self.assertIn("last ran Fri 2026-08-14 22:50:12", row[3])
+
+    def test_a_timer_that_will_never_fire_again_says_that(self):
+        row = self.rows(self.show(self.daemon(
+            "timelapse-watch.timer",
+            NextElapseUSecMonotonic="infinity")))["Credential watch"]
+        self.assertEqual(row[3], "no further runs scheduled")
+
+    def test_a_timer_about_to_fire_says_due_now(self):
+        with mock.patch.object(web.time, "monotonic", return_value=301.0):
+            row = self.rows(self.show(self.daemon(
+                "timelapse-watch.timer",
+                NextElapseUSecMonotonic="5min 1.016502s")))["Credential watch"]
+        self.assertEqual(row[3], "due now")
+
+    def test_no_timer_row_is_ever_left_with_an_empty_detail(self):
+        # The defect this fixes, stated as the invariant rather than as one
+        # case: whatever systemd says, a scheduled timer explains itself.
+        for props in ({"NextElapseUSecRealtime": "Wed 2026-08-12 00:05 EEST"},
+                      {"NextElapseUSecMonotonic": "5min 1.016502s"},
+                      {"NextElapseUSecMonotonic": "infinity"},
+                      {"LastTriggerUSec": "Fri 2026-08-14 22:50:12 EEST"}):
+            row = self.rows(self.show(
+                self.daemon("timelapse-watch.timer", **props)
+            ))["Credential watch"]
+            self.assertTrue(row[3], f"empty Detail for {props}")
+
+
     def test_a_unit_that_is_not_installed_says_so(self):
         row = self.rows(self.show(self.daemon(
             LoadState="not-found", ActiveState="inactive")))["Capture"]
@@ -618,6 +668,33 @@ class TestUnitStates(unittest.TestCase):
             rows, problem = web.unit_states()
         self.assertEqual(rows, [])
         self.assertIn("not installed", problem)
+
+
+class TestTimespanParsing(unittest.TestCase):
+    """systemd's timespan format, from systemd.time(7). Parsed rather than
+    guessed at because it is documented, which `systemctl status` output is
+    not."""
+
+    def test_the_measured_shape(self):
+        self.assertAlmostEqual(web.parse_timespan("5min 1.016502s"),
+                               301.016502, places=5)
+
+    def test_compound_units(self):
+        self.assertEqual(web.parse_timespan("1h 2min 3s"), 3723)
+        self.assertEqual(web.parse_timespan("2d 4h"), 187200)
+
+    def test_a_bare_number_of_seconds(self):
+        self.assertEqual(web.parse_timespan("90s"), 90)
+
+    def test_sub_second_units(self):
+        self.assertAlmostEqual(web.parse_timespan("250ms"), 0.25)
+
+    def test_infinity_and_junk_are_no_answer(self):
+        self.assertIsNone(web.parse_timespan("infinity"))
+        self.assertIsNone(web.parse_timespan(""))
+        self.assertIsNone(web.parse_timespan(None))
+        self.assertIsNone(web.parse_timespan("0"))
+        self.assertIsNone(web.parse_timespan("whenever"))
 
 
 class TestStatusRoutes(unittest.TestCase):
