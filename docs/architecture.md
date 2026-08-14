@@ -1264,13 +1264,27 @@ one small file, and has no business near the frames or the videos. Verified
 under systemd, where a process with that unit's writable set gets
 `Read-only file system` on the frames, the videos and `/etc/timelapse`.
 
-`adopt_new_timers()` enables a timer that did not exist at the previous
-install. Without it a companion unit added in a later release would sit on disk,
-installed and inert, on every existing deployment: the wizard is skipped on an
-upgrade that answers "don't reconfigure", and `offer_enable()` only runs when
-the operator says yes to a question about capture. It is gated on
-`timelapse-encode.timer` already being enabled, which is what distinguishes a
-live install from a files-only one.
+**An upgrade asks nothing, and changes nothing about what runs.**
+`snapshot_services()` records, before any file is written, which of the four
+managed units are present, enabled and active; `restore_services()` puts that
+back afterwards and prints one line each. The four questions this replaced
+(reconfigure, run the pre-flight, enable capture, enable the web UI) were all
+answerable from the system itself, and asking them made `timelapse update`
+interactive at the moment an operator most wants it to be boring.
+
+Three parts of that are load-bearing. The snapshot must run **before**
+`install_units()` and `sync_units()`, which rewrite what it reads. The restart
+of a live daemon is no longer offered as a choice, because declining left the
+old build serving while every version number said otherwise. And a unit that
+was not present before is adopted **only if it is a timer**: a companion timer
+added in a later release would otherwise sit installed and inert on every
+existing deployment, while a new *service* switched on by an upgrade would
+override a deliberate decision, which is exactly what keeps the opt-in web UI
+opt-in.
+
+A unit that was active before and is not active after is reported as an error
+with its `journalctl` line, since that is the one upgrade outcome worth
+interrupting anybody for, and it used to be reported as success.
 
 Prompts read from `/dev/tty` for the same reason the wizard's do. `--uninstall`
 removes programs and units but never captured data.
@@ -1763,7 +1777,7 @@ changes:
   `/healthz`, 404 on unknown routes, no interpreter version in the `Server`
   header; clean SIGTERM shutdown; `systemd-analyze verify` clean; and the full
   install → re-install → uninstall cycle including `sync_units()` leaving the
-  web unit without a `ReadWritePaths` line and `restart_upgraded_services()`
+  web unit without a `ReadWritePaths` line and `restore_services()`
   picking the live unit up.
 - **Late mount**: same host, all three shapes. A library that vanishes
   entirely leaves the index intact, says it is waiting, and **picks the

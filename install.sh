@@ -563,31 +563,18 @@ sync_units() {
     note "Web index dir=$webrw"
 }
 
-# A unit that did not exist at the last install is enabled by nobody: the
-# wizard is skipped on an upgrade that answers "don't reconfigure", and
-# `enable --now` in offer_enable only runs when the operator says yes to a
-# question about capture. So a companion timer added in a later release would
-# sit on disk, installed and inert, on every existing deployment. Anything
-# introduced alongside an already-enabled unit has to be adopted here.
-adopt_new_timers() {
-    [ -d /run/systemd/system ] || return 0
-    systemctl is-enabled --quiet timelapse-encode.timer 2>/dev/null || return 0
-    if ! systemctl is-enabled --quiet timelapse-watch.timer 2>/dev/null; then
-        systemctl enable --now timelapse-watch.timer >/dev/null 2>&1 \
-            && ok "Credential watch timer enabled." \
-            || warn "Could not enable timelapse-watch.timer; enable it by hand."
-    fi
-}
-
 run_wizard() {
     step "Configuration"
+    # An upgrade never reconfigures. It used to ask, and the answer was "no"
+    # essentially every time: reconfiguring is a separate job with its own
+    # commands, and walking the whole wizard is a strange thing to be offered
+    # by something you ran to get a bug fix. New keys arrive with defaults, so
+    # an untouched config keeps working.
     if [ -f "$CONFIG" ]; then
-        note "An existing config was found at $CONFIG"
-        if ! ask_yn "Reconfigure it?" n; then
-            note "Keeping the existing configuration."
-            sync_units
-            return
-        fi
+        note "Keeping the existing configuration at $CONFIG"
+        note "To change it:  timelapse setup   (or: timelapse config)"
+        sync_units
+        return
     fi
     local wizard_args=(--output "$CONFIG"
                        --template "$CONFDIR/config.example.json"
@@ -598,6 +585,65 @@ run_wizard() {
     chown "root:$SVCUSER" "$CONFIG" 2>/dev/null || true
     chmod 0640 "$CONFIG" 2>/dev/null || true
     sync_units
+}
+
+# ---------------------------------------------------------------------------
+# Service state across an upgrade
+#
+# An upgrade must not change what is running. This used to be settled by asking
+# four questions (reconfigure, run the pre-flight, enable capture, enable the
+# web UI) and every one of those answers was already knowable from the system
+# itself: whatever was enabled stays enabled, whatever was running stays
+# running, and whatever was off stays off. Asking also made `timelapse update`
+# interactive at exactly the moment an operator wants it to be boring.
+#
+# Captured BEFORE anything is written, because install_units() and sync_units()
+# both rewrite the files this reads.
+# ---------------------------------------------------------------------------
+
+MANAGED_UNITS=(timelapse-capture.service timelapse-encode.timer
+               timelapse-watch.timer timelapse-web.service)
+
+IS_UPGRADE=0
+UNITS_ENABLED_BEFORE=" "
+UNITS_ACTIVE_BEFORE=" "
+UNITS_PRESENT_BEFORE=" "
+
+snapshot_services() {
+    # An existing config is what makes this an upgrade rather than a first
+    # install: it is the same signal the wizard has always used, and it is true
+    # before any of our own files are written.
+    if [ -f "$CONFIG" ]; then
+        IS_UPGRADE=1
+    fi
+    [ -d /run/systemd/system ] || return 0
+
+    # `if` blocks throughout, never `test && VAR+=...`: under `set -e` an
+    # AND-list whose first command fails takes the list's status with it, so a
+    # single stopped unit would abort the installer here.
+    local unit
+    for unit in "${MANAGED_UNITS[@]}"; do
+        if [ -f "$UNITDIR/$unit" ]; then
+            UNITS_PRESENT_BEFORE="$UNITS_PRESENT_BEFORE$unit "
+        fi
+        if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+            UNITS_ENABLED_BEFORE="$UNITS_ENABLED_BEFORE$unit "
+        fi
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            UNITS_ACTIVE_BEFORE="$UNITS_ACTIVE_BEFORE$unit "
+        fi
+    done
+    return 0
+}
+
+# Substring match on a space-delimited list. Associative arrays would read
+# better and would need bash 4, which is one more thing to be wrong about on a
+# distro nobody here has tried.
+was_in() {
+    case "$1" in
+        *" $2 "*) return 0 ;;
+    esac
+    return 1
 }
 
 # A daemon keeps executing the code it read at startup, so replacing the files
@@ -614,49 +660,112 @@ run_wizard() {
 # finishes on the code it started with and the next trigger picks up the new.
 RESTART_UNITS=(timelapse-capture.service timelapse-web.service)
 
-restart_upgraded_services() {
+restore_services() {
     [ -d /run/systemd/system ] || return 0
+    step "Services"
 
-    # `if`, not `cmd && live+=(...)`: under `set -e` an AND-list whose first
-    # command fails takes the list's exit status with it, so a stopped unit
-    # would abort the installer here.
-    local live=() unit
+    local unit
+
+    # Restart what was running, so it executes the build just installed. Not
+    # offered as a choice: the operator asked for this version, and declining
+    # leaves the old one serving while every version number says otherwise. It
+    # costs the frames due during the restart, a second or two.
     for unit in "${RESTART_UNITS[@]}"; do
-        if systemctl is-active --quiet "$unit"; then
-            live+=("$unit")
+        if was_in "$UNITS_ACTIVE_BEFORE" "$unit"; then
+            systemctl restart "$unit" >/dev/null 2>&1 || true
         fi
     done
-    if [ ${#live[@]} -eq 0 ]; then
-        return 0
-    fi
+    sleep 2
 
-    step "Restart"
-    note "Still running the previously installed build: ${live[*]}"
-    if ! ask_yn "Restart so this version takes effect?" y; then
-        warn "Still running the old build."
-        note "Apply it later with: systemctl restart ${live[*]}"
-        return 0
-    fi
+    for unit in "${MANAGED_UNITS[@]}"; do
+        [ -f "$UNITDIR/$unit" ] || continue
 
-    # Restarting capture costs only the frames due during the restart - a
-    # second or two.
-    for unit in "${live[@]}"; do
-        if systemctl restart "$unit"; then
-            sleep 2
-            if systemctl is-active --quiet "$unit"; then
-                ok "$unit restarted on this version."
-            else
-                err "$unit did not come back up."
-                note "See: journalctl -u ${unit%.service} -n 40"
+        if was_in "$UNITS_ENABLED_BEFORE" "$unit"; then
+            if ! systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+                systemctl enable "$unit" >/dev/null 2>&1 || true
             fi
-        else
-            err "$unit restart failed. See: journalctl -u ${unit%.service} -n 40"
         fi
+        if was_in "$UNITS_ACTIVE_BEFORE" "$unit"; then
+            if ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+                systemctl start "$unit" >/dev/null 2>&1 || true
+            fi
+        fi
+
+        # A unit this release introduced has no earlier state to restore, so it
+        # follows the deployment as a whole: a live install adopts it, a
+        # files-only one does not. Timers only. A *service* that was never
+        # present must not be switched on by an upgrade, and the web UI in
+        # particular is opt-in through the config rather than through here.
+        case "$unit" in
+            *.timer)
+                if ! was_in "$UNITS_PRESENT_BEFORE" "$unit" \
+                   && was_in "$UNITS_ENABLED_BEFORE" "timelapse-capture.service"; then
+                    systemctl enable --now "$unit" >/dev/null 2>&1 || true
+                fi ;;
+        esac
+
+        report_unit "$unit"
     done
     return 0
 }
 
+# One line per unit: what it is doing now, and whether that is what it was
+# doing before. The second half is the point. An upgrade that quietly leaves
+# capture stopped is the worst outcome this script has, and it used to be
+# reported as success.
+report_unit() {
+    local unit="$1" enabled active
+    # `systemctl is-enabled` PRINTS the state and exits non-zero for anything
+    # that is not enabled, so the obvious `|| echo disabled` appends a second
+    # word and the line comes out as "disabled\ndisabled". Take the output when
+    # there is any, and only substitute when there is none (an unknown unit).
+    enabled="$(systemctl is-enabled "$unit" 2>/dev/null)" || true
+    active="$(systemctl is-active "$unit" 2>/dev/null)" || true
+    [ -n "$enabled" ] || enabled="disabled"
+    [ -n "$active" ] || active="inactive"
+
+    case "$active" in
+        active)   active="running" ;;
+        inactive) active="stopped" ;;
+    esac
+    # A timer sitting between firings is idle, not broken, and a oneshot's
+    # timer is the thing to look at anyway.
+    case "$unit" in
+        *.timer) [ "$active" = "running" ] && active="waiting" ;;
+    esac
+
+    if was_in "$UNITS_ACTIVE_BEFORE" "$unit" \
+       && ! systemctl is-active --quiet "$unit" 2>/dev/null; then
+        err "$(printf '%-30s %s, %s - it was running before this upgrade' \
+                "$unit" "$enabled" "$active")"
+        note "See: journalctl -u ${unit%.*} -n 40"
+        return 0
+    fi
+    if [ "$enabled" = "enabled" ]; then
+        ok "$(printf '%-30s %s, %s' "$unit" "$enabled" "$active")"
+    else
+        # Six spaces so the unit names line up under the "OK" rows: ok() emits
+        # a six-character status column that note() does not have.
+        note "$(printf '%6s%-30s %s, %s' "" "$unit" "$enabled" "$active")"
+    fi
+    return 0
+}
+
 offer_enable() {
+    # On an upgrade the services have already been put back exactly as they
+    # were found, so there is nothing to offer: the pre-flight, enabling
+    # capture and enabling the web UI are all decisions that were made once,
+    # already, and re-asking them every release is how a two-minute update
+    # turns into a five-question interview.
+    if [ "$IS_UPGRADE" = "1" ]; then
+        step "Next steps"
+        say "Nothing to do; the services are as you left them."
+        say "Check the cameras any time with:  timelapse test"
+        printf '\n'
+        say "${B}timelapse${N} status | logs | test | usage | encode | config | cameras | transfer | web | update"
+        return
+    fi
+
     step "Next steps"
     if [ ! -f "$CONFIG" ]; then
         say "1. Configure:   timelapse setup"
@@ -822,13 +931,16 @@ BANNER
         return 0
     fi
 
+    # Before install_deps: everything after this point rewrites the very files
+    # and unit states it reads, and an upgrade has to be able to put them back.
+    snapshot_services
+
     install_deps
     obtain_source
     install_files
     install_units
     [ "$RUN_WIZARD" = "1" ] && run_wizard
-    restart_upgraded_services       # after sync_units, before the pre-flight
-    adopt_new_timers                # units added by this release, on upgrades
+    restore_services                # after sync_units, so units are current
     offer_enable
     printf '\n'
 }

@@ -86,23 +86,40 @@ What it does and does not touch:
 
 | | On upgrade |
 |---|---|
-| `config.json` | **Kept.** You are asked "Reconfigure it?" and the default is *no*. |
+| `config.json` | **Kept, and not asked about.** Reconfiguring is a separate job: `timelapse setup` or `timelapse config`. |
 | `config.example.json` | Replaced, so you can diff it for new keys. |
 | Scripts and units | Replaced, then `ReadWritePaths` is re-derived from your config. |
 | Captured frames and videos | Never touched. |
-| A running capture daemon | Restarted, after asking; see below. |
+| Which services run | **Exactly as you left them.** Enabled stays enabled, running stays running, and anything you had switched off stays off. |
+| A running capture daemon | Restarted onto the new build; see below. |
 | An encode already in flight | Left alone. It is oneshot, so it finishes on the build it started with and the next nightly trigger uses the new one. |
+| A unit new in this release | Adopted only if it is a timer and the install is live. A new *service* is never switched on for you, which is what keeps the web UI opt-in. |
 
-**Why the restart prompt matters.** A running daemon keeps executing the code it
-read at startup, and `systemctl enable --now` does nothing to an already-active
-unit. Say no and you keep running the old build with the new one sitting unused
-on disk. Apply it later with:
+**An upgrade asks nothing.** It records what is enabled and what is running
+before it touches anything, and puts that back afterwards, then prints one line
+per unit so you can see it did. There is no "reconfigure?", no "run the
+pre-flight?", no "enable capture?" and no "enable the web UI?": every one of
+those was a decision you had already made, and the installer can read it off the
+system instead of asking you again.
 
-```bash
-sudo systemctl restart timelapse-capture.service
+```
+── Services ───────────────────────────────────────────────
+  OK    timelapse-capture.service      enabled, running
+  OK    timelapse-encode.timer         enabled, waiting
+  OK    timelapse-watch.timer          enabled, waiting
+        timelapse-web.service          disabled, stopped
 ```
 
-A restart costs only the frames due while it happens: a second or two.
+A unit that was running before and is not running after is reported as an
+error, with the `journalctl` line to look at. That is the one outcome worth
+interrupting you for, and it used to be reported as success.
+
+**The restart is not optional.** A running daemon keeps executing the code it
+read at startup, and `systemctl enable --now` does nothing to an already-active
+unit, so declining would leave the old build serving while every version number
+claimed otherwise. It costs only the frames due while it happens, a second or
+two. If you want to avoid even that, stop capture before upgrading: it will
+still be enabled and stopped afterwards, exactly as you left it.
 
 **New config keys** are read with defaults, so an older `config.json` keeps
 working; you get the new behaviour without editing anything. Re-run

@@ -2313,10 +2313,35 @@ class TestWatchUnitWiring(unittest.TestCase):
 
     def test_new_timers_are_adopted_on_upgrade(self):
         # A unit that did not exist at the previous install is enabled by
-        # nobody: the wizard is skipped when an upgrade says "don't
-        # reconfigure", and offer_enable only runs on a fresh setup.
-        self.assertIn("adopt_new_timers", self.installer)
-        self.assertIn("enable --now timelapse-watch.timer", self.installer)
+        # nobody, because an upgrade skips the wizard and offer_enable returns
+        # early. restore_services() adopts it by noticing it was not present
+        # before, and only for timers: a *service* that was never installed
+        # must not be switched on by an upgrade, which is what keeps the
+        # opt-in web UI opt-in.
+        self.assertIn("UNITS_PRESENT_BEFORE", self.installer)
+        self.assertIn("*.timer)", self.installer)
+
+    def test_an_upgrade_asks_nothing(self):
+        # Verified live in WSL, where an upgrade of a fully enabled install
+        # printed zero prompts. This pins the three that were removed, since
+        # each one would silently take its default under `curl | bash` and so
+        # would not fail loudly if it came back.
+        for gone in ("Reconfigure it?",
+                     "Restart so this version takes effect?"):
+            self.assertNotIn(gone, self.installer)
+        # These two survive, for a *fresh* install only, behind the early
+        # return in offer_enable.
+        self.assertIn('if [ "$IS_UPGRADE" = "1" ]; then', self.installer)
+        self.assertIn("Run the pre-flight check now?", self.installer)
+
+    def test_service_state_is_captured_before_anything_is_written(self):
+        # install_units() and sync_units() both rewrite what the snapshot
+        # reads, so ordering is the whole correctness argument here.
+        body = self.installer.split("main() {")[1]
+        snap = body.index("snapshot_services")
+        self.assertLess(snap, body.index("install_units"))
+        self.assertLess(snap, body.index("run_wizard"))
+        self.assertLess(body.index("restore_services"), body.index("offer_enable"))
 
     def test_the_timer_does_not_catch_up_missed_runs(self):
         timer = (self.repo / "service" / "timelapse-watch.timer"

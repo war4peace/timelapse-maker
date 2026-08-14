@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [Unreleased]
+
+### Changed
+- **Upgrading no longer asks four questions.** Re-running the installer, or
+  `sudo timelapse update`, used to ask whether to reconfigure, whether to run
+  the pre-flight, whether to enable capture and the nightly encode, and whether
+  to enable the web UI. Every one of those was a decision already made, and
+  visible to the installer: it now records which units are enabled and which
+  are running *before* it touches anything, and puts exactly that back
+  afterwards.
+
+  What was enabled stays enabled, what was running stays running, and anything
+  deliberately switched off stays off. One line per unit is printed so you can
+  see it happened, and a unit that was running before and is not running after
+  is reported as an error rather than passing as success. Reconfiguring is a
+  separate job with its own commands (`timelapse setup`, `timelapse config`),
+  and the pre-flight is still there as `timelapse test`.
+
+  A first install is unchanged: the wizard runs, and it still offers the
+  pre-flight and the services at the end.
+
+  The restart of a running daemon is also no longer a question. Declining it
+  left the old build serving while every version number claimed otherwise,
+  which is the failure this rule exists to prevent. It costs a second or two of
+  frames; stop capture before upgrading if you would rather not pay even that,
+  and it will be enabled and stopped afterwards, exactly as you left it.
+
+- A unit introduced by a release is adopted automatically on upgrade, but
+  **only if it is a timer**. A new *service* is never switched on for you,
+  which is what keeps the web UI opt-in.
+
 ## [0.1.6] - 2026-08-14
 
 ### Fixed
