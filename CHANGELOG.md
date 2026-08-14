@@ -31,6 +31,23 @@ While the version is `0.x`, the configuration format may change in any release.
   service then refused to start with `Cannot listen on ::1:8787`.
 
 ### Fixed
+- **RTSP cameras now capture. They never have.** A camera added with the
+  "RTSP only" type passed its test, was written to the config, and then
+  captured nothing: the capture log filled with `Could not open file` and
+  ffmpeg restarted every ten seconds for ever. The command asked ffmpeg to
+  create each day's directory using an option that only one of its other
+  output formats supports, and ffmpeg neither used it nor complained. The
+  daemon creates the directory itself now.
+
+  This has been broken since the first release. It went unnoticed because the
+  test both the wizard and `timelapse test` run grabs a single frame into a
+  directory that already exists, so it proved the camera was reachable
+  without ever exercising the way frames are really written. That test now
+  runs the daemon's exact command.
+
+  Nothing to do beyond upgrading. If you have an RTSP camera configured, it
+  starts working when capture restarts; days it missed are gone, since no
+  frames were ever written. Reported from a real 0.1.6 install.
 - Addresses printed by the installer, the wizard and the web UI are bracketed
   when they are IPv6, so the URLs they offer can be opened. The one that
   mattered was inside `.m3u` playlists generated when a player sends no usable

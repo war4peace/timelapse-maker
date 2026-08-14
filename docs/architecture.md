@@ -270,9 +270,35 @@ knows nothing and two attempts settle it again.
 with no HTTP snapshot endpoint (e.g. TP-Link Tapo).
 
 Supervises a persistent `ffmpeg` doing `-vf fps=1/N` into the image2 muxer with
-`-strftime 1 -strftime_mkdir 1`, so ffmpeg itself creates the `YYYY-MM-DD`
-directory and produces the identical layout. On exit, logs stderr and restarts
-after 10s.
+`-strftime 1`, writing `HHMMSS.jpg` into a `YYYY-MM-DD` directory **this class
+creates**, which produces the identical layout to the HTTP path. On exit, logs
+stderr and restarts after 10s.
+
+**This path was broken from the first release until 0.1.7 and nobody noticed**,
+because it is the rarest configuration: the deployment's eight cameras are all
+HTTP. The pattern used to be `%Y-%m-%d/%H%M%S.jpg` with `-strftime_mkdir 1` to
+have the muxer create the directory. **That option belongs to the hls muxer**;
+`image2` has never had it, and ffmpeg does not report an unknown private
+option, even at `-loglevel warning`. So every write failed with `Could not open
+file` and the supervisor restart-looped for ever. Reproduced against ffmpeg
+6.1.1 by running the daemon's own argv with `testsrc` as input: `rc=251` and no
+frames without the day directory, `rc=0` and a frame with it.
+
+Two things follow, and both are the point rather than the fix:
+
+- **Neither RTSP probe would ever have caught it.** The wizard's
+  `test_camera_rtsp()` and `timelapse test`'s `test_rtsp()` both write one
+  fixed filename, with `-frames:v 1`, into a directory that already exists. So
+  they prove the camera is reachable and decodable and never touch the output
+  side, which is where the fault was. Same lesson as `PIX_FMT` in the encoder
+  probe: **a probe must produce what the pipeline produces.**
+  `smoke_test.py`'s `rtsp_writer_check()` now takes the argv from
+  `RtspCamera._cmd()` itself and swaps only the input, so it cannot drift.
+- **`_discard_empty_day()` is the other half.** Creating the directory
+  ourselves means an unreachable camera would leave one empty directory per
+  day for ever, since the encoder `SKIP`s a short day and does not clean up.
+  So a day that ends with no `.jpg` in it is removed, along with its cadence
+  marker and nothing else.
 
 **`DiskGuard(threading.Thread)`**
 
@@ -1445,19 +1471,25 @@ the config.
   has not begun, reads the config. So a daemon restarted at 14:00 finishes the
   day the way it started it, and there is no window in which an edit lands
   early.
-- **The marker is written twice over, deliberately.** `_dest_path()` writes it
-  as it creates the directory, which is the moment the answer is not in doubt.
-  The RTSP path never creates directories (ffmpeg does, via
-  `-strftime_mkdir`), so `record_cadences()` also runs once a minute from
-  `main()` for any directory that exists and lacks one. It never *creates*
-  one: a camera offline all day would otherwise leave an empty directory
-  behind every night, which the encoder finds, reports as a `SKIP`, and never
-  cleans up.
+- **The marker is written twice over, deliberately.** Both paths write it as
+  they create the day directory (`_dest_path()` for HTTP, `_prepare_day()` for
+  RTSP), which is the moment the answer is not in doubt, and
+  `record_cadences()` runs once a minute from `main()` as a backstop for any
+  directory that exists and lacks one. Before 0.1.7 that backstop was the only
+  writer on the RTSP path, on the belief that ffmpeg created those directories;
+  it did not, and the whole path was broken. It never *creates* a directory: a
+  camera offline all day would otherwise leave an empty one behind every night,
+  which the encoder finds, reports as a `SKIP`, and never cleans up.
 - **RTSP gets `-t seconds_to_midnight()`.** ffmpeg carries `fps=1/interval` on
   its command line, so a new cadence means a new process, and the boundary is
   the only moment that may happen. Its `rc=0` is the planned handover and is
   logged at info; logging it as a warning nightly would train people to ignore
-  the line that matters.
+  the line that matters. Since 0.1.7 the day is also baked into the output
+  path, so **one ffmpeg process writes into exactly one day directory**. If it
+  overruns the boundary it writes into the day it started in rather than
+  creating the next one, which is the safe direction: `-t` bounds output
+  duration, so the last frame's timestamp is before midnight and at worst one
+  frame lands in the day it belongs to a second late.
 - **The encoder prefers the marker too.** A cadence edit at 14:00 means
   tonight's run is encoding a day that ran on the *old* settings. Reading the
   config would measure yesterday against a cadence yesterday never ran at: a
@@ -2060,7 +2092,7 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 
 ```
 install.sh                       bootstrap installer, 958 lines
-scripts/timelapse_capture.py     daemon, 1083 lines
+scripts/timelapse_capture.py     daemon, 1150 lines
 scripts/timelapse_encode.py      batch job, 1727 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 840 lines
 scripts/timelapse_setup.py       configuration wizard, 3670 lines

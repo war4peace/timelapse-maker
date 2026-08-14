@@ -213,7 +213,7 @@ class TestPerCameraCadence(unittest.TestCase):
         c = cap.RtspCamera({"name": "R", "url": "rtsp://192.0.2.1/s",
                             "interval_seconds": 120}, self.cfg)
         self.assertEqual(c.interval, 120)
-        self.assertIn("fps=1/120", c._cmd())
+        self.assertIn("fps=1/120", c._cmd("2026-08-14"))
 
 
 class TestOneDayOneCadence(unittest.TestCase):
@@ -370,7 +370,7 @@ class TestOneDayOneCadence(unittest.TestCase):
         # moment that may happen.
         cam = cap.RtspCamera({"name": "R", "url": "rtsp://192.0.2.1/s"},
                              self.cfg, str(self.path))
-        cmd = cam._cmd()
+        cmd = cam._cmd("2026-08-14")
         self.assertIn("-t", cmd)
         self.assertGreater(int(cmd[cmd.index("-t") + 1]), 0)
 
@@ -1210,6 +1210,77 @@ class TestErrorReachesTheStateFile(unittest.TestCase):
                               make_config(self.tmp))
         entry = cap.capture_state([rtsp], time.time())["cameras"][0]
         self.assertNotIn("error", entry)
+
+
+class TestRtspWritesItsFrames(unittest.TestCase):
+    """The RTSP path never worked, from the first release to 0.1.6.
+
+    The command put %Y-%m-%d in the output pattern and passed
+    `-strftime_mkdir 1` to have the muxer create it. That option belongs to
+    the **hls** muxer; image2 has never had it, and ffmpeg does not complain
+    about an unknown private option even at -loglevel warning. So every write
+    failed with "Could not open file" and the daemon restart-looped. Reported
+    from a real 0.1.6 install, reproduced against ffmpeg 6.1.1.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = make_config(self.tmp / "frames")
+        self.cam = cap.RtspCamera({"name": "Hallway", "method": "rtsp",
+                                   "url": "rtsp://192.0.2.9/s1"}, self.cfg)
+        self.day = "2026-08-14"
+
+    def test_the_muxer_is_never_asked_to_make_a_directory(self):
+        self.assertNotIn("-strftime_mkdir", self.cam._cmd(self.day))
+
+    def test_the_output_pattern_holds_no_directory_strftime(self):
+        # %H%M%S in the filename still needs -strftime; what must not be
+        # there is a %-directory, because nothing would create it.
+        pattern = self.cam._cmd(self.day)[-1]
+        self.assertNotIn("%Y", pattern)
+        self.assertTrue(pattern.endswith("%H%M%S.jpg"), pattern)
+        self.assertIn(self.day, pattern)
+        self.assertIn("-strftime", self.cam._cmd(self.day))
+
+    def test_the_pattern_is_inside_the_day_directory_that_gets_created(self):
+        made = self.cam._prepare_day(self.day)
+        self.assertTrue(made.is_dir())
+        self.assertEqual(Path(self.cam._cmd(self.day)[-1]).parent, made)
+
+    def test_preparing_the_day_records_its_cadence(self):
+        made = self.cam._prepare_day(self.day)
+        self.assertEqual(cap.read_cadence(made),
+                         (self.cam.interval, self.cam.framerate))
+
+    def test_preparing_twice_is_harmless(self):
+        first = self.cam._prepare_day(self.day)
+        (first / "120000.jpg").write_bytes(b"\xff\xd8frame")
+        self.cam._prepare_day(self.day)
+        self.assertTrue((first / "120000.jpg").exists())
+
+    def test_a_day_with_no_frames_is_discarded(self):
+        # A camera unreachable all day would otherwise leave one empty
+        # directory per day for ever: the encoder SKIPs and never cleans up.
+        made = self.cam._prepare_day(self.day)
+        self.cam._discard_empty_day(made)
+        self.assertFalse(made.exists())
+
+    def test_a_day_with_frames_is_kept(self):
+        made = self.cam._prepare_day(self.day)
+        (made / "120000.jpg").write_bytes(b"\xff\xd8frame")
+        self.cam._discard_empty_day(made)
+        self.assertTrue(made.exists())
+        self.assertTrue((made / "120000.jpg").exists())
+
+    def test_anything_unexpected_in_the_day_is_left_alone(self):
+        made = self.cam._prepare_day(self.day)
+        (made / "notes.txt").write_text("do not delete me", encoding="utf-8")
+        self.cam._discard_empty_day(made)
+        self.assertTrue(made.exists())
+
+    def test_discarding_a_day_that_is_gone_does_not_raise(self):
+        self.cam._discard_empty_day(self.tmp / "nope" / "2026-08-14")
 
 
 if __name__ == "__main__":
