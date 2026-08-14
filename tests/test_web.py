@@ -3076,6 +3076,30 @@ class TestLogout(unittest.TestCase):
         _, _, body = request("/", self.config)
         self.assertNotIn("/logout", body)
 
+    def test_log_out_is_not_dressed_as_one_more_tab(self):
+        """It sat beside "Recent log", sharing the word "log", and the
+        operator hit it repeatedly while trying to open the log. It is the
+        only control in that bar that is not a destination and the only one
+        that is expensive to hit by accident, so it is spaced away from the
+        tabs and coloured as an action."""
+        _, _, body = request("/", self.config, auth=self.auth,
+                             headers=cookie_header(self.auth.open_session()))
+        self.assertIn('href="/logout" class="signout"', body)
+        self.assertIn("nav a.signout", body)
+        # Set apart from the tabs, and visibly not one of them.
+        self.assertIn("margin-left: 3rem", body)
+        self.assertIn("#8c1d18", body)
+
+    def test_the_tabs_themselves_are_not_recoloured(self):
+        # Only the action changes. A red tab bar would be worse than the
+        # problem it fixes.
+        _, _, body = request("/", self.config, auth=self.auth,
+                             headers=cookie_header(self.auth.open_session()))
+        nav = re.search(r"<nav>(.*?)</nav>", body, re.S).group(1)
+        self.assertEqual(nav.count("signout"), 1)
+        for tab in ("Overview", "Library", "Recent log"):
+            self.assertIn(tab, nav)
+
 
 class TestPostBody(unittest.TestCase):
 

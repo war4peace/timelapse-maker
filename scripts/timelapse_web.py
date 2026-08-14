@@ -1817,6 +1817,20 @@ LAYOUT = """<!doctype html>
            border-radius: 999px; padding: .25rem .8rem; font-size: .9rem;
            color: inherit; }}
   nav a.on {{ background: rgba(128,128,128,.18); font-weight: 600; }}
+  /* Log out is the only thing in this bar that is not a destination, and the
+     only one that is expensive to hit by mistake. It sat beside "Recent log",
+     the two of them sharing the word "log", and the operator reported hitting
+     it repeatedly while trying to open the log (2026-08-14). So it is spaced
+     away from the tabs and coloured as an action rather than dressed as one
+     more of them. */
+  nav a.signout {{ margin-left: 3rem; background: #8c1d18; color: #fff;
+                   border-color: #8c1d18; }}
+  nav a.signout:hover {{ background: #6f1713; border-color: #6f1713; }}
+  @media (max-width: 30rem) {{
+    /* Narrow enough that the bar wraps: the button is then on its own line
+       and already separated, so the gap would only push it off-centre. */
+    nav a.signout {{ margin-left: .5rem; }}
+  }}
   pre {{ overflow-x: auto; background: rgba(128,128,128,.12); border-radius: 6px;
          padding: .8rem .9rem; font-size: .82rem; line-height: 1.45;
          margin: 0; }}
@@ -2316,7 +2330,7 @@ class Handler(BaseHTTPRequestHandler):
         # The logout link appears only when there is a session to end. With no
         # login configured it would be a control that does nothing, and on the
         # login page itself it would offer to leave somewhere nobody is.
-        logout = ('<a href="/logout">Log out</a>'
+        logout = ('<a href="/logout" class="signout">Log out</a>'
                   if self.server.auth.enabled else "")
         bar = NAV.format(
             on_home="on" if page == "home" else "",

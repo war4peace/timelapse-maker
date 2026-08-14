@@ -26,6 +26,11 @@ While the version is `0.x`, the configuration format may change in any release.
   of "supervised by ffmpeg", and the failure column is left empty when there is
   nothing wrong rather than saying "0 failed" on every healthy row.
 
+- **Log out no longer looks like one more tab.** It sat immediately beside
+  "Recent log", the two sharing the word "log", which made it easy to end your
+  session while reaching for the log. It is now set apart from the tabs and
+  coloured as an action.
+
 ### Fixed
 - **The credential watch row now says when it next runs.** It read "Scheduled"
   with an empty Detail, which looked like something was wrong with it. It runs
