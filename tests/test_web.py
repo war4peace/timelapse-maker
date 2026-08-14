@@ -3612,5 +3612,79 @@ class TestLastEncodePanel(StateMixin, unittest.TestCase):
         self.assertNotIn("Older", body)
 
 
+class TestIPv6Bind(unittest.TestCase):
+    """The server must open the family its bind address names.
+
+    ThreadingHTTPServer's address_family is AF_INET, so before this the
+    service exited on an IPv6 bind while check_bind() in the wizard, which
+    walks every family getaddrinfo() returns, had already called it usable.
+    A check that passes what the service refuses is worse than no check.
+    """
+
+    def serve(self, bind):
+        """A real listening socket, closed on teardown. Port 0 lets the
+        kernel choose, so this cannot collide with anything."""
+        cfg = {"web": {"enabled": True, "bind": bind, "port": 0},
+               "paths": {}, "cameras": []}
+        srv = web.Server((bind, 0), web.Handler, cfg, None)
+        self.addCleanup(srv.server_close)
+        return srv
+
+    def test_an_ipv4_bind_opens_an_ipv4_socket(self):
+        self.assertEqual(self.serve("127.0.0.1").address_family,
+                         socket.AF_INET)
+
+    def test_an_ipv6_bind_opens_an_ipv6_socket(self):
+        srv = self.serve("::1")
+        self.assertEqual(srv.address_family, socket.AF_INET6)
+        self.assertEqual(srv.socket.family, socket.AF_INET6)
+
+    def test_an_ipv6_server_actually_listens(self):
+        # The point of the fix: it binds, rather than raising at startup.
+        srv = self.serve("::1")
+        host, port = srv.socket.getsockname()[:2]
+        self.assertEqual(port, srv.server_address[1])
+        conn = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        self.addCleanup(conn.close)
+        conn.settimeout(5)
+        conn.connect((host, port))          # raises if nothing is listening
+
+    def test_the_ipv6_wildcard_accepts_ipv4_too(self):
+        # IPV6_V6ONLY is set explicitly rather than inherited from
+        # net.ipv6.bindv6only, so "listen on ::" means the same on any host.
+        srv = self.serve("::")
+        self.assertEqual(
+            srv.socket.getsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY), 0)
+
+
+class TestIPv6InEmittedURLs(IndexCase):
+    """The bind address reaches a playlist, and must be bracketed there.
+
+    _base_url() prefers the request's own Host header, which HOST_RE already
+    accepts in bracketed form. The fallback is the config, and that is the
+    path that produced http://::1:8787/video/... which no player can open.
+    A .m3u that does not play arrives as a bug report about video.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.config = cfg(self.tmp, transfer={"enabled": True,
+                                              "destination": str(self.root)})
+        self.scan()
+
+    def test_an_ipv6_bind_is_bracketed_in_the_playlist_fallback(self):
+        config = dict(self.config)
+        config["web"] = {"bind": "::1", "port": 8787}
+        _, _, body = request("/play/Gate.20260707.mkv", config, self.index,
+                             headers="Host: bad host\r\n")
+        self.assertIn("http://[::1]:8787/video/", body)
+        self.assertNotIn("http://::1:8787/", body)
+
+    def test_a_bracketed_host_header_is_still_preferred(self):
+        _, _, body = request("/play/Gate.20260707.mkv", self.config,
+                             self.index, headers="Host: [fdd2::1]:8787\r\n")
+        self.assertIn("http://[fdd2::1]:8787/video/", body)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -270,9 +270,35 @@ knows nothing and two attempts settle it again.
 with no HTTP snapshot endpoint (e.g. TP-Link Tapo).
 
 Supervises a persistent `ffmpeg` doing `-vf fps=1/N` into the image2 muxer with
-`-strftime 1 -strftime_mkdir 1`, so ffmpeg itself creates the `YYYY-MM-DD`
-directory and produces the identical layout. On exit, logs stderr and restarts
-after 10s.
+`-strftime 1`, writing `HHMMSS.jpg` into a `YYYY-MM-DD` directory **this class
+creates**, which produces the identical layout to the HTTP path. On exit, logs
+stderr and restarts after 10s.
+
+**This path was broken from the first release until 0.1.7 and nobody noticed**,
+because it is the rarest configuration: the deployment's eight cameras are all
+HTTP. The pattern used to be `%Y-%m-%d/%H%M%S.jpg` with `-strftime_mkdir 1` to
+have the muxer create the directory. **That option belongs to the hls muxer**;
+`image2` has never had it, and ffmpeg does not report an unknown private
+option, even at `-loglevel warning`. So every write failed with `Could not open
+file` and the supervisor restart-looped for ever. Reproduced against ffmpeg
+6.1.1 by running the daemon's own argv with `testsrc` as input: `rc=251` and no
+frames without the day directory, `rc=0` and a frame with it.
+
+Two things follow, and both are the point rather than the fix:
+
+- **Neither RTSP probe would ever have caught it.** The wizard's
+  `test_camera_rtsp()` and `timelapse test`'s `test_rtsp()` both write one
+  fixed filename, with `-frames:v 1`, into a directory that already exists. So
+  they prove the camera is reachable and decodable and never touch the output
+  side, which is where the fault was. Same lesson as `PIX_FMT` in the encoder
+  probe: **a probe must produce what the pipeline produces.**
+  `smoke_test.py`'s `rtsp_writer_check()` now takes the argv from
+  `RtspCamera._cmd()` itself and swaps only the input, so it cannot drift.
+- **`_discard_empty_day()` is the other half.** Creating the directory
+  ourselves means an unreachable camera would leave one empty directory per
+  day for ever, since the encoder `SKIP`s a short day and does not clean up.
+  So a day that ends with no `.jpg` in it is removed, along with its cadence
+  marker and nothing else.
 
 **`DiskGuard(threading.Thread)`**
 
@@ -537,6 +563,89 @@ not obvious:
   and earlier wrote parses to `("", 0)` and therefore sorts first, which is
   correct: it is older than anything written since.
 
+#### 4.4a Camera discovery (WS-Discovery)
+
+`discover_cameras()` sends a UDP multicast Probe to `239.255.255.250:3702` and
+collects ProbeMatch replies for a fixed window. Stdlib sockets and
+ElementTree: no SOAP stack, no WSDL, no dependency, which is what made this
+worth having after the ONVIF client library was refused (decided-against.md).
+Offered in the wizard, in `timelapse cameras`, and standalone as
+`timelapse discover`, which needs no root and touches no config.
+
+It lives in the wizard rather than in a daemon on purpose. The wizard runs as
+root and outside a unit; the daemons run under `RestrictAddressFamilies`,
+where a multicast bind is exactly the thing that works in development and
+fails in production. The web UI's bind probe is here for the same reason.
+
+Measured against eight cameras from four vendors on 2026-08-14, which settled
+more than it confirmed:
+
+- **Only the typed Probe is sent** (`dn:NetworkVideoTransmitter`). An untyped
+  one found no camera the typed one missed and pulled in a network printer and
+  two Windows PCs, because **Windows WSD shares this group and port**. It is
+  not symmetric either: the Reolink and the Tapo answer the typed probe alone,
+  so an untyped-only client misses two of eight. Replies were attributed to
+  their probe by giving each a distinct MessageID and reading `RelatesTo` back.
+- **`Types` classifies, never the `type` scope.** The scope is vendor free
+  text: Dahua writes `Network_Video_Transmitter`, Hikvision and Reolink write
+  `video_encoder`, TP-Link writes `NetworkVideoTransmitter`. Classifying on it
+  called six of the eight real cameras not-cameras. Even in `Types` the prefix
+  moves (`dn:` on five, `tdn:` on two), so `wsd_is_camera()` strips
+  punctuation and compares on the local name.
+- **Deduplication is on the device id, never the address.** One device answers
+  several times and an NVR proxies the cameras behind it. Two spellings exist,
+  `urn:uuid:<x>` and bare `uuid:<x>`; a device is consistent, so the string
+  works as a key, but the prefix is not something to assume.
+- **`wsd_address()` prefers an address the device answered *from*** over one it
+  merely advertised. That is a cheaper answer to "the advertisement may be
+  unreachable" than fetching it: the reply proves the source works from here,
+  and the wizard then tests the real snapshot URL, which is the thing that has
+  to work. IPv4 before IPv6, because that is what the camera was configured
+  with.
+- **An XAddr is not necessarily a URL.** One Dahua advertises
+  `http://[]/onvif/device_service`, and `urlparse` raises `ValueError` on it
+  under Python 3.12+. `wsd_host()` returns `""` instead of raising.
+- **Only the host is taken, never the port.** The device service and the
+  snapshot endpoint are different things: the Reolink answers ONVIF on `:8000`
+  and serves snapshots on `:80`. Discovery's value is the address and the
+  model, not a port to paste into a template.
+- **The name scope is a model, not a place.** It returns `Dahua` on three
+  different cameras, so `wsd_preset()` uses it only to preselect a vendor
+  template, and the operator still names the camera. `wsd_preset()` returns
+  `""` rather than guessing when nothing matches, which is the honest answer
+  for the Reolink (`IPC-BO`) and the Tapo (`TC40`), neither of which names its
+  maker. **A wrong preselection is worse than none**, because it is a wrong
+  URL that looks deliberate.
+- **IPv6 is not probed.** All three plausible destinations were measured;
+  every camera answered the IPv4 probe, `ff05::c` (site-local) got no reply at
+  all, and `ff02::c` found only this workstation's own loopback WSD service.
+  IPv6 would double the replies to deduplicate and add a Windows PC.
+
+Two properties are load-bearing and easy to erode. **Discovery is an offer**:
+`offer_discovery()` catches every exception, returns `[]` on any failure, and
+is skipped entirely without a terminal, because a network that cannot be
+probed must leave the operator typing an address rather than reading a
+traceback. And **finding nothing is never reported as "there are no
+cameras"**: multicast does not cross subnets or VLANs, and a dedicated camera
+VLAN is common in exactly the deployments that have the most cameras.
+
+**`url_host()` brackets an IPv6 address before it reaches a preset template.**
+The presets are `http://{ip}/...` strings and the wizard used to format
+whatever was typed, so an IPv6-only camera produced
+`http://fdd2:49bd:...:22ac/ISAPI/...`, whose colons are read as a port. Both
+consumers fail, and neither says so usefully: `requests` raises
+`InvalidURL: Failed to parse`, and ffmpeg reports **"Failed to resolve hostname
+fdd2"**, which sends an operator to look at DNS for an address they typed
+correctly. Measured against a real Hikvision over its ULA address on
+2026-08-14: bracketed, both `requests` and ffmpeg reach the camera and get its
+401; bare, both fail. Hostnames and IPv4 pass through untouched, an address the
+operator already bracketed is not bracketed twice, and a zone id stays inside
+the brackets (`[fe80::1%eth0]`) because it is part of the address. The wizard
+additionally warns on a bare `fe80:` address, since link-local needs a zone and
+moves with the interface. **Nothing in the daemons needed changing**: the URL
+reaches `session.get()` and ffmpeg's `-i` verbatim, which is what made this a
+wizard-only fix.
+
 `timelapse config` hands the file to `$EDITOR` and so does not pass through
 `write_config()` at all; the wrapper calls `--backup-now` first for exactly
 that reason. **A new write path means adding a backup call, or that path
@@ -767,6 +876,34 @@ naming the cause. A port already in use is accepted with a note, since the
 usual holder is the web UI itself being reconfigured. A port below 1024 is
 refused without probing at all: the wizard normally runs as root and the
 service does not, so that probe would pass and prove nothing.
+
+**`bind` may be an IPv6 address (0.1.7).** `ThreadingHTTPServer`'s
+`address_family` is `AF_INET`, so `Server.__init__` sets it from the configured
+address before calling `super().__init__()`, which is where the socket is
+created. Until then the service exited with `Cannot listen on ::1:8787` while
+**`check_bind()` had already called that address usable**: it calls
+`getaddrinfo()` and walks every family returned, so `::1` and `::` both probed
+`ok`. That was the actual defect, and it is the same shape as any check that
+guesses: a probe is only as honest as its agreement with the thing it predicts.
+
+**`IPV6_V6ONLY` is set explicitly, not inherited.** `server_bind()` sets it to
+0 for any `AF_INET6` socket, so a `::` bind accepts IPv4 as v4-mapped
+addresses. Linux defaults `net.ipv6.bindv6only` to 0 and Windows does not, and
+a hardened host may have changed it; inheriting would make one config mean two
+things. A kernel that refuses the option is warned about, not fatal, because
+serving IPv6 alone beats not starting. Verified under systemd 255: `::1` serves
+200 and listens on `[::1]:8787`, and with `::` both an IPv6 and an IPv4 client
+get 200 from the same socket.
+
+**Every emitted `host:port` goes through `hostport()`.** There were five, all
+latent bugs for an IPv6 bind, and the one that mattered was `_base_url()`'s
+fallback: it is what lands in a `.m3u` when the `Host` header is missing or
+malformed, so it would have handed VLC `http://::1:8787/video/...` and arrived
+as a bug report about video playback. The others are the startup log line, the
+bind-failure message, two wizard summaries and the URL `install.sh` offers.
+`HOST_RE` already accepted a bracketed authority, so the ordinary path, where
+the origin comes from the request, always worked. Verified live over IPv6 that
+both the per-file and the day playlist carry `http://[::1]:8787/video/...`.
 
 `lan_address()` asks the routing table for the source address it would use to
 reach TEST-NET-1. No packets are sent; a UDP `connect()` only fixes the peer
@@ -1264,13 +1401,27 @@ one small file, and has no business near the frames or the videos. Verified
 under systemd, where a process with that unit's writable set gets
 `Read-only file system` on the frames, the videos and `/etc/timelapse`.
 
-`adopt_new_timers()` enables a timer that did not exist at the previous
-install. Without it a companion unit added in a later release would sit on disk,
-installed and inert, on every existing deployment: the wizard is skipped on an
-upgrade that answers "don't reconfigure", and `offer_enable()` only runs when
-the operator says yes to a question about capture. It is gated on
-`timelapse-encode.timer` already being enabled, which is what distinguishes a
-live install from a files-only one.
+**An upgrade asks nothing, and changes nothing about what runs.**
+`snapshot_services()` records, before any file is written, which of the four
+managed units are present, enabled and active; `restore_services()` puts that
+back afterwards and prints one line each. The four questions this replaced
+(reconfigure, run the pre-flight, enable capture, enable the web UI) were all
+answerable from the system itself, and asking them made `timelapse update`
+interactive at the moment an operator most wants it to be boring.
+
+Three parts of that are load-bearing. The snapshot must run **before**
+`install_units()` and `sync_units()`, which rewrite what it reads. The restart
+of a live daemon is no longer offered as a choice, because declining left the
+old build serving while every version number said otherwise. And a unit that
+was not present before is adopted **only if it is a timer**: a companion timer
+added in a later release would otherwise sit installed and inert on every
+existing deployment, while a new *service* switched on by an upgrade would
+override a deliberate decision, which is exactly what keeps the opt-in web UI
+opt-in.
+
+A unit that was active before and is not active after is reported as an error
+with its `journalctl` line, since that is the one upgrade outcome worth
+interrupting anybody for, and it used to be reported as success.
 
 Prompts read from `/dev/tty` for the same reason the wizard's do. `--uninstall`
 removes programs and units but never captured data.
@@ -1320,19 +1471,25 @@ the config.
   has not begun, reads the config. So a daemon restarted at 14:00 finishes the
   day the way it started it, and there is no window in which an edit lands
   early.
-- **The marker is written twice over, deliberately.** `_dest_path()` writes it
-  as it creates the directory, which is the moment the answer is not in doubt.
-  The RTSP path never creates directories (ffmpeg does, via
-  `-strftime_mkdir`), so `record_cadences()` also runs once a minute from
-  `main()` for any directory that exists and lacks one. It never *creates*
-  one: a camera offline all day would otherwise leave an empty directory
-  behind every night, which the encoder finds, reports as a `SKIP`, and never
-  cleans up.
+- **The marker is written twice over, deliberately.** Both paths write it as
+  they create the day directory (`_dest_path()` for HTTP, `_prepare_day()` for
+  RTSP), which is the moment the answer is not in doubt, and
+  `record_cadences()` runs once a minute from `main()` as a backstop for any
+  directory that exists and lacks one. Before 0.1.7 that backstop was the only
+  writer on the RTSP path, on the belief that ffmpeg created those directories;
+  it did not, and the whole path was broken. It never *creates* a directory: a
+  camera offline all day would otherwise leave an empty one behind every night,
+  which the encoder finds, reports as a `SKIP`, and never cleans up.
 - **RTSP gets `-t seconds_to_midnight()`.** ffmpeg carries `fps=1/interval` on
   its command line, so a new cadence means a new process, and the boundary is
   the only moment that may happen. Its `rc=0` is the planned handover and is
   logged at info; logging it as a warning nightly would train people to ignore
-  the line that matters.
+  the line that matters. Since 0.1.7 the day is also baked into the output
+  path, so **one ffmpeg process writes into exactly one day directory**. If it
+  overruns the boundary it writes into the day it started in rather than
+  creating the next one, which is the safe direction: `-t` bounds output
+  duration, so the last frame's timestamp is before midnight and at worst one
+  frame lands in the day it belongs to a second late.
 - **The encoder prefers the marker too.** A cadence edit at 14:00 means
   tonight's run is encoding a day that ran on the *old* settings. Reading the
   config would measure yesterday against a cadence yesterday never ran at: a
@@ -1540,7 +1697,7 @@ is read with `.get(key, default)`.
 | Key | Notes |
 |---|---|
 | `enabled` | `false` by default. The program exits 0 when false, so the unit may be enabled without the server running. |
-| `bind` | `127.0.0.1` by default. There is no TLS, and the optional login below is a door lock rather than a safe; any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup, worded according to whether a login is configured. |
+| `bind` | `127.0.0.1` by default. There is no TLS, and the optional login below is a door lock rather than a safe; any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup, worded according to whether a login is configured. IPv4 or IPv6; `::` is dual-stack and accepts both. |
 | `port` | `8787` by default. |
 | `auth` | Optional single login: `{username, password_hash}`. Absent, or either field blank, means no login and the pages behave exactly as they did before it existed. The hash is PBKDF2-SHA256 and self-describing (`pbkdf2_sha256$iters$salt$key`), so the iteration count can rise later without locking anyone out. A username with an unparseable hash **refuses to start**, rather than serving the pages to everyone because the check could not be made. |
 | `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path, typically a remote rsync destination that is *also* mounted locally. Not `/tmp` or `/var/tmp`: `PrivateTmp=true` hides those from the unit. |
@@ -1763,7 +1920,7 @@ changes:
   `/healthz`, 404 on unknown routes, no interpreter version in the `Server`
   header; clean SIGTERM shutdown; `systemd-analyze verify` clean; and the full
   install → re-install → uninstall cycle including `sync_units()` leaving the
-  web unit without a `ReadWritePaths` line and `restart_upgraded_services()`
+  web unit without a `ReadWritePaths` line and `restore_services()`
   picking the live unit up.
 - **Late mount**: same host, all three shapes. A library that vanishes
   entirely leaves the index intact, says it is waiting, and **picks the
@@ -1934,13 +2091,13 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 836 lines
-scripts/timelapse_capture.py     daemon, 1083 lines
-scripts/timelapse_encode.py      batch job, 1672 lines
+install.sh                       bootstrap installer, 958 lines
+scripts/timelapse_capture.py     daemon, 1150 lines
+scripts/timelapse_encode.py      batch job, 1727 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 840 lines
-scripts/timelapse_setup.py       configuration wizard, 3167 lines
+scripts/timelapse_setup.py       configuration wizard, 3670 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 3123 lines
+scripts/timelapse_web.py         read-only web UI, 3160 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

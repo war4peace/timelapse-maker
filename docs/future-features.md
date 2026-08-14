@@ -39,7 +39,25 @@ how it arrived, because it is the argument for keeping refusals rather than
 deleting them: it existed *because* of the reasoning that killed item 7, and it
 turned out to be a defect fix rather than a feature. Item 9 came the same way,
 out of the decision against an ONVIF library: it is the part of that idea which
-needs no dependency.
+needs no dependency. **Item 10 was the same story a third time**, and the
+shortest-lived entry this file has had: it was what remained after the IPv6
+camera fix in 0.1.7, and it **shipped the same day it was written**. Every one
+of these arrived as the residue of a decision about something else, which is
+the argument for writing the decisions down at all.
+
+**Item 9 shipped in 0.1.7** and went the same way. Its entry was worth having:
+it was written from a prototype run against eight real cameras, and more than
+half of what it recorded was a correction to something I had assumed. The
+measurements now live in architecture.md §4.4a, next to the code they explain.
+That leaves this file holding one item.
+
+Writing item 10 down before building it still paid, which is worth knowing
+before anyone treats an obvious fix as too small to research. The entry started
+out claiming `check_bind()` needed changing to match the server; checking
+instead of assuming showed the opposite, that it already walked every family
+`getaddrinfo()` returned and was therefore **passing an address the service
+would refuse**. That turned a missing feature into a defect and moved it to the
+front of the list. The design is in architecture.md §4.5 now.
 
 Item 3 shipped **narrower than it was planned**, and that is worth noting for
 the next entry that lists candidates: it proposed ntfy, gotify and email, and
@@ -50,58 +68,6 @@ A pre-plan is a starting point for the conversation, not the specification.
 Everything below is **researched against the code as of 0.1.5**, so each entry
 says where it would hook in and what is already there. None of it is designed;
 these are pre-plans, and the traps are the point.
-
----
-
-## 9. Find cameras with WS-Discovery
-
-**Effort:** small to medium. **Prerequisites:** none.
-
-### What it is
-
-A UDP multicast Probe to `239.255.255.250:3702`, to which ONVIF devices answer
-with their device service address and a set of scopes. Stdlib sockets and a
-regex; no SOAP stack, no WSDL, no dependency. That is why it survived the
-decision against an ONVIF library (decided-against.md): it is the one ONVIF
-capability worth having here, and it is the one that costs nothing to have.
-
-### What it would buy
-
-The wizard asks for each camera's IP by hand. It would offer a list instead:
-address, model and hardware read from the scopes, so an operator picks rather
-than types, and the vendor template can be pre-selected from the name it
-reports.
-
-### What it does not buy, stated up front
-
-Discovery returns a **device service address and a name**. It does not return a
-snapshot URL. Getting from one to the other still needs credentials plus
-`GetProfiles` and `GetStreamUri`, which is the roughly 150 lines already
-prototyped in `temp/onvif_snapshot_uri.py`. So the honest scope is "fills in
-the address and preselects the template", not "configures the camera".
-
-### Traps
-
-- **Multicast does not cross subnets, and rarely crosses VLANs.** A dedicated
-  camera VLAN is common in exactly the deployments that have many cameras, so
-  this must be an offer and never the only path, and finding nothing must not
-  be reported as "there are no cameras".
-- **One device can answer several times**, from several addresses, and NVRs
-  proxy their cameras. Deduplicate on the device UUID in the response, never on
-  the address.
-- **The advertised XAddr is not always reachable from here.** Verify by
-  fetching, exactly as `test_onvif_profiles()` already does, rather than
-  trusting the advertisement. The TC40 measured on 2026-08-14 is the general
-  lesson in miniature: it advertises a JPEG profile that renders as garbage, so
-  **an ONVIF advertisement is a claim, not a guarantee.**
-- **A response is not necessarily a camera.** NVRs, encoders and doorbells all
-  answer. The scopes carry a type; use it, and let the operator overrule it.
-- **Keep it in the wizard.** The wizard runs as root and outside a unit, while
-  the daemons run sandboxed; a multicast bind is exactly the kind of thing that
-  would work here and fail under `RestrictAddressFamilies`. The bind probe for
-  the web UI already lives in the wizard for the same reason.
-- Collect for a fixed window of two or three seconds rather than waiting for
-  quiet, since there is no end-of-list marker.
 
 ---
 

@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.1.7] - 2026-08-14
+
+### Added
+- **The wizard can find your cameras for you.** Adding a camera now offers a
+  scan of the local network; ONVIF cameras answer with their address and model,
+  and the vendor template is preselected from what they report. Also available
+  on its own as **`timelapse discover`**, which needs no root, writes nothing
+  and sends no credentials, so it cannot lock a camera account.
+
+  Typing an address by hand is unchanged and always works. Discovery uses
+  multicast, which does not cross subnets or VLANs, so cameras on a separate
+  network will not appear even though they work perfectly; the wizard says so
+  rather than reporting "no cameras found".
+
+- **The web UI can listen on an IPv6 address.** `web.bind` accepts `::1`, `::`
+  or any address this host holds, and the wizard offers them. `::` accepts IPv4
+  connections as well, so it is the IPv6 answer to `0.0.0.0`. Nothing changes
+  for an existing install: the default bind is unchanged.
+
+  This was a real trap rather than a missing feature. The wizard's bind check
+  probes the address for real and reported an IPv6 one as usable, and the
+  service then refused to start with `Cannot listen on ::1:8787`.
+
+### Fixed
+- **RTSP cameras now capture. They never have.** A camera added with the
+  "RTSP only" type passed its test, was written to the config, and then
+  captured nothing: the capture log filled with `Could not open file` and
+  ffmpeg restarted every ten seconds for ever. The command asked ffmpeg to
+  create each day's directory using an option that only one of its other
+  output formats supports, and ffmpeg neither used it nor complained. The
+  daemon creates the directory itself now.
+
+  This has been broken since the first release. It went unnoticed because the
+  test both the wizard and `timelapse test` run grabs a single frame into a
+  directory that already exists, so it proved the camera was reachable
+  without ever exercising the way frames are really written. That test now
+  runs the daemon's exact command.
+
+  Nothing to do beyond upgrading. If you have an RTSP camera configured, it
+  starts working when capture restarts; days it missed are gone, since no
+  frames were ever written. Reported from a real 0.1.6 install.
+- Addresses printed by the installer, the wizard and the web UI are bracketed
+  when they are IPv6, so the URLs they offer can be opened. The one that
+  mattered was inside `.m3u` playlists generated when a player sends no usable
+  `Host` header: those contained `http://::1:8787/...`, which no player can
+  open.
+- **A camera reachable only over IPv6 can now be added with the wizard's
+  vendor presets.** Typing an IPv6 address at "IP address or hostname" built a
+  URL whose colons were read as a port number, so the camera could not be
+  fetched. The address is bracketed automatically now, and a link-local one
+  (`fe80::`) is flagged as needing a zone id. Capture itself always worked over
+  IPv6; if you already added such a camera by hand with the "Custom URL"
+  option, nothing changes and nothing needs redoing.
+
+### Changed
+- **Upgrading no longer asks four questions.** Re-running the installer, or
+  `sudo timelapse update`, used to ask whether to reconfigure, whether to run
+  the pre-flight, whether to enable capture and the nightly encode, and whether
+  to enable the web UI. Every one of those was a decision already made, and
+  visible to the installer: it now records which units are enabled and which
+  are running *before* it touches anything, and puts exactly that back
+  afterwards.
+
+  What was enabled stays enabled, what was running stays running, and anything
+  deliberately switched off stays off. One line per unit is printed so you can
+  see it happened, and a unit that was running before and is not running after
+  is reported as an error rather than passing as success. Reconfiguring is a
+  separate job with its own commands (`timelapse setup`, `timelapse config`),
+  and the pre-flight is still there as `timelapse test`.
+
+  A first install is unchanged: the wizard runs, and it still offers the
+  pre-flight and the services at the end.
+
+  The restart of a running daemon is also no longer a question. Declining it
+  left the old build serving while every version number claimed otherwise,
+  which is the failure this rule exists to prevent. It costs a second or two of
+  frames; stop capture before upgrading if you would rather not pay even that,
+  and it will be enabled and stopped afterwards, exactly as you left it.
+
+- A unit introduced by a release is adopted automatically on upgrade, but
+  **only if it is a timer**. A new *service* is never switched on for you,
+  which is what keeps the web UI opt-in.
+
 ## [0.1.6] - 2026-08-14
 
 ### Fixed
@@ -1083,6 +1166,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.7]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.7
 [0.1.6]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.6
 [0.1.5]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.5
 [0.1.4]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.4

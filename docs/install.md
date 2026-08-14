@@ -86,23 +86,40 @@ What it does and does not touch:
 
 | | On upgrade |
 |---|---|
-| `config.json` | **Kept.** You are asked "Reconfigure it?" and the default is *no*. |
+| `config.json` | **Kept, and not asked about.** Reconfiguring is a separate job: `timelapse setup` or `timelapse config`. |
 | `config.example.json` | Replaced, so you can diff it for new keys. |
 | Scripts and units | Replaced, then `ReadWritePaths` is re-derived from your config. |
 | Captured frames and videos | Never touched. |
-| A running capture daemon | Restarted, after asking; see below. |
+| Which services run | **Exactly as you left them.** Enabled stays enabled, running stays running, and anything you had switched off stays off. |
+| A running capture daemon | Restarted onto the new build; see below. |
 | An encode already in flight | Left alone. It is oneshot, so it finishes on the build it started with and the next nightly trigger uses the new one. |
+| A unit new in this release | Adopted only if it is a timer and the install is live. A new *service* is never switched on for you, which is what keeps the web UI opt-in. |
 
-**Why the restart prompt matters.** A running daemon keeps executing the code it
-read at startup, and `systemctl enable --now` does nothing to an already-active
-unit. Say no and you keep running the old build with the new one sitting unused
-on disk. Apply it later with:
+**An upgrade asks nothing.** It records what is enabled and what is running
+before it touches anything, and puts that back afterwards, then prints one line
+per unit so you can see it did. There is no "reconfigure?", no "run the
+pre-flight?", no "enable capture?" and no "enable the web UI?": every one of
+those was a decision you had already made, and the installer can read it off the
+system instead of asking you again.
 
-```bash
-sudo systemctl restart timelapse-capture.service
+```
+── Services ───────────────────────────────────────────────
+  OK    timelapse-capture.service      enabled, running
+  OK    timelapse-encode.timer         enabled, waiting
+  OK    timelapse-watch.timer          enabled, waiting
+        timelapse-web.service          disabled, stopped
 ```
 
-A restart costs only the frames due while it happens: a second or two.
+A unit that was running before and is not running after is reported as an
+error, with the `journalctl` line to look at. That is the one outcome worth
+interrupting you for, and it used to be reported as success.
+
+**The restart is not optional.** A running daemon keeps executing the code it
+read at startup, and `systemctl enable --now` does nothing to an already-active
+unit, so declining would leave the old build serving while every version number
+claimed otherwise. It costs only the frames due while it happens, a second or
+two. If you want to avoid even that, stop capture before upgrading: it will
+still be enabled and stopped afterwards, exactly as you left it.
 
 **New config keys** are read with defaults, so an older `config.json` keeps
 working; you get the new behaviour without editing anything. Re-run
@@ -115,12 +132,12 @@ timelapse version
 ```
 
 ```
-  capture  0.1.6
-  encode   0.1.6
-  test     0.1.6
-  setup    0.1.6
-  update   0.1.6
-  web      0.1.6
+  capture  0.1.7
+  encode   0.1.7
+  test     0.1.7
+  setup    0.1.7
+  update   0.1.7
+  web      0.1.7
 ```
 
 If the daemon predates the installed files it says so explicitly, which is the
@@ -468,6 +485,7 @@ of it; nothing needs a reinstall.
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and every notification sink. Run it after any change. |
 | `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. A menu with no options; `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` go straight to one. §9. |
+| `timelapse discover` | Lists ONVIF cameras answering on this network, with address and model. Needs no root, writes nothing and sends no credentials. Multicast does not cross subnets or VLANs, so an empty result is not proof there are no cameras. §9. |
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |
 | `timelapse notify` | Where the nightly summary goes: a Discord webhook, ntfy, Telegram, any combination of them, or none. Offers a test message for each. Needs no restart, because the encode job reads the config when it runs. §6a. |
 | `timelapse web` | Turn the read-only web UI on or off and set its address, port, library path and whether it asks for a login. §11. |
@@ -612,6 +630,52 @@ loops on single-key actions:
 Adding uses the same preset list and live test as the installer. Passwords in
 the query string are masked in the listing; `ask_secret` keeps them out of
 scroll-back when you type them, so printing them back would defeat it.
+
+### Letting it find the cameras
+
+The first time you add a camera in a session, the wizard offers to look for
+them:
+
+```
+  Scan this network for cameras? (Y/n):
+
+  OK    8 camera(s) answered.
+
+    Found on this network:
+          ADDRESS          MODEL                    TYPE
+       1  192.168.2.202    IPC-HFW5442E-SE          Dahua / Amcrest
+       2  192.168.2.204    DS-2DE2A404IW-DE3        Hikvision (ISAPI)
+       3  192.168.2.208    D340P                    ? choose below
+       0  none of these, enter an address by hand
+```
+
+Picking one fills in the address and preselects the camera type. You still
+choose the **name**, because what a camera reports is its model, not where it
+is pointing, and three cameras from one maker report the same thing.
+
+The same list on its own, without starting the wizard:
+
+```bash
+timelapse discover
+```
+
+That needs no root, writes nothing and sends no credentials, so it cannot lock
+a camera account no matter how often you run it.
+
+Two things it cannot do, both worth knowing before you conclude something is
+broken:
+
+- **It will not see a camera on another subnet or VLAN.** Discovery is
+  multicast, which stops at the first router. A camera VLAN is common in
+  exactly the setups that have the most cameras, so an empty result is normal
+  there and means nothing about whether the cameras work. Type the address in.
+- **It will not find a camera with ONVIF turned off**, which some ship as the
+  default and which is a per-camera setting in its own web interface.
+
+Cameras that report nothing about their maker (a Reolink calls itself
+`IPC-BO`, a TP-Link Tapo calls itself `TC40`) show `? choose below` and you
+pick the type from the list. That is deliberate: a wrong guess would be a
+wrong URL that looks like it was chosen on purpose.
 
 ### Skipping the menu
 
@@ -942,6 +1006,11 @@ you accept it: **anyone on that network can watch your cameras' footage.**
 That is the right trade on a trusted home LAN and the wrong one anywhere else.
 Answer `127.0.0.1` to keep it to this machine. Put a reverse proxy with TLS and
 authentication in front of it for anything wider, and do not port-forward it.
+
+**IPv6 works here too.** Any address this host holds is accepted, `::1` is the
+IPv6 loopback, and `::` accepts IPv4 connections as well, so it is the IPv6
+equivalent of `0.0.0.0`. A link-local address (`fe80::`) is not offered,
+because it cannot be bound without naming the interface it belongs to.
 
 ### The optional login
 

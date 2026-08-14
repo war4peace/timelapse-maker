@@ -40,7 +40,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 
 # ----------------------------------------------------------------------------
@@ -730,8 +730,11 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
 class RtspCamera(DayCadenceMixin, threading.Thread):
     """Supervises a persistent ffmpeg that writes one frame per interval.
 
-    -strftime_mkdir 1 makes ffmpeg create the YYYY-MM-DD directory itself, so
-    the on-disk layout matches the HTTP path exactly.
+    The day directory is created here, by `_prepare_day()`, and the output
+    pattern names it literally. ffmpeg is given `-strftime 1` for the
+    `%H%M%S.jpg` filename and nothing else, so the on-disk layout matches the
+    HTTP path exactly. See `_prepare_day()` for why the muxer is not asked to
+    do this.
     """
 
     def __init__(self, cam, cfg, cfg_path=None):
@@ -760,8 +763,66 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
         self.last_success = None
         self.last_started = None
 
-    def _cmd(self):
-        pattern = str(self.root / "%Y-%m-%d" / "%H%M%S.jpg")
+    def _prepare_day(self, day):
+        """Create the day directory, because ffmpeg will not.
+
+        This is the whole of the RTSP bug fixed in 0.1.7. The command used to
+        put `%Y-%m-%d` in the output pattern and pass `-strftime_mkdir 1` to
+        make the muxer create it. **That option belongs to the hls muxer, not
+        image2**, and ffmpeg does not complain about an unknown private
+        option: measured on 6.1.1, `-h muxer=image2` does not list it, and
+        even at `-loglevel warning` nothing is said. So it was silently
+        ignored, every write failed with "Could not open file", and the RTSP
+        path had never once worked. Verified by reproducing the exact argv
+        against testsrc: it fails with no day directory and succeeds with one.
+
+        The cadence marker goes in at the same moment, for the same reason
+        `_dest_path()` writes it: this is the point at which the directory is
+        known to be new, so what the day is being captured at is not in doubt.
+        `record_cadences()` also writes it once a minute, and that stays true;
+        it just no longer has to be what makes the marker appear at all.
+        """
+        day_dir = self.root / day
+        day_dir.mkdir(parents=True, exist_ok=True)
+        write_cadence(day_dir, self.interval, self.framerate)
+        return day_dir
+
+    def _discard_empty_day(self, day_dir):
+        """Undo _prepare_day() when nothing was captured into it.
+
+        A camera that is unreachable all day would otherwise leave one empty
+        directory per day for ever: the encoder SKIPs a day under min_frames
+        and does not clean up after it. Removes only what this class created,
+        and only when there is not a single frame, so a run that captured for
+        six hours and then dropped keeps everything.
+
+        Taking the cadence marker with it is safe for exactly that reason.
+        "One day, one cadence" exists to stop a day being captured half at one
+        rate and half at another; a day with no frames has no half to protect,
+        so re-reading the config on the next attempt is the right answer and
+        not an edit landing early.
+        """
+        try:
+            entries = list(day_dir.iterdir())
+        except OSError:
+            return
+        if any(e.suffix == ".jpg" for e in entries):
+            return
+        for e in entries:
+            if e.name != CADENCE_FILE:
+                return          # something unexpected; leave it alone
+        try:
+            for e in entries:
+                e.unlink()
+            day_dir.rmdir()
+        except OSError:
+            pass                # a racing writer, or gone already; harmless
+
+    def _cmd(self, day):
+        # The day is resolved here rather than by the muxer, so the pattern
+        # names a directory that already exists. `-t` below bounds this
+        # process to one day, which is what makes a fixed day correct.
+        pattern = str(self.root / day / "%H%M%S.jpg")
         return [
             self.ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error",
             "-rtsp_transport", "tcp",
@@ -771,8 +832,9 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
             "-vf", f"fps=1/{self.interval}",
             "-q:v", self.quality,
             "-f", "image2",
+            # Still needed: %H%M%S in the filename is strftime. What is gone
+            # is -strftime_mkdir, which image2 has never had.
             "-strftime", "1",
-            "-strftime_mkdir", "1",
             # Stop at midnight so the supervisor gets a turn: this process
             # carries fps=1/interval on its command line, so adopting a new
             # cadence means launching a new one, and the day boundary is the
@@ -796,11 +858,14 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
             # Re-read at the boundary and nowhere else, the same rule the HTTP
             # path follows. A mid-day relaunch after a dropped connection
             # therefore reconnects on the cadence the day started with.
-            self.begin_day(day_string(time.time()))
+            day = day_string(time.time())
+            self.begin_day(day)
+            day_dir = self._prepare_day(day)
             rolled = False
             try:
                 self.proc = subprocess.Popen(
-                    self._cmd(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    self._cmd(day), stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE)
                 self.last_started = self.last_attempt = time.time()
                 _, err = self.proc.communicate()
                 if not STOP.is_set():
@@ -818,6 +883,7 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
                                          self.proc.returncode, self.restarts, msg)
             except Exception as exc:
                 self.log.error("failed to start ffmpeg: %s", exc)
+            self._discard_empty_day(day_dir)
             if not STOP.is_set() and not rolled:
                 STOP.wait(10)           # backoff before reconnecting
 
@@ -867,15 +933,16 @@ class DiskGuard(threading.Thread):
 def record_cadences(cams):
     """Annotate today's day directory for any camera that has one yet.
 
-    The HTTP path records the cadence as it creates the directory, but the
-    RTSP path never creates one: ffmpeg does that itself, through
-    -strftime_mkdir, at whatever moment its first frame lands. So the marker
-    is also written from here, once a minute, for a directory that already
-    exists.
+    Both camera classes now record the cadence as they create the day
+    directory, so this is a backstop rather than the only writer. It still
+    earns its place: a directory can outlive the process that made it, a
+    marker can fail to be written, and `write_cadence()` never overwrites, so
+    running this once a minute costs a stat and closes the gap.
 
     It never creates a directory. A camera that is offline all day would
     otherwise leave an empty one behind every night, which the encoder would
-    find, report as a SKIP, and never clean up.
+    find, report as a SKIP, and never clean up. The RTSP path takes the same
+    care in reverse, by discarding a day it captured nothing into.
     """
     today = day_string(time.time())
     for cam in cams:

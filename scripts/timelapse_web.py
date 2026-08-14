@@ -66,7 +66,7 @@ from timelapse_update import (                            # noqa: E402
 # passwords in full. A lazy import inside the renderer could fail at request
 # time and quietly leave the page unredacted; failing at startup is the
 # behaviour a security filter should have.
-from timelapse_encode import redact                       # noqa: E402
+from timelapse_encode import hostport, is_ipv6, redact    # noqa: E402
 
 # The runtime-state contract, from the module that defines it. Aliased on
 # purpose: this file already uses "state_dir" for web.state_dir, the UI's own
@@ -78,7 +78,7 @@ from timelapse_encode import (                            # noqa: E402
     state_dir as runtime_state_dir,
 )
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 log = logging.getLogger("web")
 
@@ -2406,7 +2406,11 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").strip()
         if not HOST_RE.match(host):
             web = self.server.cfg.get("web", {})
-            host = f"{web.get('bind', DEFAULT_BIND)}:{web.get('port', DEFAULT_PORT)}"
+            # hostport(), not an f-string: an IPv6 bind would otherwise put
+            # http://::1:8787/video/3 into a playlist, and a .m3u that does
+            # not play arrives as a bug report about video, not about binding.
+            host = hostport(web.get("bind", DEFAULT_BIND),
+                            web.get("port", DEFAULT_PORT))
         # Set by a reverse proxy terminating TLS; anything else is ignored.
         proto = (self.headers.get("X-Forwarded-Proto") or "http").strip().lower()
         if proto not in ("http", "https"):
@@ -2994,6 +2998,12 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, addr, handler, cfg, index, updates=None, auth=None):
+        # Set before super().__init__, which creates the socket from it.
+        # ThreadingHTTPServer's default is AF_INET, so without this an IPv6
+        # bind fails at startup while check_bind() in the wizard, which walks
+        # every family getaddrinfo() returns, had already reported it usable.
+        self.address_family = (socket.AF_INET6 if is_ipv6(addr[0])
+                               else socket.AF_INET)
         super().__init__(addr, handler)
         self.cfg = cfg
         self.index = index
@@ -3003,6 +3013,32 @@ class Server(ThreadingHTTPServer):
         # Same reasoning: a disabled Auth answers every question the handler
         # asks, so no route has to know whether a login exists.
         self.auth = auth or Auth()
+
+    def server_bind(self):
+        """Decide dual-stack explicitly rather than inheriting a sysctl.
+
+        A socket bound to `::` accepts IPv4 as v4-mapped addresses when
+        IPV6_V6ONLY is 0, which is Linux's default (`net.ipv6.bindv6only`) and
+        not Windows'. Inheriting that would make "listen on ::" mean different
+        things on two hosts with identical configs, and a hardened host may
+        well have changed it. 0 is the choice here: someone who asks for the
+        IPv6 wildcard wants every interface, which is what 0.0.0.0 means to
+        them on the other stack.
+
+        It is set for any AF_INET6 socket, not only the wildcard, because on a
+        specific address the option has no effect and a conditional would only
+        be one more thing to get wrong.
+        """
+        if self.address_family == socket.AF_INET6:
+            try:
+                self.socket.setsockopt(socket.IPPROTO_IPV6,
+                                       socket.IPV6_V6ONLY, 0)
+            except OSError as exc:
+                # Some kernels refuse to change it. Serving IPv6 only is a far
+                # better outcome than refusing to start.
+                log.warning("Could not enable dual-stack on this socket "
+                            "(%s); IPv4 clients will not be accepted.", exc)
+        super().server_bind()
 
     def handle_error(self, request, client_address):
         """A client that walks away is not an error.
@@ -3095,7 +3131,7 @@ def main():
     except OSError as exc:
         # Almost always "address already in use" or a bind address that does
         # not exist on this host. Both are config errors, not crashes.
-        sys.exit(f"Cannot listen on {bind}:{port}: {exc}")
+        sys.exit(f"Cannot listen on {hostport(bind, port)}: {exc}")
 
     def on_signal(signum, _frame):
         log.info("signal %s received, shutting down", signum)
@@ -3106,7 +3142,8 @@ def main():
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 
-    log.info("Serving on http://%s:%d/ (pid %d)", bind, port, os.getpid())
+    log.info("Serving on http://%s/ (pid %d)", hostport(bind, port),
+             os.getpid())
 
     # After the socket is listening, never before: the first scan of a large
     # share on a slow link must not delay the page that reports its progress.

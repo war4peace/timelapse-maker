@@ -36,7 +36,7 @@ import tempfile
 import urllib.error
 import urllib.request
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 GITHUB_REPO = "war4peace/timelapse-maker"
 GITHUB_API = "https://api.github.com/repos/" + GITHUB_REPO

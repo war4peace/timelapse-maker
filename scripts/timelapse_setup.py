@@ -18,15 +18,19 @@ import errno
 import json
 import os
 import re
+import select
 import shutil
 import socket
 import subprocess
 import sys
 import time
+import uuid
+import xml.etree.ElementTree as ET
 from datetime import date
 from pathlib import Path, PurePosixPath
+from urllib.parse import unquote, urlparse
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -536,6 +540,320 @@ def estimate_budget(cfg, disk, n_cams, per_day):
     note("timelapse_test.py will replace this estimate with real measurements.")
 
 
+# ----------------------------------------------------------------------------
+# Camera discovery (WS-Discovery)
+#
+# A UDP multicast Probe that ONVIF devices answer with their device service
+# address and a set of scopes. Stdlib sockets and ElementTree; no SOAP stack,
+# no WSDL, no dependency, which is why this survived the decision against an
+# ONVIF client library (docs/decided-against.md).
+#
+# It lives in the wizard on purpose. The wizard runs as root and outside a
+# unit; the daemons run under ProtectSystem=strict with RestrictAddressFamilies
+# set, where a multicast bind is exactly the kind of thing that works in
+# development and fails in production. The web UI's bind probe is here for the
+# same reason.
+#
+# Everything below was measured against eight cameras from four vendors on
+# 2026-08-14 with temp/ws_discovery.py; architecture.md §4.4a records what that
+# run settled and what it disproved.
+# ----------------------------------------------------------------------------
+
+WSD_GROUP = "239.255.255.250"
+WSD_PORT = 3702
+WSD_WINDOW = 3.0                   # seconds to collect; there is no end marker
+WSD_REPEAT = 2                     # UDP is lossy, and a lost probe is a camera
+WSD_NS = "http://www.onvif.org/ver10/network/wsdl"
+
+# The typed Probe, and only the typed Probe. An untyped one found no camera
+# this one missed and pulled in a printer and two Windows PCs, because Windows
+# WSD shares this group and port. It is not symmetric either: two of the eight
+# cameras answer the typed probe alone, so sending only an untyped probe would
+# have missed them.
+WSD_TYPES = "dn:NetworkVideoTransmitter"
+
+
+def wsd_probe():
+    """One Probe datagram. Each carries a fresh MessageID, since some firmware
+    suppresses a duplicate it has already answered."""
+    return ('<?xml version="1.0" encoding="utf-8"?>'
+            '<s:Envelope'
+            ' xmlns:s="http://www.w3.org/2003/05/soap-envelope"'
+            ' xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing"'
+            ' xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery">'
+            '<s:Header>'
+            f'<a:MessageID>uuid:{uuid.uuid4()}</a:MessageID>'
+            '<a:To s:mustUnderstand="1">'
+            'urn:schemas-xmlsoap-org:ws:2005:04:discovery</a:To>'
+            '<a:Action s:mustUnderstand="1">'
+            'http://schemas.xmlsoap.org/ws/2005/04/discovery/Probe</a:Action>'
+            '</s:Header><s:Body>'
+            f'<d:Probe><d:Types xmlns:dn="{WSD_NS}">{WSD_TYPES}'
+            '</d:Types></d:Probe>'
+            '</s:Body></s:Envelope>').encode("utf-8")
+
+
+def wsd_source_addresses():
+    """Local IPv4 addresses to probe from.
+
+    Sending from 0.0.0.0 lets the routing table pick one interface, and a
+    recorder running Docker, a VM bridge or a VPN has several. Probing from
+    each in turn is what finds cameras when the default route points elsewhere.
+    Reuses host_addresses(), which is already this file's answer to "what is
+    on this machine"; "" is the last resort and means INADDR_ANY.
+    """
+    addrs = [a for a in host_addresses()
+             if ":" not in a and not a.startswith("127.")]
+    lan = lan_address()
+    if lan and lan not in addrs:
+        addrs.append(lan)
+    return addrs or [""]
+
+
+def wsd_open_sockets(addrs):
+    socks = []
+    for addr in addrs:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.bind((addr, 0))
+            if addr:
+                s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                             socket.inet_aton(addr))
+            # 2, not 1: a camera one hop away behind a switch that decrements
+            # is cheap to reach and costs nothing when it is not there.
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+            socks.append(s)
+        except OSError:
+            # An interface that cannot send multicast is ordinary. Discovery
+            # is an offer, so one failure must never stop the others.
+            s.close()
+    return socks
+
+
+def wsd_localname(tag):
+    """Namespace prefixes are not portable between vendors: the same field
+    arrives as d:XAddrs, wsdd:XAddrs or plain XAddrs."""
+    return tag.rpartition("}")[2]
+
+
+def wsd_text(root, name):
+    for elem in root.iter():
+        if wsd_localname(elem.tag) == name and elem.text:
+            return elem.text.strip()
+    return ""
+
+
+def wsd_scopes(raw):
+    """onvif://www.onvif.org/name/Front%20Door -> ("name", "Front Door")."""
+    out = []
+    for scope in raw.split():
+        try:
+            parsed = urlparse(scope)
+        except ValueError:
+            continue
+        if parsed.scheme != "onvif":
+            continue
+        parts = [p for p in parsed.path.split("/") if p]
+        if parts:
+            out.append((parts[0],
+                        unquote("/".join(parts[1:])) if len(parts) > 1 else ""))
+    return out
+
+
+def wsd_parse(data):
+    """The fields worth having from one ProbeMatch, or None."""
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError:
+        return None                 # not XML, or truncated; nothing to do
+    if not any(wsd_localname(e.tag) == "ProbeMatch" for e in root.iter()):
+        return None
+    uid = ""
+    for elem in root.iter():
+        if wsd_localname(elem.tag) == "EndpointReference":
+            uid = wsd_text(elem, "Address")
+            break
+    return {
+        # The device identity, and the only field stable across the several
+        # answers one device sends. Two spellings exist in the wild,
+        # urn:uuid:<x> and bare uuid:<x>; a device is consistent, so the
+        # string works as a key, but do not assume the prefix.
+        "uuid": uid,
+        "xaddrs": wsd_text(root, "XAddrs").split(),
+        "types": wsd_text(root, "Types"),
+        "scopes": wsd_scopes(wsd_text(root, "Scopes")),
+    }
+
+
+def wsd_is_camera(types):
+    """Does the Types list claim a video transmitter?
+
+    Reads Types, never the `type` scope. The scope is vendor free text: Dahua
+    writes Network_Video_Transmitter, Hikvision and Reolink write
+    video_encoder, TP-Link writes NetworkVideoTransmitter. Classifying on it
+    called six of eight real cameras not-cameras. Even in Types the prefix
+    moves (dn: on five, tdn: on two), so compare on the local name with the
+    punctuation stripped.
+    """
+    return "networkvideotransmitter" in re.sub(r"[^a-z]", "", types.lower())
+
+
+def wsd_host(xaddr):
+    """The host of an advertised address, or "" if it does not parse.
+
+    An XAddr is a string a camera chose to send, not necessarily a URL. One
+    Dahua here advertises `http://[]/onvif/device_service`, empty brackets and
+    no host, which urlparse raises ValueError on under Python 3.12+.
+    """
+    try:
+        host = urlparse(xaddr).hostname or ""
+    except ValueError:
+        return ""
+    return host.strip("[]")
+
+
+def wsd_address(dev):
+    """The address to offer for this device.
+
+    Prefers one it demonstrably answered *from* over one it merely advertised.
+    That is a cheaper answer to "the advertisement may be unreachable" than
+    fetching it: the reply itself proves the source address works from here,
+    and the wizard then tests the real snapshot URL anyway, which is the thing
+    that actually has to work. IPv4 before IPv6, because that is the address
+    an operator configured the camera with.
+    """
+    hosts = [h for h in (wsd_host(x) for x in dev["xaddrs"]) if h]
+    if not hosts:
+        return dev["sources"][0] if dev["sources"] else ""
+    return sorted(hosts, key=lambda h: (h not in dev["sources"], ":" in h))[0]
+
+
+def wsd_scope(dev, key):
+    for k, v in dev["scopes"]:
+        if k == key and v:
+            return v
+    return ""
+
+
+def discover_cameras(window=WSD_WINDOW, repeat=WSD_REPEAT):
+    """Probe the local network and return the devices that answered.
+
+    Cameras first, then anything else that answered, each sorted by address.
+    Never raises: discovery is an offer, and a network this cannot probe must
+    leave the operator typing an address rather than looking at a traceback.
+    """
+    socks = wsd_open_sockets(wsd_source_addresses())
+    if not socks:
+        return []
+    try:
+        for _ in range(repeat):
+            for s in socks:
+                try:
+                    s.sendto(wsd_probe(), (WSD_GROUP, WSD_PORT))
+                except OSError:
+                    pass
+            time.sleep(0.15)
+
+        devices = {}
+        deadline = time.time() + window
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            try:
+                ready, _, _ = select.select(socks, [], [], remaining)
+            except OSError:
+                break
+            for s in ready:
+                try:
+                    data, addr = s.recvfrom(65535)
+                except OSError:
+                    continue
+                reply = wsd_parse(data)
+                if reply is None:
+                    continue
+                # Deduplicate on the device id, never on the address: one
+                # device answers several times, from several addresses, and an
+                # NVR proxies the cameras behind it.
+                key = reply["uuid"] or f"addr:{addr[0]}"
+                dev = devices.setdefault(key, {
+                    "uuid": reply["uuid"], "xaddrs": [], "sources": [],
+                    "scopes": [], "types": "",
+                })
+                dev["types"] = dev["types"] or reply["types"]
+                for x in reply["xaddrs"]:
+                    if x not in dev["xaddrs"]:
+                        dev["xaddrs"].append(x)
+                if addr[0] not in dev["sources"]:
+                    dev["sources"].append(addr[0])
+                for pair in reply["scopes"]:
+                    if pair not in dev["scopes"]:
+                        dev["scopes"].append(pair)
+    finally:
+        for s in socks:
+            s.close()
+
+    return wsd_finalise(devices)
+
+
+def wsd_finalise(devices):
+    """Turn collected replies into the list the wizard shows.
+
+    Separate from the socket work so the classification can be tested against
+    real response bodies without a network. `types`, never the `type` scope:
+    that is the trap this whole path exists around.
+    """
+    found = []
+    for dev in devices.values():
+        dev["address"] = wsd_address(dev)
+        dev["camera"] = wsd_is_camera(dev["types"])
+        dev["name"] = wsd_scope(dev, "name")
+        dev["hardware"] = wsd_scope(dev, "hardware")
+        if dev["address"]:
+            found.append(dev)
+    # Cameras first, then anything else that answered.
+    return sorted(found, key=lambda d: (not d["camera"],
+                                        sort_key_for_address(d["address"])))
+
+
+def sort_key_for_address(addr):
+    """Numeric where it can be, so .9 sorts before .10."""
+    parts = addr.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        return (0, tuple(int(p) for p in parts), "")
+    return (1, (), addr)
+
+
+# Substrings that actually name a vendor, matched against the ONVIF name and
+# hardware scopes together. Deliberately short: only the makes this wizard has
+# a template for, and only names specific enough that a false match is
+# unlikely. The value is the CAMERA_PRESETS label, so that reordering the
+# presets cannot silently repoint these.
+VENDOR_HINTS = (
+    ("dahua", "Dahua / Amcrest"),
+    ("amcrest", "Dahua / Amcrest"),
+    ("hikvision", "Hikvision (ISAPI)"),
+    ("reolink", "Reolink"),
+    ("axis", "Axis"),
+)
+
+
+def wsd_preset(dev):
+    """The CAMERA_PRESETS label this device looks like, or "".
+
+    Returns "" rather than guessing. Measured: this identifies six of the
+    eight cameras here, and the two it misses report no vendor name at all
+    (a Reolink calls itself IPC-BO, a TP-Link Tapo calls itself TC40). A
+    wrong preselection is worse than none, because it is a wrong URL that
+    looks deliberate.
+    """
+    text = f"{dev.get('name', '')} {dev.get('hardware', '')}".lower()
+    for needle, label in VENDOR_HINTS:
+        if needle in text:
+            return label
+    return ""
+
+
 CAMERA_PRESETS = [
     ("Dahua / Amcrest", "http", "digest",
      "http://{ip}/cgi-bin/snapshot.cgi?channel=1&subtype=0"),
@@ -555,6 +873,18 @@ CAMERA_PRESETS = [
 ]
 
 
+def url_host(raw):
+    """Bracket an IPv6 literal so it can go inside a URL.
+
+    The rule lives in timelapse_encode, which is where the wizard, the
+    pre-flight and the web UI all read shared rules from; this is the name the
+    wizard calls it by. Same arrangement as redact_url() above, and for the
+    same reason: one rule, not one copy per caller.
+    """
+    from timelapse_encode import url_host as shared
+    return shared(raw)
+
+
 def choose_cameras(cfg, expected):
     heading("Cameras")
     cfg["cameras"] = []
@@ -571,9 +901,11 @@ def choose_cameras(cfg, expected):
     if not ask_yes("Configure cameras now?", True):
         return
 
+    found = offer_discovery()
+
     cams = []
     while True:
-        cam = add_one_camera(cfg, len(cams) + 1)
+        cam = add_one_camera(cfg, len(cams) + 1, found)
         if cam:
             cams.append(cam)
             good(f"Added '{cam['name']}' ({len(cams)} configured)")
@@ -590,12 +922,149 @@ def choose_cameras(cfg, expected):
     cfg["cameras"] = cams
 
 
-def add_one_camera(cfg, n):
+def print_discovered():
+    """`timelapse discover`: what is on this network, and nothing else.
+
+    Exists because cameras are usually added long after the install, and
+    because "what is my camera's address" is a question worth answering
+    without starting a wizard that wants to write a config.
+    """
+    heading("Cameras on this network")
+    try:
+        found = discover_cameras()
+    except Exception as exc:                        # noqa: BLE001
+        fail(f"Discovery failed: {type(exc).__name__}: {exc}")
+        return 1
+
+    if not found:
+        warn("Nothing answered.")
+        note("Multicast does not cross subnets or VLANs, so a camera on a")
+        note("separate network will not appear here even though it works")
+        note("perfectly. Many cameras also ship with ONVIF turned off.")
+        return 0
+
+    print()
+    print(f"  {'':<4}{'ADDRESS':<16} {'NAME':<24} {'MODEL':<22} TYPE")
+    for dev in found:
+        print(f"  {'cam' if dev['camera'] else '':<4}"
+              f"{dev['address']:<16} {(dev['name'] or '-')[:24]:<24} "
+              f"{(dev['hardware'] or '-')[:22]:<22} "
+              f"{'camera' if dev['camera'] else 'other device'}")
+    print()
+    note("'cam' means the device claims to be a video transmitter. Anything")
+    note("else answering is an NVR, a doorbell, a printer or a PC: Windows")
+    note("shares this discovery protocol.")
+    cams = [d for d in found if d["camera"]]
+    if cams:
+        print()
+        note("Service addresses (ONVIF), not snapshot URLs:")
+        for dev in cams:
+            for xaddr in dev["xaddrs"]:
+                print(f"    {dev['address']:<16} {xaddr}")
+    return 0
+
+
+def offer_discovery():
+    """Offer a scan, and return what answered. Never the only path.
+
+    Multicast does not cross subnets and rarely crosses VLANs, and a dedicated
+    camera VLAN is common in exactly the deployments that have many cameras.
+    So finding nothing is reported as "nothing answered here", never as "there
+    are no cameras", and typing an address by hand stays a first-class answer.
+    """
+    if AUTO or _TTY is None:
+        # ask_yes() returns the default without a terminal, so without this
+        # an unattended run would spend three seconds probing a network on
+        # behalf of nobody, and have no way to offer the result.
+        return []
+
+    print()
+    note("Cameras that speak ONVIF can usually be found automatically. This")
+    note("sends one multicast query and listens for a few seconds; it sends")
+    note("no credentials, so it cannot lock a camera account.")
+    print()
+    if not ask_yes("Scan this network for cameras?", True):
+        return []
+
+    print()
+    note(f"Listening for {WSD_WINDOW:.0f} seconds ...")
+    try:
+        found = discover_cameras()
+    except Exception as exc:                        # noqa: BLE001
+        # Discovery is a convenience. Anything at all going wrong here must
+        # leave the operator adding cameras by hand, not looking at a stack.
+        warn(f"Discovery failed ({type(exc).__name__}: {exc}).")
+        note("Add cameras by hand below; nothing else is affected.")
+        return []
+
+    cameras = [d for d in found if d["camera"]]
+    if not cameras:
+        print()
+        warn("Nothing answered on this network segment.")
+        note("That does not mean there are no cameras. Multicast does not")
+        note("cross subnets or VLANs, and many cameras have ONVIF turned off")
+        note("by default. Add them by hand below, which always works.")
+        return []
+
+    print()
+    good(f"{len(cameras)} camera(s) answered.")
+    others = len(found) - len(cameras)
+    if others:
+        # An NVR, an encoder or a doorbell answers this probe too, and so does
+        # every Windows machine on the LAN.
+        note(f"{others} other device(s) also answered and are not offered.")
+    note("They are listed for each camera you add. What a camera reports is")
+    note("its model, not its location, so you still choose what to call it.")
+    return cameras
+
+
+def pick_discovered(found):
+    """Let the operator choose a discovered camera, or 0 to type one in.
+
+    Returns the device, or None for "by hand". A device already added is not
+    offered again, and the marking happens only once the camera is really
+    added, so abandoning one halfway does not lose it from the list.
+    """
+    free = [d for d in found if not d.get("used")]
+    if not free:
+        return None
+    print()
+    print("    Found on this network:")
+    print(f"          {'ADDRESS':<16} {'MODEL':<24} TYPE")
+    for i, dev in enumerate(free, 1):
+        # The model, not the name: three Dahuas here all call themselves
+        # "Dahua", so the name does not distinguish them and the model does.
+        model = dev["hardware"] or dev["name"] or "(unnamed)"
+        print(f"      {i:>2}  {dev['address']:<16} {model[:24]:<24} "
+              f"{wsd_preset(dev) or '? choose below'}")
+    print("       0  none of these, enter an address by hand")
+    choice = ask_int("Pick one", 1, 0, len(free))
+    return None if choice == 0 else free[choice - 1]
+
+
+def add_one_camera(cfg, n, found=None):
     print()
     print(f"  {bold(f'Camera {n}')}")
+
+    device = pick_discovered(found) if found else None
+
+    default_type = 1
+    if device is not None:
+        hint = wsd_preset(device)
+        if hint:
+            # +1: the menu is 1-based. Matched by label rather than by index
+            # so that reordering CAMERA_PRESETS cannot silently repoint it.
+            default_type = [p[0] for p in CAMERA_PRESETS].index(hint) + 1
+        else:
+            print()
+            note(f"This device calls itself "
+                 f"'{device['name'] or device['hardware'] or 'nothing'}',")
+            note("which does not identify the make. Pick the type below.")
+
+    print()
     for i, (label, _, _, _) in enumerate(CAMERA_PRESETS, 1):
         print(f"    {i}  {label}")
-    choice = ask_int("Camera type", 1, 1, len(CAMERA_PRESETS))
+    choice = ask_int("Camera type", default_type, 1, len(CAMERA_PRESETS))
     label, method, auth, template = CAMERA_PRESETS[choice - 1]
 
     name = ask("Name (used as the folder name)", f"Camera{n}")
@@ -613,12 +1082,25 @@ def add_one_camera(cfg, n):
             user = ask("Username", "admin")
             pwd = ask_secret("Password")
     else:
-        ip = ask("IP address or hostname", "192.168.1.100")
+        # The discovered address is a default, never a fact: it is offered so
+        # it can be corrected. Only the host is taken, never the port the
+        # device service answered on. Those are different endpoints, and a
+        # Reolink's ONVIF service on :8000 says nothing about where its
+        # snapshot lives, which is :80.
+        ip = ask("IP address or hostname",
+                 device["address"] if device else "192.168.1.100")
+        host = url_host(ip)
+        if host != ip.strip():
+            note(f"IPv6 address bracketed for the URL: {host}")
+            if ip.strip().lower().startswith("fe80:") and "%" not in ip:
+                warn("A link-local address needs a zone id (fe80::1%eth0),")
+                note("and it moves with the interface. Prefer the camera's")
+                note("stable address if it has one.")
         user = pwd = ""
         if auth in ("digest", "basic") or method == "rtsp" or "{user}" in template:
             user = ask("Username", "admin")
             pwd = ask_secret("Password")
-        url = template.format(ip=ip, user=quote(user), password=quote(pwd))
+        url = template.format(ip=host, user=quote(user), password=quote(pwd))
 
     cam = {"name": name, "enabled": True, "method": method, "url": url}
     if method == "http":
@@ -632,6 +1114,10 @@ def add_one_camera(cfg, n):
     if ask_yes("Test this camera now?", True):
         if not test_camera(cam, cfg) and not ask_yes("Keep it anyway?", True):
             return None
+    if device is not None:
+        # Only now, so that abandoning a camera halfway leaves its device
+        # available to pick again.
+        device["used"] = True
     return cam
 
 
@@ -1048,6 +1534,9 @@ def manage_cameras(cfg):
 
     cams = cfg.setdefault("cameras", [])
     changed = False
+    # Offered once per session rather than on every "a": a scan takes seconds
+    # and the answer does not change between two adds a minute apart.
+    found = None
     while True:
         list_cameras(cfg)
         print()
@@ -1055,7 +1544,9 @@ def manage_cameras(cfg):
         action = ask("Action", "q").strip().lower()[:1]
 
         if action == "a":
-            cam = add_one_camera(cfg, len(cams) + 1)
+            if found is None:
+                found = offer_discovery()
+            cam = add_one_camera(cfg, len(cams) + 1, found)
             if cam:
                 if name_taken(cams, cam["name"]):
                     fail(f"A camera called '{cam['name']}' already exists; "
@@ -1130,7 +1621,7 @@ def camera_action(cfg, action, token):
         return False, True
 
     if action == "add":
-        cam = add_one_camera(cfg, len(cams) + 1)
+        cam = add_one_camera(cfg, len(cams) + 1, offer_discovery())
         if not cam:
             note("Nothing added.")
             return False, True
@@ -2050,6 +2541,8 @@ def choose_web(cfg):
         warn(f"This is currently {web['bind']}, reachable only from this host.")
         warn(f"Accepting {suggested} below opens it to your network.")
 
+    note("An IPv6 address works too; :: is the IPv6 answer to 0.0.0.0 and")
+    note("accepts IPv4 as well.")
     while True:
         chosen = ask("Listen on", suggested).strip()
         # Port 0 asks the kernel only whether this host holds the address,
@@ -2455,7 +2948,8 @@ def summarise(cfg, out_path):
     # needs PEP 701, which is Python 3.12. This project supports 3.9.
     web_line = "disabled"
     if w.get("enabled"):
-        web_line = "http://{}:{}/".format(w.get("bind"), w.get("port"))
+        from timelapse_encode import hostport
+        web_line = "http://{}/".format(hostport(w.get("bind"), w.get("port")))
     print(f"  {'Web UI':<12}{web_line}")
     print(f"  {'Config':<12}{out_path}")
 
@@ -2821,8 +3315,9 @@ def summarise_web(cfg):
         note("Web UI disabled.")
         return
     where, why = web_library_preview(cfg)
+    from timelapse_encode import hostport
     print()
-    note(f"listen        http://{web.get('bind')}:{web.get('port')}/")
+    note(f"listen        http://{hostport(web.get('bind'), web.get('port'))}/")
     note(f"library       {where or '(not set)'}  ({why})")
     note(f"index         {web.get('state_dir')}")
     note(f"update check  {'on' if web.get('update_check', True) else 'off'}")
@@ -2904,6 +3399,9 @@ def main():
                     help="restore a previous config from the backups")
     ap.add_argument("--backup-now", action="store_true",
                     help="take a config backup and print its path, then stop")
+    ap.add_argument("--discover", action="store_true",
+                    help="list ONVIF devices answering on this network "
+                         "and exit; sends no credentials")
     ap.add_argument("--redacted", action="store_true",
                     help="print the config with its credentials masked, for "
                          "pasting into a bug report")
@@ -2965,6 +3463,11 @@ def main():
     # pipe, and it must never prompt.
     if args.redacted:
         return print_redacted_config(args.output)
+
+    # Also never prompts, so it works over a pipe and needs no terminal. It
+    # sends no credentials, so it needs no privileges either.
+    if args.discover:
+        return print_discovered()
 
     # Machine-readable mode used by install.sh to template the systemd units.
     if args.print_paths:

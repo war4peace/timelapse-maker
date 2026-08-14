@@ -15,6 +15,7 @@ no network, no GPU - it falls back to libx264 if NVENC is unavailable.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -68,6 +69,65 @@ def build_frames(day_dir):
     # a file below min_bytes, and a file with a non-JPEG header.
     (day_dir / "235950.jpg").write_bytes(b"\xff\xd8\xff" + b"\x00" * 100)
     (day_dir / "235955.jpg").write_bytes(b"NOT A JPEG" + b"\x00" * 8000)
+
+
+def rtsp_writer_check(tmp):
+    """Run the RTSP grabber's real argv, with testsrc in place of a camera.
+
+    This is the check that was missing when RTSP capture shipped broken from
+    the first release to 0.1.6. Both RTSP probes (the wizard's and
+    `timelapse test`) write one fixed filename into a directory that already
+    exists, so they proved the camera was reachable and never touched the
+    output side, which is where the fault was: the command asked the image2
+    muxer to create the day directory with `-strftime_mkdir`, an option that
+    belongs to the hls muxer and which ffmpeg silently ignores.
+
+    Same lesson as PIX_FMT in the encoder probe: **a probe must produce what
+    the pipeline produces.** So this takes the argv from the daemon itself
+    rather than restating it, and only swaps the input.
+    """
+    sys.path.insert(0, str(REPO / "scripts"))
+    import timelapse_capture as capture
+
+    print("\nChecking the RTSP writer (argv taken from the daemon)...")
+    day = date.today().isoformat()
+    grabber = capture.RtspCamera.__new__(capture.RtspCamera)
+    grabber.ffmpeg, grabber.url = FFMPEG, "rtsp://example.invalid/stream"
+    grabber.interval, grabber.quality, grabber.framerate = 1, "2", FPS
+    grabber.root = tmp / "rtsp" / "Hallway"
+    grabber.root.mkdir(parents=True, exist_ok=True)
+
+    argv = grabber._cmd(day)
+    check("the output pattern names a real directory, not a strftime one",
+          "%Y" not in argv[-1], argv[-1])
+    check("no -strftime_mkdir (image2 has never had it)",
+          "-strftime_mkdir" not in argv)
+
+    grabber._prepare_day(day)
+    i = argv.index("-i")
+    head = [a for a in argv[:i] if a not in ("-rtsp_transport", "tcp",
+                                             "-use_wallclock_as_timestamps",
+                                             "1")]
+    argv = head + ["-f", "lavfi", "-i", "testsrc=size=64x64:rate=5"] + argv[i + 2:]
+    argv[argv.index("-t") + 1] = "3"
+    p = subprocess.run(argv, capture_output=True, text=True, timeout=90)
+    frames = sorted(grabber.root.rglob("*.jpg"))
+    check("ffmpeg exits cleanly", p.returncode == 0,
+          (p.stderr or "").strip().splitlines()[0][:90] if p.returncode else "")
+    check("frames land in the day directory", len(frames) >= 1,
+          f"{len(frames)} frame(s)")
+    check("frames are named HHMMSS.jpg",
+          bool(frames) and re.fullmatch(r"\d{6}\.jpg", frames[0].name),
+          frames[0].name if frames else "none")
+
+    # The other half of the fix: a day nothing was captured into is removed,
+    # so an unreachable camera does not leave one empty directory per day.
+    empty = tmp / "rtsp" / "Offline"
+    grabber.root = empty
+    grabber._prepare_day(day)
+    check("an empty day directory is created", (empty / day).is_dir())
+    grabber._discard_empty_day(empty / day)
+    check("and discarded when it holds no frames", not (empty / day).exists())
 
 
 def main():
@@ -227,6 +287,7 @@ def second_night(tmp, cfg, cfg_path, videos):
     check("the empty run recorded no days and no error",
           len(runs) > 1 and runs[1]["days"] == [] and not runs[1]["error"])
 
+    rtsp_writer_check(tmp)
     return finish(tmp)
 
 

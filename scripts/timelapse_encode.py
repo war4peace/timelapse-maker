@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import ipaddress
 import json
 import logging
 import logging.handlers
@@ -33,7 +34,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -71,6 +72,60 @@ CRED_PATTERNS = (
     # reaches the log through urllib's exception text on a failed notification.
     (re.compile(r"(/api/webhooks/\d+/)[\w-]+", re.I), r"\1" + MASK),
 )
+
+
+def url_host(raw):
+    """An address as it must appear inside a URL.
+
+    An IPv6 literal has to be bracketed, or the colons are read as the port
+    separator. Both failure modes are misleading: requests raises
+    `InvalidURL: Failed to parse`, and ffmpeg reports "Failed to resolve
+    hostname fdd2", which sends an operator to look at DNS for a camera whose
+    address they typed correctly. Measured against a real Hikvision over its
+    ULA address, 2026-08-14: bracketed works on both, bare fails on both.
+
+    Hostnames and IPv4 addresses pass through untouched, so this is safe to
+    apply to whatever was typed. It lives here rather than in the wizard
+    because the web UI needs the same rule for the addresses it prints, and
+    two copies is two chances to emit a URL nothing can open.
+    """
+    host = raw.strip()
+    if host.startswith("[") and host.endswith("]"):
+        return host                        # already bracketed by the operator
+    try:
+        # Split the zone id off before validating: 3.9 is the floor, and a
+        # scoped address is only accepted by ipaddress from 3.9 onwards.
+        ipaddress.IPv6Address(host.split("%")[0])
+    except ValueError:
+        return host
+    return "[%s]" % host
+
+
+def is_ipv6(addr):
+    """Is this an IPv6 literal? Brackets and a zone id are both tolerated.
+
+    A hostname returns False even if it resolves to IPv6, which is correct for
+    every caller here: they are deciding how to *format* an address, or which
+    socket family to open for a literal the operator typed.
+    """
+    host = str(addr).strip()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    try:
+        ipaddress.IPv6Address(host.split("%")[0])
+    except ValueError:
+        return False
+    return True
+
+
+def hostport(addr, port):
+    """`host:port` for a URL or for display, with IPv6 bracketed.
+
+    Every unbracketed `f"{bind}:{port}"` in this project was a latent bug: the
+    startup log, two wizard summaries and the playlist origin all produced
+    `http://::1:8787/`, which no client can open.
+    """
+    return "%s:%s" % (url_host(str(addr)), port)
 
 
 def redact(text):
