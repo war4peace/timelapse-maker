@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
-## [Unreleased]
+## [0.1.6] - 2026-08-14
 
 ### Fixed
 - **A camera that rejects our credentials is no longer hammered with them.**
@@ -1083,6 +1083,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.6]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.6
 [0.1.5]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.5
 [0.1.4]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.4
 [0.1.3]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.3

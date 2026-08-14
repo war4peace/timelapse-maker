@@ -26,7 +26,7 @@ import time
 from datetime import date
 from pathlib import Path, PurePosixPath
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers

@@ -813,7 +813,7 @@ main() {
   ╚══════════════════════════════════════════════════════════╝
 BANNER
     printf '%s' "$N"
-    printf '  %sEXPERIMENTAL (v0.1.5)%s - early software, tested on one machine.\n' "$Y$B" "$N"
+    printf '  %sEXPERIMENTAL (v0.1.6)%s - early software, tested on one machine.\n' "$Y$B" "$N"
     note "Config format may change between versions. Not for production use."
 
     if [ "$DO_UNINSTALL" = "1" ]; then
