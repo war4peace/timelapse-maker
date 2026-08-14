@@ -3,7 +3,7 @@
 > [!WARNING]
 > ## ⚠️ EXPERIMENTAL: IN DEVELOPMENT
 >
-> **Version 0.1.6.** This is early software that has run on exactly one machine.
+> **Version 0.1.7.** This is early software that has run on exactly one machine.
 > It has not been tested across different distributions, camera makes, GPUs or
 > disk layouts, and it almost certainly has rough edges nobody has hit yet.
 >

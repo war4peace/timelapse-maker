@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
-## [Unreleased]
+## [0.1.7] - 2026-08-14
 
 ### Added
 - **The wizard can find your cameras for you.** Adding a camera now offers a
@@ -59,8 +59,7 @@ While the version is `0.x`, the configuration format may change in any release.
   fetched. The address is bracketed automatically now, and a link-local one
   (`fe80::`) is flagged as needing a zone id. Capture itself always worked over
   IPv6; if you already added such a camera by hand with the "Custom URL"
-  option, nothing changes and nothing needs redoing. The web UI still binds
-  IPv4 only.
+  option, nothing changes and nothing needs redoing.
 
 ### Changed
 - **Upgrading no longer asks four questions.** Re-running the installer, or
@@ -1167,6 +1166,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.7]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.7
 [0.1.6]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.6
 [0.1.5]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.5
 [0.1.4]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.4
