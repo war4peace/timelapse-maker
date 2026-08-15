@@ -1234,7 +1234,15 @@ def list_cameras(cfg):
         # Anything new on this row is paid for from the other columns.
         if len(url) > 36:
             url = url[:20] + "..." + url[-13:]
-        state = "yes" if cam.get("enabled", True) else dim("no")
+        # Padded before colouring, never after. dim() wraps the text in escape
+        # codes and a format width counts them, so `{dim("no"):<4}` pads to
+        # nothing and the row reads "no5s/60". Invisible in every test and on
+        # CI, because dim() is a no-op unless stdout is a tty; it only appears
+        # in front of the operator. Reported from a real terminal at 0.1.9.
+        on = cam.get("enabled", True)
+        state = f"{'yes' if on else 'no':<4}"
+        if not on:
+            state = dim(state)
         # A trailing * means this camera is not following the global settings,
         # which is what decides whether changing them will move it. +N is
         # optional smoothing. All three answer one question, "how is this
@@ -1248,7 +1256,7 @@ def list_cameras(cfg):
         # too wide for its column pushes the row out instead of running into
         # the next one. 3600s/240*+30 is absurd but constructible, and an
         # absurd config should still be readable.
-        print(f"    {i:>2}  {str(cam.get('name', '')):<14} {state:<4}"
+        print(f"    {i:>2}  {str(cam.get('name', '')):<14} {state}"
               f"{cad:<11} {str(cam.get('method', 'http')):<4} {dim(url)}")
     if any(camera_overrides(c) for c in cams):
         note("  * has its own interval or frame rate; the rest follow the "

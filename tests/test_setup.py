@@ -2525,6 +2525,29 @@ class TestCadenceListing(unittest.TestCase):
         out = self.show([{"name": "A", "url": "http://h/s"}])
         self.assertNotIn("own interval or frame rate", out)
 
+    def test_columns_line_up_whether_or_not_a_camera_is_disabled(self):
+        """Reported from a real terminal, and invisible here until forced.
+
+        `dim()` is a no-op unless stdout is a tty, which no test run and no
+        CI job ever is, so the padding looked correct everywhere it was
+        checked and collided only in front of the operator: a format width
+        counts the escape codes, so `{state:<4}` on an already-coloured "no"
+        adds nothing and the row reads "no5s/60". Pad first, colour second.
+
+        Asserting on column positions rather than on the absence of one
+        string, because the defect is alignment and any coloured column can
+        reintroduce it.
+        """
+        with mock.patch.object(setup, "_COLOR", True):
+            out = self.show([{"name": "On", "url": "http://h/s"},
+                             {"name": "Off", "url": "http://h/s",
+                              "enabled": False}])
+        rows = [re.sub(r"\x1b\[[0-9;]*m", "", ln) for ln in out.splitlines()
+                if "http://h/s" in ln]
+        self.assertEqual(len(rows), 2, out)
+        self.assertEqual(rows[0].index("5s/60"), rows[1].index("5s/60"),
+                         f"cadence column moved:\n{rows[0]}\n{rows[1]}")
+
     def test_smoothing_is_shown_against_the_camera_that_has_it(self):
         out = self.show([{"name": "A", "url": "http://h/s"},
                          {"name": "B", "url": "http://h/s",

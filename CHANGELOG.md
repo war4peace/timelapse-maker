@@ -9,6 +9,18 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+- **A disabled camera's row in `timelapse cameras -l` no longer collides with
+  the next column**, printing `no5s/60` where an enabled camera prints
+  `yes 5s/60`. The state is dimmed for a disabled camera, and a format width
+  counts the escape codes that dimming adds, so padding an already-coloured
+  string added nothing. Padding now happens before colouring. Present since
+  0.1.8 and reported from a real terminal at 0.1.9; it was invisible to the
+  test suite and to CI because colour is disabled when stdout is not a tty,
+  which is every automated run. The test that covers it forces colour on and
+  asserts that the cadence column starts at the same offset whether or not the
+  camera is disabled, rather than checking for one bad string.
+
 ## [0.1.9] - 2026-08-15
 
 ### Added
