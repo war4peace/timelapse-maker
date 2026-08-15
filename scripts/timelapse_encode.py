@@ -206,6 +206,50 @@ def redact_config(node):
 
 
 # ----------------------------------------------------------------------------
+# The atomic write
+#
+# Write to a temporary name, then rename over the destination. Every state file
+# and every captured frame in this project lands that way, so a reader never
+# sees a half-written file and a process killed mid-write leaves a stray .tmp
+# rather than a corrupt frame.
+#
+# The rename is the part that is not portable, and the difference is not a
+# detail: POSIX rename() ignores open handles entirely, while Windows refuses
+# while anything holds the destination. Duplicated in timelapse_capture.py, for
+# the same reason load_config() and the redaction rule are, with a test pinning
+# the copies together.
+# ----------------------------------------------------------------------------
+
+REPLACE_TRIES = 20
+REPLACE_WAIT = 0.05
+
+
+def replace_atomic(tmp, final):
+    """os.replace(), retried briefly, for files a reader may hold open.
+
+    POSIX rename() does not care who has the destination open, so this wins on
+    the first pass on Linux and costs nothing. Windows raises PermissionError
+    instead, because CPython's open() does not ask for FILE_SHARE_DELETE, and
+    every file written this way here is written by a daemon and read by the
+    web UI. A page load arriving in the same millisecond would otherwise lose
+    a frame, a heartbeat or a cadence marker.
+
+    Retried rather than branched on the platform, because a reader is gone in
+    milliseconds and there is nothing to decide. A genuine permission problem
+    still raises, a second later, carrying its own error, so every caller's
+    existing OSError handling applies unchanged.
+    """
+    for attempt in range(REPLACE_TRIES):
+        try:
+            os.replace(tmp, final)
+            return
+        except PermissionError:
+            if attempt == REPLACE_TRIES - 1:
+                raise
+            time.sleep(REPLACE_WAIT)
+
+
+# ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
 
@@ -579,7 +623,7 @@ def mark_encoded(day_dir, out_file, result, encoder_name):
                        "size": result["size"],
                        "encoder": encoder_name,
                        "version": __version__}, fh)
-        os.replace(tmp, path)
+        replace_atomic(tmp, path)
         return True
     except OSError as exc:
         log.warning("  %s: could not mark the day encoded (%s); it will be "
@@ -746,7 +790,7 @@ def write_run_state(cfg, record):
         tmp = path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh)
-        os.replace(tmp, path)
+        replace_atomic(tmp, path)
         return True
     except OSError as exc:
         log.warning("could not update %s: %s", path, exc)
@@ -1415,7 +1459,7 @@ def save_notified(cfg, incidents):
         tmp = path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"version": STATE_VERSION, "incidents": incidents}, fh)
-        os.replace(tmp, path)
+        replace_atomic(tmp, path)
         return True
     except OSError as exc:
         # Losing this file means the next run repeats a notification, which is

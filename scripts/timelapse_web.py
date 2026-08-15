@@ -66,7 +66,8 @@ from timelapse_update import (                            # noqa: E402
 # passwords in full. A lazy import inside the renderer could fail at request
 # time and quietly leave the page unredacted; failing at startup is the
 # behaviour a security filter should have.
-from timelapse_encode import hostport, is_ipv6, redact    # noqa: E402
+from timelapse_encode import (hostport, is_ipv6, redact,  # noqa: E402
+                              replace_atomic)
 
 # The runtime-state contract, from the module that defines it. Aliased on
 # purpose: this file already uses "state_dir" for web.state_dir, the UI's own
@@ -1006,7 +1007,7 @@ class UpdateChecker:
             tmp = self.path.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump(self.state, fh)
-            os.replace(tmp, self.path)
+            replace_atomic(tmp, self.path)
         except OSError as exc:
             # An unwritable state dir already has its own visible symptom.
             log.debug("Could not cache the update check: %s", exc)

@@ -2400,6 +2400,14 @@ def check_bind(addr, port):
     SO_REUSEADDR matches what the server sets, so this probes the same
     conditions the service will meet rather than stricter ones. It binds only,
     never listens, and closes immediately.
+
+    Windows is the exception, and matching the server there would defeat the
+    whole check: SO_REUSEADDR on Windows permits binding a port something else
+    is actively listening on, so the probe succeeds and the wizard reports a
+    taken port as free. Measured three ways: SO_REUSEADDR succeeds,
+    SO_EXCLUSIVEADDRUSE refuses with 10048, and no option at all refuses with
+    10048. So ask for exclusive use where the constant exists, which is
+    Windows only and is therefore its own platform test.
     """
     if not str(addr).strip():
         return "bad", "no address given"
@@ -2412,7 +2420,9 @@ def check_bind(addr, port):
     for family, socktype, proto, _canon, sockaddr in infos:
         s = socket.socket(family, socktype, proto)
         try:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            exclusive = getattr(socket, "SO_EXCLUSIVEADDRUSE", None)
+            s.setsockopt(socket.SOL_SOCKET,
+                         exclusive if exclusive else socket.SO_REUSEADDR, 1)
             s.bind(sockaddr)
             return "ok", ""
         except OSError as exc:
@@ -3111,6 +3121,7 @@ def write_config(cfg, out_path, owner=None):
     install.sh used to fix this afterwards, so a standalone `timelapse setup`
     produced a config the service could not read.
     """
+    from timelapse_encode import replace_atomic
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     backup_config(out)
@@ -3118,7 +3129,7 @@ def write_config(cfg, out_path, owner=None):
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(cfg, fh, indent=2)
         fh.write("\n")
-    os.replace(tmp, out)
+    replace_atomic(tmp, out)
     try:
         os.chmod(out, 0o640)          # it holds camera credentials
     except OSError:

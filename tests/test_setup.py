@@ -1865,10 +1865,16 @@ class TestBindProbe(unittest.TestCase):
     def test_empty_is_rejected(self):
         self.assertEqual(setup.check_bind("", 0)[0], "bad")
 
-    @unittest.skipIf(sys.platform == "win32",
-                     "Windows SO_REUSEADDR permits binding an active "
-                     "listener, where Linux refuses; the service is Linux-only")
     def test_a_taken_port_reads_as_in_use(self):
+        """This used to be skipped on Windows, which was the wrong call.
+
+        The skip said "the service is Linux-only", but the *wizard* is not:
+        it runs wherever someone runs it, and there it reported a taken port
+        as free, which is the one answer this check exists to prevent. That
+        is a defect in check_bind(), not a platform difference to route
+        around, so the probe now asks for exclusive use where the constant
+        exists and the test runs everywhere.
+        """
         s = socket.socket()
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", 0))

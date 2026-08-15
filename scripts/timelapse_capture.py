@@ -327,6 +327,47 @@ def camera_framerate(cam, cfg):
 
 
 # ----------------------------------------------------------------------------
+# The atomic write
+#
+# Duplicated from timelapse_encode.py, deliberately and for the same reason
+# load_config() and the redaction rule are: this daemon imports nothing from
+# its siblings. A test pins the copies together.
+#
+# It matters most here. The encoder writes a handful of state files a night;
+# this daemon renames every single frame it captures, which is one every few
+# seconds, per camera, for ever.
+# ----------------------------------------------------------------------------
+
+REPLACE_TRIES = 20
+REPLACE_WAIT = 0.05
+
+
+def replace_atomic(tmp, final):
+    """os.replace(), retried briefly, for files a reader may hold open.
+
+    POSIX rename() does not care who has the destination open, so this wins on
+    the first pass on Linux and costs nothing. Windows raises PermissionError
+    instead, because CPython's open() does not ask for FILE_SHARE_DELETE, and
+    every file written this way here is written by a daemon and read by the
+    web UI. A page load arriving in the same millisecond would otherwise lose
+    a frame, a heartbeat or a cadence marker.
+
+    Retried rather than branched on the platform, because a reader is gone in
+    milliseconds and there is nothing to decide. A genuine permission problem
+    still raises, a second later, carrying its own error, so every caller's
+    existing OSError handling applies unchanged.
+    """
+    for attempt in range(REPLACE_TRIES):
+        try:
+            os.replace(tmp, final)
+            return
+        except PermissionError:
+            if attempt == REPLACE_TRIES - 1:
+                raise
+            time.sleep(REPLACE_WAIT)
+
+
+# ----------------------------------------------------------------------------
 # One day, one cadence
 #
 # A day directory records the interval and frame rate it was captured at, and
@@ -384,7 +425,7 @@ def write_cadence(day_dir, interval, framerate):
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"interval_seconds": int(interval),
                        "framerate": int(framerate)}, fh)
-        os.replace(tmp, path)
+        replace_atomic(tmp, path)
         return True
     except OSError as exc:
         log.debug("could not record the cadence in %s: %s", day_dir, exc)
@@ -642,7 +683,7 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
         tmp = final.parent / f".{final.stem}.tmp"
         with open(tmp, "wb") as fh:
             fh.write(data)
-        os.replace(tmp, final)          # atomic: no partial file ever visible
+        replace_atomic(tmp, final)      # atomic: no partial file ever visible
 
     # -- main loop ----------------------------------------------------------
 
@@ -1069,7 +1110,7 @@ def write_state(cfg, cams, started, running=True):
         tmp = path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(capture_state(cams, started, running), fh)
-        os.replace(tmp, path)
+        replace_atomic(tmp, path)
         _state_warned = False
         return True
     except OSError as exc:

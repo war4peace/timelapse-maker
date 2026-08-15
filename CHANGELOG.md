@@ -10,6 +10,22 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Fixed
+- **Two defects that only appear when the scripts are run on Windows.**
+  **Nothing changes on a Linux install**, which is every supported deployment
+  today; these were found while researching a possible Windows variant and are
+  fixed now because they are cheap and because they are the kind of thing that
+  is much harder to find later. First, the atomic write used for every state
+  file and every captured frame renames a temporary file over its destination,
+  and Windows refuses that rename while any other process has the destination
+  open, so a web UI page load landing in the same millisecond as a daemon's
+  write would lose the write. It now waits the reader out and still reports a
+  genuine permission problem. Second, the wizard's bind check reported a port
+  as free when something was already listening on it, because the option it
+  sets to match the server means something different on Windows; it now asks
+  for exclusive use where that applies. The second had been recorded as a
+  skipped test rather than a bug: the service is Linux-only, but the wizard
+  runs wherever it is run, and a platform difference that makes a check lie is
+  a defect in the check.
 - **A disabled camera's row in `timelapse cameras -l` no longer collides with
   the next column**, printing `no5s/60` where an enabled camera prints
   `yes 5s/60`. The state is dimmed for a disabled camera, and a format width

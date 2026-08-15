@@ -714,6 +714,20 @@ class TestCredentialsNeverReachTheLog(unittest.TestCase):
                          enc.state_dir({"paths": {"state_dir": "/srv/s"}}))
         self.assertEqual(cap.state_dir({}), enc.state_dir({}))
 
+    def test_the_daemons_copy_of_the_atomic_write_has_not_drifted(self):
+        """Third duplicated thing, pinned for the same reason as the other two.
+
+        This one is character-identical rather than value-identical because it
+        is a function, and the part that matters is the retry, which no
+        assertion about its output would notice going missing on Linux.
+        """
+        import inspect
+        import timelapse_encode as enc
+        self.assertEqual(inspect.getsource(cap.replace_atomic),
+                         inspect.getsource(enc.replace_atomic))
+        self.assertEqual(cap.REPLACE_TRIES, enc.REPLACE_TRIES)
+        self.assertEqual(cap.REPLACE_WAIT, enc.REPLACE_WAIT)
+
     def test_the_daemons_copy_of_the_rule_has_not_drifted(self):
         """The rule exists twice: this daemon imports nothing from its
         siblings, for the same reason load_config() is duplicated. A security

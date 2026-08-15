@@ -2557,5 +2557,102 @@ class TestAddressFormatting(unittest.TestCase):
         return Path(__file__).resolve().parent.parent
 
 
+class TestReplaceAtomic(unittest.TestCase):
+    """The rename half of the atomic write.
+
+    On Linux every one of these passes on the first attempt, so the retry is
+    dead code here and would rot unobserved. Hence the fake: the failure mode
+    is Windows-only but the *handling* of it is not, and it can be tested
+    anywhere.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.src = self.tmp / "state.json.tmp"
+        self.dst = self.tmp / "state.json"
+        self.src.write_text("new", encoding="utf-8")
+        self.dst.write_text("old", encoding="utf-8")
+
+    def test_it_replaces_the_destination(self):
+        enc.replace_atomic(self.src, self.dst)
+        self.assertEqual(self.dst.read_text(encoding="utf-8"), "new")
+        self.assertFalse(self.src.exists())
+
+    def test_it_does_not_sleep_when_the_first_attempt_wins(self):
+        # The common path on every platform, and it must cost nothing: this
+        # runs once per captured frame, per camera, for ever.
+        with mock.patch.object(enc.time, "sleep") as slept:
+            enc.replace_atomic(self.src, self.dst)
+        slept.assert_not_called()
+
+    def test_a_reader_holding_the_destination_is_waited_out(self):
+        """Windows refuses the rename while another handle holds the target.
+
+        Simulated rather than reproduced, because on Linux the real call
+        simply succeeds. Two refusals then success is the shape a web UI page
+        load produces: it is gone in milliseconds.
+        """
+        real, calls = enc.os.replace, []
+
+        def flaky(a, b):
+            calls.append(1)
+            if len(calls) < 3:
+                raise PermissionError(13, "Access is denied")
+            return real(a, b)
+
+        with mock.patch.object(enc.os, "replace", flaky), \
+                mock.patch.object(enc.time, "sleep") as slept:
+            enc.replace_atomic(self.src, self.dst)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(slept.call_count, 2)
+        self.assertEqual(self.dst.read_text(encoding="utf-8"), "new")
+
+    def test_a_real_permission_problem_still_raises(self):
+        """A reader goes away; a wrong owner does not.
+
+        The caller's own OSError handling is what turns this into a logged
+        warning rather than a crash, so the error has to arrive rather than be
+        swallowed into a silent no-op that loses the write.
+        """
+        def denied(a, b):
+            raise PermissionError(13, "Access is denied")
+
+        with mock.patch.object(enc.os, "replace", denied), \
+                mock.patch.object(enc.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                enc.replace_atomic(self.src, self.dst)
+
+    def test_other_errors_are_not_retried(self):
+        # A missing source or a cross-device rename will not fix itself, and
+        # retrying it 20 times just delays the log line.
+        def gone(a, b):
+            raise FileNotFoundError(2, "No such file")
+
+        with mock.patch.object(enc.os, "replace", gone), \
+                mock.patch.object(enc.time, "sleep") as slept:
+            with self.assertRaises(FileNotFoundError):
+                enc.replace_atomic(self.src, self.dst)
+        slept.assert_not_called()
+
+    def test_every_atomic_write_in_the_project_goes_through_it(self):
+        """A new call site that used os.replace directly would be a fresh
+        instance of the same bug, on the platform least likely to be the one
+        it was written on. Cheaper to pin the count at zero than to find it."""
+        import re
+        # Anchored to the start of a line, so the mention in replace_atomic's
+        # own docstring does not count as a call. The first draft of this test
+        # counted the substring and failed on its own documentation.
+        call = re.compile(r"^\s*os\.replace\(", re.M)
+        scripts = Path(__file__).resolve().parent.parent / "scripts"
+        for path in sorted(scripts.glob("timelapse_*.py")):
+            src = path.read_text(encoding="utf-8")
+            # The definition itself is the one legitimate use, and there is
+            # one copy of it per daemon-independent module.
+            self.assertEqual(
+                len(call.findall(src)), src.count("def replace_atomic("),
+                f"{path.name} calls os.replace() outside replace_atomic()")
+
+
 if __name__ == "__main__":
     unittest.main()
