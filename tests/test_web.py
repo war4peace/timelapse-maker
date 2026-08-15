@@ -3697,6 +3697,20 @@ class TestTodaysCoverage(StateMixin, unittest.TestCase):
         body = self.body()
         self.assertIn("0%", body)
 
+    def test_the_cadence_reads_as_a_rate_not_as_a_fraction(self):
+        """"1 / 5s" was read as one fifth of a second as readily as as one
+        frame every five seconds, and those are two very different cameras.
+        Reported by the operator 2026-08-14. Naming the unit fixes it: a rate
+        cannot be read backwards."""
+        self.capture([self.cam("Roof", interval=5)])
+        body = self.body()
+        self.assertIn("5s / frame", body)
+        self.assertNotIn("1 / 5s", body)
+
+    def test_a_slow_camera_reads_the_same_way(self):
+        self.capture([self.cam("Roof", interval=60)])
+        self.assertIn("60s / frame", self.body())
+
     def test_a_healthy_row_has_an_empty_problems_column(self):
         # A column that says "0 failed" on every healthy row trains the eye
         # to skip it, which is the opposite of what it is for.

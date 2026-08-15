@@ -26,6 +26,10 @@ While the version is `0.x`, the configuration format may change in any release.
   of "supervised by ffmpeg", and the failure column is left empty when there is
   nothing wrong rather than saying "0 failed" on every healthy row.
 
+- The Cadence column reads **"5s / frame"** rather than "1 / 5s", which could
+  be read as one fifth of a second just as easily as one frame every five
+  seconds.
+
 - **Log out no longer looks like one more tab.** It sat immediately beside
   "Recent log", the two sharing the word "log", which made it easy to end your
   session while reaching for the log. It is now set apart from the tabs and

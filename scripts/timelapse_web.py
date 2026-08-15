@@ -2947,7 +2947,12 @@ class Handler(BaseHTTPRequestHandler):
         for cam in cams:
             cls, phrase = camera_verdict(cam, snap)
             interval = cam.get("interval")
-            cadence = f"1 / {interval}s" if interval else "-"
+            # "5s / frame", not "1 / 5s". The old form was read as the
+            # fraction one fifth of a second as readily as one frame every
+            # five seconds, which are two very different cameras; reported by
+            # the operator 2026-08-14. A rate with its unit named cannot be
+            # read backwards.
+            cadence = f"{interval}s / frame" if interval else "-"
             # Empty when there is nothing wrong. A column that says "0 failed"
             # on every healthy row trains the eye to skip it, which is the
             # opposite of what a problems column is for.
