@@ -1970,7 +1970,12 @@ LAYOUT = """<!doctype html>
         border-bottom: 1px solid rgba(128,128,128,.3); padding: .3rem .5rem; }}
   td {{ padding: .3rem .5rem; border-bottom: 1px solid rgba(128,128,128,.14);
         vertical-align: top; }}
-  td.num {{ text-align: right; font-variant-numeric: tabular-nums;
+  /* Numbers line up on the left with everything else, and with their own
+     headers, which are left-aligned too: right-aligning only these columns
+     left each one detached from the label above it. Tabular figures still
+     keep the digits in a column, which is what makes a stack of counts
+     scannable without moving them. */
+  td.num {{ text-align: left; font-variant-numeric: tabular-nums;
             white-space: nowrap; }}
   td.dim {{ opacity: .6; font-size: .85em; }}
   summary {{ cursor: pointer; font-size: .85rem; opacity: .6; }}

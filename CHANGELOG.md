@@ -10,6 +10,10 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Changed
+- **Every column in the web UI's tables now starts at the same edge.** The
+  counted columns (Frames today, Coverage, and most of the Library tab) were
+  right-aligned while their own headers, and every other column, were
+  left-aligned.
 - **Every timestamp in the web UI is now shown in the same format**,
   `2026-08-15 16:43:21`. The page draws on three sources and each had its own
   idea of what a timestamp looks like: the capture and encode heartbeats gave

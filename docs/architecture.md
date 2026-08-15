@@ -1213,6 +1213,12 @@ deliberate price of dropping a tab.
   four pages at two window sizes: 240px of drift before, 1px after, the
   remainder being sub-pixel rounding when centring inside containers of
   different widths.
+- **Every column starts at the same edge** (0.1.9). The counted columns
+  (`td.num`: frames, coverage, sizes, and most of the library table) were
+  right-aligned while every other cell and *every header* was left-aligned, so
+  each number sat away from the label naming it. They are left-aligned now and
+  keep `tabular-nums`, which is what makes a stack of counts scannable without
+  moving it. Reported by the operator 2026-08-15.
 - **Every timestamp on the page is rendered in one format, at the point of
   display** (0.1.9): `2026-08-15 16:43:21`, by `show_stamp()` for text and
   `stamp_of()` for epoch seconds. Three sources feed this page and each has its

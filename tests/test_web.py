@@ -861,6 +861,19 @@ class TestStatusRoutes(unittest.TestCase):
         head = css.split("header {", 1)[1].split("}", 1)[0]
         self.assertIn("justify-content: center", head)
 
+    def test_table_cells_all_start_at_the_same_edge(self):
+        """Reported 2026-08-15: the counted columns (Frames today, Coverage,
+        and most of the library table) were right-aligned while every other
+        column and every header was left-aligned, so each number sat away
+        from the label above it. Tabular figures stay: they are what keeps a
+        stack of counts readable without moving it."""
+        _, _, body = request("/", self.config)
+        css = body.split("</style>", 1)[0]
+        self.assertNotIn("text-align: right", css)
+        num = css.split("td.num {", 1)[1].split("}", 1)[0]
+        self.assertIn("text-align: left", num)
+        self.assertIn("tabular-nums", num)
+
     def test_the_header_names_the_project_and_its_version_only(self):
         _, _, body = request("/", self.config)
         header = body.split("<header>", 1)[1].split("</header>", 1)[0]
