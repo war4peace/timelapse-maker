@@ -8,6 +8,7 @@ and binding a port in a unit test invites flakiness on a CI runner.
 import contextlib
 import io
 import json
+import os
 import re
 import shutil
 import socket
@@ -3524,16 +3525,40 @@ class TestCameraVerdict(unittest.TestCase):
         self.assertEqual(cls, "warn")
         self.assertIn("no frame yet", phrase)
 
-    def test_an_rtsp_camera_is_judged_on_its_process(self):
-        # Judged on the grabber process, because there is no last-frame time
-        # to judge, but said in the reader's terms rather than by naming the
-        # program that does the work.
-        cls, phrase = self.verdict(0, supervised=True, alive=True)
+    def test_a_stopped_rtsp_grabber_beats_any_reading_of_its_frames(self):
+        # A stopped process is the more actionable fact, and the reason there
+        # will be no further frames.
+        cls, phrase = web.camera_verdict(
+            {"supervised": True, "alive": False, "interval": 5}, 0, quiet=1)
+        self.assertEqual((cls, phrase), ("bad", "not recording"))
+
+    def test_a_running_rtsp_camera_is_judged_on_its_frames_like_any_other(self):
+        # The consolidation: one column, one meaning. This row used to say
+        # "recording" while every other row said "12s ago".
+        cls, phrase = web.camera_verdict(
+            {"supervised": True, "alive": True, "interval": 5}, 0, quiet=3)
         self.assertEqual(cls, "ok")
-        self.assertEqual(phrase, "recording")
-        cls, phrase = self.verdict(0, supervised=True, alive=False)
+        self.assertEqual(phrase, "3s ago")
+        cls, phrase = web.camera_verdict(
+            {"supervised": True, "alive": True, "interval": 5}, 0, quiet=900)
         self.assertEqual(cls, "bad")
-        self.assertEqual(phrase, "not recording")
+        self.assertEqual(phrase, "15m ago")
+
+    def test_a_running_rtsp_camera_with_no_frames_at_all(self):
+        cls, phrase = web.camera_verdict(
+            {"supervised": True, "alive": True, "interval": 5}, 0)
+        self.assertEqual((cls, phrase), ("warn", "no frame yet"))
+
+    def test_disk_beats_the_heartbeat_when_both_are_available(self):
+        # The heartbeat lands once a minute, so its answer can be a minute
+        # stale; a file on disk has no such lag.
+        snap = 1_800_000_000
+        cam = {"name": "Roof", "interval": 5, "supervised": False,
+               "last_success": web.datetime.datetime.fromtimestamp(
+                   snap - 600).isoformat()}
+        self.assertEqual(web.camera_verdict(cam, snap), ("bad", "10m ago"))
+        self.assertEqual(web.camera_verdict(cam, snap, quiet=4),
+                         ("ok", "4s ago"))
 
     def test_silence_is_measured_against_the_snapshot_not_now(self):
         """The heartbeat is a minute old by the time anyone reads it.
@@ -3615,12 +3640,11 @@ class TestCameraPanel(StateMixin, unittest.TestCase):
         self.capture([self.cam("Roof", ok=17280)])
         self.assertNotIn("17,280", self.body())
 
-    def test_an_rtsp_camera_shows_restarts_and_plain_language(self):
+    def test_an_rtsp_camera_shows_its_restarts(self):
         self.capture([self.cam("Gate", supervised=True, alive=True,
                                restarts=4, last_success=None)])
         body = self.body()
         self.assertIn("4 restart(s)", body)
-        self.assertIn("recording", body)
         # Naming the program doing the work is an implementation detail, and
         # the reader of a status page has not asked what ffmpeg is.
         self.assertNotIn("ffmpeg", body)
@@ -3780,6 +3804,64 @@ class TestTodaysCoverage(StateMixin, unittest.TestCase):
         self.assertEqual(web.count_frames(d), 3)    # served from the cache
         web._counts.clear()
         self.assertEqual(web.count_frames(d), 4)
+
+    def test_the_last_frame_comes_from_the_newest_filename(self):
+        d = self.day_dir("Roof")
+        for name in ("101500.jpg", "120000.jpg", "093000.jpg"):
+            (d / name).write_bytes(b"\xff\xd8x")
+        day = web.datetime.datetime.now().strftime("%Y-%m-%d")
+        got = web.last_frame_epoch(self.config, {"name": "Roof"})
+        self.assertEqual(got, web.frame_epoch(day, "120000.jpg"))
+
+    def test_the_time_comes_from_the_name_never_from_mtime(self):
+        # Order and time are properties of the name throughout this project.
+        # An mtime that disagrees must not move the answer, or a restore or
+        # an rsync without -t would rewrite history.
+        d = self.day_dir("Roof")
+        f = d / "120000.jpg"
+        f.write_bytes(b"\xff\xd8x")
+        os.utime(f, (0, 0))                 # 1970, if anything read mtime
+        day = web.datetime.datetime.now().strftime("%Y-%m-%d")
+        self.assertEqual(web.last_frame_epoch(self.config, {"name": "Roof"}),
+                         web.frame_epoch(day, "120000.jpg"))
+
+    def test_the_dst_suffix_still_parses(self):
+        # A duplicate second during the fall-back hour is written as
+        # HHMMSS-1.jpg, and must not become an unparseable name.
+        self.assertEqual(web.frame_epoch("2026-08-14", "031500-1.jpg"),
+                         web.frame_epoch("2026-08-14", "031500.jpg"))
+
+    def test_a_name_that_is_not_a_frame_is_no_answer(self):
+        for name in ("", "cadence.json", "9999.jpg", "abcdef.jpg",
+                     "997000.jpg"):
+            self.assertIsNone(web.frame_epoch("2026-08-14", name), name)
+
+    def test_yesterday_answers_in_the_minute_after_midnight(self):
+        # Today's directory exists and is empty for up to one interval after
+        # the day rolls over; the newest frame is the one that just ended.
+        now = web.datetime.datetime.now().replace(hour=0, minute=0, second=3,
+                                                  microsecond=0)
+        yesterday = now - web.datetime.timedelta(days=1)
+        d = self.frames / "Roof" / yesterday.strftime("%Y-%m-%d")
+        d.mkdir(parents=True)
+        (d / "235957.jpg").write_bytes(b"\xff\xd8x")
+        got = web.last_frame_epoch(self.config, {"name": "Roof"}, now=now)
+        self.assertEqual(got, web.frame_epoch(yesterday.strftime("%Y-%m-%d"),
+                                              "235957.jpg"))
+
+    def test_a_camera_that_has_never_captured_has_no_last_frame(self):
+        self.assertIsNone(web.last_frame_epoch(self.config, {"name": "Roof"}))
+
+    def test_an_rtsp_row_reads_like_every_other_row(self):
+        # The consolidation, end to end through the real handler.
+        now = web.datetime.datetime.now()
+        d = self.day_dir("Gate")
+        (d / f"{now:%H%M%S}.jpg").write_bytes(b"\xff\xd8x")
+        self.capture([self.cam("Gate", supervised=True, alive=True,
+                               last_success=None)])
+        body = self.body()
+        self.assertIn("s ago", body)
+        self.assertNotIn(">recording<", body)
 
     def test_only_jpegs_are_counted(self):
         d = self.write_frames("Roof", 2)

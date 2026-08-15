@@ -1303,12 +1303,16 @@ def read_state(cfg, filename):
 # from a live one, and it bounds the cost of somebody holding down refresh.
 COUNT_TTL = 20
 
-_counts = {}                    # (path, day) -> (counted_at, frames)
+_counts = {}                    # (path, ttl bucket) -> (frames, newest name)
 _counts_lock = threading.Lock()
 
+# HHMMSS at the start of a frame name. The DST fall-back suffix (`-1`) may
+# follow, which is why this matches a prefix rather than the whole name.
+FRAME_NAME = re.compile(r"^(\d{2})(\d{2})(\d{2})")
 
-def count_frames(day_dir):
-    """How many frames are on disk for a day, or None if it cannot be read.
+
+def scan_day(day_dir):
+    """(frames, newest filename) for a day, in one pass over the directory.
 
     Counted from the directory rather than taken from the daemon's own
     counter, which resets on every restart and so answers a question nobody
@@ -1316,34 +1320,98 @@ def count_frames(day_dir):
     about whether today has been captured. The directory is the record.
 
     It also works for RTSP cameras, where the daemon *cannot* count: ffmpeg
-    writes those frames and this program never sees them. Counting on disk is
-    method-agnostic, which is what lets that column stop saying "-".
+    writes those frames and this program never sees them. Reading on disk is
+    method-agnostic, which is what lets those columns stop saying "-".
 
-    None, not 0, when the directory is missing: "no directory" and "a
-    directory with nothing in it" are the same thing to an operator, but
-    "cannot read this" is a different claim and must not be dressed as zero.
+    (None, None) when the directory cannot be read. A *missing* directory is
+    (0, ""), because "no directory" and "an empty directory" are the same
+    thing to an operator, while "cannot read this" is a different claim and
+    must not be dressed as zero.
     """
     key = (str(day_dir), int(time.time() // COUNT_TTL))
     with _counts_lock:
         hit = _counts.get(key)
     if hit is not None:
         return hit
+    frames, newest = 0, ""
     try:
         with os.scandir(day_dir) as it:
-            # scandir over listdir: the name is enough, so this never stats a
-            # single file, which is what keeps a 17,000-frame day cheap.
-            frames = sum(1 for e in it if e.name.endswith(".jpg"))
+            # scandir over listdir, and the name only: this never stats a
+            # single file, which is what keeps a 17,000-frame day cheap. The
+            # newest name comes free from the same pass.
+            for entry in it:
+                if entry.name.endswith(".jpg"):
+                    frames += 1
+                    if entry.name > newest:
+                        newest = entry.name
     except FileNotFoundError:
-        frames = 0
+        pass
     except OSError:
-        return None
+        return None, None
+    result = (frames, newest)
     with _counts_lock:
         # Bounded by construction: keys carry a TTL bucket, so old ones can
         # never be looked up again. Clearing wholesale beats an LRU here.
         if len(_counts) > 512:
             _counts.clear()
-        _counts[key] = frames
-    return frames
+        _counts[key] = result
+    return result
+
+
+def count_frames(day_dir):
+    """How many frames are on disk for a day, or None if unreadable."""
+    return scan_day(day_dir)[0]
+
+
+def frame_epoch(day, name):
+    """When a frame was captured, from its name. Never from its mtime.
+
+    Order and time are properties of the *name* throughout this project:
+    filenames are zero-padded `HHMMSS`, so lexical order is chronological
+    order, and nothing reads mtime (architecture.md §2). A PowerShell
+    predecessor mixed `CreationTime` and `LastWriteTime` between its passes
+    and deleted the wrong files; that whole class of bug is gone as long as
+    the name stays the authority. Reading mtime here to answer "when was the
+    last frame" would put it back, and would also be wrong after any copy,
+    restore or rsync that did not preserve timestamps.
+    """
+    m = FRAME_NAME.match(name or "")
+    if not m:
+        return None
+    hour, minute, second = (int(g) for g in m.groups())
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    try:
+        midnight = datetime.datetime.strptime(day, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+    return midnight.replace(hour=hour, minute=minute,
+                            second=second).timestamp()
+
+
+def last_frame_epoch(cfg, cam, now=None):
+    """When this camera's newest frame was captured, or None.
+
+    The same answer for every camera however its frames are written, which is
+    the point: an RTSP camera's row used to say "recording" where every other
+    row said "12s ago", because the daemon has no last-frame time for a
+    stream another process is writing. The directory has one.
+
+    Yesterday is consulted only when today is empty. That is the minute after
+    midnight, when the newest frame is still in the day that just ended, and
+    it costs one listing of a directory that is empty by definition.
+    """
+    root = cfg.get("paths", {}).get("frames_root")
+    if not root or not cam.get("name"):
+        return None
+    now = datetime.datetime.now() if now is None else now
+    base = Path(root) / str(cam["name"])
+    for back in (0, 1):
+        day = (now - datetime.timedelta(days=back)).strftime("%Y-%m-%d")
+        frames, newest = scan_day(base / day)
+        if frames:
+            return frame_epoch(day, newest)
+    return None
 
 
 def seconds_elapsed_today(now=None):
@@ -1398,23 +1466,21 @@ def silence_seconds(cam, snapshot_epoch):
     return max(0.0, snapshot_epoch - last)
 
 
-def camera_verdict(cam, snapshot_epoch):
+def camera_verdict(cam, snapshot_epoch, quiet=None):
     """(css class, phrase) for one camera row.
 
     The judgement lives here rather than in the daemon: what counts as quiet
     depends on that camera's interval, and a file that had already decided
     could not be overruled by a reader that knows better.
+
+    `quiet` is seconds since the newest frame on disk, which the caller can
+    work out for any camera by any method. When it is None this falls back to
+    the daemon's own `last_success`, which exists only for HTTP cameras.
     """
-    if cam.get("supervised"):
-        # An RTSP camera's frames are written by a separate process, so this
-        # daemon has no last-frame time to judge and the honest answer is
-        # whether that process is alive. Say that in the reader's terms: the
-        # old wording named the program doing the work, which is an
-        # implementation detail nobody reading a status page has asked about.
-        # The Frames and Coverage columns now answer "is it working", counted
-        # from disk, which is what that question was really standing in for.
-        if cam.get("alive"):
-            return "ok", "recording"
+    if cam.get("supervised") and not cam.get("alive"):
+        # An RTSP camera whose grabber is not running. This beats any reading
+        # of the frames, because a stopped process is the more actionable
+        # fact and the reason there will be no further frames.
         return "bad", "not recording"
 
     # A camera that is refusing our credentials is silent for a reason this
@@ -1425,7 +1491,8 @@ def camera_verdict(cam, snapshot_epoch):
     if err.get("class") == "auth" and err.get("confirmed"):
         return "bad", "refusing our credentials"
 
-    quiet = silence_seconds(cam, snapshot_epoch)
+    if quiet is None:
+        quiet = silence_seconds(cam, snapshot_epoch)
     if quiet is None:
         return "warn", "no frame yet"
     interval = cam.get("interval") or 0
@@ -2944,8 +3011,15 @@ class Handler(BaseHTTPRequestHandler):
                      "<th>Cadence</th><th>Frames today</th>"
                      "<th>Coverage</th><th>Problems</th></tr>")
         unreadable = False
+        now = time.time()
         for cam in cams:
-            cls, phrase = camera_verdict(cam, snap)
+            # From disk, so an RTSP camera answers this the same way as every
+            # other row, and measured against now rather than against the
+            # heartbeat, because a file on disk has none of the heartbeat's
+            # up-to-a-minute lag.
+            last = last_frame_epoch(self.server.cfg, cam)
+            cls, phrase = camera_verdict(
+                cam, snap, max(0.0, now - last) if last else None)
             interval = cam.get("interval")
             # "5s / frame", not "1 / 5s". The old form was read as the
             # fraction one fifth of a second as readily as one frame every

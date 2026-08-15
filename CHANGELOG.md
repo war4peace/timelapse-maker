@@ -22,9 +22,15 @@ While the version is `0.x`, the configuration format may change in any release.
   RTSP and HTTP cameras are counted the same way, so the column that read `-`
   for an RTSP camera now shows real numbers.
 
-- An RTSP camera's status reads **"recording"** or **"not recording"** instead
-  of "supervised by ffmpeg", and the failure column is left empty when there is
-  nothing wrong rather than saying "0 failed" on every healthy row.
+- **"Last frame" now means the same thing for every camera.** An RTSP camera
+  used to report that it was being supervised, where every other camera
+  reported when its last frame arrived; it now reports the age of its newest
+  frame, like the rest. The failure column is also left empty when there is
+  nothing wrong, rather than saying "0 failed" on every healthy row.
+
+  This shows a fault the page could not previously report: an RTSP camera
+  whose recorder is running but producing nothing looked healthy, and now
+  reads as what it is.
 
 - The Cadence column reads **"5s / frame"** rather than "1 / 5s", which could
   be read as one fifth of a second just as easily as one frame every five

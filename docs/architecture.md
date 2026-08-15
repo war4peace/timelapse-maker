@@ -135,7 +135,7 @@ Rules that hold this together:
 | **Facts, never verdicts** | There is deliberately no "healthy" or "state" field. Whether 42 seconds of silence is a fault depends on that camera's interval and on whether capture is paused; a reader can work that out, and a writer that had already decided could not be overruled. The cadence each number should be read against travels beside it for exactly this reason. |
 | **`error` is a classification, not a verdict** | It says what the camera answered (`auth`, `unreachable`, `other`), when that started, and whether the daemon's own back-off has confirmed it. `confirmed` is not a health judgement: it means "two refusals, ten minutes, one more attempt", which is a statement about what was tried. A reader still decides what to do about it, and the web UI and the credential watch decide differently. |
 | **`error.since` is the incident's identity** | Anything that must act once per incident compares that timestamp rather than inventing its own notion of when one failure stops being the same failure. It is stable while the incident lasts and moves when the class changes or the daemon restarts. |
-| **The RTSP path publishes different fields, marked `supervised`** | ffmpeg writes those frames and the thread only supervises the process, so `last_success` stays `null` rather than being filled in from something that is not a frame. Reading the day directory's mtime would have produced a plausible number and taught readers to trust it everywhere. |
+| **The RTSP path publishes different fields, marked `supervised`** | ffmpeg writes those frames and the thread only supervises the process, so `last_success` stays `null` rather than being filled in from something that is not a frame. Reading the day directory's mtime would have produced a plausible number and taught readers to trust it everywhere. This still holds for the daemon; since 0.1.8 the web UI answers the same question from the newest frame's **filename**, which is a frame rather than a proxy for one (§4.5). |
 | **Writing it can never fail the job** | A daemon that cannot write its status file must keep capturing, and a run that encoded seven days has not failed because a history file could not be updated. Capture complains once, not once a minute. |
 | **Written atomically** | `os.replace`, like every other file this project writes. A reader gets the previous snapshot or the next one, never half of either. |
 | **The daemons write it; the web UI only reads it** | Not `web.state_dir`, which is the UI's own index directory and the single path that service may write. Verified under systemd: a process with the web unit's `ReadWritePaths` gets `Read-only file system` here. |
@@ -1280,10 +1280,34 @@ deliberate price of dropping a tab.
   than in the daemon: `camera_verdict()` allows two intervals of silence and
   never less than fifteen seconds, so a camera at one frame a minute is not
   measured by a five-second camera's clock. Four details worth keeping:
-  - **Silence is measured against the snapshot, not against now.** The
-    heartbeat lands once a minute, so measuring against now would add up to a
-    minute of the file's own age to every camera and paint a healthy
-    five-second camera as a minute quiet.
+  - **"Last frame" is the newest frame on disk, for every camera** (0.1.8).
+    `last_frame_epoch()` takes the newest name from the same directory pass
+    that counts the frames, so it costs nothing extra, and turns it into a
+    time with `frame_epoch()`. Requested by the operator: an RTSP row said
+    "recording" where every other row said "12s ago", because the daemon has
+    no last-frame time for a stream another process writes.
+    - **The time comes from the *name*, never from mtime**, which is the one
+      correction to that request. Order and time are properties of the name
+      throughout this project (§2), because a PowerShell predecessor mixed
+      `CreationTime` and `LastWriteTime` and deleted the wrong files; mtime
+      would also be wrong after any restore or `rsync` that did not preserve
+      timestamps. `FRAME_NAME` matches a prefix so the DST fall-back suffix
+      (`HHMMSS-1.jpg`) still parses.
+    - **It gained a fault the page could not previously see.** An RTSP
+      grabber can be alive and producing nothing; `alive` said "recording" in
+      green for as long as that lasted. Measured on a synthetic day: a camera
+      whose newest frame is 66 minutes old now reads red at 93% coverage.
+      A *stopped* grabber still overrides the frame reading, because that is
+      the more actionable fact and the reason there will be no more frames.
+    - **Yesterday is consulted only when today is empty.** That is the minute
+      after midnight, when the newest frame belongs to the day that just
+      ended, and it costs one listing of a directory that is empty anyway.
+  - **Silence is measured against now when it comes from disk, and against
+    the snapshot when it falls back to the heartbeat.** The heartbeat lands
+    once a minute, so measuring *it* against now would add up to a minute of
+    the file's own age to every camera and paint a healthy five-second camera
+    as a minute quiet. A file on disk has no such lag, so the same correction
+    applied to it would be an error in the other direction.
   - **A stopped or stale daemon is announced above the table**, because it
     explains every quiet row beneath it and leaving the reader to infer that
     from eight red rows is not an explanation. `paused` gets its own line for
