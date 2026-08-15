@@ -79,7 +79,7 @@ from timelapse_encode import (                            # noqa: E402
     state_dir as runtime_state_dir,
 )
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 log = logging.getLogger("web")
 
@@ -182,10 +182,17 @@ def resolve_library(cfg):
         dest = trans["destination"].strip()
         if is_remote_spec(dest):
             out["source"] = "transfer.destination (remote)"
-            out["note"] = (f"Videos are transferred to {dest}, which is a remote "
+            # Names the two supported fixes rather than only the problem. A
+            # readable library is a prerequisite of this tab, not a gap in it:
+            # browsing an SSH-only destination was considered and refused, so
+            # there is no third answer coming and the message should not imply
+            # one. See decided-against.md.
+            out["note"] = (f"Videos are transferred to {dest}, which is an "
                            f"rsync target, not a path this host can read. "
-                           f"Browsing is not supported. Set web.library_root if "
-                           f"the same files are reachable locally.")
+                           f"Browsing needs a readable library: mount that "
+                           f"share and set web.library_root to the mount "
+                           f"point, or disable transfer to keep the videos on "
+                           f"this host.")
             return out
         out["path"], out["source"] = Path(dest), "transfer.destination"
     else:

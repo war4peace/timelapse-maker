@@ -287,8 +287,63 @@ def second_night(tmp, cfg, cfg_path, videos):
     check("the empty run recorded no days and no error",
           len(runs) > 1 and runs[1]["days"] == [] and not runs[1]["error"])
 
+    smoothed_night(tmp, cfg, cfg_path, videos)
     rtsp_writer_check(tmp)
     return finish(tmp)
+
+
+def smoothed_night(tmp, cfg, cfg_path, videos):
+    """A camera with `smooth_frames` set, encoded by a real ffmpeg.
+
+    The unit tests assert about the -vf string, which proves the filter was
+    *asked for* and nothing about whether ffmpeg accepts it in this chain,
+    after the concat demuxer and the range conversion. Worth a real run for
+    one claim in particular: tmix must not change the frame count, because the
+    video's length and every coverage figure depend on it. A filter that
+    silently dropped its warm-up frames would shorten every smoothed video and
+    nothing else here would notice.
+    """
+    frames_root = Path(cfg["paths"]["frames_root"])
+    day = (date.today() - timedelta(days=3)).isoformat()
+    day_dir = frames_root / "TestCam" / day
+
+    print("\nThird night, with smoothing on...")
+    build_frames(day_dir)
+    cfg["cameras"][0]["smooth_frames"] = 5
+    cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+    proc = subprocess.run([sys.executable, str(ENCODE), str(cfg_path)],
+                          capture_output=True, text=True, timeout=900)
+    out = videos / f"TestCam.{day.replace('-', '')}.mkv"
+    print("Assertions:")
+    check("smoothed run exits 0", proc.returncode == 0, f"rc={proc.returncode}")
+    check("smoothed video produced", out.exists(), out.name)
+    if not out.exists():
+        print(proc.stdout, proc.stderr)
+        return
+    check("smoothed video is non-trivial", out.stat().st_size > 1024,
+          f"{out.stat().st_size} B")
+    check("the run says it smoothed", "smoothing 5" in proc.stdout,
+          "log line should name the frame count")
+
+    # The whole point: same frames in, same frames out, same duration.
+    expected = GOOD_FRAMES / FPS
+    try:
+        dur = float(ffprobe_field(out, "format=duration") or
+                    ffprobe_field(out, "stream=duration"))
+    except ValueError:
+        dur = -1.0
+    check("smoothing does not change the duration", abs(dur - expected) < 0.2,
+          f"{dur:.2f}s, expected {expected:.2f}s")
+
+    # tmix sits in the same chain as the range conversion, and getting that
+    # wrong is invisible until someone plays the file.
+    check("smoothed video still tagged limited range",
+          ffprobe_field(out, "stream=color_range") == "tv")
+    check("smoothed video still tagged bt709",
+          ffprobe_field(out, "stream=color_space") == "bt709")
+    check("smoothed video is still yuv420p",
+          ffprobe_field(out, "stream=pix_fmt") == "yuv420p")
 
 
 def finish(tmp):

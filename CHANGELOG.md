@@ -9,7 +9,52 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-08-15
+
+### Added
+- **Optional motion smoothing, per camera.** A camera carrying `smooth_frames`
+  has that many neighbouring frames averaged into each output frame when it is
+  encoded, which calms the shimmer of wind in trees. That shimmer is most of
+  what makes a timelapse look like it is jumping: at one frame every 5 seconds
+  the leaves are in a different place in every frame, and averaging settles
+  them. The wizard offers it when you add or edit a camera, defaulting to no,
+  and to 15 frames once you say yes; any value from 3 to 30 is accepted.
+  `timelapse cameras -l` shows it as `+15` beside the cadence, and
+  `timelapse test` reports it.
+
+  **It is off unless a camera asks for it, and there is no global setting**,
+  which is deliberate and unlike `interval_seconds` and `framerate`: those
+  fall back to a default so an untouched camera still follows it, whereas
+  smoothing suits a wide view of foliage and spoils a doorway. **Upgrading
+  changes nothing**, because every existing config is one where no camera
+  says anything.
+
+  Two things worth knowing before turning it on. It cannot help with cars or
+  people: anything crossing the frame is captured once, so averaging softens
+  the flash into a brief ghost but cannot make it fluid, and nothing else can
+  either. And a camera's burnt-in clock will blur its fastest-changing digits,
+  because they differ in every frame being averaged.
+
+  This is encode-time only: capture, frame counts, coverage and video length
+  are untouched. **Turn it on during the day and that same day is smoothed**,
+  because the nightly run encodes the day that has just finished and reads the
+  config as it stands then. Unlike a cadence change, which is pinned to what a
+  day was actually captured at, there is nothing to wait for. Days already
+  encoded are not redone without `timelapse_encode.py --force`.
+
 ### Changed
+- **The Library tab now tells you how to fix a remote destination**, instead of
+  only saying that browsing is unsupported. A `transfer.destination` of
+  `user@nas:/path` is not a path this host can read, and the two supported
+  answers are named on the page: mount that share and set `web.library_root`
+  to the mount point, or turn transfer off and keep the videos local. A
+  mounted share is an absolute path, so it browses normally and always has.
+  Browsing an SSH-only destination over SFTP has been **refused** rather than
+  left as a to-do (see `docs/decided-against.md`): it would give the one
+  network-facing service a second outbound connection, over SSH, to the host
+  holding every video, and mounting the share costs a line in `/etc/fstab`.
+  Only the wording changes; a readable library path is now a stated
+  prerequisite rather than a pending feature.
 - **The Overview is ordered by how often you need it**: Cameras, Last encode,
   Services, Version. The page had grown in the order the panels were built,
   which put the version number above the cameras.
@@ -1231,6 +1276,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.9]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.9
 [0.1.8]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.8
 [0.1.7]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.7
 [0.1.6]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.6

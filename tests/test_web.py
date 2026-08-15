@@ -263,7 +263,27 @@ class TestRouting(unittest.TestCase):
             "enabled": True, "destination": "user@nas:/mnt/user/timelapse/"})
         status, _, body = request("/", config)
         self.assertEqual(status, 200)
-        self.assertIn("Browsing is not supported", body)
+        self.assertIn("not a path this host can read", body)
+
+    def test_remote_destination_names_both_supported_fixes(self):
+        # A readable library is a prerequisite of this tab rather than a gap
+        # in it: browsing an SSH-only destination was refused, so no third
+        # answer is coming and the message must not leave the reader waiting
+        # for one. It has to say what to do, not only what is wrong.
+        config = cfg(self.tmp, transfer={
+            "enabled": True, "destination": "user@nas:/mnt/user/timelapse/"})
+        _, _, body = request("/", config)
+        self.assertIn("web.library_root", body)
+        self.assertIn("mount", body)
+        self.assertIn("disable transfer", body)
+
+    def test_a_mounted_share_is_not_treated_as_remote(self):
+        # The whole reason the refusal is affordable: an absolute path is
+        # settled before the colon test, so mounting the NAS is all it takes
+        # to get a working library.
+        self.assertFalse(web.is_remote_spec("/mnt/nas/timelapse/"))
+        self.assertTrue(web.is_remote_spec("user@nas:/mnt/user/timelapse/"))
+        self.assertTrue(web.is_remote_spec("rsync://nas/timelapse"))
 
     def test_path_from_config_is_escaped(self):
         config = cfg(self.tmp, transfer={"enabled": False},

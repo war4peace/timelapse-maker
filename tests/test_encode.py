@@ -1198,6 +1198,147 @@ class TestPerCameraEncodeSettings(unittest.TestCase):
         self.assertNotIn("120", args)
 
 
+class TestCameraSmoothing(unittest.TestCase):
+    """Per-camera tmix. Absence means off, and nothing else may turn it on."""
+
+    def test_a_camera_that_says_nothing_gets_no_smoothing(self):
+        # The whole opt-in claim rests on this: every existing config on every
+        # existing install is a camera that says nothing.
+        self.assertEqual(enc.camera_smoothing({}), 0)
+
+    def test_a_configured_value_is_used(self):
+        self.assertEqual(enc.camera_smoothing({"smooth_frames": 15}), 15)
+
+    def test_there_is_no_global_to_inherit(self):
+        # interval_seconds and framerate fall back to encode/capture defaults.
+        # This one deliberately does not, so putting it there does nothing.
+        self.assertEqual(enc.camera_smoothing({}), 0)
+
+    def test_a_value_under_the_floor_reads_as_off(self):
+        # A leftover 0, or a 1 or 2 from someone guessing at the units. None
+        # can average anything, and each must mean off rather than emit a
+        # filter that does nothing or fails.
+        for value in (0, 1, 2, -5):
+            self.assertEqual(enc.camera_smoothing({"smooth_frames": value}), 0,
+                             f"{value} should read as off")
+
+    def test_an_absurd_value_is_clamped_rather_than_obeyed(self):
+        # This is read off a file an operator may have edited by hand, and the
+        # cost of believing it is buffering that many frames of 4K per camera.
+        self.assertEqual(enc.camera_smoothing({"smooth_frames": 500}),
+                         enc.SMOOTH_MAX)
+
+    def test_junk_is_off_rather_than_a_traceback(self):
+        # A oneshot that dies on a malformed key takes the whole night's
+        # encode with it, for every camera, not just the mistyped one.
+        for value in ("lots", None, [], {}, "15x"):
+            self.assertEqual(enc.camera_smoothing({"smooth_frames": value}), 0,
+                             f"{value!r} should read as off")
+
+    def test_a_string_number_is_accepted(self):
+        # JSON written by hand puts quotes in odd places.
+        self.assertEqual(enc.camera_smoothing({"smooth_frames": "15"}), 15)
+
+    def test_the_offered_default_sits_inside_the_bounds(self):
+        self.assertLessEqual(enc.SMOOTH_MIN, enc.SMOOTH_DEFAULT)
+        self.assertLessEqual(enc.SMOOTH_DEFAULT, enc.SMOOTH_MAX)
+
+
+class TestSmoothingReachesFfmpeg(unittest.TestCase):
+    """camera_smoothing() returning 15 is worth nothing if -vf never says so.
+
+    Same reasoning as the cadence and marker tests: the accessor is the easy
+    half, and the wiring is the half that has actually broken here before.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.day = self.tmp / "frames" / "Roof" / "2026-08-10"
+        for i in range(5):
+            make_frame(self.day / ("%06d.jpg" % (i * 5)))
+        self.out = self.tmp / "videos"
+        self.out.mkdir()
+
+    def vf_for(self, cam):
+        """The -vf argument encode_day() builds for this camera entry."""
+        cfg = {"capture": {"interval_seconds": 5, "min_bytes": 100},
+               "encode": {"framerate": 60, "gop": 120, "min_frames": 1,
+                          "container": "mkv"},
+               "paths": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+               "cameras": [dict(cam, name="Roof")]}
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["vf"] = cmd[cmd.index("-vf") + 1]
+            Path(cmd[-1]).write_bytes(b"\0" * 4096)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(enc, "probe_dimensions", return_value=(512, 512)), \
+                mock.patch.object(enc.subprocess, "run", side_effect=fake_run):
+            enc.encode_day(cfg, {"codec": "libx264", "args": [],
+                                 "name": "libx264 (CPU)"},
+                           "Roof", self.day, self.out, False)
+        return seen["vf"]
+
+    def test_an_unsmoothed_camera_gets_no_tmix_at_all(self):
+        self.assertNotIn("tmix", self.vf_for({}))
+
+    def test_a_smoothed_camera_gets_its_own_frame_count(self):
+        self.assertIn("tmix=frames=15", self.vf_for({"smooth_frames": 15}))
+
+    def test_tmix_runs_last_so_it_averages_converted_pixels(self):
+        # Ahead of the range conversion it would average full-range JPEG and
+        # hand the scaler something it was not told about.
+        vf = self.vf_for({"smooth_frames": 15})
+        self.assertLess(vf.index("out_range=limited"), vf.index("tmix"))
+        self.assertLess(vf.index(f"format={enc.PIX_FMT}"), vf.index("tmix"))
+
+    def test_a_clamped_value_reaches_ffmpeg_clamped(self):
+        self.assertIn(f"tmix=frames={enc.SMOOTH_MAX}",
+                      self.vf_for({"smooth_frames": 900}))
+
+    def test_an_edit_today_smooths_the_day_it_was_made_on(self):
+        """Turning smoothing on at 14:00 smooths that same day's video.
+
+        The nightly run encodes the day that has just finished and reads the
+        config as it stands then, so there is nothing to wait for. This is
+        deliberately unlike a cadence change, which is pinned to what the day
+        was *captured* at precisely so an edit cannot land mid-day. Smoothing
+        is not a property of the capture, so it has no such anchor, and a day
+        already under way is the normal thing for it to apply to.
+        """
+        (self.day / enc.CADENCE_FILE).write_text(
+            json.dumps({"interval_seconds": 5, "framerate": 60}),
+            encoding="utf-8")
+        vf = self.vf_for({"smooth_frames": 15})
+        self.assertIn("tmix=frames=15", vf)
+
+    def test_the_cadence_marker_cannot_pin_smoothing_off(self):
+        # A day recorded at a cadence that predates the setting must still be
+        # smoothed. If smoothing ever moved into .cadence.json, turning it on
+        # would silently skip every day already under way, which is every day
+        # anyone would think to turn it on for.
+        (self.day / enc.CADENCE_FILE).write_text(
+            json.dumps({"interval_seconds": 60, "framerate": 30}),
+            encoding="utf-8")
+        self.assertIn("tmix=frames=8", self.vf_for({"smooth_frames": 8}))
+
+    def test_the_marker_carries_cadence_only(self):
+        # The read side of the same claim: day_cadence() has nowhere to put a
+        # smoothing value even if something wrote one.
+        (self.day / enc.CADENCE_FILE).write_text(
+            json.dumps({"interval_seconds": 5, "framerate": 60,
+                        "smooth_frames": 30}), encoding="utf-8")
+        self.assertEqual(enc.day_cadence(self.day), (5, 60))
+
+    def test_smoothing_does_not_disturb_the_colour_tagging(self):
+        # The filter sits in the same chain as the range conversion, and
+        # getting this wrong is invisible until someone plays the file.
+        vf = self.vf_for({"smooth_frames": 15})
+        self.assertIn("in_range=full:out_range=limited", vf)
+
+
 class TestEncodeDayMarksTheDay(unittest.TestCase):
     """`day_encoded()` answering correctly is worth nothing if nothing writes.
 
