@@ -132,12 +132,12 @@ timelapse version
 ```
 
 ```
-  capture  0.1.8
-  encode   0.1.8
-  test     0.1.8
-  setup    0.1.8
-  update   0.1.8
-  web      0.1.8
+  capture  0.1.9
+  encode   0.1.9
+  test     0.1.9
+  setup    0.1.9
+  update   0.1.9
+  web      0.1.9
 ```
 
 If the daemon predates the installed files it says so explicitly, which is the
@@ -739,9 +739,9 @@ defaults, so changing the global interval later still moves it. Only cameras
 you deliberately set stay put, and `timelapse cameras -l` marks them:
 
 ```
-     #  Name           On  Cadence    Type  URL
-     1  Driveway       yes 5s/60      http  http://192.0.2.10/cg...l=1&subtype=0
-     2  Roof           yes 60s/30*    http  http://192.0.2.12:80...hot?Profile_1
+     #  Name           On  Cadence     Type URL
+     1  Driveway       yes 5s/60       http http://192.0.2.10/cg...l=1&subtype=0
+     2  Roof           yes 60s/30*     http http://192.0.2.12:80...hot?Profile_1
     * has its own interval or frame rate; the rest follow the global settings.
 ```
 
@@ -783,6 +783,75 @@ config for those.
 startup, so an edit does nothing until it restarts; you are asked, and told the
 command if you decline. Nothing here touches paths, so the systemd units are
 unaffected.
+
+### Smoothing one camera's motion
+
+Timelapses shimmer. At one frame every 5 seconds, leaves are somewhere
+different in every frame, so foliage boils and the whole picture looks like it
+is jumping. Adding or editing a camera offers to settle it:
+
+```
+  Smoothing averages neighbouring frames when encoding, so wind
+  in trees stops shimmering. It also fades out anything crossing
+  the frame quickly, so it suits wide views more than doorways.
+  Smooth this camera? (y/N): y
+  Frames to average (3-30) [15]: 15
+  Each output frame becomes the average of 15, spanning 75s of real time.
+  This changes encoding only. Tonight's run smooths today too; days
+  already encoded keep their video unless you re-encode with --force.
+```
+
+**It is off unless you ask, and it is per camera.** There is no global setting,
+on purpose: this is not like the interval and frame rate, which have a default
+every camera follows. Smoothing is worth having on a roof full of trees and
+actively unwanted on a gate people walk through, so each camera answers for
+itself. Upgrading an existing install changes nothing.
+
+`timelapse cameras -l` shows it as `+N` next to the cadence:
+
+```
+     #  Name           On  Cadence     Type URL
+     1  Driveway       yes 5s/60       http http://192.0.2.10/cg...l=1&subtype=0
+     2  Roof           yes 60s/30*+15  http http://192.0.2.12:80...hot?Profile_1
+    * has its own interval or frame rate; the rest follow the global settings.
+    +N averages N frames at encode time to smooth motion; capture is unchanged.
+```
+
+**What to expect, honestly.** It fixes the shimmer, which is the constant,
+everyday judder. It cannot make cars or people fluid: at a 5 second interval
+something crossing the frame is photographed once and once only, so averaging
+softens the flash into a brief ghost instead of a hard pop, and that is the
+whole of what any amount of processing can do. The only real fix for fast
+motion is a shorter capture interval, which costs storage in proportion.
+
+Two side effects worth knowing:
+
+- **A camera's burnt-in clock blurs its fastest digits.** They are different in
+  every frame being averaged, so they smear. At 15 frames the date, hour and
+  minute stay readable and the seconds do not, which at 300x playback speed is
+  usually nobody's loss. If it bothers you, most cameras can drop seconds from
+  the overlay.
+- **Nothing else changes.** Capture, storage, frame counts, coverage and the
+  length of the video are all identical; only the picture differs. Encoding
+  costs a few percent more.
+
+**Which value.** 15 is the offered default and suits a wide view where the
+detail is small anyway. Lower values keep events crisper: at 3 a passing
+delivery van is still clearly a van, while at 30 it is a faint wash. If you are
+unsure, start at 15 on one camera, watch a day, and adjust.
+
+**Turn it on during the day and that same day is smoothed.** The nightly run
+just after midnight encodes the day that has just finished, and it reads the
+config as it stands then, so there is nothing to wait for.
+
+This is worth stating because it is the opposite of the interval and frame
+rate above. Those are pinned to what a day was actually *captured* at, so an
+edit cannot land halfway through a day and today keeps the cadence it started
+with. Smoothing is not part of the capture at all, so it has no such anchor:
+whatever the config says when the encoder runs is what that run uses. The same
+goes for any older days still waiting in the backlog, which that run will
+smooth too. Days already encoded keep the video they have; re-encoding one
+needs `timelapse_encode.py --force`.
 
 ### It will not let you strand frames silently
 
@@ -926,12 +995,14 @@ timelapse-web`: the server reads its config once, at startup.
 
 It gives you six things:
 
-- **Where your videos actually are**: see the warning below, this is the
-  question people get wrong.
+- **Where your videos actually are**, at the head of the Library tab: the
+  path, how it was worked out, and whether it can be read. See the warning
+  below, this is the question people get wrong. If it cannot be read the
+  Overview says so too, since that is a fault and not a detail.
 - **Whether your cameras are actually answering.** A table on the Overview,
   one row per camera: when its last frame landed, the cadence it is running
-  at, how many frames it has taken since the service started, and how many
-  failures. This is the thing `systemctl` cannot tell you. A daemon whose
+  at, how many frames are on disk for today, what percentage of the day that
+  covers, and how many fetches have failed. This is the thing `systemctl` cannot tell you. A daemon whose
   cameras are all refusing connections is "running", and so is one that has
   paused itself because the disk filled up; both look perfect in the Services
   table and neither is capturing anything.
@@ -939,7 +1010,7 @@ It gives you six things:
   encoder, how many videos, whether the transfer worked, and a row per camera
   with the frame count and the coverage percentage.
 - **Service status and recent log**, without an SSH session. Service status is
-  four rows at the foot of the Overview, saying whether each part is working
+  a row per unit on the Overview, saying whether each part is working
   and what to do if it is not, rather than the page of systemd internals
   `timelapse status` prints. *Technical data* links to the full output, which
   is what to paste into a bug report.
@@ -987,10 +1058,27 @@ The UI works this out for you and says which path it chose. Two cases worth
 knowing:
 
 - **A remote destination** (`user@nas:/mnt/user/timelapse/`) is not a path this
-  host can read at all. The page says so rather than showing an empty list. If
-  the same files are also mounted locally, give that path as `library_root`.
+  host can read at all. The page says so rather than showing an empty list.
 - **A NAS that is not mounted** looks identical to an empty library, so the
   page reports the directory as unreadable instead of pretending it is empty.
+
+**Browsing the library requires a readable path, and that is a prerequisite
+rather than a limitation to be worked around.** There are exactly two ways to
+have one, and either is fine:
+
+- **Mount the destination share** (CIFS, NFS, sshfs) and give the mount point
+  as `web.library_root`. A mounted share is an absolute path, so the UI treats
+  it as local and browses it normally. This is the usual answer, and the wizard
+  can set up a CIFS mount for you.
+- **Leave transfer disabled**, so the videos stay in `paths.video_output`,
+  which the UI reads by default.
+
+Reaching an SSH-only destination directly, over SFTP, was considered and
+**refused**: it would give the one network-facing service a second outbound
+connection, over SSH, to the host holding every video you have, and mounting
+the same share costs a line in `/etc/fstab`. The reasoning is in
+[decided-against.md](decided-against.md). So if the page tells you the library
+is a remote rsync target, mount it; nothing else is coming.
 
 Do not put the library under `/tmp` or `/var/tmp`. The unit sets
 `PrivateTmp=true`, so the service gets a private empty one and reports your

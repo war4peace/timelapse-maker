@@ -35,7 +35,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 OUT = Path(os.environ.get("TIMELAPSE_TEST_DIR") or
            Path(tempfile.gettempdir()) / "timelapse-test")
@@ -345,6 +345,8 @@ def test_cadence(cfg, cams):
     per-camera override changes, and their consequence (how long tonight's
     video is) is not something you can read off the config.
     """
+    from timelapse_encode import camera_smoothing
+
     min_frames = cfg.get("encode", {}).get("min_frames", 100)
     g_int = cfg["capture"]["interval_seconds"]
     g_fps = cfg["encode"].get("framerate", 60)
@@ -356,9 +358,15 @@ def test_cadence(cfg, cams):
         secs = per_day / fps
         own = "own" if (cam.get("interval_seconds") or cam.get("framerate")) \
             else "default"
+        # Smoothing changes what the video looks like without changing any of
+        # the arithmetic above, so it is reported and never warned about: there
+        # is no wrong value, only a preference per scene.
+        smooth = camera_smoothing(cam)
         line = (f"{name}: every {interval}s at {fps}fps -> {per_day:,} "
                 f"frames/day, {int(secs // 60)}:{int(secs % 60):02d} of video "
-                f"({own})")
+                f"({own})"
+                + (f", smoothing {smooth} frames ({smooth * interval}s)"
+                   if smooth else ""))
         if per_day < min_frames:
             # The encoder SKIPs below min_frames, so this camera would produce
             # nothing at all, silently, every night. Cheap to catch here.

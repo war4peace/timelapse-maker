@@ -79,7 +79,7 @@
     "_comment": "Optional read-only status page and video index. It never changes anything - no encode triggers, no camera control, no config edits.",
     "_comment_bind": "127.0.0.1 means only this machine can reach it, which is the safe value to hand-edit but rarely the useful one on a headless recorder. 'timelapse web' suggests this host's LAN address instead and checks that the address exists before writing it. There is no HTTPS, so anything other than 127.0.0.1 exposes the page to your LAN; put a reverse proxy in front for anything wider. Changing this needs 'systemctl restart timelapse-web' to take effect.",
     "_comment_auth": "Optional single login. Leave auth out entirely, or leave either field empty, and the pages open to anyone who can reach the address, which is how it has always worked. Set it with 'timelapse web': the password is stored only as a PBKDF2 hash and cannot be read back, so a forgotten one is reset by running that again. What it is for: keeping the household or a guest out of the status page and the video index. What it is NOT: there is no HTTPS, so the password crosses the network in clear, and the video FILES stay reachable to anyone who knows their exact address. That last part is deliberate - it is what lets a saved .m3u keep playing in VLC after you log out.",
-    "_comment_library": "Leave library_root empty to work it out automatically: the transfer destination when transfer is enabled, otherwise paths.video_output. Set it when the videos are readable here under a different path - e.g. transfer sends them to a remote 'user@nas:/...' spec that is also mounted locally.",
+    "_comment_library": "Leave library_root empty to work it out automatically: the transfer destination when transfer is enabled, otherwise paths.video_output. Set it when the videos are readable here under a different path - e.g. transfer sends them to a remote 'user@nas:/...' spec that is also mounted locally. Browsing needs a path this host can read, which is a prerequisite rather than a limitation: either mount the destination share and point library_root at the mount, or leave transfer off so the videos stay local. Reaching an SSH-only destination over SFTP is deliberately not supported; see docs/decided-against.md.",
     "_comment_state": "state_dir is the ONLY directory the web UI may write to - it holds the sqlite index of your video library, and the cached update check. The systemd unit is scoped to exactly this path, so the videos, the frames and this config stay read-only to it.",
     "_comment_update": "update_check asks api.github.com once a day whether a newer version is tagged, and only while someone has the Overview page open. It is the ONLY outbound connection this service makes. It sends no configuration, no camera names and nothing about your videos; GitHub sees this host's IP and the version string. Set false to disable it entirely.",
     "enabled": false,
@@ -98,6 +98,7 @@
     "enabled  -> false excludes the camera from both capture and encode",
     "method   -> 'http' (snapshot URL, preferred) or 'rtsp' (persistent ffmpeg grabber)",
     "auth     -> 'digest', 'basic' or 'none'",
+    "smooth_frames -> optional, 3-30, omit for none. Averages that many neighbouring frames when encoding, which calms wind in trees at the cost of fading out anything that crosses the frame quickly. Per camera because it suits a wide view of foliage and spoils a doorway. Encoding only: capture, frame counts and video length are unchanged.",
     "keys starting with _ are documentation and ignored by the code",
     "run timelapse_test.py before enabling anything, and again after any URL change"
   ],
@@ -140,7 +141,8 @@
       "auth": "basic",
       "username": "USERNAME",
       "password": "PASSWORD",
-      "_note": "Disabled example. Some cameras want basic rather than digest; if both fail with 401 but the URL works in a browser with no login, try auth 'none'."
+      "smooth_frames": 15,
+      "_note": "Disabled example, and a smoothed one. Some cameras want basic rather than digest; if both fail with 401 but the URL works in a browser with no login, try auth 'none'. smooth_frames survives being disabled and re-enabled, so a garden view keeps its setting while it is switched off for the winter."
     },
     {
       "name": "Hallway",

@@ -30,7 +30,7 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers
@@ -1111,6 +1111,8 @@ def add_one_camera(cfg, n, found=None):
     else:
         cam["quality"] = 2
 
+    edit_camera_smoothing(cfg, cam)
+
     if ask_yes("Test this camera now?", True):
         if not test_camera(cam, cfg) and not ask_yes("Keep it anyway?", True):
             return None
@@ -1211,12 +1213,14 @@ def camera_overrides(cam):
 
 
 def list_cameras(cfg):
+    from timelapse_encode import camera_smoothing
+
     cams = cfg.get("cameras", [])
     if not cams:
         note("No cameras configured.")
         return
     print()
-    print(f"    {'#':>2}  {'Name':<14} {'On':<4}{'Cadence':<11}{'Type':<6}URL")
+    print(f"    {'#':>2}  {'Name':<14} {'On':<4}{'Cadence':<11} {'Type':<4} URL")
     for i, cam in enumerate(cams, 1):
         # Elide the middle, not the tail. Reolink-style URLs are identical for
         # their first 40 characters, so a plain truncation makes every camera
@@ -1224,18 +1228,34 @@ def list_cameras(cfg):
         # masked, which reads as though nothing were redacted at all. The head
         # is kept long enough for the IP, which is the part that differs.
         url = redact_url(str(cam.get("url", "")))
+        # 36, and the 13-character tail in particular, is load-bearing: on a
+        # Reolink URL that is what keeps the *** in view, and a listing that
+        # elides the mask reads as though the password were printed in full.
+        # Anything new on this row is paid for from the other columns.
         if len(url) > 36:
             url = url[:20] + "..." + url[-13:]
         state = "yes" if cam.get("enabled", True) else dim("no")
         # A trailing * means this camera is not following the global settings,
-        # which is what decides whether changing them will move it.
+        # which is what decides whether changing them will move it. +N is
+        # optional smoothing. All three answer one question, "how is this
+        # camera's video made", so they share a column rather than spending
+        # width the 80-column budget does not have.
+        n = camera_smoothing(cam)
         cad = (f"{camera_interval(cfg, cam)}s/{camera_framerate(cfg, cam)}"
-               + ("*" if camera_overrides(cam) else ""))
+               + ("*" if camera_overrides(cam) else "")
+               + (f"+{n}" if n else ""))
+        # The separators are literal spaces rather than padding, so a cadence
+        # too wide for its column pushes the row out instead of running into
+        # the next one. 3600s/240*+30 is absurd but constructible, and an
+        # absurd config should still be readable.
         print(f"    {i:>2}  {str(cam.get('name', '')):<14} {state:<4}"
-              f"{cad:<11}{str(cam.get('method', 'http')):<6}{dim(url)}")
+              f"{cad:<11} {str(cam.get('method', 'http')):<4} {dim(url)}")
     if any(camera_overrides(c) for c in cams):
         note("  * has its own interval or frame rate; the rest follow the "
              "global settings.")
+    if any(camera_smoothing(c) for c in cams):
+        note("  +N averages N frames at encode time to smooth motion; "
+             "capture is unchanged.")
 
 
 def pick_camera(cams, verb):
@@ -1340,6 +1360,7 @@ def edit_one_camera(cfg, cams, cam):
         cam["name"] = new_name
 
     edit_camera_cadence(cfg, cam)
+    edit_camera_smoothing(cfg, cam)
 
     if ask_yes("Test it now?", True):
         test_camera(cam, cfg)
@@ -1394,6 +1415,46 @@ def edit_camera_cadence(cfg, cam):
              f"encode would skip this camera every night.")
         note(f"A {interval}s interval needs min_frames below {per_day} to "
              f"produce anything.")
+
+
+def edit_camera_smoothing(cfg, cam):
+    """Optional motion smoothing for this camera, off unless asked for.
+
+    Deliberately not modelled on the cadence questions above. Those answer to a
+    global, so absence means "follow it"; here absence means off, because there
+    is no sensible global. Averaging frames calms wind in foliage, which is
+    most of what makes a timelapse look like it jumps, at the cost of thinning
+    out anything that crosses the frame in a frame or two. A roof of trees
+    wants it; a gate people walk through does not.
+
+    Answering no *removes* the key rather than storing a zero, so a config that
+    has never wanted smoothing stays the shape it has always been.
+    """
+    from timelapse_encode import (SMOOTH_DEFAULT, SMOOTH_MAX, SMOOTH_MIN,
+                                  camera_smoothing)
+
+    current = camera_smoothing(cam)
+    print()
+    # One note() per printed line: it does not wrap, and the terminal is the
+    # only place these are ever read.
+    note("Smoothing averages neighbouring frames when encoding, so wind")
+    note("in trees stops shimmering. It also fades out anything crossing")
+    note("the frame quickly, so it suits wide views more than doorways.")
+    if not ask_yes("Smooth this camera?", bool(current)):
+        cam.pop("smooth_frames", None)
+        return
+
+    n = ask_int(f"Frames to average ({SMOOTH_MIN}-{SMOOTH_MAX})",
+                current or SMOOTH_DEFAULT, SMOOTH_MIN, SMOOTH_MAX)
+    cam["smooth_frames"] = n
+    # Said in real time, not in frames. Frames are the knob, but the thing
+    # being blurred together is a span of the day, and that span moves with
+    # this camera's interval: 15 frames is 75s at 5s and 15 minutes at 60s.
+    span = n * camera_interval(cfg, cam)
+    note(f"Each output frame becomes the average of {n}, spanning {span}s of "
+         f"real time.")
+    note("This changes encoding only. Tonight's run smooths today too; days")
+    note("already encoded keep their video unless you re-encode with --force.")
 
 
 def load_existing_config(path):
@@ -2585,8 +2646,12 @@ def choose_web(cfg):
     note(f"Videos will be read from: {where or '(not set)'}")
     note(f"  because: {why}")
     if "REMOTE" in why:
+        # Mounting is the answer, not a fallback: browsing an SSH-only
+        # destination over SFTP is refused (decided-against.md), so this must
+        # not read as though the operator could wait for it.
         warn("That is an rsync remote spec, not a path this host can read.")
-        warn("If the same files are also mounted here, give that path below.")
+        warn("Browsing needs a readable path: mount that share and give the")
+        warn("mount point below, or turn transfer off to keep videos local.")
     elif where and not Path(where).is_dir():
         warn(f"{where} does not exist yet - if it is a NAS mount, it may")
         warn("simply not be mounted. The page will say so rather than")

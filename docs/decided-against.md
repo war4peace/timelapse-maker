@@ -397,6 +397,102 @@ separate, separately-hardened unit, not a feature of this one.
 
 ---
 
+## Remote library browsing over SFTP
+
+**Refused 2026-08-15, on cost against a narrow audience with a free
+workaround. A readable library path is now a stated prerequisite of the web
+UI's Library tab rather than a gap in it: either mount the destination share,
+or keep the videos local.**
+
+This was item 6, and the last thing in `future-features.md`. It read as though
+the web UI lacked a browser. It does not: the browser works for any path the
+host can read, which is every configuration except one.
+
+**The one it does not cover** is a `transfer.destination` that is an rsync
+spec (`user@nas:/path` or `rsync://…`) whose files are readable nowhere on the
+recorder. `is_remote_spec()` detects it and `resolve_library()` reports it
+honestly instead of rendering an empty list, which is the correct behaviour and
+stays. Note that an absolute path is settled *first*, so a mounted share like
+`/mnt/nas/timelapse/` is not remote and browses normally.
+
+**Why the audience is narrow.** Anything speaking SSH almost always also
+speaks NFS, CIFS or sshfs, and mounting it costs a line in `/etc/fstab` and
+nothing else. So the real population is "a destination that accepts SSH and
+cannot be mounted", which nobody has asked for.
+
+Against that:
+
+- **It would give the one network-facing service a second outbound
+  connection**, over SSH, to the host holding the entire archive, with a key
+  that can read all of it. The standing rule is that the web UI's single
+  egress point stays single, opt-out and named on the page (architecture.md
+  §4.5). This would be the first exception, and the worst-placed one.
+- **The stdlib has no SSH client.** Staying stdlib-only means shelling out to
+  `sftp`/`ssh` and parsing directory listings from a program whose output is
+  not a contract.
+- **Latency.** Every reconcile-on-access becomes an SSH round trip, and the
+  index's cheap `(size, mtime)` change key needs a `stat` per file, over a
+  link chosen precisely because it is far away.
+
+The credential half really was easier than an older note claimed, and that is
+recorded here so it is not re-discovered as a blocker: all three units run as
+the same `timelapse` account, and a remote transfer destination means
+rsync-over-SSH already works for it, so the keys exist and the host key is
+already trusted. Easy credentials were never what made this expensive.
+
+**Reopen if:** people actually ask, more than once, with a destination that
+genuinely cannot be mounted. That is the trigger, and nothing else is. If it
+does reopen, the answer may well not be SFTP: a small read-only agent on the
+NAS, or an index the transfer itself pushes ahead of the files, would both
+avoid giving the web service an SSH key to the archive.
+
+---
+
+## Motion interpolation to smooth the judder
+
+**Refused on evidence, 2026-08-15, while building per-camera smoothing
+(architecture.md §4.8a). It is the obvious tool for "make the motion fluid",
+it is what every forum thread suggests, and on this input it produces a worse
+picture than frame averaging while costing roughly 350x as much.**
+
+At a 5s capture interval, adjacent frames are 5 real seconds apart.
+`minterpolate` works by finding where a thing in frame A went in frame B, and
+at that spacing the answer is usually "nowhere you can see": a car crosses the
+whole scene inside one interval, and wind-blown foliage is decorrelated. Given
+no correspondence it invents one, which is visible as the background warping
+around a moving object.
+
+Measured on a real 1440p day from the deployment, 600 frames:
+
+| Treatment | Frame-to-frame PSNR | Time | Extrapolated per camera-day |
+|---|---|---|---|
+| Untreated | 27.19 dB | 4.0s | - |
+| `tmix=frames=3` | **34.69 dB** | **3.9s** | **~2 min** |
+| `tmix=frames=5:weights='1 2 3 2 1'` | 37.21 dB | 3.8s | ~2 min |
+| `minterpolate` mci to 120fps | n/a (120fps) | 676s | ~5.4 h |
+| `minterpolate` to 240fps + `tmix=4` | 29.81 dB | 1,359s | ~10.9 h |
+
+The last row is the interesting one, because it is the *correct* cinematic
+technique (synthesise a shutter, then average it) and it still loses to a
+one-token filter. The reason is structural rather than a tuning failure: it
+blurs *within* each 5s gap, so consecutive output frames remain 5 seconds
+apart in content, and the frame-to-frame delta is the entire problem. `tmix`
+averages *across* source frames, which is the only operation that touches it.
+
+Cost alone would also have settled it. Eight cameras at 5.4 hours each does
+not fit in a night, and the deployment has a 4K camera that is worse.
+
+**Reopen if:** the capture interval drops far enough that adjacent frames
+genuinely overlap (1s or below), *and* something like an NVENC-accelerated
+optical-flow filter makes the arithmetic affordable. Both halves are required:
+cheap interpolation of uncorrelated frames is still wrong, just faster.
+
+**Not refused:** frame averaging itself, which shipped as `smooth_frames`, and
+a shorter capture interval, which is the only real fix for fast objects and is
+a storage decision for the operator rather than a code change.
+
+---
+
 ## Where the rest of the "no" decisions live
 
 Several refusals are recorded next to the code they constrain, because that is

@@ -7,6 +7,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [Unreleased]
+
+## [0.1.9] - 2026-08-15
+
+### Added
+- **Optional motion smoothing, per camera.** A camera carrying `smooth_frames`
+  has that many neighbouring frames averaged into each output frame when it is
+  encoded, which calms the shimmer of wind in trees. That shimmer is most of
+  what makes a timelapse look like it is jumping: at one frame every 5 seconds
+  the leaves are in a different place in every frame, and averaging settles
+  them. The wizard offers it when you add or edit a camera, defaulting to no,
+  and to 15 frames once you say yes; any value from 3 to 30 is accepted.
+  `timelapse cameras -l` shows it as `+15` beside the cadence, and
+  `timelapse test` reports it.
+
+  **It is off unless a camera asks for it, and there is no global setting**,
+  which is deliberate and unlike `interval_seconds` and `framerate`: those
+  fall back to a default so an untouched camera still follows it, whereas
+  smoothing suits a wide view of foliage and spoils a doorway. **Upgrading
+  changes nothing**, because every existing config is one where no camera
+  says anything.
+
+  Two things worth knowing before turning it on. It cannot help with cars or
+  people: anything crossing the frame is captured once, so averaging softens
+  the flash into a brief ghost but cannot make it fluid, and nothing else can
+  either. And a camera's burnt-in clock will blur its fastest-changing digits,
+  because they differ in every frame being averaged.
+
+  This is encode-time only: capture, frame counts, coverage and video length
+  are untouched. **Turn it on during the day and that same day is smoothed**,
+  because the nightly run encodes the day that has just finished and reads the
+  config as it stands then. Unlike a cadence change, which is pinned to what a
+  day was actually captured at, there is nothing to wait for. Days already
+  encoded are not redone without `timelapse_encode.py --force`.
+
+### Changed
+- **The Library tab now tells you how to fix a remote destination**, instead of
+  only saying that browsing is unsupported. A `transfer.destination` of
+  `user@nas:/path` is not a path this host can read, and the two supported
+  answers are named on the page: mount that share and set `web.library_root`
+  to the mount point, or turn transfer off and keep the videos local. A
+  mounted share is an absolute path, so it browses normally and always has.
+  Browsing an SSH-only destination over SFTP has been **refused** rather than
+  left as a to-do (see `docs/decided-against.md`): it would give the one
+  network-facing service a second outbound connection, over SSH, to the host
+  holding every video, and mounting the share costs a line in `/etc/fstab`.
+  Only the wording changes; a readable library path is now a stated
+  prerequisite rather than a pending feature.
+- **The Overview is ordered by how often you need it**: Cameras, Last encode,
+  Services, Version. The page had grown in the order the panels were built,
+  which put the version number above the cameras.
+- **Where the video library lives is now shown on the Library tab**, at the
+  head of the panel that already answered every other question about it,
+  instead of in its own section on the Overview. A library that cannot be read
+  still says so on the Overview, with a link to the tab.
+- **Every column in the web UI's tables now starts at the same edge.** The
+  counted columns (Frames today, Coverage, and most of the Library tab) were
+  right-aligned while their own headers, and every other column, were
+  left-aligned.
+- **Every timestamp in the web UI is now shown in the same format**,
+  `2026-08-15 16:43:21`. The page draws on three sources and each had its own
+  idea of what a timestamp looks like: the capture and encode heartbeats gave
+  `2026-08-15T16:43:21`, systemd gave `since Sat 2026-08-15 16:42:21 EEST`, and
+  the library index gave a time with no seconds. The weekday and the timezone
+  are gone with it: the weekday follows from the date, and the timezone is the
+  server's own on every row. The `/status` and `Recent log` pages still hold
+  command output exactly as it came back, which is what makes them worth
+  pasting into a bug report.
+
 ## [0.1.8] - 2026-08-15
 
 ### Changed
@@ -1207,6 +1276,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.9]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.9
 [0.1.8]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.8
 [0.1.7]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.7
 [0.1.6]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.6

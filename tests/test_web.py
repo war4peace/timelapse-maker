@@ -263,7 +263,27 @@ class TestRouting(unittest.TestCase):
             "enabled": True, "destination": "user@nas:/mnt/user/timelapse/"})
         status, _, body = request("/", config)
         self.assertEqual(status, 200)
-        self.assertIn("Browsing is not supported", body)
+        self.assertIn("not a path this host can read", body)
+
+    def test_remote_destination_names_both_supported_fixes(self):
+        # A readable library is a prerequisite of this tab rather than a gap
+        # in it: browsing an SSH-only destination was refused, so no third
+        # answer is coming and the message must not leave the reader waiting
+        # for one. It has to say what to do, not only what is wrong.
+        config = cfg(self.tmp, transfer={
+            "enabled": True, "destination": "user@nas:/mnt/user/timelapse/"})
+        _, _, body = request("/", config)
+        self.assertIn("web.library_root", body)
+        self.assertIn("mount", body)
+        self.assertIn("disable transfer", body)
+
+    def test_a_mounted_share_is_not_treated_as_remote(self):
+        # The whole reason the refusal is affordable: an absolute path is
+        # settled before the colon test, so mounting the NAS is all it takes
+        # to get a working library.
+        self.assertFalse(web.is_remote_spec("/mnt/nas/timelapse/"))
+        self.assertTrue(web.is_remote_spec("user@nas:/mnt/user/timelapse/"))
+        self.assertTrue(web.is_remote_spec("rsync://nas/timelapse"))
 
     def test_path_from_config_is_escaped(self):
         config = cfg(self.tmp, transfer={"enabled": False},
@@ -474,7 +494,7 @@ class TestUnitStates(unittest.TestCase):
     def test_a_running_daemon_says_running_and_since_when(self):
         row = self.rows(self.show(self.daemon()))["Capture"]
         self.assertEqual(row[1:3], ("ok", "Running"))
-        self.assertIn("since Mon 2026-08-10", row[3])
+        self.assertIn("since 2026-08-10 22:00:01", row[3])
 
     def test_a_finished_oneshot_reads_as_a_success(self):
         # The nightly encode is inactive for 23 hours 22 minutes of every day,
@@ -486,7 +506,7 @@ class TestUnitStates(unittest.TestCase):
             InactiveEnterTimestamp="Mon 2026-08-11 00:42:11 EEST",
             Result="success")))["Last encode run"]
         self.assertEqual(row[1:3], ("ok", "Successful"))
-        self.assertIn("last finished Mon 2026-08-11", row[3])
+        self.assertIn("last finished 2026-08-11 00:42:11", row[3])
 
     def test_a_oneshot_that_has_never_run_says_that_instead(self):
         # No timestamp, so there is no run to call successful. Saying so beats
@@ -520,7 +540,7 @@ class TestUnitStates(unittest.TestCase):
             NextElapseUSecRealtime="Wed 2026-08-12 00:05:00 EEST",
         )))["Nightly encode"]
         self.assertEqual(row[1:3], ("ok", "Scheduled"))
-        self.assertIn("next run Wed 2026-08-12 00:05:00", row[3])
+        self.assertIn("next run 2026-08-12 00:05:00", row[3])
 
     def test_a_monotonic_timer_shows_its_next_run_too(self):
         """The credential watch fires on OnBootSec/OnUnitActiveSec, so
@@ -544,7 +564,7 @@ class TestUnitStates(unittest.TestCase):
             NextElapseUSecMonotonic="infinity",
             LastTriggerUSec="Fri 2026-08-14 22:50:12 EEST",
         )))["Credential watch"]
-        self.assertIn("last ran Fri 2026-08-14 22:50:12", row[3])
+        self.assertIn("last ran 2026-08-14 22:50:12", row[3])
 
     def test_a_timer_that_will_never_fire_again_says_that(self):
         row = self.rows(self.show(self.daemon(
@@ -610,7 +630,7 @@ class TestUnitStates(unittest.TestCase):
             ActiveEnterTimestamp="Tue 2026-08-11 00:05:12 EEST",
         )))["Last encode run"]
         self.assertEqual(row[2], "Finished")
-        self.assertIn("ran at Tue 2026-08-11", row[3])
+        self.assertIn("ran at 2026-08-11 00:05:12", row[3])
 
     def test_a_running_oneshot_is_called_running(self):
         row = self.rows(self.show(self.daemon(
@@ -631,7 +651,7 @@ class TestUnitStates(unittest.TestCase):
             InactiveExitTimestamp="Wed 2026-08-12 00:05:00 EEST",
         )))["Last encode run"]
         self.assertEqual(row[1:3], ("ok", "Running"))
-        self.assertIn("started Wed 2026-08-12 00:05:00", row[3])
+        self.assertIn("started 2026-08-12 00:05:00", row[3])
 
     def test_a_daemon_mid_start_is_still_starting(self):
         # The oneshot rule must not swallow the state it was named for.
@@ -728,6 +748,34 @@ class TestStatusRoutes(unittest.TestCase):
         self.assertIn("Services", body)
         self.assertIn("Capture", body)
         self.assertIn("Running", body)
+
+    def test_the_overview_is_ordered_by_how_often_it_is_asked(self):
+        # Requested 2026-08-15. The page grew in the order the panels were
+        # built, which put the version above the cameras.
+        body = self.overview()
+        order = [body.index(f"<h2>{h}</h2>")
+                 for h in ("Cameras", "Last encode", "Services", "Version")]
+        self.assertEqual(order, sorted(order))
+
+    def test_the_library_location_is_not_on_the_overview_any_more(self):
+        # It moved into the Library panel, which is where the rest of the
+        # library already was. A healthy library says nothing here.
+        body = self.overview()
+        self.assertNotIn("Resolved from", body)
+        self.assertNotIn("Location", body)
+
+    def test_an_unreadable_library_still_says_so_on_the_landing_page(self):
+        # The detail moved; the fault did not. A library that cannot be read
+        # is a fault, and the landing page is where faults belong, whichever
+        # tab owns the explanation.
+        config = cfg(self.tmp, transfer={"enabled": True,
+                                         "destination": str(Path(self.tmp,
+                                                                 "gone"))})
+        with mock.patch.object(web, "run_command",
+                               return_value=(self.SHOW, "")):
+            body = request("/", config)[2]
+        self.assertIn("does not exist or is not readable", body)
+        self.assertIn('href="/library"', body)
 
     def test_the_overview_says_nothing_a_reader_did_not_ask_for(self):
         body = self.overview()
@@ -860,6 +908,19 @@ class TestStatusRoutes(unittest.TestCase):
         self.assertIn("justify-content: center", nav)
         head = css.split("header {", 1)[1].split("}", 1)[0]
         self.assertIn("justify-content: center", head)
+
+    def test_table_cells_all_start_at_the_same_edge(self):
+        """Reported 2026-08-15: the counted columns (Frames today, Coverage,
+        and most of the library table) were right-aligned while every other
+        column and every header was left-aligned, so each number sat away
+        from the label above it. Tabular figures stay: they are what keeps a
+        stack of counts readable without moving it."""
+        _, _, body = request("/", self.config)
+        css = body.split("</style>", 1)[0]
+        self.assertNotIn("text-align: right", css)
+        num = css.split("td.num {", 1)[1].split("}", 1)[0]
+        self.assertIn("text-align: left", num)
+        self.assertIn("tabular-nums", num)
 
     def test_the_header_names_the_project_and_its_version_only(self):
         _, _, body = request("/", self.config)
@@ -1343,6 +1404,29 @@ class TestLibraryRoutes(IndexCase):
         self.assertEqual(status, 200)
         self.assertIn("Gate", body)
         self.assertIn("2024-01", body)
+
+    def test_the_library_panel_says_where_it_is_and_how_that_was_decided(self):
+        # Moved off the overview 2026-08-15, into the panel that already
+        # answered every other question about the library.
+        _, _, body = self.get("/library")
+        head = body.split("<h2>Library</h2>", 1)[1]
+        self.assertIn("Location", head)
+        self.assertIn(str(self.root), head)
+        self.assertIn("Resolved from", head)
+        self.assertIn("Readable", head)
+        # And still above the counts, which are the same question's answer.
+        self.assertLess(head.index("Location"), head.index("Files"))
+
+    def test_an_unreadable_library_names_the_path_it_could_not_read(self):
+        # The one state where the location is not implied by a listing being
+        # on the screen, and the one where somebody needs to read it.
+        config = cfg(self.tmp, transfer={"enabled": True,
+                                         "destination": str(Path(self.tmp,
+                                                                 "gone"))})
+        _, _, body = request("/library", config, self.index)
+        self.assertIn("Location", body)
+        self.assertIn("gone", body)
+        self.assertIn(">no<", body)
 
     def test_both_spellings_are_listed(self):
         _, _, body = self.get("/library")
@@ -2725,7 +2809,7 @@ class TestGate(unittest.TestCase):
         # asks for it.
         status, _, body = request("/", self.config)
         self.assertEqual(status, 200)
-        self.assertIn("Video library", body)
+        self.assertIn("<h2>Cameras</h2>", body)
 
     def test_the_pages_need_a_session(self):
         for path, where in (("/", "/login"),
@@ -2746,7 +2830,7 @@ class TestGate(unittest.TestCase):
         status, _, body = self.get("/", cookie_header(
             self.auth.open_session()))
         self.assertEqual(status, 200)
-        self.assertIn("Video library", body)
+        self.assertIn("<h2>Cameras</h2>", body)
 
     def test_a_stale_or_forged_cookie_does_not(self):
         for value in ("nonsense", "", "a=b; c=d"):
@@ -3899,7 +3983,9 @@ class TestLastEncodePanel(StateMixin, unittest.TestCase):
         self.run_payload()
         body = self.body()
         self.assertIn("Last encode", body)
-        self.assertIn("2026-08-12T00:27:56", body)
+        # The state file's ISO stamp, rendered in the page's one format.
+        self.assertIn("2026-08-12 00:27:56", body)
+        self.assertNotIn("2026-08-12T00:27:56", body)
         self.assertIn("AV1 (av1_nvenc)", body)
         self.assertIn("1 video(s)", body)
 
@@ -4033,6 +4119,51 @@ class TestIPv6InEmittedURLs(IndexCase):
         _, _, body = request("/play/Gate.20260707.mkv", self.config,
                              self.index, headers="Host: [fdd2::1]:8787\r\n")
         self.assertIn("http://[fdd2::1]:8787/video/", body)
+
+
+class TestStampFormat(unittest.TestCase):
+    """One timestamp format on the page, from two upstream formats.
+
+    Reported by the operator 2026-08-15: the overview carried
+    "2026-08-15T16:43:21" from our own state files and
+    "since Sat 2026-08-15 16:42:21 EEST" from systemd, in the same view.
+    """
+
+    def test_our_own_iso_stamp_loses_the_t(self):
+        self.assertEqual(web.show_stamp("2026-08-15T16:43:21"),
+                         "2026-08-15 16:43:21")
+
+    def test_a_systemd_stamp_loses_the_weekday_and_the_zone(self):
+        # The weekday is derivable from the date and the zone is the server's
+        # own, identical on every row, so both are noise.
+        self.assertEqual(web.show_stamp("Sat 2026-08-15 16:42:21 EEST"),
+                         "2026-08-15 16:42:21")
+
+    def test_a_utc_stamp_is_handled_too(self):
+        # systemd prints UTC for a server with no local zone set.
+        self.assertEqual(web.show_stamp("Sat 2026-08-15 13:42:21 UTC"),
+                         "2026-08-15 13:42:21")
+
+    def test_fractional_seconds_and_an_offset_are_dropped(self):
+        # Neither shape occurs today. Allowing for them costs nothing, and a
+        # tz-aware isoformat() upstream would otherwise fall through raw.
+        self.assertEqual(web.show_stamp("2026-08-15T16:43:21.482+03:00"),
+                         "2026-08-15 16:43:21")
+
+    def test_an_unparseable_stamp_is_passed_through(self):
+        # It is still the only answer available. Blanking it would turn a
+        # format surprise into a missing fact.
+        self.assertEqual(web.show_stamp("whenever"), "whenever")
+
+    def test_nothing_stays_nothing(self):
+        # Every caller tests the result for truth before building a phrase
+        # around it, so this must not become a stray "None".
+        self.assertEqual(web.show_stamp(""), "")
+        self.assertIsNone(web.show_stamp(None))
+
+    def test_an_epoch_renders_in_the_same_shape(self):
+        when = time.mktime((2026, 8, 15, 16, 43, 21, 0, 0, -1))
+        self.assertEqual(web.stamp_of(when), "2026-08-15 16:43:21")
 
 
 if __name__ == "__main__":

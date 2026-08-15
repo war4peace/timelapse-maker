@@ -6,6 +6,7 @@ kinds of thing that look like disks but aren't. These drive it with a synthetic
 """
 
 import contextlib
+import inspect
 import io
 import json
 import re
@@ -23,6 +24,7 @@ from urllib.parse import parse_qs, urlparse
 import _support
 from _support import FakeStatVFS, write_mounts
 
+import timelapse_encode as enc
 import timelapse_setup as setup
 
 
@@ -496,11 +498,18 @@ class TestCameraCounter(unittest.TestCase):
             setup.test_camera = prev_test
         return cfg["cameras"], buf.getvalue()
 
-    # configure? / scan? / type / name / ip / user / pass / test? / add another?
+    # configure? / scan? / type / name / ip / user / pass / smooth? / test? /
+    # add another?
     # The scan is offered once for the whole section, not once per camera,
     # which is why TWO does not answer it a second time.
-    ONE = "y\nn\n1\nGate\n10.0.0.1\nadmin\npw\nn\n"
-    TWO = ONE + "y\n1\nYard\n10.0.0.2\nadmin\npw\nn\n"
+    #
+    # Smoothing is answered with a bare Enter rather than an explicit "n", so
+    # these also pin "off unless asked for" through the real wizard path. If
+    # that default ever flips, Enter starts answering the frames question
+    # instead and every keystroke after it shifts, which fails loudly here
+    # rather than quietly enabling smoothing on every camera anyone adds.
+    ONE = "y\nn\n1\nGate\n10.0.0.1\nadmin\npw\n\nn\n"
+    TWO = ONE + "y\n1\nYard\n10.0.0.2\nadmin\npw\n\nn\n"
 
     def test_prompt_names_the_next_camera_not_the_count(self):
         _, out = self.drive(self.ONE + "n\n", 9)
@@ -2288,6 +2297,131 @@ class TestFramerate(unittest.TestCase):
         self.assertEqual(setup.video_length(60, 0), "1:00")
 
 
+class TestPerCameraSmoothing(unittest.TestCase):
+    """Optional tmix, per camera, off unless asked for.
+
+    The mirror image of the cadence rule next door, and the difference is the
+    point: cadence keys are absent to mean "follow the global", this one is
+    absent to mean "no". There is no global to follow, because averaging suits
+    a roof of trees and spoils a doorway.
+    """
+
+    def setUp(self):
+        self.cfg = {"capture": {"interval_seconds": 5},
+                    "encode": {"framerate": 60, "min_frames": 100}}
+        setup.AUTO, setup._TTY = False, None
+
+    def tearDown(self):
+        setup.AUTO, setup._TTY = False, None
+
+    def edit(self, cam, keys):
+        setup._TTY = FakeTTY(keys, tty=False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            setup.edit_camera_smoothing(self.cfg, cam)
+        return cam, buf.getvalue()
+
+    def test_the_default_answer_is_no_for_a_new_camera(self):
+        # Pressing Enter through a new camera must never enable it. This is
+        # the "off by default for new installations" claim, in one test.
+        cam, _ = self.edit({"name": "C"}, "\n")
+        self.assertEqual(cam, {"name": "C"})
+
+    def test_saying_no_stores_nothing_rather_than_a_zero(self):
+        # A config that has never wanted smoothing keeps the shape it has
+        # always had, which is what makes the upgrade a no-op.
+        cam, _ = self.edit({"name": "C"}, "n\n")
+        self.assertNotIn("smooth_frames", cam)
+
+    def test_saying_yes_offers_the_documented_default(self):
+        cam, out = self.edit({"name": "C"}, "y\n\n")
+        self.assertEqual(cam["smooth_frames"], enc.SMOOTH_DEFAULT)
+        self.assertIn(f"[{enc.SMOOTH_DEFAULT}]", out)
+
+    def test_a_chosen_value_is_stored(self):
+        cam, _ = self.edit({"name": "C"}, "y\n8\n")
+        self.assertEqual(cam["smooth_frames"], 8)
+
+    def test_turning_it_off_removes_the_key(self):
+        cam, _ = self.edit({"name": "C", "smooth_frames": 15}, "n\n")
+        self.assertNotIn("smooth_frames", cam)
+
+    def test_an_enabled_camera_defaults_to_staying_enabled(self):
+        cam, out = self.edit({"name": "C", "smooth_frames": 20}, "\n\n")
+        self.assertEqual(cam["smooth_frames"], 20)
+        self.assertIn("[20]", out)
+
+    def test_a_value_outside_the_range_is_refused_and_reasked(self):
+        # ask_int loops rather than accepting, so the stored value is the
+        # second answer, not the first.
+        cam, out = self.edit({"name": "C"}, "y\n99\n30\n")
+        self.assertEqual(cam["smooth_frames"], 30)
+        cam, _ = self.edit({"name": "D"}, "y\n1\n3\n")
+        self.assertEqual(cam["smooth_frames"], 3)
+
+    def test_the_span_is_reported_in_real_time_not_frames(self):
+        # 15 frames means something different at 5s and at 60s, and the
+        # seconds are what the operator is actually choosing.
+        _, out = self.edit({"name": "C"}, "y\n15\n")
+        self.assertIn("75s", out)
+
+    def test_the_span_follows_this_cameras_own_interval(self):
+        _, out = self.edit({"name": "C", "interval_seconds": 60}, "y\n15\n")
+        self.assertIn("900s", out)
+
+    def test_what_the_wizard_writes_is_what_the_encoder_reads(self):
+        # The two halves live in different modules and only agree by
+        # convention. Pin them together rather than trusting the key name.
+        cam, _ = self.edit({"name": "C"}, "y\n12\n")
+        self.assertEqual(enc.camera_smoothing(cam), 12)
+        cam, _ = self.edit(cam, "n\n")
+        self.assertEqual(enc.camera_smoothing(cam), 0)
+
+    def test_the_wizard_cannot_offer_a_value_the_encoder_would_clamp(self):
+        # The prompt's bounds and the encoder's clamp are two statements of
+        # one rule, so a drift between them would silently ignore an answer
+        # the wizard had just accepted.
+        for value in (enc.SMOOTH_MIN, enc.SMOOTH_MAX):
+            cam, _ = self.edit({"name": "C"}, f"y\n{value}\n")
+            self.assertEqual(enc.camera_smoothing(cam), value)
+
+
+class TestSmoothingSurvivesCameraToggling(unittest.TestCase):
+    """Disabling a camera must not cost it its settings.
+
+    A camera gets disabled for a season, not forever, and re-enabling it
+    should not mean setting it up again. The enable/disable path touches one
+    key, and this is what says so.
+    """
+
+    def test_disabling_and_re_enabling_keeps_smoothing(self):
+        cam = {"name": "Roof", "enabled": True, "smooth_frames": 15,
+               "interval_seconds": 60}
+        cam["enabled"] = False
+        self.assertEqual(cam["smooth_frames"], 15)
+        self.assertEqual(enc.camera_smoothing(cam), 15)
+        cam["enabled"] = True
+        self.assertEqual(cam["smooth_frames"], 15)
+        self.assertEqual(enc.camera_smoothing(cam), 15)
+
+    def test_a_disabled_camera_still_reports_its_smoothing(self):
+        # It has to survive being read while off, or the listing would show
+        # the setting vanishing the moment someone disabled the camera.
+        self.assertEqual(
+            enc.camera_smoothing({"enabled": False, "smooth_frames": 15}), 15)
+
+    def test_the_toggle_in_manage_cameras_writes_only_enabled(self):
+        # Read the source rather than drive the loop: the claim is about what
+        # that branch does NOT touch, and a test that drives it would pass
+        # just as happily if a future edit reset the camera's other keys.
+        src = inspect.getsource(setup.manage_cameras)
+        toggle = src[src.index('elif action == "x"'):src.index('elif action == "t"')]
+        self.assertIn('cam["enabled"] = False', toggle)
+        self.assertIn('cam["enabled"] = True', toggle)
+        self.assertNotIn("smooth_frames", toggle)
+        self.assertNotIn("pop(", toggle)
+
+
 class TestPerCameraCadence(unittest.TestCase):
     """Editing one camera's interval and frame rate.
 
@@ -2390,6 +2524,53 @@ class TestCadenceListing(unittest.TestCase):
     def test_no_overrides_means_no_footnote(self):
         out = self.show([{"name": "A", "url": "http://h/s"}])
         self.assertNotIn("own interval or frame rate", out)
+
+    def test_smoothing_is_shown_against_the_camera_that_has_it(self):
+        out = self.show([{"name": "A", "url": "http://h/s"},
+                         {"name": "B", "url": "http://h/s",
+                          "smooth_frames": 15}])
+        self.assertIn("5s/60+15", out)
+        self.assertIn("averages N frames", out)
+
+    def test_no_smoothing_means_no_footnote(self):
+        out = self.show([{"name": "A", "url": "http://h/s"}])
+        self.assertNotIn("averages N frames", out)
+
+    def test_both_markers_can_appear_on_one_camera(self):
+        out = self.show([{"name": "A", "url": "http://h/s",
+                          "interval_seconds": 60, "framerate": 30,
+                          "smooth_frames": 8}])
+        self.assertIn("60s/30*+8", out)
+
+    def test_a_smoothed_listing_still_fits_eighty_columns(self):
+        # The row had no slack left when smoothing was added, which is why it
+        # shares the cadence column rather than getting one of its own. The
+        # URL elision is what would otherwise have paid, and it cannot: see
+        # the mask test below.
+        out = self.show([{"name": "DoorbellFront", "interval_seconds": 3,
+                          "smooth_frames": 30,
+                          "url": "http://192.0.2.11/cgi-bin/api.cgi?cmd=Snap"
+                                 "&channel=0&user=admin&password=hunter2"}])
+        for line in out.splitlines():
+            self.assertLessEqual(len(re.sub(r"\x1b\[[0-9;]*m", "", line)), 80,
+                                 line)
+
+    def test_a_smoothed_row_still_masks_the_password(self):
+        # The 13-character URL tail is what keeps *** in view on a Reolink
+        # URL, and a listing that elides the mask reads as though nothing had
+        # been redacted. Adding a column must never be paid for from there.
+        out = self.show([{"name": "A", "smooth_frames": 15,
+                          "url": "http://h/api?user=admin&password=hunter2"}])
+        self.assertNotIn("hunter2", out)
+        self.assertIn("***", out)
+
+    def test_an_absurd_cadence_does_not_collide_with_the_next_column(self):
+        # 3600s at 240fps with smoothing overflows the column. It may push
+        # the row wider, but it must not run into the type.
+        out = self.show([{"name": "A", "url": "http://h/s", "method": "rtsp",
+                          "interval_seconds": 3600, "framerate": 240,
+                          "smooth_frames": 30}])
+        self.assertIn("3600s/240*+30 rtsp", out)
 
     def test_the_listing_still_fits_eighty_columns(self):
         # It gained a Cadence column, and the URL elision was shortened from

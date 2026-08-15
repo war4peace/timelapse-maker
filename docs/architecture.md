@@ -940,6 +940,18 @@ A destination is not necessarily a path. `is_remote_spec()` classifies
 reported as such rather than rendered as an empty list. An absolute path is
 settled before the colon test, so `/mnt/odd:name/videos` stays local.
 
+**A readable library path is a prerequisite of the Library tab, not a gap in
+it.** Either the destination share is mounted and `library_root` names the
+mount point, or transfer is off and the videos stay in `video_output`.
+Reaching an SSH-only destination over SFTP was item 6 and is **refused**
+(decided-against.md): it would make this, the only network-facing unit, open a
+second outbound connection over SSH to the host holding the whole archive,
+with a key that can read it, against a standing rule that its one egress point
+stays one; and mounting the same share costs a line in `/etc/fstab`. The note
+`resolve_library()` returns therefore names both supported fixes rather than
+only the problem, because no third answer is coming and the message must not
+imply one.
+
 The function returns a dict with `usable` and a `note` rather than a path,
 because "why is this empty" is the question the page exists to answer, and a
 dropped NAS mount is a *correct* empty library, not a fault.
@@ -1194,7 +1206,7 @@ connection this service makes, and should stay the only one.
   because that is the part worth searching for.
 
 **Service state and logs** shell out only when a human asks for a page. The
-services table is one `systemctl show` at the foot of the overview; `/status`
+services table is one `systemctl show` on the overview; `/status`
 and `/logs` are one command each. Nothing polls and nothing is collected in
 the background, and the endpoints a machine might hit in a loop (`/healthz`,
 and the `/scan` and `/update` fragments the page's own scripts poll) run no
@@ -1213,6 +1225,47 @@ deliberate price of dropping a tab.
   four pages at two window sizes: 240px of drift before, 1px after, the
   remainder being sub-pixel rounding when centring inside containers of
   different widths.
+- **The overview is ordered by how often the question is asked** (0.1.9):
+  Cameras, Last encode, Services, Version. It had grown in the order the
+  panels were built, which put the version number, the thing nobody opens the
+  page for, above the cameras, the thing they do. `OVERVIEW` is the whole of
+  it, so the order is one template rather than a call sequence, and a test
+  pins the four headings in sequence.
+  - **The library's location moved to the Library tab**, into the panel that
+    already answered every other question about the library, so the same
+    question stopped being answered in halves. `where_rows()` emits it in
+    *both* of that panel's states: when the library is unreadable the path is
+    not implied by a listing being on the screen, and that is precisely when
+    somebody needs to read it.
+  - **The fault did not move with the detail.** An unreadable library still
+    warns on the landing page, now as a one-line note carrying a link to the
+    tab. It is empty when there is nothing wrong, so the healthy page loses
+    the section entirely; the alarm is what the landing page is for.
+- **Every column starts at the same edge** (0.1.9). The counted columns
+  (`td.num`: frames, coverage, sizes, and most of the library table) were
+  right-aligned while every other cell and *every header* was left-aligned, so
+  each number sat away from the label naming it. They are left-aligned now and
+  keep `tabular-nums`, which is what makes a stack of counts scannable without
+  moving it. Reported by the operator 2026-08-15.
+- **Every timestamp on the page is rendered in one format, at the point of
+  display** (0.1.9): `2026-08-15 16:43:21`, by `show_stamp()` for text and
+  `stamp_of()` for epoch seconds. Three sources feed this page and each has its
+  own idea of a timestamp: the state files carry ISO 8601 with a `T`, systemd
+  carries `Sat 2026-08-15 16:42:21 EEST`, and the index carries epoch seconds.
+  All three were being printed as they arrived, so one overview showed two
+  formats and the same instant looked like two different kinds of fact.
+  Reported by the operator 2026-08-15. Two decisions inside it:
+  - **The conversion is at the point of display, not at the point of writing.**
+    ISO 8601 is correct in a machine-readable state file and systemd's format
+    is not ours to change, so nothing that writes a file moves.
+  - **The weekday and the zone are dropped.** The weekday is derivable from the
+    date, and the zone is the server's own, identical on every row of every
+    page, which makes it noise on all of them. An unparseable stamp is passed
+    through unchanged rather than blanked: it is still the only answer
+    available, and hiding it would turn a format surprise into a missing fact.
+
+  `/status` and `/logs` are exempt, deliberately: they hold command output
+  verbatim, which is what makes them worth pasting into a bug report.
 - **The services table answers the question in one word, at the foot of the
   overview.** It was a tab holding `systemctl status` verbatim, which is a
   page per unit: the invocation ID, the cgroup, the PID, the task count and
@@ -1621,6 +1674,78 @@ video is, cannot be read off the config. It fails a camera whose frames/day
 falls below `encode.min_frames`: the encoder `SKIP`s that, so the camera would
 produce nothing at all, every night, without ever failing.
 
+### 4.8a Per-camera motion smoothing
+
+`smooth_frames` on a camera appends `tmix=frames=N` to that camera's filter
+chain. It is optional, per camera, and **absent means off**, which is the exact
+opposite of §4.8's rule and is the point: interval and frame rate fall back to
+a global so an untouched camera still moves when the global does, while
+smoothing has no global to fall back to. Averaging suits a roof full of trees
+and spoils a doorway, so nothing may turn it on but the camera itself. Every
+config written before 0.1.9 is a config where no camera says anything, so an
+upgrade changes nothing.
+
+**What it is for.** At a 5s interval each frame is 5 real seconds from its
+neighbour, so every transition is a jump. That is temporal aliasing, not a
+frame-rate problem: the output is already 60fps with one captured frame per
+output frame, and raising the rate cannot help because there is no more
+information to show. Three kinds of motion behave differently:
+
+- **Wind in foliage** decorrelates between frames, so leaves boil. This is the
+  constant, everyday judder, and averaging genuinely fixes it.
+- **Shadows, cloud and light** drift slowly and were never the problem.
+- **Anything crossing the frame** is sampled once and cannot be fixed by
+  anything. Measured on the deployment's own footage: a car appears in exactly
+  one frame, and a 45-second bin collection yielded 3 frames of the lorry and
+  1 of the worker. Averaging turns that hard one-frame flash into a soft ghost
+  across N frames, which is an improvement, but it is not fluidity and no
+  setting will make it so.
+
+**Motion interpolation was tested and rejected**, on quality before cost.
+`minterpolate` needs frame-to-frame correspondence, which is precisely what a
+5s interval destroys, so it warps the scene where it guesses wrong. Measured at
+1440p: `mi_mode=mci` ran 676s for 600 frames (~5.4 hours per camera-day), and
+motion-compensated synthetic blur ran 1,359s (~10.9 hours) while scoring
+*worse* on frame-to-frame difference than plain `tmix` at 3. The reason is
+structural: it simulates a shutter *within* each 5s gap, so consecutive frames
+are still 5 seconds apart in content. See `decided-against.md`.
+
+Four things that are not obvious:
+
+- **It is encode-time only, and that inverts §4.8's timing rule.** Capture,
+  frame counts, `Cov%` and video length are all untouched, and so is
+  `.cadence.json`, which records what a day was *captured* at. A cadence edit
+  cannot land mid-day precisely because that marker outranks the config;
+  smoothing has no marker, is not a property of the capture, and is read from
+  the config at the moment of encoding. So enabling it at 14:00 smooths that
+  same afternoon's video, in the 00:05 run, together with any backlog days
+  that run picks up. Days already carrying `.encoded.json` are not redone;
+  `--force` is the lever. Three tests pin this, including one that puts a
+  `.cadence.json` predating the setting in the day directory: if smoothing
+  ever moved into that marker, turning it on would silently skip every day
+  already under way, which is every day anyone would think to turn it on for.
+- **`tmix` is last in the chain**, after `scale`'s full-to-limited conversion
+  and `format`. Ahead of them it would average full-range JPEG and hand the
+  scaler something it had not been told about.
+- **The value is clamped, not trusted.** `SMOOTH_MIN` 3, `SMOOTH_MAX` 30,
+  offered default 15. This is read off a file operators edit by hand, and the
+  cost of believing a typed 500 is buffering 500 frames of 4K per camera.
+  Anything under 3 reads as off, which is what a leftover 0 means.
+- **The bounds come from measurement, not taste.** At 3 frames a bin lorry
+  stays legible; at 7 flat it is an unreadable wash. Frame-to-frame difference
+  keeps improving as the window widens, which is exactly why it is the wrong
+  thing to optimise: that metric is maximised by erasing events. 15 suits a
+  scene that is mostly foliage with no small detail to lose, which is why it is
+  the offered default rather than the floor.
+
+The cost is negligible: measured at under 10% of decode time, against an
+encode that dominates either way, with no change to output size. The one
+visible loss is that a camera's burnt-in clock blurs its fastest-changing
+digits, since they differ in every frame being averaged.
+
+`timelapse test`'s Cadence section reports smoothing but never warns about it:
+there is no wrong value, only a preference per scene.
+
 ### 4.9 Credential redaction
 
 Reported 2026-08-11, from a real deployment's web UI, and the most serious
@@ -1777,7 +1902,7 @@ is read with `.get(key, default)`.
 | `bind` | `127.0.0.1` by default. There is no TLS, and the optional login below is a door lock rather than a safe; any other value exposes the page to the LAN, and anything wider belongs behind a reverse proxy. A non-loopback bind logs a warning at startup, worded according to whether a login is configured. IPv4 or IPv6; `::` is dual-stack and accepts both. |
 | `port` | `8787` by default. |
 | `auth` | Optional single login: `{username, password_hash}`. Absent, or either field blank, means no login and the pages behave exactly as they did before it existed. The hash is PBKDF2-SHA256 and self-describing (`pbkdf2_sha256$iters$salt$key`), so the iteration count can rise later without locking anyone out. A username with an unparseable hash **refuses to start**, rather than serving the pages to everyone because the check could not be made. |
-| `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path, typically a remote rsync destination that is *also* mounted locally. Not `/tmp` or `/var/tmp`: `PrivateTmp=true` hides those from the unit. |
+| `library_root` | Empty means "work it out": the transfer destination when transfer is enabled, otherwise `video_output`. Set it when the videos are readable here under a different path, typically a remote rsync destination that is *also* mounted locally. **Browsing requires a readable path**, so an SSH-only destination must be mounted; SFTP browsing is refused (§4.5). Not `/tmp` or `/var/tmp`: `PrivateTmp=true` hides those from the unit. |
 | `state_dir` | The **only** directory the web UI may write to; holds the sqlite index. The unit's `ReadWritePaths` is scoped to exactly this, so the library, the frames and the config stay read-only to it. `install.sh` creates it: a `ReadWritePaths` naming a missing directory stops the unit dead, and the service cannot create it itself. |
 
 ### `cameras[]`
@@ -1789,6 +1914,7 @@ is read with `.get(key, default)`.
 | `auth` | `digest`, `basic`, or `none`. Cameras that put credentials in the query string → `none`. |
 | `interval_seconds` | Optional. This camera's seconds between snapshots. Absent means `capture.interval_seconds`. |
 | `framerate` | Optional. This camera's playback rate. Absent means `encode.framerate`, and `gop` follows it. |
+| `smooth_frames` | Optional, 3-30. Averages that many neighbouring frames when encoding (§4.8a). Absent means **off**: there is no global to inherit. Encode-time only. |
 | `quality` | RTSP only: ffmpeg `-q:v`, 2 = high. |
 | `_note` | Ignored by code. Keys starting with `_` are documentation. |
 
@@ -1825,10 +1951,15 @@ Ordered roughly by how much of the existing design they disturb.
 via temp + `os.replace`, and dispatch on `method` in `main()`. Nothing in the
 encoder changes.
 
-**Per-camera settings**: interval and frame rate are done (see §4.8);
-resolution and quality would follow the same shape. The camera dict is passed
-whole to the thread constructor, so it is `cam.get(key) or <global>` and
-nothing structural.
+**Per-camera settings**: interval and frame rate are done (see §4.8), as is
+smoothing (§4.8a); resolution and quality would follow the same shape. The
+camera dict is passed whole to the thread constructor, so it is
+`cam.get(key) or <global>` and nothing structural. Decide first which of the
+two shapes a new key has: one that falls back to a global (absent means
+"follow it", and the wizard must *remove* the key when the answer equals the
+global) or one that does not (absent means off, and there is no global to put
+it in). Getting that backwards is how a setting ends up either impossible to
+turn off or silently pinned on every camera anyone has opened.
 
 **Another notification sink**: add a function taking
 `(sink, title, description, level, fields)` and register it in `SINKS`. The
@@ -2170,11 +2301,11 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ```
 install.sh                       bootstrap installer, 958 lines
 scripts/timelapse_capture.py     daemon, 1150 lines
-scripts/timelapse_encode.py      batch job, 1727 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 840 lines
-scripts/timelapse_setup.py       configuration wizard, 3670 lines
+scripts/timelapse_encode.py      batch job, 1799 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 848 lines
+scripts/timelapse_setup.py       configuration wizard, 3735 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 3160 lines
+scripts/timelapse_web.py         read-only web UI, 3516 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
@@ -2193,7 +2324,7 @@ service/timelapse-watch.timer     every 5 minutes
 service/timelapse-web.service
 docs/architecture.md             this file
 docs/install.md                  operator guide
-docs/future-features.md          planned work, in build order
+docs/future-features.md          planned work, in build order (empty at 0.1.9)
 docs/decided-against.md          considered and refused, and why
 ```
 
