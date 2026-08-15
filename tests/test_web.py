@@ -474,7 +474,7 @@ class TestUnitStates(unittest.TestCase):
     def test_a_running_daemon_says_running_and_since_when(self):
         row = self.rows(self.show(self.daemon()))["Capture"]
         self.assertEqual(row[1:3], ("ok", "Running"))
-        self.assertIn("since Mon 2026-08-10", row[3])
+        self.assertIn("since 2026-08-10 22:00:01", row[3])
 
     def test_a_finished_oneshot_reads_as_a_success(self):
         # The nightly encode is inactive for 23 hours 22 minutes of every day,
@@ -486,7 +486,7 @@ class TestUnitStates(unittest.TestCase):
             InactiveEnterTimestamp="Mon 2026-08-11 00:42:11 EEST",
             Result="success")))["Last encode run"]
         self.assertEqual(row[1:3], ("ok", "Successful"))
-        self.assertIn("last finished Mon 2026-08-11", row[3])
+        self.assertIn("last finished 2026-08-11 00:42:11", row[3])
 
     def test_a_oneshot_that_has_never_run_says_that_instead(self):
         # No timestamp, so there is no run to call successful. Saying so beats
@@ -520,7 +520,7 @@ class TestUnitStates(unittest.TestCase):
             NextElapseUSecRealtime="Wed 2026-08-12 00:05:00 EEST",
         )))["Nightly encode"]
         self.assertEqual(row[1:3], ("ok", "Scheduled"))
-        self.assertIn("next run Wed 2026-08-12 00:05:00", row[3])
+        self.assertIn("next run 2026-08-12 00:05:00", row[3])
 
     def test_a_monotonic_timer_shows_its_next_run_too(self):
         """The credential watch fires on OnBootSec/OnUnitActiveSec, so
@@ -544,7 +544,7 @@ class TestUnitStates(unittest.TestCase):
             NextElapseUSecMonotonic="infinity",
             LastTriggerUSec="Fri 2026-08-14 22:50:12 EEST",
         )))["Credential watch"]
-        self.assertIn("last ran Fri 2026-08-14 22:50:12", row[3])
+        self.assertIn("last ran 2026-08-14 22:50:12", row[3])
 
     def test_a_timer_that_will_never_fire_again_says_that(self):
         row = self.rows(self.show(self.daemon(
@@ -610,7 +610,7 @@ class TestUnitStates(unittest.TestCase):
             ActiveEnterTimestamp="Tue 2026-08-11 00:05:12 EEST",
         )))["Last encode run"]
         self.assertEqual(row[2], "Finished")
-        self.assertIn("ran at Tue 2026-08-11", row[3])
+        self.assertIn("ran at 2026-08-11 00:05:12", row[3])
 
     def test_a_running_oneshot_is_called_running(self):
         row = self.rows(self.show(self.daemon(
@@ -631,7 +631,7 @@ class TestUnitStates(unittest.TestCase):
             InactiveExitTimestamp="Wed 2026-08-12 00:05:00 EEST",
         )))["Last encode run"]
         self.assertEqual(row[1:3], ("ok", "Running"))
-        self.assertIn("started Wed 2026-08-12 00:05:00", row[3])
+        self.assertIn("started 2026-08-12 00:05:00", row[3])
 
     def test_a_daemon_mid_start_is_still_starting(self):
         # The oneshot rule must not swallow the state it was named for.
@@ -3899,7 +3899,9 @@ class TestLastEncodePanel(StateMixin, unittest.TestCase):
         self.run_payload()
         body = self.body()
         self.assertIn("Last encode", body)
-        self.assertIn("2026-08-12T00:27:56", body)
+        # The state file's ISO stamp, rendered in the page's one format.
+        self.assertIn("2026-08-12 00:27:56", body)
+        self.assertNotIn("2026-08-12T00:27:56", body)
         self.assertIn("AV1 (av1_nvenc)", body)
         self.assertIn("1 video(s)", body)
 
@@ -4033,6 +4035,51 @@ class TestIPv6InEmittedURLs(IndexCase):
         _, _, body = request("/play/Gate.20260707.mkv", self.config,
                              self.index, headers="Host: [fdd2::1]:8787\r\n")
         self.assertIn("http://[fdd2::1]:8787/video/", body)
+
+
+class TestStampFormat(unittest.TestCase):
+    """One timestamp format on the page, from two upstream formats.
+
+    Reported by the operator 2026-08-15: the overview carried
+    "2026-08-15T16:43:21" from our own state files and
+    "since Sat 2026-08-15 16:42:21 EEST" from systemd, in the same view.
+    """
+
+    def test_our_own_iso_stamp_loses_the_t(self):
+        self.assertEqual(web.show_stamp("2026-08-15T16:43:21"),
+                         "2026-08-15 16:43:21")
+
+    def test_a_systemd_stamp_loses_the_weekday_and_the_zone(self):
+        # The weekday is derivable from the date and the zone is the server's
+        # own, identical on every row, so both are noise.
+        self.assertEqual(web.show_stamp("Sat 2026-08-15 16:42:21 EEST"),
+                         "2026-08-15 16:42:21")
+
+    def test_a_utc_stamp_is_handled_too(self):
+        # systemd prints UTC for a server with no local zone set.
+        self.assertEqual(web.show_stamp("Sat 2026-08-15 13:42:21 UTC"),
+                         "2026-08-15 13:42:21")
+
+    def test_fractional_seconds_and_an_offset_are_dropped(self):
+        # Neither shape occurs today. Allowing for them costs nothing, and a
+        # tz-aware isoformat() upstream would otherwise fall through raw.
+        self.assertEqual(web.show_stamp("2026-08-15T16:43:21.482+03:00"),
+                         "2026-08-15 16:43:21")
+
+    def test_an_unparseable_stamp_is_passed_through(self):
+        # It is still the only answer available. Blanking it would turn a
+        # format surprise into a missing fact.
+        self.assertEqual(web.show_stamp("whenever"), "whenever")
+
+    def test_nothing_stays_nothing(self):
+        # Every caller tests the result for truth before building a phrase
+        # around it, so this must not become a stray "None".
+        self.assertEqual(web.show_stamp(""), "")
+        self.assertIsNone(web.show_stamp(None))
+
+    def test_an_epoch_renders_in_the_same_shape(self):
+        when = time.mktime((2026, 8, 15, 16, 43, 21, 0, 0, -1))
+        self.assertEqual(web.stamp_of(when), "2026-08-15 16:43:21")
 
 
 if __name__ == "__main__":

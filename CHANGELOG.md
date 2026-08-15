@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [Unreleased]
+
+### Changed
+- **Every timestamp in the web UI is now shown in the same format**,
+  `2026-08-15 16:43:21`. The page draws on three sources and each had its own
+  idea of what a timestamp looks like: the capture and encode heartbeats gave
+  `2026-08-15T16:43:21`, systemd gave `since Sat 2026-08-15 16:42:21 EEST`, and
+  the library index gave a time with no seconds. The weekday and the timezone
+  are gone with it: the weekday follows from the date, and the timezone is the
+  server's own on every row. The `/status` and `Recent log` pages still hold
+  command output exactly as it came back, which is what makes them worth
+  pasting into a bug report.
+
 ## [0.1.8] - 2026-08-15
 
 ### Changed

@@ -1213,6 +1213,25 @@ deliberate price of dropping a tab.
   four pages at two window sizes: 240px of drift before, 1px after, the
   remainder being sub-pixel rounding when centring inside containers of
   different widths.
+- **Every timestamp on the page is rendered in one format, at the point of
+  display** (0.1.9): `2026-08-15 16:43:21`, by `show_stamp()` for text and
+  `stamp_of()` for epoch seconds. Three sources feed this page and each has its
+  own idea of a timestamp: the state files carry ISO 8601 with a `T`, systemd
+  carries `Sat 2026-08-15 16:42:21 EEST`, and the index carries epoch seconds.
+  All three were being printed as they arrived, so one overview showed two
+  formats and the same instant looked like two different kinds of fact.
+  Reported by the operator 2026-08-15. Two decisions inside it:
+  - **The conversion is at the point of display, not at the point of writing.**
+    ISO 8601 is correct in a machine-readable state file and systemd's format
+    is not ours to change, so nothing that writes a file moves.
+  - **The weekday and the zone are dropped.** The weekday is derivable from the
+    date, and the zone is the server's own, identical on every row of every
+    page, which makes it noise on all of them. An unparseable stamp is passed
+    through unchanged rather than blanked: it is still the only answer
+    available, and hiding it would turn a format surprise into a missing fact.
+
+  `/status` and `/logs` are exempt, deliberately: they hold command output
+  verbatim, which is what makes them worth pasting into a bug report.
 - **The services table answers the question in one word, at the foot of the
   overview.** It was a tab holding `systemctl status` verbatim, which is a
   page per unit: the invocation ID, the cgroup, the PID, the task count and
@@ -2170,11 +2189,11 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ```
 install.sh                       bootstrap installer, 958 lines
 scripts/timelapse_capture.py     daemon, 1150 lines
-scripts/timelapse_encode.py      batch job, 1727 lines
+scripts/timelapse_encode.py      batch job, 1750 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 840 lines
 scripts/timelapse_setup.py       configuration wizard, 3670 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 3160 lines
+scripts/timelapse_web.py         read-only web UI, 3480 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests

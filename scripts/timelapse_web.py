@@ -1125,6 +1125,46 @@ def status_report():
             "hint": ""}
 
 
+STAMP_FMT = "%Y-%m-%d %H:%M:%S"
+
+# Both shapes this page is handed. Ours is ISO 8601 with a `T` separator;
+# systemd's carries a weekday in front and a zone abbreviation behind. The
+# fractional seconds and the numeric offset are neither's today, and cost
+# nothing to allow for.
+STAMP_TEXT = re.compile(
+    r"^(?:[A-Za-z]{2,9}\s+)?"                        # optional weekday
+    r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})"    # the part we keep
+    r"(?:\.\d+)?"                                    # fractional seconds
+    r"(?:\s*(?:[A-Za-z]{1,6}|[+-]\d{2}:?\d{2}))?$")  # zone name or offset
+
+
+def show_stamp(text):
+    """Any timestamp this page displays, in one shape: 2026-08-15 16:43:21.
+
+    Two upstreams, two formats, and the page was printing both verbatim.
+    Our own state files carry ISO 8601 ("2026-08-15T16:43:21") because that
+    is what a machine-readable file should carry, and systemd carries its own
+    ("Sat 2026-08-15 16:42:21 EEST"). Neither is wrong at its source, so the
+    conversion belongs here, at the point of display, and nothing that writes
+    a file has to change.
+
+    The weekday and the zone are dropped: the weekday is derivable from the
+    date, and the zone is the server's own, the same for every row on the
+    page, which makes it noise on all of them.
+
+    Anything unrecognised is returned unchanged. A timestamp this could not
+    parse is still the only answer available, and hiding it would turn a
+    format surprise into a missing fact.
+    """
+    m = STAMP_TEXT.match((text or "").strip())
+    return f"{m.group(1)} {m.group(2)}" if m else text
+
+
+def stamp_of(epoch):
+    """The same shape, from epoch seconds."""
+    return time.strftime(STAMP_FMT, time.localtime(epoch))
+
+
 def describe_unit(label, kind, props, name):
     """One row of the services table: (label, class, state, detail).
 
@@ -1167,7 +1207,8 @@ def describe_unit(label, kind, props, name):
             # finishes.
             began = props.get("InactiveExitTimestamp", "")
             return (label, "ok", "Running",
-                    f"started {began}" if began else "in progress now")
+                    f"started {show_stamp(began)}" if began
+                    else "in progress now")
         return (label, "", "Starting", "")
     if active == "deactivating":
         return (label, "", "Stopping", "")
@@ -1177,10 +1218,11 @@ def describe_unit(label, kind, props, name):
             # RemainAfterExit leaves a finished job "active". Nothing is
             # running, so saying "Running" would be a plain untruth.
             when = props.get("ActiveEnterTimestamp", "")
-            return (label, "", "Finished", f"ran at {when}" if when else "")
+            return (label, "", "Finished",
+                    f"ran at {show_stamp(when)}" if when else "")
         if kind == "timer":
             detail = next_run_detail(props)
-            last = (props.get("LastTriggerUSec") or "").strip()
+            last = show_stamp((props.get("LastTriggerUSec") or "").strip())
             if last:
                 # A repeating timer's last run is as reassuring as its next
                 # one, and it is the half that proves it has ever worked.
@@ -1190,7 +1232,7 @@ def describe_unit(label, kind, props, name):
         detail = ""
         since = props.get("ActiveEnterTimestamp", "")
         if since:
-            detail = f"since {since}"
+            detail = f"since {show_stamp(since)}"
         if props.get("UnitFileState") == "disabled":
             # Running now, gone after the next reboot. The one state that
             # looks entirely healthy and is not.
@@ -1210,8 +1252,8 @@ def describe_unit(label, kind, props, name):
                     "the timer has not fired since this was installed")
         result = props.get("Result", "success")
         if result and result != "success":
-            return (label, "bad", "Failed", f"{result}, at {when}")
-        return (label, "ok", "Successful", f"last finished {when}")
+            return (label, "bad", "Failed", f"{result}, at {show_stamp(when)}")
+        return (label, "ok", "Successful", f"last finished {show_stamp(when)}")
     return (label, "bad", "Stopped", f"start it with: sudo systemctl start {name}")
 
 
@@ -1557,9 +1599,9 @@ def next_run_detail(props, now_monotonic=None):
     empty, so a reader of only that saw an empty cell and reasonably wondered
     whether the unit was broken. Reported by the operator 2026-08-14.
     """
-    stamp = (props.get("NextElapseUSecRealtime") or "").strip()
-    if stamp:
-        return f"next run {stamp}"
+    when = (props.get("NextElapseUSecRealtime") or "").strip()
+    if when:
+        return f"next run {show_stamp(when)}"
 
     raw = (props.get("NextElapseUSecMonotonic") or "").strip()
     if raw.lower() == "infinity":
@@ -2496,7 +2538,7 @@ class Handler(BaseHTTPRequestHandler):
                         f'{self._next_try(u)} {retry}</p>')
 
         if u["checked"]:
-            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(u["checked"]))
+            when = stamp_of(u["checked"])
             body.append(
                 f'<p class="quiet">Last successful check {when}, and at most '
                 f'once a day. This is the only request this service makes to '
@@ -2764,7 +2806,7 @@ class Handler(BaseHTTPRequestHandler):
             body = (f'<p class="note">{escape(s["error"])}</p>'
                     f'<p class="scan">{rescan}</p>')
         elif s["finished"]:
-            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(s["finished"]))
+            when = stamp_of(s["finished"])
             # Only claim a duration when the start was actually recorded;
             # otherwise the subtraction reports the age of the epoch.
             took = (f' in {s["finished"] - s["started"]:.1f}s'
@@ -2988,14 +3030,14 @@ class Handler(BaseHTTPRequestHandler):
         # eight red rows.
         if not state.get("running", True):
             parts.append('<p class="note">Capture stopped cleanly at '
-                         f'{escape(state.get("updated") or "?")}. '
+                         f'{escape(show_stamp(state.get("updated")) or "?")}. '
                          'Nothing is being captured.</p>')
         elif age is not None and age > STATE_STALE_AFTER:
             parts.append(
                 f'<p class="note bad">Last heartbeat {escape(human_age(age))} '
                 f'ago. This is written once a minute while capture runs, so '
                 f'the daemon is stopped or wedged, and the rows below are '
-                f'from {escape(state.get("updated") or "?")}.</p>')
+                f'from {escape(show_stamp(state.get("updated")) or "?")}.</p>')
         if state.get("paused"):
             parts.append('<p class="note bad">Capture is PAUSED by the disk '
                          'guard: free space fell below '
@@ -3072,7 +3114,7 @@ class Handler(BaseHTTPRequestHandler):
             'running at today; under 100% means frames are missing, including '
             'any part of today before capture started. The rest of each row '
             'comes from the capture service, updated once a minute'
-            + (f', last at {escape(state.get("updated"))}.'
+            + (f', last at {escape(show_stamp(state.get("updated")))}.'
                if state.get("updated") else ".")
             + '</p>')
         if unreadable:
@@ -3100,7 +3142,7 @@ class Handler(BaseHTTPRequestHandler):
             return "".join(parts)
 
         run = runs[0]
-        when = run.get("finished") or run.get("started") or "?"
+        when = show_stamp(run.get("finished") or run.get("started")) or "?"
         rows = [("Finished", when),
                 ("Took", human_age(run.get("seconds") or 0))]
         if run.get("encoder"):
