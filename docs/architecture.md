@@ -1194,7 +1194,7 @@ connection this service makes, and should stay the only one.
   because that is the part worth searching for.
 
 **Service state and logs** shell out only when a human asks for a page. The
-services table is one `systemctl show` at the foot of the overview; `/status`
+services table is one `systemctl show` on the overview; `/status`
 and `/logs` are one command each. Nothing polls and nothing is collected in
 the background, and the endpoints a machine might hit in a loop (`/healthz`,
 and the `/scan` and `/update` fragments the page's own scripts poll) run no
@@ -1213,6 +1213,22 @@ deliberate price of dropping a tab.
   four pages at two window sizes: 240px of drift before, 1px after, the
   remainder being sub-pixel rounding when centring inside containers of
   different widths.
+- **The overview is ordered by how often the question is asked** (0.1.9):
+  Cameras, Last encode, Services, Version. It had grown in the order the
+  panels were built, which put the version number, the thing nobody opens the
+  page for, above the cameras, the thing they do. `OVERVIEW` is the whole of
+  it, so the order is one template rather than a call sequence, and a test
+  pins the four headings in sequence.
+  - **The library's location moved to the Library tab**, into the panel that
+    already answered every other question about the library, so the same
+    question stopped being answered in halves. `where_rows()` emits it in
+    *both* of that panel's states: when the library is unreadable the path is
+    not implied by a listing being on the screen, and that is precisely when
+    somebody needs to read it.
+  - **The fault did not move with the detail.** An unreadable library still
+    warns on the landing page, now as a one-line note carrying a link to the
+    tab. It is empty when there is nothing wrong, so the healthy page loses
+    the section entirely; the alarm is what the landing page is for.
 - **Every column starts at the same edge** (0.1.9). The counted columns
   (`td.num`: frames, coverage, sizes, and most of the library table) were
   right-aligned while every other cell and *every header* was left-aligned, so

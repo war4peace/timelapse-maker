@@ -10,6 +10,13 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Changed
+- **The Overview is ordered by how often you need it**: Cameras, Last encode,
+  Services, Version. The page had grown in the order the panels were built,
+  which put the version number above the cameras.
+- **Where the video library lives is now shown on the Library tab**, at the
+  head of the panel that already answered every other question about it,
+  instead of in its own section on the Overview. A library that cannot be read
+  still says so on the Overview, with a link to the tab.
 - **Every column in the web UI's tables now starts at the same edge.** The
   counted columns (Frames today, Coverage, and most of the Library tab) were
   right-aligned while their own headers, and every other column, were

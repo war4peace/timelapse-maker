@@ -902,6 +902,23 @@ def external(url, label):
             f'rel="noopener noreferrer">{escape(label)}</a>')
 
 
+def where_rows(lib):
+    """Where the videos are and how that was decided, as <dl> rows.
+
+    A section of its own on the overview until 0.1.9, and now the head of the
+    Library panel, where the rest of the library already was. Emitted in both
+    of that panel's states: an unreadable library is the one case where the
+    path is not implied by there being a listing on the screen, and it is
+    exactly the case where somebody needs to read it.
+    """
+    return (f'<dt>Location</dt><dd><code>'
+            f'{escape(str(lib["path"]) if lib["path"] else "-")}</code></dd>'
+            f'<dt>Resolved from</dt><dd>{escape(lib["source"] or "-")}</dd>'
+            f'<dt>Readable</dt>'
+            f'<dd class="{"ok" if lib["usable"] else "bad"}">'
+            f'{"yes" if lib["usable"] else "no"}</dd>')
+
+
 def latest_label(u):
     """The version to print for "Latest", in the shape "Installed" uses.
 
@@ -2110,23 +2127,22 @@ SCAN_POLL_JS = """<script>
 })();
 </script>"""
 
-OVERVIEW = """<section>
-  <h2>Video library</h2>
-  <dl>
-    <dt>Location</dt><dd><code>{lib_path}</code></dd>
-    <dt>Resolved from</dt><dd>{lib_source}</dd>
-    <dt>Readable</dt><dd class="{lib_class}">{lib_state}</dd>
-  </dl>
-  {lib_note}
-</section>
-
-{update}
+# Ordered by how often the question is asked, which is not the order this
+# page grew in: are the cameras working, did last night encode, are the
+# services up, and only then which version this is. The library's location
+# and readability moved onto the Library tab at 0.1.9, where the rest of the
+# library already was; `lib_note` stays because a library that cannot be read
+# is a fault, and a fault belongs on the landing page whatever tab owns the
+# detail. It is empty when there is nothing wrong.
+OVERVIEW = """{lib_note}
 
 {cameras}
 
 {encode}
 
 {services}
+
+{update}
 """
 
 # Said once, here, rather than in three branches: an operator upgrading from
@@ -2464,15 +2480,13 @@ class Handler(BaseHTTPRequestHandler):
         # comes and goes, and a page that reports a stale answer is worse than
         # no page. It is two stat() calls.
         lib = resolve_library(self.server.cfg)
-        note = f'<p class="note">{escape(lib["note"])}</p>' if lib["note"] else ""
+        note = (f'<p class="note">{escape(lib["note"])} '
+                f'<a href="/library">Library</a> has the detail.</p>'
+                if lib["note"] else "")
         # Kicked off here rather than at startup: a service nobody looks at
         # never calls out, and this returns immediately either way.
         self.server.updates.refresh_if_stale()
         return OVERVIEW.format(
-            lib_path=escape(str(lib["path"]) if lib["path"] else "-"),
-            lib_source=escape(lib["source"] or "-"),
-            lib_class="ok" if lib["usable"] else "bad",
-            lib_state="yes" if lib["usable"] else "no",
             lib_note=note,
             update=self._update_panel(),
             cameras=self._cameras(),
@@ -2772,8 +2786,13 @@ class Handler(BaseHTTPRequestHandler):
             # The scan banner belongs here too: if a scan is waiting for the
             # library to appear, saying so is the difference between "this is
             # broken" and "this will fix itself when the mount comes back".
+            # Where it looked and how it got there, even here: "not readable"
+            # is only actionable next to the path it could not read, and this
+            # is the one branch where the answer is not self-evident from a
+            # listing being on the screen.
             return (self._scan_banner() +
-                    '<section><h2>Video library</h2>'
+                    '<section><h2>Library</h2><dl>'
+                    + where_rows(lib) + '</dl>'
                     f'<p class="note">{escape(lib["note"] or "No readable library.")}'
                     '</p></section>')
 
@@ -2785,7 +2804,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._scan_banner() + self._camera_view(args["camera"][0])
         if "flagged" in args:
             return self._scan_banner() + self._flagged_view()
-        return self._scan_banner() + self._library_home()
+        return self._scan_banner() + self._library_home(lib)
 
     def _scan_banner(self, with_script=True):
         """The indexing status line, wrapped so it can be replaced in place.
@@ -2827,11 +2846,16 @@ class Handler(BaseHTTPRequestHandler):
             out += SCAN_POLL_JS
         return out
 
-    def _library_home(self):
+    def _library_home(self, lib):
         index = self.server.index
         tot = index.totals()
         parts = [
             '<section><h2>Library</h2><dl>',
+            # Location and how it was resolved were a section of their own on
+            # the overview until 0.1.9. They belong to the same question as
+            # the counts below them, and asking it in two places meant the
+            # answer arrived in halves.
+            where_rows(lib),
             f'<dt>Files</dt><dd>{tot["n"]:,}</dd>',
             f'<dt>Size</dt><dd>{human_size(tot["b"])}</dd>',
             f'<dt>Span</dt><dd>{escape(tot["a"] or "-")} to '

@@ -926,12 +926,14 @@ timelapse-web`: the server reads its config once, at startup.
 
 It gives you six things:
 
-- **Where your videos actually are**: see the warning below, this is the
-  question people get wrong.
+- **Where your videos actually are**, at the head of the Library tab: the
+  path, how it was worked out, and whether it can be read. See the warning
+  below, this is the question people get wrong. If it cannot be read the
+  Overview says so too, since that is a fault and not a detail.
 - **Whether your cameras are actually answering.** A table on the Overview,
   one row per camera: when its last frame landed, the cadence it is running
-  at, how many frames it has taken since the service started, and how many
-  failures. This is the thing `systemctl` cannot tell you. A daemon whose
+  at, how many frames are on disk for today, what percentage of the day that
+  covers, and how many fetches have failed. This is the thing `systemctl` cannot tell you. A daemon whose
   cameras are all refusing connections is "running", and so is one that has
   paused itself because the disk filled up; both look perfect in the Services
   table and neither is capturing anything.
@@ -939,7 +941,7 @@ It gives you six things:
   encoder, how many videos, whether the transfer worked, and a row per camera
   with the frame count and the coverage percentage.
 - **Service status and recent log**, without an SSH session. Service status is
-  four rows at the foot of the Overview, saying whether each part is working
+  a row per unit on the Overview, saying whether each part is working
   and what to do if it is not, rather than the page of systemd internals
   `timelapse status` prints. *Technical data* links to the full output, which
   is what to paste into a bug report.

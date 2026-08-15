@@ -729,6 +729,34 @@ class TestStatusRoutes(unittest.TestCase):
         self.assertIn("Capture", body)
         self.assertIn("Running", body)
 
+    def test_the_overview_is_ordered_by_how_often_it_is_asked(self):
+        # Requested 2026-08-15. The page grew in the order the panels were
+        # built, which put the version above the cameras.
+        body = self.overview()
+        order = [body.index(f"<h2>{h}</h2>")
+                 for h in ("Cameras", "Last encode", "Services", "Version")]
+        self.assertEqual(order, sorted(order))
+
+    def test_the_library_location_is_not_on_the_overview_any_more(self):
+        # It moved into the Library panel, which is where the rest of the
+        # library already was. A healthy library says nothing here.
+        body = self.overview()
+        self.assertNotIn("Resolved from", body)
+        self.assertNotIn("Location", body)
+
+    def test_an_unreadable_library_still_says_so_on_the_landing_page(self):
+        # The detail moved; the fault did not. A library that cannot be read
+        # is a fault, and the landing page is where faults belong, whichever
+        # tab owns the explanation.
+        config = cfg(self.tmp, transfer={"enabled": True,
+                                         "destination": str(Path(self.tmp,
+                                                                 "gone"))})
+        with mock.patch.object(web, "run_command",
+                               return_value=(self.SHOW, "")):
+            body = request("/", config)[2]
+        self.assertIn("does not exist or is not readable", body)
+        self.assertIn('href="/library"', body)
+
     def test_the_overview_says_nothing_a_reader_did_not_ask_for(self):
         body = self.overview()
         for noise in ("Invocation:", "Main PID:", "CGroup:", "Docs:"):
@@ -1356,6 +1384,29 @@ class TestLibraryRoutes(IndexCase):
         self.assertEqual(status, 200)
         self.assertIn("Gate", body)
         self.assertIn("2024-01", body)
+
+    def test_the_library_panel_says_where_it_is_and_how_that_was_decided(self):
+        # Moved off the overview 2026-08-15, into the panel that already
+        # answered every other question about the library.
+        _, _, body = self.get("/library")
+        head = body.split("<h2>Library</h2>", 1)[1]
+        self.assertIn("Location", head)
+        self.assertIn(str(self.root), head)
+        self.assertIn("Resolved from", head)
+        self.assertIn("Readable", head)
+        # And still above the counts, which are the same question's answer.
+        self.assertLess(head.index("Location"), head.index("Files"))
+
+    def test_an_unreadable_library_names_the_path_it_could_not_read(self):
+        # The one state where the location is not implied by a listing being
+        # on the screen, and the one where somebody needs to read it.
+        config = cfg(self.tmp, transfer={"enabled": True,
+                                         "destination": str(Path(self.tmp,
+                                                                 "gone"))})
+        _, _, body = request("/library", config, self.index)
+        self.assertIn("Location", body)
+        self.assertIn("gone", body)
+        self.assertIn(">no<", body)
 
     def test_both_spellings_are_listed(self):
         _, _, body = self.get("/library")
@@ -2738,7 +2789,7 @@ class TestGate(unittest.TestCase):
         # asks for it.
         status, _, body = request("/", self.config)
         self.assertEqual(status, 200)
-        self.assertIn("Video library", body)
+        self.assertIn("<h2>Cameras</h2>", body)
 
     def test_the_pages_need_a_session(self):
         for path, where in (("/", "/login"),
@@ -2759,7 +2810,7 @@ class TestGate(unittest.TestCase):
         status, _, body = self.get("/", cookie_header(
             self.auth.open_session()))
         self.assertEqual(status, 200)
-        self.assertIn("Video library", body)
+        self.assertIn("<h2>Cameras</h2>", body)
 
     def test_a_stale_or_forged_cookie_does_not(self):
         for value in ("nonsense", "", "a=b; c=d"):
