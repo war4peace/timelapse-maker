@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
-## [Unreleased]
+## [0.1.8] - 2026-08-15
 
 ### Changed
 - **The web UI now counts today's frames from disk, and shows coverage per
@@ -1207,6 +1207,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.8]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.8
 [0.1.7]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.7
 [0.1.6]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.6
 [0.1.5]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.5

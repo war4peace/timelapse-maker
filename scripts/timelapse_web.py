@@ -79,7 +79,7 @@ from timelapse_encode import (                            # noqa: E402
     state_dir as runtime_state_dir,
 )
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 log = logging.getLogger("web")
 
