@@ -8,6 +8,7 @@ and binding a port in a unit test invites flakiness on a CI runner.
 import contextlib
 import io
 import json
+import os
 import re
 import shutil
 import socket
@@ -521,6 +522,56 @@ class TestUnitStates(unittest.TestCase):
         self.assertEqual(row[1:3], ("ok", "Scheduled"))
         self.assertIn("next run Wed 2026-08-12 00:05:00", row[3])
 
+    def test_a_monotonic_timer_shows_its_next_run_too(self):
+        """The credential watch fires on OnBootSec/OnUnitActiveSec, so
+        systemd leaves NextElapseUSecRealtime empty and answers in a timespan
+        since boot instead. Reading only the realtime property left that row
+        with an empty Detail, which reads as though the unit were broken.
+        These are the exact strings systemd 255 produced, measured
+        2026-08-14."""
+        with mock.patch.object(web.time, "monotonic", return_value=15.463836):
+            row = self.rows(self.show(self.daemon(
+                "timelapse-watch.timer",
+                NextElapseUSecRealtime="",
+                NextElapseUSecMonotonic="5min 1.016502s",
+            )))["Credential watch"]
+        self.assertEqual(row[1:3], ("ok", "Scheduled"))
+        self.assertIn("next run in 4m", row[3])
+
+    def test_a_timer_that_has_run_says_when(self):
+        row = self.rows(self.show(self.daemon(
+            "timelapse-watch.timer",
+            NextElapseUSecMonotonic="infinity",
+            LastTriggerUSec="Fri 2026-08-14 22:50:12 EEST",
+        )))["Credential watch"]
+        self.assertIn("last ran Fri 2026-08-14 22:50:12", row[3])
+
+    def test_a_timer_that_will_never_fire_again_says_that(self):
+        row = self.rows(self.show(self.daemon(
+            "timelapse-watch.timer",
+            NextElapseUSecMonotonic="infinity")))["Credential watch"]
+        self.assertEqual(row[3], "no further runs scheduled")
+
+    def test_a_timer_about_to_fire_says_due_now(self):
+        with mock.patch.object(web.time, "monotonic", return_value=301.0):
+            row = self.rows(self.show(self.daemon(
+                "timelapse-watch.timer",
+                NextElapseUSecMonotonic="5min 1.016502s")))["Credential watch"]
+        self.assertEqual(row[3], "due now")
+
+    def test_no_timer_row_is_ever_left_with_an_empty_detail(self):
+        # The defect this fixes, stated as the invariant rather than as one
+        # case: whatever systemd says, a scheduled timer explains itself.
+        for props in ({"NextElapseUSecRealtime": "Wed 2026-08-12 00:05 EEST"},
+                      {"NextElapseUSecMonotonic": "5min 1.016502s"},
+                      {"NextElapseUSecMonotonic": "infinity"},
+                      {"LastTriggerUSec": "Fri 2026-08-14 22:50:12 EEST"}):
+            row = self.rows(self.show(
+                self.daemon("timelapse-watch.timer", **props)
+            ))["Credential watch"]
+            self.assertTrue(row[3], f"empty Detail for {props}")
+
+
     def test_a_unit_that_is_not_installed_says_so(self):
         row = self.rows(self.show(self.daemon(
             LoadState="not-found", ActiveState="inactive")))["Capture"]
@@ -618,6 +669,33 @@ class TestUnitStates(unittest.TestCase):
             rows, problem = web.unit_states()
         self.assertEqual(rows, [])
         self.assertIn("not installed", problem)
+
+
+class TestTimespanParsing(unittest.TestCase):
+    """systemd's timespan format, from systemd.time(7). Parsed rather than
+    guessed at because it is documented, which `systemctl status` output is
+    not."""
+
+    def test_the_measured_shape(self):
+        self.assertAlmostEqual(web.parse_timespan("5min 1.016502s"),
+                               301.016502, places=5)
+
+    def test_compound_units(self):
+        self.assertEqual(web.parse_timespan("1h 2min 3s"), 3723)
+        self.assertEqual(web.parse_timespan("2d 4h"), 187200)
+
+    def test_a_bare_number_of_seconds(self):
+        self.assertEqual(web.parse_timespan("90s"), 90)
+
+    def test_sub_second_units(self):
+        self.assertAlmostEqual(web.parse_timespan("250ms"), 0.25)
+
+    def test_infinity_and_junk_are_no_answer(self):
+        self.assertIsNone(web.parse_timespan("infinity"))
+        self.assertIsNone(web.parse_timespan(""))
+        self.assertIsNone(web.parse_timespan(None))
+        self.assertIsNone(web.parse_timespan("0"))
+        self.assertIsNone(web.parse_timespan("whenever"))
 
 
 class TestStatusRoutes(unittest.TestCase):
@@ -2999,6 +3077,30 @@ class TestLogout(unittest.TestCase):
         _, _, body = request("/", self.config)
         self.assertNotIn("/logout", body)
 
+    def test_log_out_is_not_dressed_as_one_more_tab(self):
+        """It sat beside "Recent log", sharing the word "log", and the
+        operator hit it repeatedly while trying to open the log. It is the
+        only control in that bar that is not a destination and the only one
+        that is expensive to hit by accident, so it is spaced away from the
+        tabs and coloured as an action."""
+        _, _, body = request("/", self.config, auth=self.auth,
+                             headers=cookie_header(self.auth.open_session()))
+        self.assertIn('href="/logout" class="signout"', body)
+        self.assertIn("nav a.signout", body)
+        # Set apart from the tabs, and visibly not one of them.
+        self.assertIn("margin-left: 3rem", body)
+        self.assertIn("#8c1d18", body)
+
+    def test_the_tabs_themselves_are_not_recoloured(self):
+        # Only the action changes. A red tab bar would be worse than the
+        # problem it fixes.
+        _, _, body = request("/", self.config, auth=self.auth,
+                             headers=cookie_header(self.auth.open_session()))
+        nav = re.search(r"<nav>(.*?)</nav>", body, re.S).group(1)
+        self.assertEqual(nav.count("signout"), 1)
+        for tab in ("Overview", "Library", "Recent log"):
+            self.assertIn(tab, nav)
+
 
 class TestPostBody(unittest.TestCase):
 
@@ -3423,13 +3525,40 @@ class TestCameraVerdict(unittest.TestCase):
         self.assertEqual(cls, "warn")
         self.assertIn("no frame yet", phrase)
 
-    def test_an_rtsp_camera_is_judged_on_its_process(self):
-        cls, phrase = self.verdict(0, supervised=True, alive=True)
+    def test_a_stopped_rtsp_grabber_beats_any_reading_of_its_frames(self):
+        # A stopped process is the more actionable fact, and the reason there
+        # will be no further frames.
+        cls, phrase = web.camera_verdict(
+            {"supervised": True, "alive": False, "interval": 5}, 0, quiet=1)
+        self.assertEqual((cls, phrase), ("bad", "not recording"))
+
+    def test_a_running_rtsp_camera_is_judged_on_its_frames_like_any_other(self):
+        # The consolidation: one column, one meaning. This row used to say
+        # "recording" while every other row said "12s ago".
+        cls, phrase = web.camera_verdict(
+            {"supervised": True, "alive": True, "interval": 5}, 0, quiet=3)
         self.assertEqual(cls, "ok")
-        self.assertIn("ffmpeg", phrase)
-        cls, phrase = self.verdict(0, supervised=True, alive=False)
+        self.assertEqual(phrase, "3s ago")
+        cls, phrase = web.camera_verdict(
+            {"supervised": True, "alive": True, "interval": 5}, 0, quiet=900)
         self.assertEqual(cls, "bad")
-        self.assertIn("not running", phrase)
+        self.assertEqual(phrase, "15m ago")
+
+    def test_a_running_rtsp_camera_with_no_frames_at_all(self):
+        cls, phrase = web.camera_verdict(
+            {"supervised": True, "alive": True, "interval": 5}, 0)
+        self.assertEqual((cls, phrase), ("warn", "no frame yet"))
+
+    def test_disk_beats_the_heartbeat_when_both_are_available(self):
+        # The heartbeat lands once a minute, so its answer can be a minute
+        # stale; a file on disk has no such lag.
+        snap = 1_800_000_000
+        cam = {"name": "Roof", "interval": 5, "supervised": False,
+               "last_success": web.datetime.datetime.fromtimestamp(
+                   snap - 600).isoformat()}
+        self.assertEqual(web.camera_verdict(cam, snap), ("bad", "10m ago"))
+        self.assertEqual(web.camera_verdict(cam, snap, quiet=4),
+                         ("ok", "4s ago"))
 
     def test_silence_is_measured_against_the_snapshot_not_now(self):
         """The heartbeat is a minute old by the time anyone reads it.
@@ -3499,27 +3628,247 @@ class TestCameraPanel(StateMixin, unittest.TestCase):
         self.capture()
         self.assertNotIn("Last heartbeat", self.body())
 
-    def test_counters_are_shown(self):
+    def test_failures_are_shown(self):
         self.capture([self.cam("Roof", ok=17280, fail=3, consec_fail=2)])
         body = self.body()
-        self.assertIn("17,280", body)
+        self.assertIn("3 failed fetch(es)", body)
         self.assertIn("2 in a row", body)
 
-    def test_an_rtsp_camera_shows_restarts_and_no_invented_frame_count(self):
+    def test_the_restart_counter_is_not_shown_as_a_frame_count(self):
+        # The daemon's own "ok" counter resets whenever capture restarts, so
+        # it answered a question nobody asked. It is gone from the table.
+        self.capture([self.cam("Roof", ok=17280)])
+        self.assertNotIn("17,280", self.body())
+
+    def test_an_rtsp_camera_shows_its_restarts(self):
         self.capture([self.cam("Gate", supervised=True, alive=True,
                                restarts=4, last_success=None)])
         body = self.body()
         self.assertIn("4 restart(s)", body)
-        self.assertIn("supervised by ffmpeg", body)
+        # Naming the program doing the work is an implementation detail, and
+        # the reader of a status page has not asked what ffmpeg is.
+        self.assertNotIn("ffmpeg", body)
+
+    def test_an_rtsp_camera_that_is_not_running_says_so_plainly(self):
+        self.capture([self.cam("Gate", supervised=True, alive=False,
+                               restarts=9, last_success=None)])
+        self.assertIn("not recording", self.body())
 
     def test_no_enabled_cameras_is_a_sentence(self):
         self.capture([])
         self.assertIn("No cameras are enabled", self.body())
 
-    def test_the_page_says_what_the_counters_count(self):
-        # "1,200 frames" invites being read as today's total, which it is not.
+    def test_the_page_says_where_the_numbers_come_from(self):
         self.capture()
-        self.assertIn("since the capture service last started", self.body())
+        body = self.body()
+        self.assertIn("counted from the files on disk", body)
+        self.assertIn("since midnight", body)
+
+
+class TestTodaysCoverage(StateMixin, unittest.TestCase):
+    """Frames and coverage are counted on disk, not taken from the daemon.
+
+    The daemon's counter resets on restart, so "48 frames" after a restart at
+    17:55 says nothing about whether today has been captured. It also does not
+    exist at all for RTSP cameras, where a separate process writes the frames.
+    The directory is the record for both.
+    """
+
+    def setUp(self):
+        super().setUp()
+        web._counts.clear()
+        self.addCleanup(web._counts.clear)
+        self.frames = Path(self.config["paths"]["frames_root"])
+
+    def day_dir(self, camera, when=None):
+        when = when or web.datetime.datetime.now()
+        d = self.frames / camera / when.strftime("%Y-%m-%d")
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def write_frames(self, camera, n, cadence=None):
+        d = self.day_dir(camera)
+        for i in range(n):
+            (d / f"{i:06d}.jpg").write_bytes(b"\xff\xd8x")
+        if cadence:
+            (d / ".cadence.json").write_text(
+                json.dumps({"interval_seconds": cadence, "framerate": 60}),
+                encoding="utf-8")
+        return d
+
+    def body(self):
+        _, _, body = request("/", self.config)
+        return body
+
+    def test_frames_on_disk_are_counted(self):
+        self.write_frames("Roof", 42)
+        self.capture([self.cam("Roof")])
+        self.assertIn("42", self.body())
+
+    def test_a_camera_with_no_directory_today_counts_zero(self):
+        # "No directory" and "an empty directory" are the same thing to an
+        # operator, and both mean nothing has been captured today.
+        self.capture([self.cam("Roof")])
+        frames, cov = web.today_progress(self.config, {"name": "Roof",
+                                                       "interval": 5})
+        self.assertEqual(frames, 0)
+        self.assertEqual(cov, 0.0)
+
+    def test_nothing_captured_reads_as_zero_percent_not_a_dash(self):
+        # The case an operator most needs stated plainly. A dash invites
+        # being read as "not measured".
+        self.capture([self.cam("Roof")])
+        body = self.body()
+        self.assertIn("0%", body)
+
+    def test_the_cadence_reads_as_a_rate_not_as_a_fraction(self):
+        """"1 / 5s" was read as one fifth of a second as readily as as one
+        frame every five seconds, and those are two very different cameras.
+        Reported by the operator 2026-08-14. Naming the unit fixes it: a rate
+        cannot be read backwards."""
+        self.capture([self.cam("Roof", interval=5)])
+        body = self.body()
+        self.assertIn("5s / frame", body)
+        self.assertNotIn("1 / 5s", body)
+
+    def test_a_slow_camera_reads_the_same_way(self):
+        self.capture([self.cam("Roof", interval=60)])
+        self.assertIn("60s / frame", self.body())
+
+    def test_a_healthy_row_has_an_empty_problems_column(self):
+        # A column that says "0 failed" on every healthy row trains the eye
+        # to skip it, which is the opposite of what it is for.
+        self.write_frames("Roof", 10)
+        self.capture([self.cam("Roof", fail=0, consec_fail=0)])
+        self.assertNotIn("failed fetch(es)", self.body())
+
+    def test_an_rtsp_camera_is_counted_the_same_way(self):
+        # The whole point: this column used to read "-" for RTSP, because the
+        # daemon cannot see frames another process writes.
+        self.write_frames("Gate", 17)
+        self.capture([self.cam("Gate", supervised=True, alive=True,
+                               last_success=None)])
+        body = self.body()
+        self.assertIn("17", body)
+        self.assertNotIn("<td class=\"num dim\">-</td>", body)
+
+    def test_coverage_is_measured_against_elapsed_time_not_the_whole_day(self):
+        now = web.datetime.datetime.now().replace(hour=6, minute=0, second=0,
+                                                  microsecond=0)
+        # Six hours at one frame every 5s is 4,320 frames for a full house.
+        frames, cov = web.today_progress(
+            self.config, {"name": "Roof", "interval": 5}, now=now)
+        self.assertEqual(frames, 0)
+        self.write_frames("Roof", 0)
+        d = self.day_dir("Roof")
+        for i in range(4320):
+            (d / f"{i:06d}.jpg").write_bytes(b"\xff\xd8x")
+        web._counts.clear()
+        _, cov = web.today_progress(self.config, {"name": "Roof",
+                                                  "interval": 5}, now=now)
+        self.assertEqual(cov, 100.0)
+
+    def test_half_the_expected_frames_reads_as_half_coverage(self):
+        now = web.datetime.datetime.now().replace(hour=1, minute=0, second=0,
+                                                  microsecond=0)
+        self.write_frames("Roof", 360)          # 720 expected in one hour
+        _, cov = web.today_progress(self.config, {"name": "Roof",
+                                                  "interval": 5}, now=now)
+        self.assertEqual(cov, 50.0)
+
+    def test_the_days_recorded_cadence_beats_the_running_config(self):
+        # A cadence edit takes effect at midnight, so today may still be
+        # running on yesterday's answer. Measuring against the new one would
+        # report a perfect day as a near-outage, which is the same bug the
+        # nightly summary already had.
+        now = web.datetime.datetime.now().replace(hour=1, minute=0, second=0,
+                                                  microsecond=0)
+        self.write_frames("Roof", 60, cadence=60)   # 60 expected in one hour
+        _, cov = web.today_progress(self.config,
+                                    {"name": "Roof", "interval": 5}, now=now)
+        self.assertEqual(cov, 100.0)
+
+    def test_an_unreadable_directory_is_a_question_mark_not_a_zero(self):
+        with mock.patch.object(web.os, "scandir",
+                               side_effect=PermissionError("nope")):
+            web._counts.clear()
+            frames, cov = web.today_progress(self.config, {"name": "Roof",
+                                                           "interval": 5})
+        self.assertIsNone(frames)
+        self.assertIsNone(cov)
+
+    def test_the_count_is_cached_so_refreshing_does_not_walk_the_disk(self):
+        d = self.write_frames("Roof", 3)
+        self.assertEqual(web.count_frames(d), 3)
+        (d / "999999.jpg").write_bytes(b"\xff\xd8x")
+        self.assertEqual(web.count_frames(d), 3)    # served from the cache
+        web._counts.clear()
+        self.assertEqual(web.count_frames(d), 4)
+
+    def test_the_last_frame_comes_from_the_newest_filename(self):
+        d = self.day_dir("Roof")
+        for name in ("101500.jpg", "120000.jpg", "093000.jpg"):
+            (d / name).write_bytes(b"\xff\xd8x")
+        day = web.datetime.datetime.now().strftime("%Y-%m-%d")
+        got = web.last_frame_epoch(self.config, {"name": "Roof"})
+        self.assertEqual(got, web.frame_epoch(day, "120000.jpg"))
+
+    def test_the_time_comes_from_the_name_never_from_mtime(self):
+        # Order and time are properties of the name throughout this project.
+        # An mtime that disagrees must not move the answer, or a restore or
+        # an rsync without -t would rewrite history.
+        d = self.day_dir("Roof")
+        f = d / "120000.jpg"
+        f.write_bytes(b"\xff\xd8x")
+        os.utime(f, (0, 0))                 # 1970, if anything read mtime
+        day = web.datetime.datetime.now().strftime("%Y-%m-%d")
+        self.assertEqual(web.last_frame_epoch(self.config, {"name": "Roof"}),
+                         web.frame_epoch(day, "120000.jpg"))
+
+    def test_the_dst_suffix_still_parses(self):
+        # A duplicate second during the fall-back hour is written as
+        # HHMMSS-1.jpg, and must not become an unparseable name.
+        self.assertEqual(web.frame_epoch("2026-08-14", "031500-1.jpg"),
+                         web.frame_epoch("2026-08-14", "031500.jpg"))
+
+    def test_a_name_that_is_not_a_frame_is_no_answer(self):
+        for name in ("", "cadence.json", "9999.jpg", "abcdef.jpg",
+                     "997000.jpg"):
+            self.assertIsNone(web.frame_epoch("2026-08-14", name), name)
+
+    def test_yesterday_answers_in_the_minute_after_midnight(self):
+        # Today's directory exists and is empty for up to one interval after
+        # the day rolls over; the newest frame is the one that just ended.
+        now = web.datetime.datetime.now().replace(hour=0, minute=0, second=3,
+                                                  microsecond=0)
+        yesterday = now - web.datetime.timedelta(days=1)
+        d = self.frames / "Roof" / yesterday.strftime("%Y-%m-%d")
+        d.mkdir(parents=True)
+        (d / "235957.jpg").write_bytes(b"\xff\xd8x")
+        got = web.last_frame_epoch(self.config, {"name": "Roof"}, now=now)
+        self.assertEqual(got, web.frame_epoch(yesterday.strftime("%Y-%m-%d"),
+                                              "235957.jpg"))
+
+    def test_a_camera_that_has_never_captured_has_no_last_frame(self):
+        self.assertIsNone(web.last_frame_epoch(self.config, {"name": "Roof"}))
+
+    def test_an_rtsp_row_reads_like_every_other_row(self):
+        # The consolidation, end to end through the real handler.
+        now = web.datetime.datetime.now()
+        d = self.day_dir("Gate")
+        (d / f"{now:%H%M%S}.jpg").write_bytes(b"\xff\xd8x")
+        self.capture([self.cam("Gate", supervised=True, alive=True,
+                               last_success=None)])
+        body = self.body()
+        self.assertIn("s ago", body)
+        self.assertNotIn(">recording<", body)
+
+    def test_only_jpegs_are_counted(self):
+        d = self.write_frames("Roof", 2)
+        (d / ".cadence.json").write_text("{}", encoding="utf-8")
+        (d / ".encoded.json").write_text("{}", encoding="utf-8")
+        web._counts.clear()
+        self.assertEqual(web.count_frames(d), 2)
 
 
 class TestLastEncodePanel(StateMixin, unittest.TestCase):

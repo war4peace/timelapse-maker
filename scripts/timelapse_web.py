@@ -75,10 +75,11 @@ from timelapse_encode import hostport, is_ipv6, redact    # noqa: E402
 # file is how the wrong directory ends up in a hardening claim.
 from timelapse_encode import (                            # noqa: E402
     CAPTURE_STATE, ENCODE_STATE, STATE_VERSION,
+    coverage_of, day_cadence,
     state_dir as runtime_state_dir,
 )
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 log = logging.getLogger("web")
 
@@ -840,7 +841,13 @@ STATUS_UNITS = (
 # whether capture is running.
 STATUS_PROPS = ("Id", "LoadState", "ActiveState", "SubState", "UnitFileState",
                 "ActiveEnterTimestamp", "InactiveEnterTimestamp",
-                "InactiveExitTimestamp", "Result", "NextElapseUSecRealtime")
+                "InactiveExitTimestamp", "Result", "NextElapseUSecRealtime",
+                # A monotonic timer (OnBootSec/OnUnitActiveSec, which is what
+                # the credential watch uses) leaves NextElapseUSecRealtime
+                # empty and reports here instead. Reading only the realtime
+                # one left that row with a blank Detail, which reads as though
+                # something were wrong with it.
+                "NextElapseUSecMonotonic", "LastTriggerUSec")
 
 # Request values pick a key; the *value* is what reaches the command line. No
 # string from a request is ever interpolated into an argv, so there is no
@@ -1172,9 +1179,14 @@ def describe_unit(label, kind, props, name):
             when = props.get("ActiveEnterTimestamp", "")
             return (label, "", "Finished", f"ran at {when}" if when else "")
         if kind == "timer":
-            nxt = props.get("NextElapseUSecRealtime", "")
-            return (label, "ok", "Scheduled",
-                    f"next run {nxt}" if nxt else "")
+            detail = next_run_detail(props)
+            last = (props.get("LastTriggerUSec") or "").strip()
+            if last:
+                # A repeating timer's last run is as reassuring as its next
+                # one, and it is the half that proves it has ever worked.
+                detail = f"{detail}; last ran {last}" if detail \
+                    else f"last ran {last}"
+            return (label, "ok", "Scheduled", detail)
         detail = ""
         since = props.get("ActiveEnterTimestamp", "")
         if since:
@@ -1286,6 +1298,150 @@ def read_state(cfg, filename):
     return data, ""
 
 
+# How long a frame count is reused before the directory is walked again. The
+# page is read by a person, so a count up to this old is indistinguishable
+# from a live one, and it bounds the cost of somebody holding down refresh.
+COUNT_TTL = 20
+
+_counts = {}                    # (path, ttl bucket) -> (frames, newest name)
+_counts_lock = threading.Lock()
+
+# HHMMSS at the start of a frame name. The DST fall-back suffix (`-1`) may
+# follow, which is why this matches a prefix rather than the whole name.
+FRAME_NAME = re.compile(r"^(\d{2})(\d{2})(\d{2})")
+
+
+def scan_day(day_dir):
+    """(frames, newest filename) for a day, in one pass over the directory.
+
+    Counted from the directory rather than taken from the daemon's own
+    counter, which resets on every restart and so answers a question nobody
+    asked: "48 frames" since a restart at 17:55 tells an operator nothing
+    about whether today has been captured. The directory is the record.
+
+    It also works for RTSP cameras, where the daemon *cannot* count: ffmpeg
+    writes those frames and this program never sees them. Reading on disk is
+    method-agnostic, which is what lets those columns stop saying "-".
+
+    (None, None) when the directory cannot be read. A *missing* directory is
+    (0, ""), because "no directory" and "an empty directory" are the same
+    thing to an operator, while "cannot read this" is a different claim and
+    must not be dressed as zero.
+    """
+    key = (str(day_dir), int(time.time() // COUNT_TTL))
+    with _counts_lock:
+        hit = _counts.get(key)
+    if hit is not None:
+        return hit
+    frames, newest = 0, ""
+    try:
+        with os.scandir(day_dir) as it:
+            # scandir over listdir, and the name only: this never stats a
+            # single file, which is what keeps a 17,000-frame day cheap. The
+            # newest name comes free from the same pass.
+            for entry in it:
+                if entry.name.endswith(".jpg"):
+                    frames += 1
+                    if entry.name > newest:
+                        newest = entry.name
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return None, None
+    result = (frames, newest)
+    with _counts_lock:
+        # Bounded by construction: keys carry a TTL bucket, so old ones can
+        # never be looked up again. Clearing wholesale beats an LRU here.
+        if len(_counts) > 512:
+            _counts.clear()
+        _counts[key] = result
+    return result
+
+
+def count_frames(day_dir):
+    """How many frames are on disk for a day, or None if unreadable."""
+    return scan_day(day_dir)[0]
+
+
+def frame_epoch(day, name):
+    """When a frame was captured, from its name. Never from its mtime.
+
+    Order and time are properties of the *name* throughout this project:
+    filenames are zero-padded `HHMMSS`, so lexical order is chronological
+    order, and nothing reads mtime (architecture.md §2). A PowerShell
+    predecessor mixed `CreationTime` and `LastWriteTime` between its passes
+    and deleted the wrong files; that whole class of bug is gone as long as
+    the name stays the authority. Reading mtime here to answer "when was the
+    last frame" would put it back, and would also be wrong after any copy,
+    restore or rsync that did not preserve timestamps.
+    """
+    m = FRAME_NAME.match(name or "")
+    if not m:
+        return None
+    hour, minute, second = (int(g) for g in m.groups())
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    try:
+        midnight = datetime.datetime.strptime(day, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+    return midnight.replace(hour=hour, minute=minute,
+                            second=second).timestamp()
+
+
+def last_frame_epoch(cfg, cam, now=None):
+    """When this camera's newest frame was captured, or None.
+
+    The same answer for every camera however its frames are written, which is
+    the point: an RTSP camera's row used to say "recording" where every other
+    row said "12s ago", because the daemon has no last-frame time for a
+    stream another process is writing. The directory has one.
+
+    Yesterday is consulted only when today is empty. That is the minute after
+    midnight, when the newest frame is still in the day that just ended, and
+    it costs one listing of a directory that is empty by definition.
+    """
+    root = cfg.get("paths", {}).get("frames_root")
+    if not root or not cam.get("name"):
+        return None
+    now = datetime.datetime.now() if now is None else now
+    base = Path(root) / str(cam["name"])
+    for back in (0, 1):
+        day = (now - datetime.timedelta(days=back)).strftime("%Y-%m-%d")
+        frames, newest = scan_day(base / day)
+        if frames:
+            return frame_epoch(day, newest)
+    return None
+
+
+def seconds_elapsed_today(now=None):
+    """Seconds since local midnight. The denominator for today's coverage."""
+    now = datetime.datetime.now() if now is None else now
+    return (now - now.replace(hour=0, minute=0, second=0,
+                              microsecond=0)).total_seconds()
+
+
+def today_progress(cfg, cam, now=None):
+    """(frames, coverage) for one camera so far today.
+
+    The cadence comes from the day's own `.cadence.json` first, because a
+    cadence edit lands at midnight and today may still be running on
+    yesterday's answer; the heartbeat's value is the fallback. This is the
+    same precedence the encoder uses, and for the same reason.
+    """
+    root = cfg.get("paths", {}).get("frames_root")
+    if not root or not cam.get("name"):
+        return None, None
+    now = datetime.datetime.now() if now is None else now
+    day_dir = Path(root) / str(cam["name"]) / now.strftime("%Y-%m-%d")
+    frames = count_frames(day_dir)
+    if frames is None:
+        return None, None
+    recorded = day_cadence(day_dir)
+    interval = recorded[0] if recorded else cam.get("interval")
+    return frames, coverage_of(frames, interval, seconds_elapsed_today(now))
+
+
 def parse_stamp(text):
     """One of our own ISO stamps back to epoch seconds, or None."""
     if not text:
@@ -1310,19 +1466,22 @@ def silence_seconds(cam, snapshot_epoch):
     return max(0.0, snapshot_epoch - last)
 
 
-def camera_verdict(cam, snapshot_epoch):
+def camera_verdict(cam, snapshot_epoch, quiet=None):
     """(css class, phrase) for one camera row.
 
     The judgement lives here rather than in the daemon: what counts as quiet
     depends on that camera's interval, and a file that had already decided
     could not be overruled by a reader that knows better.
+
+    `quiet` is seconds since the newest frame on disk, which the caller can
+    work out for any camera by any method. When it is None this falls back to
+    the daemon's own `last_success`, which exists only for HTTP cameras.
     """
-    if cam.get("supervised"):
-        # ffmpeg owns the frames on this path, so there is no last-frame time
-        # to judge. Liveness of the process is the honest answer.
-        if cam.get("alive"):
-            return "ok", "supervised by ffmpeg"
-        return "bad", "grabber not running"
+    if cam.get("supervised") and not cam.get("alive"):
+        # An RTSP camera whose grabber is not running. This beats any reading
+        # of the frames, because a stopped process is the more actionable
+        # fact and the reason there will be no further frames.
+        return "bad", "not recording"
 
     # A camera that is refusing our credentials is silent for a reason this
     # page can state, and "3h ago" would send somebody looking at the network.
@@ -1332,7 +1491,8 @@ def camera_verdict(cam, snapshot_epoch):
     if err.get("class") == "auth" and err.get("confirmed"):
         return "bad", "refusing our credentials"
 
-    quiet = silence_seconds(cam, snapshot_epoch)
+    if quiet is None:
+        quiet = silence_seconds(cam, snapshot_epoch)
     if quiet is None:
         return "warn", "no frame yet"
     interval = cam.get("interval") or 0
@@ -1353,6 +1513,67 @@ def human_age(seconds):
     if seconds < 86400:
         return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
     return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+
+# systemd prints a monotonic timestamp as a timespan since boot, e.g.
+# "5min 1.016502s" or "1h 2min 3s". Documented in systemd.time(7), which is
+# what makes this safe to parse where `systemctl status` output is not.
+TIMESPAN_UNITS = {
+    "us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3,
+    "s": 1, "sec": 1, "second": 1, "seconds": 1,
+    "min": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "week": 604800, "weeks": 604800,
+}
+TIMESPAN_TOKEN = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]+)")
+
+
+def parse_timespan(text):
+    """A systemd timespan to seconds, or None if it says nothing useful.
+
+    None for "infinity" as well as for junk: a timer whose next elapse is
+    infinity will not fire again, which is a real answer but not a duration,
+    and the caller says so in words.
+    """
+    text = (text or "").strip().lower()
+    if not text or text == "infinity":
+        return None
+    total = 0.0
+    matched = 0
+    for value, unit in TIMESPAN_TOKEN.findall(text):
+        if unit in TIMESPAN_UNITS:
+            total += float(value) * TIMESPAN_UNITS[unit]
+            matched += 1
+    return total if matched else None
+
+
+def next_run_detail(props, now_monotonic=None):
+    """When a timer fires next, in whichever form systemd offers it.
+
+    A calendar timer (`OnCalendar`, the nightly encode) answers with a real
+    timestamp. A monotonic one (`OnBootSec`/`OnUnitActiveSec`, the credential
+    watch) answers with a span since boot and leaves the realtime property
+    empty, so a reader of only that saw an empty cell and reasonably wondered
+    whether the unit was broken. Reported by the operator 2026-08-14.
+    """
+    stamp = (props.get("NextElapseUSecRealtime") or "").strip()
+    if stamp:
+        return f"next run {stamp}"
+
+    raw = (props.get("NextElapseUSecMonotonic") or "").strip()
+    if raw.lower() == "infinity":
+        return "no further runs scheduled"
+    since_boot = parse_timespan(raw)
+    if since_boot is None:
+        return ""
+    now = time.monotonic() if now_monotonic is None else now_monotonic
+    left = since_boot - now
+    # Both properties are CLOCK_MONOTONIC on Linux, so this subtraction is
+    # exact. A tiny negative is a timer about to fire, not an error.
+    if left <= 1:
+        return "due now"
+    return f"next run in {human_age(left)}"
 
 
 def journal_report(unit_key, lines_key):
@@ -1663,6 +1884,20 @@ LAYOUT = """<!doctype html>
            border-radius: 999px; padding: .25rem .8rem; font-size: .9rem;
            color: inherit; }}
   nav a.on {{ background: rgba(128,128,128,.18); font-weight: 600; }}
+  /* Log out is the only thing in this bar that is not a destination, and the
+     only one that is expensive to hit by mistake. It sat beside "Recent log",
+     the two of them sharing the word "log", and the operator reported hitting
+     it repeatedly while trying to open the log (2026-08-14). So it is spaced
+     away from the tabs and coloured as an action rather than dressed as one
+     more of them. */
+  nav a.signout {{ margin-left: 3rem; background: #8c1d18; color: #fff;
+                   border-color: #8c1d18; }}
+  nav a.signout:hover {{ background: #6f1713; border-color: #6f1713; }}
+  @media (max-width: 30rem) {{
+    /* Narrow enough that the bar wraps: the button is then on its own line
+       and already separated, so the gap would only push it off-centre. */
+    nav a.signout {{ margin-left: .5rem; }}
+  }}
   pre {{ overflow-x: auto; background: rgba(128,128,128,.12); border-radius: 6px;
          padding: .8rem .9rem; font-size: .82rem; line-height: 1.45;
          margin: 0; }}
@@ -2162,7 +2397,7 @@ class Handler(BaseHTTPRequestHandler):
         # The logout link appears only when there is a session to end. With no
         # login configured it would be a control that does nothing, and on the
         # login page itself it would offer to leave somewhere nobody is.
-        logout = ('<a href="/logout">Log out</a>'
+        logout = ('<a href="/logout" class="signout">Log out</a>'
                   if self.server.auth.enabled else "")
         bar = NAV.format(
             on_home="on" if page == "home" else "",
@@ -2773,35 +3008,78 @@ class Handler(BaseHTTPRequestHandler):
             return "".join(parts)
 
         parts.append("<table><tr><th>Camera</th><th>Last frame</th>"
-                     "<th>Cadence</th><th>Frames</th><th>Failures</th></tr>")
+                     "<th>Cadence</th><th>Frames today</th>"
+                     "<th>Coverage</th><th>Problems</th></tr>")
+        unreadable = False
+        now = time.time()
         for cam in cams:
-            cls, phrase = camera_verdict(cam, snap)
+            # From disk, so an RTSP camera answers this the same way as every
+            # other row, and measured against now rather than against the
+            # heartbeat, because a file on disk has none of the heartbeat's
+            # up-to-a-minute lag.
+            last = last_frame_epoch(self.server.cfg, cam)
+            cls, phrase = camera_verdict(
+                cam, snap, max(0.0, now - last) if last else None)
             interval = cam.get("interval")
-            cadence = f"1 / {interval}s" if interval else "-"
+            # "5s / frame", not "1 / 5s". The old form was read as the
+            # fraction one fifth of a second as readily as one frame every
+            # five seconds, which are two very different cameras; reported by
+            # the operator 2026-08-14. A rate with its unit named cannot be
+            # read backwards.
+            cadence = f"{interval}s / frame" if interval else "-"
+            # Empty when there is nothing wrong. A column that says "0 failed"
+            # on every healthy row trains the eye to skip it, which is the
+            # opposite of what a problems column is for.
             if cam.get("supervised"):
-                # ffmpeg writes these frames, so a count here would be a
-                # number nobody could account for. Restarts are what this
-                # thread actually knows.
-                frames = "-"
-                fails = f'{cam.get("restarts", 0)} restart(s)'
+                # This camera's frames are written by a separate process, so
+                # the daemon has no fetch count. Restarts are what it knows.
+                restarts = cam.get("restarts", 0)
+                fails = f'{restarts} restart(s)' if restarts else ""
             else:
-                frames = f'{cam.get("ok", 0):,}'
                 consec = cam.get("consec_fail", 0)
-                fails = f'{cam.get("fail", 0):,}'
+                failed = cam.get("fail", 0)
+                fails = f'{failed:,} failed fetch(es)' if failed else ""
                 if consec:
                     fails += f' ({consec} in a row)'
+
+            # Counted on disk, so this is the same number for an RTSP camera
+            # as for an HTTP one, and survives a restart of the daemon.
+            frames, cov = today_progress(self.server.cfg, cam)
+            if frames is None:
+                unreadable = True
+                shown, cov_txt, cov_cls = "?", "?", "dim"
+            else:
+                shown = f"{frames:,}"
+                if cov is None:
+                    cov_txt, cov_cls = "-", "dim"
+                else:
+                    cov_txt = f"{cov:.0f}%"
+                    # 98 rather than 100: a frame is written at the start of
+                    # each tick, so the current tick is always outstanding
+                    # and a perfect camera reads a shade under 100.
+                    cov_cls = "dim" if cov >= 98 else "warn"
             parts.append(
                 f'<tr><td>{escape(str(cam.get("name", "?")))}</td>'
                 f'<td class="{cls}">{escape(phrase)}</td>'
                 f'<td class="dim">{escape(cadence)}</td>'
-                f'<td class="dim">{escape(frames)}</td>'
+                f'<td class="num dim">{escape(shown)}</td>'
+                f'<td class="num {cov_cls}">{escape(cov_txt)}</td>'
                 f'<td class="dim">{escape(fails)}</td></tr>')
         parts.append("</table>")
-        parts.append('<p class="quiet">Counted since the capture service last '
-                     'started, not since midnight. Updated once a minute'
-                     + (f', last at {escape(state.get("updated"))}.'
-                        if state.get("updated") else ".")
-                     + '</p></section>')
+        parts.append(
+            '<p class="quiet">Frames and coverage are counted from the files '
+            'on disk since midnight, against the cadence each camera is '
+            'running at today; under 100% means frames are missing, including '
+            'any part of today before capture started. The rest of each row '
+            'comes from the capture service, updated once a minute'
+            + (f', last at {escape(state.get("updated"))}.'
+               if state.get("updated") else ".")
+            + '</p>')
+        if unreadable:
+            parts.append('<p class="note">A "?" means this service could not '
+                         'read that camera\'s frames directory. It is not a '
+                         'statement about the camera.</p>')
+        parts.append("</section>")
         return "".join(parts)
 
     def _last_encode(self):

@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## [0.1.8] - 2026-08-15
+
+### Changed
+- **The web UI now counts today's frames from disk, and shows coverage per
+  camera.** The Cameras panel used to report a counter that reset every time
+  the capture service restarted, which said nothing about whether today had
+  actually been captured, and showed nothing at all for RTSP cameras. It now
+  counts the files in each camera's folder for today and shows that beside a
+  **Coverage** percentage measured against the cadence that camera is running
+  at. Under 100% means frames are missing, including any part of today before
+  capture was started.
+
+  RTSP and HTTP cameras are counted the same way, so the column that read `-`
+  for an RTSP camera now shows real numbers.
+
+- **"Last frame" now means the same thing for every camera.** An RTSP camera
+  used to report that it was being supervised, where every other camera
+  reported when its last frame arrived; it now reports the age of its newest
+  frame, like the rest. The failure column is also left empty when there is
+  nothing wrong, rather than saying "0 failed" on every healthy row.
+
+  This shows a fault the page could not previously report: an RTSP camera
+  whose recorder is running but producing nothing looked healthy, and now
+  reads as what it is.
+
+- The Cadence column reads **"5s / frame"** rather than "1 / 5s", which could
+  be read as one fifth of a second just as easily as one frame every five
+  seconds.
+
+- **Log out no longer looks like one more tab.** It sat immediately beside
+  "Recent log", the two sharing the word "log", which made it easy to end your
+  session while reaching for the log. It is now set apart from the tabs and
+  coloured as an action.
+
+### Fixed
+- **The credential watch row now says when it next runs.** It read "Scheduled"
+  with an empty Detail, which looked like something was wrong with it. It runs
+  on a five-minute interval rather than at a fixed time of day, and systemd
+  reports those two kinds of schedule in different places; only one of them was
+  being read. Timer rows also say when they last ran.
+
 ## [0.1.7] - 2026-08-14
 
 ### Added
@@ -1166,6 +1207,7 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
+[0.1.8]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.8
 [0.1.7]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.7
 [0.1.6]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.6
 [0.1.5]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.5

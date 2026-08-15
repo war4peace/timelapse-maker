@@ -30,7 +30,7 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers

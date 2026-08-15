@@ -135,7 +135,7 @@ Rules that hold this together:
 | **Facts, never verdicts** | There is deliberately no "healthy" or "state" field. Whether 42 seconds of silence is a fault depends on that camera's interval and on whether capture is paused; a reader can work that out, and a writer that had already decided could not be overruled. The cadence each number should be read against travels beside it for exactly this reason. |
 | **`error` is a classification, not a verdict** | It says what the camera answered (`auth`, `unreachable`, `other`), when that started, and whether the daemon's own back-off has confirmed it. `confirmed` is not a health judgement: it means "two refusals, ten minutes, one more attempt", which is a statement about what was tried. A reader still decides what to do about it, and the web UI and the credential watch decide differently. |
 | **`error.since` is the incident's identity** | Anything that must act once per incident compares that timestamp rather than inventing its own notion of when one failure stops being the same failure. It is stable while the incident lasts and moves when the class changes or the daemon restarts. |
-| **The RTSP path publishes different fields, marked `supervised`** | ffmpeg writes those frames and the thread only supervises the process, so `last_success` stays `null` rather than being filled in from something that is not a frame. Reading the day directory's mtime would have produced a plausible number and taught readers to trust it everywhere. |
+| **The RTSP path publishes different fields, marked `supervised`** | ffmpeg writes those frames and the thread only supervises the process, so `last_success` stays `null` rather than being filled in from something that is not a frame. Reading the day directory's mtime would have produced a plausible number and taught readers to trust it everywhere. This still holds for the daemon; since 0.1.8 the web UI answers the same question from the newest frame's **filename**, which is a frame rather than a proxy for one (§4.5). |
 | **Writing it can never fail the job** | A daemon that cannot write its status file must keep capturing, and a run that encoded seven days has not failed because a history file could not be updated. Capture complains once, not once a minute. |
 | **Written atomically** | `os.replace`, like every other file this project writes. A reader gets the previous snapshot or the next one, never half of either. |
 | **The daemons write it; the web UI only reads it** | Not `web.state_dir`, which is the UI's own index directory and the single path that service may write. Verified under systemd: a process with the web unit's `ReadWritePaths` gets `Read-only file system` here. |
@@ -1252,6 +1252,23 @@ deliberate price of dropping a tab.
     exists to answer is whether last night's encode worked. A failed run does
     not reach here (systemd leaves it `failed`), but the green line is
     conditioned on `Result` anyway rather than on the timestamp alone.
+  - **A timer's next run lives in one of two properties, and which one depends
+    on how it is scheduled** (0.1.8). A calendar timer (`OnCalendar`, the
+    nightly encode) fills `NextElapseUSecRealtime` with a timestamp. A
+    monotonic one (`OnBootSec`/`OnUnitActiveSec`, the credential watch) leaves
+    that **empty** and answers in `NextElapseUSecMonotonic` as a timespan
+    since boot, e.g. `5min 1.016502s`. Reading only the realtime property left
+    the credential watch row saying "Scheduled" with an empty Detail, which an
+    operator reasonably read as something being wrong with it; reported
+    2026-08-14. `next_run_detail()` reads both and renders "next run in 4m",
+    and `LastTriggerUSec` is appended when the timer has ever fired, because
+    that is the half that proves it works. Three notes: the timespan format is
+    documented in systemd.time(7), which is what makes parsing it safe where
+    parsing `systemctl status` is not; `infinity` means the timer will not
+    fire again and is said in words rather than treated as a duration; and the
+    subtraction against `time.monotonic()` is exact because both are
+    `CLOCK_MONOTONIC` on Linux. **No timer row may ever have an empty Detail**,
+    and a test pins that as the invariant rather than as one case.
   - **Rows are matched by `Id`, never by position.** A block that does not come
     back would otherwise shift every later unit onto the wrong row.
   The one state that looks healthy and is not gets called out: enabled=no
@@ -1263,10 +1280,34 @@ deliberate price of dropping a tab.
   than in the daemon: `camera_verdict()` allows two intervals of silence and
   never less than fifteen seconds, so a camera at one frame a minute is not
   measured by a five-second camera's clock. Four details worth keeping:
-  - **Silence is measured against the snapshot, not against now.** The
-    heartbeat lands once a minute, so measuring against now would add up to a
-    minute of the file's own age to every camera and paint a healthy
-    five-second camera as a minute quiet.
+  - **"Last frame" is the newest frame on disk, for every camera** (0.1.8).
+    `last_frame_epoch()` takes the newest name from the same directory pass
+    that counts the frames, so it costs nothing extra, and turns it into a
+    time with `frame_epoch()`. Requested by the operator: an RTSP row said
+    "recording" where every other row said "12s ago", because the daemon has
+    no last-frame time for a stream another process writes.
+    - **The time comes from the *name*, never from mtime**, which is the one
+      correction to that request. Order and time are properties of the name
+      throughout this project (§2), because a PowerShell predecessor mixed
+      `CreationTime` and `LastWriteTime` and deleted the wrong files; mtime
+      would also be wrong after any restore or `rsync` that did not preserve
+      timestamps. `FRAME_NAME` matches a prefix so the DST fall-back suffix
+      (`HHMMSS-1.jpg`) still parses.
+    - **It gained a fault the page could not previously see.** An RTSP
+      grabber can be alive and producing nothing; `alive` said "recording" in
+      green for as long as that lasted. Measured on a synthetic day: a camera
+      whose newest frame is 66 minutes old now reads red at 93% coverage.
+      A *stopped* grabber still overrides the frame reading, because that is
+      the more actionable fact and the reason there will be no more frames.
+    - **Yesterday is consulted only when today is empty.** That is the minute
+      after midnight, when the newest frame belongs to the day that just
+      ended, and it costs one listing of a directory that is empty anyway.
+  - **Silence is measured against now when it comes from disk, and against
+    the snapshot when it falls back to the heartbeat.** The heartbeat lands
+    once a minute, so measuring *it* against now would add up to a minute of
+    the file's own age to every camera and paint a healthy five-second camera
+    as a minute quiet. A file on disk has no such lag, so the same correction
+    applied to it would be an error in the other direction.
   - **A stopped or stale daemon is announced above the table**, because it
     explains every quiet row beneath it and leaving the reader to infer that
     from eight red rows is not an explanation. `paused` gets its own line for
@@ -1278,6 +1319,42 @@ deliberate price of dropping a tab.
     units restart on upgrade and this service may not have; reading an unknown
     format would put invented numbers on a page whose entire value is being
     true.
+  - **Frames and coverage are counted from disk, not read from the heartbeat**
+    (0.1.8). The daemon's `ok` counter resets on every restart, so "48 frames"
+    after a restart at 17:55 answers a question nobody asked; and it does not
+    exist at all for RTSP, where a separate process writes the frames, so that
+    column used to read `-`. `count_frames()` walks today's directory with
+    `os.scandir` and never stats a file, `today_progress()` divides by the
+    seconds elapsed since local midnight, and both camera methods get the same
+    number by the same route. Requested by the operator 2026-08-14, whose
+    argument settles it: an operator wants to know whether today has been
+    captured, and only the directory knows that.
+    - **The day's own `.cadence.json` beats the running config**, exactly as
+      the encoder does it. A cadence edit lands at midnight, so today may
+      still be running on yesterday's answer, and measuring against the new
+      one would report a perfect day as a near-outage.
+    - **`coverage_of()` in `timelapse_encode` is the only place this
+      arithmetic lives**, shared with the nightly summary so that "94% at
+      18:00" and "94% overnight" cannot come to mean different things.
+      `coverage_pct()` keeps its own rule that no frames means no answer,
+      because a nightly row exists only for a day that was processed; the live
+      panel says **0%**, which is the case an operator most needs stated.
+    - **Zero is not the same as unreadable.** A missing directory counts 0,
+      because "no directory" and "an empty directory" mean the same thing to
+      an operator, but an `OSError` renders `?` with a line saying it is a
+      statement about this service's access and not about the camera.
+    - **Counts are cached for `COUNT_TTL` (20s)**, keyed on a time bucket so
+      old entries can never be read again. Measured on a synthetic worst case
+      of 9 cameras at 17,280 frames (155,520 files, a full day at 5s): 37 ms
+      on Linux, 80 ms on the Windows dev box, and free on a cached refresh.
+      **Do not treat that as a budget**: it was measured on an SSD with a warm
+      dentry cache, and the deployment's frames root is an HDD. The bound that
+      matters is the TTL and the fact that `frames_root` is local by design.
+  - **The Problems column is empty when there is nothing wrong**, and the RTSP
+    verdict says "recording" / "not recording" rather than naming ffmpeg. Both
+    from the same operator report: a column reading "0 failed" on every healthy
+    row trains the eye to skip it, and a reader of a status page has not asked
+    which program does the work.
 - **The logs page drops the 54rem reading column.** That width suits prose and
   tables and is wrong for raw command output, whose line length journald
   decides, not us. `_render()` adds `pane-page` to `<body>` for it
