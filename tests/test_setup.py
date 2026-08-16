@@ -3424,7 +3424,15 @@ class TestWindowsTransfer(unittest.TestCase):
     that cannot work.
     """
 
-    def drive(self, keystrokes, mapping=None, local=True):
+    def drive(self, keystrokes, mapping=None, fixed="D"):
+        """`fixed` names the drive letters that are real local disks here.
+
+        Patched at plat.drive_kind rather than at setup.drive_is_local, and
+        that is the point rather than a detail: mocking the wizard's own
+        collaborator with a fixed return value meant the argument never
+        reached it, which is exactly how drive_is_local came to want `U:` while
+        every caller handed it `U:\\TL`. Patch below the seam you are testing.
+        """
         prev_tty, prev_auto = setup._TTY, setup.AUTO
         setup.AUTO = False
         setup._TTY = FakeTTY(keystrokes, tty=False)
@@ -3434,8 +3442,10 @@ class TestWindowsTransfer(unittest.TestCase):
         try:
             with contextlib.redirect_stdout(buf), \
                  mock.patch.object(setup, "IS_WINDOWS", True), \
-                 mock.patch.object(setup, "drive_is_local",
-                                   return_value=local), \
+                 mock.patch.object(plat, "IS_WINDOWS", True), \
+                 mock.patch.object(plat, "drive_kind",
+                                   side_effect=lambda root:
+                                   plat.DRIVE_FIXED if root[0] in fixed else 1), \
                  mock.patch.object(setup, "network_path",
                                    side_effect=lambda p: mapping.get(str(p))):
                 setup.choose_transfer(cfg)
@@ -3481,20 +3491,20 @@ class TestWindowsTransfer(unittest.TestCase):
         sign-in session and will not find it. Storing it would reproduce the
         exact failure this whole question exists to prevent.
         """
-        transfer, out = self.drive("y\nQ:\\videos\n", local=False)
+        transfer, out = self.drive("y\nQ:\\videos\n")
         self.assertFalse(transfer["enabled"])
         self.assertIn("unattended", out)
         self.assertIn("net use", out)
 
     def test_a_real_local_drive_is_not_refused(self):
-        transfer, _out = self.drive("y\nD:\\timelapse\\out\n", local=True)
+        transfer, _out = self.drive("y\nD:\\timelapse\\out\n")
         self.assertTrue(transfer["enabled"])
         self.assertEqual(transfer["destination"], "D:\\timelapse\\out")
 
     def test_a_unc_path_is_never_asked_about_as_a_drive(self):
         # It has no drive letter, so drive_is_local() answers None and the
         # refusal must not fire on it.
-        transfer, _out = self.drive("y\n\\\\tower\\cctv\\TL\n", local=None)
+        transfer, _out = self.drive("y\n\\\\tower\\cctv\\TL\n")
         self.assertTrue(transfer["enabled"])
 
     def test_an_rsync_spec_is_refused_with_its_reason(self):

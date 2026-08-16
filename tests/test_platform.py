@@ -1356,6 +1356,27 @@ class TestNetworkPath(unittest.TestCase):
             self.assertIs(plat.drive_is_local("C:"), True)
             self.assertIs(plat.drive_is_local("U:"), False)
 
+    def test_it_takes_a_path_and_not_only_a_letter(self):
+        """Every caller has a path in its hand. The first version wanted `U:`
+
+        exactly and answered None for `U:\\TL`, so the wizard's refusal branch
+        could never fire; the wizard test mocked this function with a fixed
+        return value and therefore never passed it an argument at all. A mock
+        that stands in for the thing being integrated tests the mock.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "drive_kind",
+                               side_effect=lambda r: plat.DRIVE_FIXED
+                               if r.startswith("D") else 1):
+            self.assertIs(plat.drive_is_local(r"D:\timelapse\out"), True)
+            self.assertIs(plat.drive_is_local(r"U:\TL\_temp_"), False)
+            self.assertIs(plat.drive_is_local("Q:/videos"), False)
+
+    def test_a_path_with_no_drive_letter_has_no_answer(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            for given in (r"\\tower\cctv\TL", "/mnt/nas", "", "x"):
+                self.assertIsNone(plat.drive_is_local(given), given)
+
     def test_the_lookup_declines_off_windows(self):
         with mock.patch.object(plat, "IS_WINDOWS", False):
             self.assertIsNone(plat.unc_for_drive("U:"))

@@ -1695,20 +1695,27 @@ def _mapped_in_registry(letter):
     return str(value) or None
 
 
-def drive_is_local(letter):
-    """True for a fixed disk this session can see. None if unanswerable.
+def drive_is_local(path):
+    """True for a fixed disk this session can see. None if there is no drive.
 
     The backstop for a drive letter that is neither resolvable nor local: from
     an elevated session an unresolvable mapping reports DRIVE_NO_ROOT_DIR,
     which is the same answer as a letter that was simply typed wrong, and both
     mean the same thing to the caller. The destination cannot be used as given.
+
+    Takes a **path**, not just a letter, for the same reason network_path()
+    does: every caller has a path in its hand. The first version wanted `U:`
+    exactly and answered None for `U:\\TL`, so the wizard's refusal could never
+    fire; its test mocked this function with a fixed value and so never passed
+    it an argument at all. None still means "no drive letter here", which is
+    the right answer for a UNC path and for a POSIX one.
     """
     if not IS_WINDOWS:
         return None
-    root = str(letter).rstrip("\\/")
-    if len(root) != 2 or root[1] != ":":
+    text = str(path)
+    if len(text) < 2 or text[1] != ":":
         return None
-    return drive_kind(root + "\\") == DRIVE_FIXED
+    return drive_kind(text[0] + ":\\") == DRIVE_FIXED
 
 
 def network_path(path, lookup=None):
