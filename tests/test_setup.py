@@ -3387,6 +3387,101 @@ class TestIPv6CameraAddresses(unittest.TestCase):
         self.assertEqual(parsed.port, 554)
 
 
+class TestSummarySinks(unittest.TestCase):
+    """The summary must describe what the questions just configured.
+
+    It read cfg['discord'] directly until 0.2.0, which is the legacy block
+    alone, so an operator who had just set up ntfy or Telegram was shown
+    "Discord  disabled" and nothing about what they had done. Wrong on Linux
+    since 0.1.6; noticed only when a Windows transcript was read line by line.
+    """
+
+    def test_the_new_sinks_are_named(self):
+        cfg = {"notify": [{"type": "ntfy", "enabled": True, "topic": "x"},
+                          {"type": "telegram", "enabled": True, "token": "t"}]}
+        self.assertEqual(setup.summarise_sinks(cfg), "ntfy, telegram")
+
+    def test_a_disabled_sink_is_not_named(self):
+        cfg = {"notify": [{"type": "ntfy", "enabled": False},
+                          {"type": "discord", "enabled": True,
+                           "webhook_url": "u"}]}
+        self.assertEqual(setup.summarise_sinks(cfg), "discord")
+
+    def test_nothing_configured_says_disabled(self):
+        self.assertEqual(setup.summarise_sinks({"notify": []}), "disabled")
+        self.assertEqual(setup.summarise_sinks({}), "disabled")
+
+    def test_the_legacy_block_still_shows(self):
+        # Every config written before 0.1.6 has one, and upgrades keep it.
+        cfg = {"discord": {"enabled": True, "webhook_url": "https://x/y"}}
+        self.assertEqual(setup.summarise_sinks(cfg), "discord")
+
+    def test_it_prints_no_credential(self):
+        """A webhook URL is the authority to post, exactly as a bot token is,
+
+        and this line gets pasted into bug reports.
+        """
+        cfg = {"notify": [
+            {"type": "discord", "enabled": True,
+             "webhook_url": "https://discord.com/api/webhooks/1/SECRET"},
+            {"type": "telegram", "enabled": True, "token": "12345:SECRET",
+             "chat_id": "99"}]}
+        out = setup.summarise_sinks(cfg)
+        for secret in ("SECRET", "discord.com", "12345", "99"):
+            self.assertNotIn(secret, out, secret)
+
+    def test_the_summary_line_uses_it(self):
+        cfg = setup.default_config()
+        cfg["notify"] = [{"type": "ntfy", "enabled": True, "topic": "x"}]
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            setup.summarise(cfg, "cfg.json")
+        self.assertIn("ntfy", buf.getvalue())
+
+
+class TestWindowsWebUI(unittest.TestCase):
+    """It is not ported, and the question must not pretend otherwise."""
+
+    def drive(self, keystrokes, windows):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=False)
+        cfg = setup.default_config()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "IS_WINDOWS", windows):
+                setup.choose_web(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return cfg["web"], buf.getvalue()
+
+    def test_windows_says_nothing_will_run_it(self):
+        """Before the question, not after. A question that looks like every
+
+        other question gets answered like every other question.
+        """
+        _web, out = self.drive("n\n", windows=True)
+        self.assertIn("not installed as a service on windows", out.lower())
+        self.assertIn("web-serve", out)
+        marker = out.lower().index("not installed as a service")
+        self.assertLess(marker, out.lower().index("?"))
+
+    def test_windows_asks_a_different_question(self):
+        _web, out = self.drive("n\n", windows=True)
+        self.assertIn("web-serve", out.split("?")[0])
+
+    def test_linux_is_unchanged(self):
+        _web, out = self.drive("n\n", windows=False)
+        self.assertIn("Enable the web UI?", out)
+        self.assertNotIn("web-serve", out)
+
+    def test_declining_leaves_it_off_on_both(self):
+        for windows in (True, False):
+            web, _out = self.drive("n\n", windows=windows)
+            self.assertFalse(web["enabled"], windows)
+
+
 class TestSshSpecDetection(unittest.TestCase):
     """user@host:/path is rsync's shape and only rsync's."""
 

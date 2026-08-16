@@ -2805,11 +2805,24 @@ def choose_web(cfg):
     note("A small read-only page: service status, and an index of your")
     note("finished videos that hands each one to VLC to play.")
     note("It changes nothing - no encoding, no camera control, no deleting.")
+    if IS_WINDOWS:
+        # Said before the question, not after it. The installer registers no
+        # service for this on Windows yet (item 11f step 5), so answering yes
+        # writes a setting nothing acts on, and a question that looks like
+        # every other question is a question the operator will answer that way.
+        print()
+        warn("Not installed as a service on Windows yet.")
+        note("Turning it on here writes the setting and starts nothing: there")
+        note("is no service to run it. 'timelapse web-serve' runs it in the")
+        note("foreground, in a window you keep open, which is worth having to")
+        note("look at the video index and no good as a permanent arrangement.")
     print()
 
     cfg.setdefault("web", {})
     web = cfg["web"]
-    if not ask_yes("Enable the web UI?", web.get("enabled", False)):
+    prompt = ("Set it up anyway, for 'timelapse web-serve'?" if IS_WINDOWS
+              else "Enable the web UI?")
+    if not ask_yes(prompt, web.get("enabled", False)):
         web["enabled"] = False
         return
     web["enabled"] = True
@@ -3231,6 +3244,19 @@ def web_writable_paths(cfg):
     return [str(PurePosixPath(state or LINUX_WEB_STATE_DIR))]
 
 
+def summarise_sinks(cfg):
+    """Which notification sinks are on, by name. "disabled" when none is.
+
+    Names only. Every sink holds a credential of some kind, a webhook URL being
+    the authority to post as surely as a bot token is, and a summary printed to
+    a terminal and pasted into a bug report is not the place for any of them.
+    """
+    from timelapse_encode import notify_sinks
+
+    kinds = [(s.get("type") or "discord").lower() for s in notify_sinks(cfg)]
+    return ", ".join(kinds) if kinds else "disabled"
+
+
 def summarise(cfg, out_path):
     heading("Summary")
     print(f"  {'Frames':<12}{cfg['paths']['frames_root']}")
@@ -3242,7 +3268,13 @@ def summarise(cfg, out_path):
         print(f"                {dim('- ' + cam['name'] + ' (' + cam['method'] + ')')}")
     t = cfg["transfer"]
     print(f"  {'Transfer':<12}{t['destination'] if t.get('enabled') else 'disabled'}")
-    print(f"  {'Discord':<12}{'enabled' if cfg['discord'].get('enabled') else 'disabled'}")
+    # Every configured sink, from the same function the encoder uses to decide
+    # where to send. It read cfg['discord'] directly until 0.2.0, which was the
+    # legacy block alone: an operator who had just set up ntfy or Telegram was
+    # shown "Discord  disabled" and nothing about what they had configured, so
+    # the summary contradicted the questions immediately above it. Not a
+    # Windows defect; it had been wrong on Linux since 0.1.6.
+    print(f"  {'Notify':<12}{summarise_sinks(cfg)}")
     w = cfg.get("web", {})
     # Built outside the f-string: nesting an expression like this inside one
     # needs PEP 701, which is Python 3.12. This project supports 3.9.
