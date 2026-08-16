@@ -1727,6 +1727,15 @@ new file and the config loses its group. On Windows a new file inherits the
 file created there afterwards, including an editor's temporary copies, is
 covered by where it is rather than by what the editor did.
 
+**No Python one-liner in `install.ps1` may contain a quote.** PowerShell strips
+embedded double quotes when it hands arguments to a native executable, so
+`-c 'print("%d.%d" % sys.version_info[:2])'` arrives at Python as
+`print(%d.%d % ...)` and dies with a SyntaxError. Found on the first real
+elevated install: the version came back empty, the floor check refused a
+working 3.12, and eleven of the harness's eighteen checks failed downstream of
+that one line. A test bans the quote rather than trusting each call site; the
+formatting belongs on the PowerShell side, where the rules are known.
+
 **`install.ps1` is pure ASCII, and that is measured.** Windows PowerShell 5.1
 reads a `.ps1` with no byte order mark as ANSI, so `install.sh`'s box-drawing
 banner comes out as mojibake and the installer's first line looks like a

@@ -275,6 +275,26 @@ class TestInstallerText(unittest.TestCase):
         self.assertEqual(offenders, [],
                          "non-ASCII in install.ps1 renders as mojibake on 5.1")
 
+    def test_no_python_one_liner_contains_a_quote(self):
+        """PowerShell strips embedded double quotes on the way to a native exe.
+
+        Measured on the first real elevated install: `-c 'import sys;
+        print("%d.%d" % sys.version_info[:2])'` arrived at Python as
+        `print(%d.%d % sys.version_info[:2])` and died with a SyntaxError
+        pointing at a percent sign. The version then came back empty, the
+        check refused a perfectly good 3.12, and the message read "this is ."
+        with nothing after it. Eleven of eighteen checks failed downstream of
+        that one line.
+
+        A quote inside `-c '...'` is therefore banned outright rather than
+        reasoned about per call site: the formatting belongs on the PowerShell
+        side, where the quoting rules are known.
+        """
+        text = self.SOURCE.decode("ascii")
+        for snippet in re.findall(r"-c '([^']*)'", text):
+            self.assertNotIn('"', snippet,
+                             "a double quote here is silently eaten: " + snippet)
+
     def test_it_installs_exactly_the_scripts_that_exist(self):
         """A third list of the same files, in a third language. The other two
 

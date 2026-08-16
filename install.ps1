@@ -120,10 +120,25 @@ function Find-Python {
 }
 
 function Test-PythonVersion {
-    param($Python)
-    $out = & $Python -c 'import sys; print("%d.%d" % sys.version_info[:2])'
+    <#
+      Returns "major minor", or $null.
+
+      Note what this one-liner does NOT contain: a quote character. PowerShell
+      strips embedded double quotes when it hands arguments to a native
+      executable, so `print("%d.%d" % sys.version_info[:2])` arrives at Python
+      as `print(%d.%d % sys.version_info[:2])` and dies with a SyntaxError
+      pointing at a percent sign. Measured on the first real install: the
+      version came back empty, the version check then refused a perfectly good
+      Python 3.12, and the message read "this is ." with nothing after it.
+
+      So: no quotes in anything passed after -c, and the formatting is done on
+      this side where the quoting rules are known.
+    #>
+    $out = & $Python -c 'import sys; print(sys.version_info[0], sys.version_info[1])'
     if ($LASTEXITCODE -ne 0) { return $null }
-    return $out.Trim()
+    $parts = $out.Trim() -split '\s+'
+    if ($parts.Count -lt 2) { return $null }
+    return "$($parts[0]).$($parts[1])"
 }
 
 function Install-Requests {
@@ -265,6 +280,12 @@ if (-not $python) {
     exit 1
 }
 $pyver = Test-PythonVersion $python
+if (-not $pyver) {
+    # An interpreter that will not report its own version is one this script
+    # knows nothing about, and guessing is worse than stopping: every check
+    # after this point would be measuring the wrong thing.
+    Die "Could not ask $python for its version. Is it really a Python?"
+}
 Ok "Python $pyver at $python"
 
 $parts = $pyver -split '\.'
