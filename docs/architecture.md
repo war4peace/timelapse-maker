@@ -1525,9 +1525,13 @@ different name:
 | where the config lives | `CONFIG_DIR`, `CONFIG_PATH` |
 | where runtime state lives | `STATE_DIR_DEFAULT`, `WEB_STATE_DIR_DEFAULT` |
 | where data lives by default | `DATA_ROOT_DEFAULT` |
-| is a service running | `service_is_active()` |
+| what a component is called here | `native_name()`, `CAPTURE_UNIT` and friends |
+| is a service running | `service_is_active()`, `service_state()` |
 | restart one | `restart_service()` |
-| how an operator drives one | `start_hint()`, `stop_hint()`, `restart_hint()`, `log_hint()` |
+| register or remove one | `install_service()`, `install_task()`, `remove_*()` |
+| be one | `run_as_service()` |
+| may this process change the box | `is_elevated()` |
+| how an operator drives one | `start_hint()`, `stop_hint()`, `restart_hint()`, `log_hint()`, `elevation_hint()` |
 | secure a file holding passwords | `secure_secret_file()` |
 | is this name usable as a filename | `is_reserved_name()`, `same_file_name()` |
 | how a log file is kept | `log_handler()`, `DailyFileHandler` |
@@ -1542,18 +1546,22 @@ stray print kills the service entry point in a way that presents as "this
 approach does not work" rather than as a bug.
 
 **"Cannot be asked" is a value, and it is not "no".** `service_is_active()`
-returns `None` where there is no systemd, and `None` on Windows until the SCM
-binding arrives. Reporting a healthy system as stopped is the same error the
+returns `None` where there is no systemd, and `None` where the SCM refused the
+question. Reporting a healthy system as stopped is the same error the
 daemon/timer/oneshot split in §4.5 exists to avoid, met in a smaller place.
+`service_state()` splits that answer three ways rather than two, because
+*absent*, *stopped* and *unanswerable* need three different responses: install
+it, start it, or say you could not tell. It is deliberately falsy for absent, so
+a caller reading it as a boolean still gets the right answer.
 
 **The Windows halves exist only where a caller does.** Locations are
-implemented for both platforms because everything imports them today. Service
-control, file permissions and the storage scan are Linux only, and on Windows
-they degrade to exactly what they already do on a Linux box without systemd or
-without `os.statvfs`: they decline. There is no stub that lies. In particular
-`secure_secret_file()` does **nothing** on Windows rather than calling `chmod`,
-because `chmod` there sets one bit (read-only), so `0640` would report success
-for a file every account on the machine can still read.
+implemented for both platforms because everything imports them today. File
+permissions and the storage scan are Linux only, and on Windows they degrade to
+exactly what they already do on a Linux box without `os.statvfs`: they decline.
+There is no stub that lies. In particular `secure_secret_file()` does
+**nothing** on Windows rather than calling `chmod`, because `chmod` there sets
+one bit (read-only), so `0640` would report success for a file every account on
+the machine can still read.
 
 **Both branches are testable from either CI leg.** `locations()` takes the
 platform as an argument rather than reading it, and builds the Windows answers
@@ -1592,12 +1600,75 @@ is less clever, and in exchange it has no failure mode.
 `writable_paths()` and `--print-state-path` emit `ReadWritePaths=` lines for a
 systemd unit, so they name `LINUX_STATE_DIR` explicitly rather than the running
 platform's default: a systemd unit is a POSIX artefact even when a Windows box
-generated it. And `timelapse-capture.py` does not import this module at all. It
-imports nothing from its siblings, so that a syntax error in a script it does
-not need cannot stop the recording, and it therefore carries a
-character-identical copy of the derivation, pinned by a test in
-`test_capture.py` exactly as `replace_atomic()` and the redaction rule are. It
-is the sole exception to the `os.name` rule and the scan names it as such.
+generated it. And `timelapse_capture.py` carries a character-identical copy of
+the path derivation and of the log handler rather than importing them, pinned by
+tests in `test_capture.py` exactly as `replace_atomic()` and the redaction rule
+are, because it imports nothing from its siblings so that a syntax error in a
+script it does not need cannot stop the recording. It is the sole exception to
+the `os.name` rule and the scan names it as such.
+
+#### Hosting a Windows service (0.2.0)
+
+`sc.exe create` pointed at a plain `python.exe` does not produce a service. The
+SCM expects `StartServiceCtrlDispatcher` within about thirty seconds and kills
+what does not answer, reporting **1053**, which reads as a broken script rather
+than as a wrong hosting model. `pywin32` answers it and costs a large native
+dependency that the one-third-party-package rule will not pay for, so the
+handshake is implemented here in `ctypes`, which is stdlib. It was proven end to
+end under a real SCM before any of it was designed (future-features.md 11c.2).
+
+`run_as_service(unit, body, request_stop)` is the whole surface.
+`body(ready)` runs on the thread the SCM provides and calls `ready()` once it is
+genuinely up; `request_stop()` is called from the SCM's control thread and must
+return immediately. Four rules are load-bearing and each was a bug first:
+
+- **Every `ctypes` function returning a handle declares its `restype`.** The
+  default is `c_int`, which truncates a 64-bit `SC_HANDLE`, and it works for as
+  long as the SCM issues small values: a defect that passes on the machine it
+  was written on.
+- **Nothing in the service path prints.** There is no console, so the only
+  witness a failure has is `on_error`, which the daemon points at its log and at
+  `service-error.log` beside the config.
+- **The entry point carries its own exception guard.** An exception escaping a
+  `ctypes` callback goes to a stderr that is nowhere, and the service then looks
+  like it hung rather than like it failed.
+- **The control handler reports `STOP_PENDING` with a wait hint before the slow
+  work.** Capture has a camera thread per camera to join, each possibly holding
+  a fetch open, and an SCM that has not been told to wait calls the stop hung.
+
+The batch jobs are **scheduled tasks**, not services, mirroring the
+`.service`/`.timer` split exactly: a service that exits within seconds is a
+service in a permanent restart loop. Their definitions are generated as XML
+rather than driven from the `schtasks` command line, because the two settings
+that matter most cannot be expressed there at all: a repetition interval with no
+duration, and `StartWhenAvailable`, which is the Windows spelling of the encode
+timer's `Persistent=true`. Reading a task back is the opposite problem and
+follows the rule `systemctl show` already set: `schtasks /Query` prints
+**localised** field names, so existence comes from an exit code and anything
+richer comes from PowerShell as JSON, whose property names are English on every
+locale.
+
+The structures are declared with `c_uint32` rather than with `ctypes.wintypes`,
+and that is not fussiness. On 64-bit Linux `wintypes.DWORD` is `c_ulong`, which
+is **eight** bytes, so every layout would be silently wrong there and every test
+asserting one would agree with it. Fixed widths are what make `SERVICE_STATUS`
+assertable from the Linux CI legs.
+
+This is the one place the daemon's independence rule bends, and the bend has a
+shape. `timelapse_capture.py` imports the platform module inside `run_service()`
+and nowhere else, so **on Linux it still imports nothing**: that line never
+runs. What the rule protects against is a partial upgrade leaving a stale
+sibling beside a fresh daemon, and on Windows that is exactly what
+`timelapse version` catches, the platform module being one of the seven files it
+compares. The alternative was a sixth pinned duplicate of the most intricate
+code in the project.
+
+Registration itself lives in `timelapse_setup.py` (`--install-units`,
+`--remove-units`, `--unit-status`) rather than in `install.ps1`, for the reason
+`tools/` was deleted: two installers that both know how to register a service
+disagree within one release. `service_definitions()` is a pure table mapping
+each unit file onto its Windows form, so both CI legs assert the same schedule,
+argv and account.
 
 ### 4.7 `install.sh`
 
@@ -2121,7 +2192,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,399 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,469 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -2141,6 +2212,20 @@ time so the tests can patch it. The Windows leg runs the unit suite only: the
 encode pipeline is shared code the Linux legs exercise on every push, and
 fetching an ffmpeg build would put a download into the one job that otherwise
 has no network dependency at all.
+
+**What CI cannot reach on Windows is the service manager**, because registering
+one needs elevation and whether a runner has any is not this project's to
+assume. So the split is deliberate: everything *around* the SCM is pure and
+unit-tested on both legs (the name mapping, `service_binpath` quoting, the task
+XML, the structure layouts, `service_definitions`), and the lifecycle itself is
+`temp/step3_check.py`, run once from an Administrator prompt. That script uses
+the shipping code path throughout, stands up a local HTTP server as a fake
+camera, and checks that the service starts, reports RUNNING only once it is
+capturing, writes frames and a log as a different account, and stops cleanly
+rather than being killed. Its unprivileged half runs anywhere and separates the
+two failure modes: if the daemon captures in the foreground and the dispatcher
+is refused with the documented 1063, then anything still broken is in the
+hosting and nowhere else.
 
 `test_web.py` drives the real handler through a fake socket rather than binding
 a port: a listening socket in a unit test is a flake waiting for a busy CI
@@ -2413,12 +2498,12 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 
 ```
 install.sh                       bootstrap installer, 964 lines
-scripts/timelapse_capture.py     daemon, 1355 lines
+scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 1846 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 905 lines
-scripts/timelapse_setup.py       configuration wizard, 3666 lines
+scripts/timelapse_setup.py       configuration wizard, 3815 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_platform.py    the only platform branch, 548 lines
+scripts/timelapse_platform.py    the only platform branch, 1398 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests

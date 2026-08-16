@@ -1811,15 +1811,18 @@ class TestRestartWeb(unittest.TestCase):
         self.assertEqual(restarted, ["timelapse-web.service"])
 
     def test_declining_says_the_settings_are_not_live(self):
+        # Against the platform's own hint rather than against `systemctl`: this
+        # asserts that the operator is told how to finish the job, and what
+        # that command is depends on the box they are standing at.
         restarted, out = self.drive("n\n")
         self.assertEqual(restarted, [])
         self.assertIn("previous settings", out)
-        self.assertIn("systemctl restart", out)
+        self.assertIn(plat.restart_hint("timelapse-web.service"), out)
 
     def test_a_stopped_service_is_told_how_to_start(self):
         restarted, out = self.drive("", active=False)
         self.assertEqual(restarted, [])
-        self.assertIn("enable --now", out)
+        self.assertIn(plat.start_hint("timelapse-web.service"), out)
 
     def test_disabling_offers_to_stop_a_running_service(self):
         # It exits 0 when disabled, so a restart is what stops it. Left alone
@@ -3365,6 +3368,199 @@ class TestIPv6CameraAddresses(unittest.TestCase):
         parsed = urlparse(url)
         self.assertEqual(parsed.hostname, "fdd2::1")
         self.assertEqual(parsed.port, 554)
+
+
+class TestServiceDefinitions(unittest.TestCase):
+    """What gets registered on Windows, held against what the units say.
+
+    This is the table install.ps1 drives, and it is pure on purpose: the argv,
+    the schedule and the mapping onto service/*.service and service/*.timer are
+    exactly what goes wrong here, and none of it needs a service manager to
+    check. So both CI legs assert the same thing.
+    """
+
+    SCRIPTS = r"C:\Program Files\timelapse"
+    CONFIG = r"C:\ProgramData\timelapse\config.json"
+
+    def defs(self):
+        return dict((unit, (desc, argv, extras)) for unit, desc, argv, extras
+                    in setup.service_definitions(self.SCRIPTS, self.CONFIG,
+                                                 python=r"C:\py\python.exe"))
+
+    def test_it_registers_the_capture_service_and_the_two_batch_jobs(self):
+        self.assertEqual(set(self.defs()),
+                         {plat.CAPTURE_UNIT, plat.ENCODE_UNIT,
+                          plat.WATCH_UNIT})
+
+    def test_the_web_ui_is_not_among_them(self):
+        """Deliberate, per item 11f: the first release is capture and encode.
+
+        The web UI carries the status source, the log source and an account
+        question of its own, and registering a service for a component that is
+        not ported yet would be a service that fails to start on every boot.
+        """
+        self.assertNotIn(plat.WEB_UNIT, self.defs())
+
+    def test_capture_is_told_to_talk_to_the_service_manager(self):
+        """Without --service it is the ordinary foreground daemon, which is
+
+        what error 1053 looks like: the SCM waits about thirty seconds for a
+        dispatcher that never connects and kills it.
+        """
+        argv = self.defs()[plat.CAPTURE_UNIT][1]
+        self.assertIn("--service", argv)
+        self.assertTrue(argv[1].endswith("timelapse_capture.py"))
+        self.assertEqual(argv[0], r"C:\py\python.exe")
+
+    def test_the_config_path_is_always_last(self):
+        # Every script here takes the config as a positional argument, so a
+        # flag appended after it would be read as a second config.
+        for _unit, (_desc, argv, _extras) in self.defs().items():
+            self.assertEqual(argv[-1], self.CONFIG)
+
+    def test_the_watch_is_the_encoder_wearing_a_flag(self):
+        argv = self.defs()[plat.WATCH_UNIT][1]
+        self.assertTrue(argv[1].endswith("timelapse_encode.py"))
+        self.assertIn("--watch", argv)
+        self.assertNotIn("--watch", self.defs()[plat.ENCODE_UNIT][1])
+
+    def test_the_nightly_job_runs_at_five_past_midnight(self):
+        # OnCalendar=*-*-* 00:05:00, so the previous day's directory is
+        # complete before anything reads it.
+        extras = self.defs()[plat.ENCODE_UNIT][2]
+        self.assertIn("T00:05:00", extras["triggers"])
+
+    def test_the_nightly_job_catches_up_and_the_watch_does_not(self):
+        """Persistent=true against a timer that deliberately is not.
+
+        A missed encode strands a whole day of frames; a missed credential
+        check is answered by the next one five minutes later.
+        """
+        self.assertTrue(self.defs()[plat.ENCODE_UNIT][2]["catch_up"])
+        self.assertFalse(self.defs()[plat.WATCH_UNIT][2]["catch_up"])
+
+    def test_the_nightly_job_has_no_time_limit_and_the_watch_has_one(self):
+        # TimeoutStartSec=infinity against TimeoutStartSec=60.
+        self.assertEqual(self.defs()[plat.ENCODE_UNIT][2]["time_limit"],
+                         "PT0S")
+        self.assertEqual(self.defs()[plat.WATCH_UNIT][2]["time_limit"], "PT1M")
+
+    def test_the_watch_repeats_every_five_minutes(self):
+        self.assertIn("<Interval>PT5M</Interval>",
+                      self.defs()[plat.WATCH_UNIT][2]["triggers"])
+
+    def test_the_scripts_directory_defaults_to_where_this_one_lives(self):
+        """An installer that guesses the wrong directory registers a service
+
+        whose binPath names a file that is not there, and the SCM reports that
+        as 1053 too, which is the same symptom as three other faults.
+        """
+        pairs = setup.service_definitions(
+            Path(setup.__file__).resolve().parent, self.CONFIG)
+        expected = Path(setup.__file__).resolve().parent / "timelapse_capture.py"
+        self.assertEqual(Path(pairs[0][2][1]), expected)
+
+    def test_every_definition_makes_a_document_task_scheduler_will_read(self):
+        for unit, (desc, argv, extras) in self.defs().items():
+            if not plat.is_scheduled(unit):
+                continue
+            xml = plat.task_xml(desc, argv, **extras)
+            ET.fromstring(xml.split("?>", 1)[1])
+
+
+class TestUnitRegistrationCommands(unittest.TestCase):
+    """install_units / remove_units: failure isolation and privilege."""
+
+    def run_units(self, install=(True, ""), task=(True, "")):
+        out = io.StringIO()
+        with mock.patch.object(setup, "install_service",
+                               return_value=install) as svc, \
+             mock.patch.object(setup, "install_task",
+                               return_value=task) as tsk, \
+             contextlib.redirect_stdout(out):
+            ok = setup.install_units("scripts", "cfg.json")
+        return ok, out.getvalue(), svc, tsk
+
+    def test_it_registers_one_service_and_two_tasks(self):
+        _ok, _text, svc, tsk = self.run_units()
+        self.assertEqual(svc.call_count, 1)
+        self.assertEqual(tsk.call_count, 2)
+
+    def test_one_failure_does_not_stop_the_others(self):
+        """The encoder's failure isolation, met in the installer. A watch task
+
+        that will not register must not cost the operator their capture
+        service, which is the component that cannot be caught up later.
+        """
+        ok, text, svc, _tsk = self.run_units(task=(False, "denied"))
+        self.assertFalse(ok)
+        self.assertEqual(svc.call_count, 1)
+        # By whatever this platform calls it: the report is read by whoever ran
+        # the installer, so it has to use the name their machine uses.
+        self.assertIn(plat.native_name(plat.CAPTURE_UNIT), text)
+
+    def test_a_partial_success_is_reported_without_being_called_a_failure(self):
+        ok, text, _svc, _tsk = self.run_units(
+            install=(True, "registered, but could not set: description"))
+        self.assertTrue(ok)
+        self.assertIn("could not set", text)
+
+    def test_removal_stops_a_service_before_deleting_it(self):
+        """DeleteService on a running service only marks it for deletion, and
+
+        it then lingers in that state until the process exits, which blocks the
+        next install with an error naming neither cause.
+        """
+        order = []
+        with mock.patch.object(setup, "stop_service",
+                               side_effect=lambda u: order.append("stop")), \
+             mock.patch.object(setup, "remove_service",
+                               side_effect=lambda u: (order.append("remove"),
+                                                      (True, ""))[1]), \
+             mock.patch.object(setup, "remove_task",
+                               return_value=(True, "")), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(setup.remove_units())
+        self.assertEqual(order, ["stop", "remove"])
+
+    def test_registering_without_privilege_refuses_and_says_how(self):
+        out = io.StringIO()
+        with mock.patch.object(setup, "is_elevated", return_value=False), \
+             mock.patch.object(setup, "install_units") as install, \
+             mock.patch.object(setup.sys, "argv",
+                               ["timelapse_setup.py", "--install-units"]), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(setup.main(), 1)
+        install.assert_not_called()
+        self.assertTrue(out.getvalue().strip())
+
+    def test_the_status_command_never_guesses(self):
+        """A component the machine could not be asked about says "unknown".
+
+        Reporting it as stopped would invent a fault on a healthy system, which
+        is the same error the three-way status split exists to avoid.
+        """
+        out = io.StringIO()
+        with mock.patch.object(setup, "service_state", return_value=None), \
+             mock.patch.object(setup, "task_info", return_value=None), \
+             mock.patch.object(setup, "task_exists", return_value=None), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(setup.print_unit_status(), 0)
+        self.assertEqual(out.getvalue().count("unknown"), 3)
+
+    def test_the_status_command_prints_one_line_per_component(self):
+        out = io.StringIO()
+        with mock.patch.object(setup, "service_state",
+                               return_value=plat.SERVICE_RUNNING), \
+             mock.patch.object(setup, "task_info",
+                               return_value={"State": "Ready",
+                                             "LastResult": 0}), \
+             contextlib.redirect_stdout(out):
+            setup.print_unit_status()
+        lines = out.getvalue().strip().splitlines()
+        self.assertEqual(len(lines), 3)
+        self.assertIn("running", lines[0])
+        self.assertIn("Ready", lines[1])
 
 
 if __name__ == "__main__":

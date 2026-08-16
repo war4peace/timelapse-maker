@@ -102,6 +102,7 @@ def locations(windows, env=None):
 
 IS_WINDOWS = os.name == "nt"
 _LOC = locations(IS_WINDOWS)
+CONFIG_DIR = _LOC["config_dir"]
 CONFIG_PATH = _LOC["config"]
 
 
@@ -1286,15 +1287,16 @@ def write_state(cfg, cams, started, running=True):
         return False
 
 
-def main():
-    if len(sys.argv) > 1 and sys.argv[1] in ("--version", "-V"):
-        print(f"timelapse_capture.py {__version__}")
-        return
-    if len(sys.argv) > 1 and sys.argv[1] in ("--help", "-h"):
-        print(f"usage: timelapse_capture.py [config.json]\n{__doc__}")
-        return
+def run_daemon(cfg_path, ready=None):
+    """Everything the daemon does, from config to clean exit.
 
-    cfg_path = sys.argv[1] if len(sys.argv) > 1 else CONFIG_PATH
+    Separated from main() so that a Windows service can host it: the SCM hands
+    us a thread and expects the work to happen on it, so this has to be callable
+    with no process-level assumptions. `ready` is how it says it is up, and is
+    called once the camera threads are running rather than once the config has
+    parsed, because a service that reports RUNNING before it can do its job
+    reports a fault as health.
+    """
     cfg = load_config(cfg_path)
     setup_logging(cfg["paths"].get("log_dir"))
 
@@ -1304,8 +1306,12 @@ def main():
         log.info("signal %s received, shutting down", signum)
         STOP.set()
 
-    signal.signal(signal.SIGTERM, on_signal)
-    signal.signal(signal.SIGINT, on_signal)
+    # Only from the main thread, because signal.signal refuses anywhere else,
+    # and under the SCM this runs on a thread Windows created. Stopping is the
+    # control handler's job there, so there is nothing lost.
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, on_signal)
+        signal.signal(signal.SIGINT, on_signal)
 
     threads = [DiskGuard(cfg)]
     for cam in cfg["cameras"]:
@@ -1321,13 +1327,18 @@ def main():
             log.error("unknown method %r for camera %s", method, cam["name"])
 
     if len(threads) == 1:
-        sys.exit("No enabled cameras in config.")
+        # Raised rather than sys.exit()ed: this is now reachable from a service,
+        # where stderr goes nowhere and SystemExit escaping the SCM's thread
+        # would present as a service that started and did nothing.
+        raise SystemExit("No enabled cameras in config.")
 
     for t in threads:
         t.start()
 
     cams = [t for t in threads if isinstance(t, DayCadenceMixin)]
     log.info("running with %d camera thread(s)", len(cams))
+    if ready is not None:
+        ready()
     started = time.time()
     # Immediately, not at the first minute mark. A restart otherwise leaves the
     # previous run's file in place for a minute, which reads as a live daemon
@@ -1351,5 +1362,66 @@ def main():
     log.info("exited cleanly")
 
 
+def service_error(text):
+    """The only witness a service failure has before logging is up.
+
+    Under the SCM there is no console, so a config that will not parse would
+    otherwise be a service that starts, stops and explains nothing. This lands
+    beside the config, which is a directory that exists before anything is
+    configured, and it never raises: a failure to record a failure must not
+    become the failure.
+    """
+    try:
+        log.error("%s", text)
+    except Exception:                                            # noqa: BLE001
+        pass
+    try:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(Path(CONFIG_DIR) / "service-error.log", "a",
+                  encoding="utf-8") as fh:
+            fh.write(f"{stamp} {redact(str(text))}\n")
+    except Exception:                                            # noqa: BLE001
+        pass
+
+
+def run_service(cfg_path):
+    """Run as a real Windows service. Returns the process exit code.
+
+    The one place this daemon imports a sibling, and only on Windows. The rule
+    it bends was written about Linux and systemd, where the danger is a partial
+    upgrade leaving a stale script beside a fresh one; that claim is untouched,
+    because on Linux this line never runs. Here the alternative was a sixth
+    pinned duplicate of the most intricate code in the project, and a stale copy
+    is what `timelapse version` already exists to catch, the platform module
+    being one of the seven files it compares.
+    """
+    from timelapse_platform import CAPTURE_UNIT, run_as_service
+
+    def body(ready):
+        run_daemon(cfg_path, ready=ready)
+
+    return run_as_service(CAPTURE_UNIT, body, STOP.set, on_error=service_error)
+
+
+def main():
+    args = sys.argv[1:]
+    if args and args[0] in ("--version", "-V"):
+        print(f"timelapse_capture.py {__version__}")
+        return 0
+    if args and args[0] in ("--help", "-h"):
+        print(f"usage: timelapse_capture.py [--service] [config.json]\n"
+              f"{__doc__}")
+        return 0
+
+    service = "--service" in args
+    if service:
+        args = [a for a in args if a != "--service"]
+    cfg_path = args[0] if args else CONFIG_PATH
+    if service:
+        return run_service(cfg_path)
+    run_daemon(cfg_path)
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

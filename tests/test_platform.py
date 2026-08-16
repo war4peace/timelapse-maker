@@ -15,6 +15,7 @@ Linux answers on Windows, and neither leg is trusting the other to have looked.
 """
 
 import contextlib
+import ctypes
 import io
 import logging
 import logging.handlers
@@ -27,6 +28,7 @@ import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
+from xml.etree import ElementTree
 
 import _support                                            # noqa: F401
 from _support import FakeStatVFS, write_mounts
@@ -325,16 +327,48 @@ class TestServiceIsActive(unittest.TestCase):
             self.assertIsNone(
                 plat.service_is_active("timelapse-capture.service"))
 
-    def test_windows_cannot_be_asked_yet_and_says_so(self):
-        """Not False. A service manager that cannot be queried yet must not
+    def _windows(self, state=None, task=None):
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "service_state", return_value=state), \
+             mock.patch.object(plat, "task_exists", return_value=task):
+            return (plat.service_is_active(plat.CAPTURE_UNIT),
+                    plat.service_is_active(plat.ENCODE_UNIT))
 
-        report a healthy system as stopped: that is the error the three-way
+    def test_a_running_windows_service_is_running(self):
+        self.assertIs(self._windows(state=plat.SERVICE_RUNNING)[0], True)
+
+    def test_a_stopped_windows_service_is_not(self):
+        self.assertIs(self._windows(state=plat.SERVICE_STOPPED)[0], False)
+
+    def test_a_service_the_scm_has_never_heard_of_is_not_running(self):
+        """Absent and stopped are different facts and the same answer here.
+
+        service_state() keeps them apart, because installing and starting are
+        different remedies; service_is_active() is asked a yes/no question and
+        must not answer None to it, which would read as "could not ask".
+        """
+        self.assertIs(self._windows(state=plat.SERVICE_ABSENT)[0], False)
+
+    def test_a_windows_service_that_could_not_be_asked_about_says_so(self):
+        """Not False. A service manager that cannot be queried must not report
+
+        a healthy system as stopped: that is the error the three-way
         daemon/timer/oneshot split in the status page exists to avoid, met
         here in a smaller place.
         """
-        with mock.patch.object(plat, "IS_WINDOWS", True):
-            self.assertIsNone(
-                plat.service_is_active("timelapse-capture.service"))
+        self.assertIsNone(self._windows(state=None)[0])
+
+    def test_a_scheduled_task_is_asked_about_as_a_task(self):
+        """The batch jobs are not services there, so nothing may ask the SCM.
+
+        `systemctl is-active` on a .timer answers "is it armed", and this is
+        the same question: a task registered and enabled is a timer armed.
+        """
+        self.assertIs(self._windows(state=plat.SERVICE_RUNNING, task=True)[1],
+                      True)
+        self.assertIs(self._windows(state=plat.SERVICE_RUNNING, task=False)[1],
+                      False)
+        self.assertIsNone(self._windows(state=plat.SERVICE_RUNNING)[1])
 
     def test_exit_zero_is_running(self):
         self.assertIs(self._ask(rc=0), True)
@@ -372,11 +406,44 @@ class TestRestartService(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("no such file", detail)
 
-    def test_windows_declines_rather_than_pretending(self):
+    def test_windows_stops_before_it_starts(self):
+        """There is no `sc restart`. Two calls, in that order, and the start
+
+        does not happen if the stop failed: starting a service that is still
+        stopping is refused by the SCM with an error naming neither.
+        """
+        order = []
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "stop_service",
+                               side_effect=lambda u: (order.append("stop"),
+                                                      (True, ""))[1]), \
+             mock.patch.object(plat, "start_service",
+                               side_effect=lambda u: (order.append("start"),
+                                                      (True, ""))[1]):
+            self.assertEqual(plat.restart_service(plat.CAPTURE_UNIT),
+                             (True, ""))
+        self.assertEqual(order, ["stop", "start"])
+
+    def test_windows_does_not_start_what_it_could_not_stop(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "stop_service",
+                               return_value=(False, "denied")), \
+             mock.patch.object(plat, "start_service") as start:
+            self.assertEqual(plat.restart_service(plat.CAPTURE_UNIT),
+                             (False, "denied"))
+        start.assert_not_called()
+
+    def test_a_scheduled_task_has_nothing_to_restart(self):
+        """It is not running, so restarting it is not a thing that can be done.
+
+        Saying so beats the alternatives: silently succeeding would tell the
+        operator a change had taken effect that had not, and running the job
+        now would turn a settings edit into a nightly encode at lunchtime.
+        """
         with mock.patch.object(plat, "IS_WINDOWS", True):
-            ok, detail = plat.restart_service("timelapse-capture.service")
+            ok, detail = plat.restart_service(plat.ENCODE_UNIT)
         self.assertFalse(ok)
-        self.assertIn("Windows", detail)
+        self.assertIn("scheduled task", detail)
 
     def test_it_prints_nothing_on_any_path(self):
         """A platform module a Windows service cannot call is not one.
@@ -394,22 +461,313 @@ class TestRestartService(unittest.TestCase):
 
 
 class TestHints(unittest.TestCase):
-    """What to tell an operator to type, for the cases where nothing ran."""
+    """What to tell an operator to type, for the cases where nothing ran.
 
-    UNIT = "timelapse-web.service"
+    Both platforms are forced, on both CI legs. A hint is the one thing here
+    that is read by a person rather than by a caller, so a hint naming the
+    wrong platform's command is not a wrong value, it is wrong advice.
+    """
 
-    def test_the_three_service_hints_name_the_unit(self):
-        for hint in (plat.start_hint, plat.stop_hint, plat.restart_hint):
-            self.assertIn(self.UNIT, hint(self.UNIT))
+    UNIT = plat.WEB_UNIT
+
+    @contextlib.contextmanager
+    def platform(self, windows):
+        with mock.patch.object(plat, "IS_WINDOWS", windows):
+            yield
+
+    def test_the_three_linux_hints_name_the_unit(self):
+        with self.platform(False):
+            for hint in (plat.start_hint, plat.stop_hint, plat.restart_hint):
+                self.assertIn(self.UNIT, hint(self.UNIT))
+
+    def test_the_three_windows_hints_name_the_service(self):
+        with self.platform(True):
+            for hint in (plat.start_hint, plat.stop_hint, plat.restart_hint):
+                self.assertIn("TimelapseWeb", hint(self.UNIT))
+                self.assertNotIn(".service", hint(self.UNIT))
+
+    def test_windows_drives_a_task_with_schtasks_not_sc(self):
+        """sc knows nothing about a scheduled task. The commands do not
+
+        overlap at all, and offering the wrong one gives an error about a
+        service that does not exist, which reads as this tool having lost it.
+        """
+        with self.platform(True):
+            self.assertIn("schtasks", plat.start_hint(plat.ENCODE_UNIT))
+            self.assertIn("schtasks", plat.stop_hint(plat.ENCODE_UNIT))
 
     def test_the_log_hint_drops_the_unit_suffix(self):
         # journalctl -u takes the unit name without .service. Pasting the
         # suffix in works, but reads as though it were required.
-        self.assertEqual(plat.log_hint(self.UNIT),
-                         "journalctl -u timelapse-web -n 40")
+        with self.platform(False):
+            self.assertEqual(plat.log_hint(self.UNIT),
+                             "journalctl -u timelapse-web -n 40")
 
     def test_the_log_hint_takes_a_line_count(self):
-        self.assertIn("-n 5", plat.log_hint(self.UNIT, 5))
+        with self.platform(False):
+            self.assertIn("-n 5", plat.log_hint(self.UNIT, 5))
+
+    def test_the_windows_log_hint_reads_the_file_the_daemon_writes(self):
+        """Not journalctl, and not capture.log either: DailyFileHandler names
+
+        the file after the day, so a hint naming a fixed filename would point
+        at something that does not exist on any Windows install.
+        """
+        with self.platform(True):
+            hint = plat.log_hint(plat.CAPTURE_UNIT, 10,
+                                 log_dir=r"D:\timelapse\logs")
+        self.assertIn(r"D:\timelapse\logs\capture-*.log", hint)
+        self.assertIn("-Tail 10", hint)
+
+    def test_the_watch_reads_the_encoders_log_because_it_is_the_encoder(self):
+        with self.platform(True):
+            self.assertIn("encode-*.log", plat.log_hint(plat.WATCH_UNIT))
+
+    def test_the_windows_log_hint_falls_back_to_the_default_directory(self):
+        with self.platform(True):
+            self.assertIn("logs", plat.log_hint(plat.CAPTURE_UNIT))
+
+    def test_the_elevation_hint_offers_no_command_on_windows(self):
+        """There is nothing to type: privilege is a property of how the shell
+
+        was launched. `runas` looks like the answer and is not, so the hint is
+        a sentence rather than something to paste.
+        """
+        with self.platform(True):
+            self.assertIn("administrator", plat.elevation_hint().lower())
+        with self.platform(False):
+            self.assertIn("sudo", plat.elevation_hint())
+
+
+class TestComponentNames(unittest.TestCase):
+    """One identifier, two spellings, and only this file knows the second."""
+
+    def test_every_unit_has_a_windows_name(self):
+        for unit in (plat.CAPTURE_UNIT, plat.WEB_UNIT, plat.ENCODE_UNIT,
+                     plat.WATCH_UNIT):
+            self.assertIn(unit, plat.WINDOWS_NAMES)
+            self.assertIn(unit, plat.LOG_STEMS)
+
+    def test_linux_calls_a_component_by_its_unit(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.assertEqual(plat.native_name(plat.CAPTURE_UNIT),
+                             plat.CAPTURE_UNIT)
+
+    def test_windows_calls_it_something_a_windows_admin_would_recognise(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertEqual(plat.native_name(plat.CAPTURE_UNIT),
+                             "TimelapseCapture")
+
+    def test_an_unknown_identifier_passes_through_unchanged(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertEqual(plat.native_name("something.service"),
+                             "something.service")
+
+    def test_the_batch_jobs_are_the_scheduled_ones(self):
+        self.assertTrue(plat.is_scheduled(plat.ENCODE_UNIT))
+        self.assertTrue(plat.is_scheduled(plat.WATCH_UNIT))
+        self.assertFalse(plat.is_scheduled(plat.CAPTURE_UNIT))
+        self.assertFalse(plat.is_scheduled(plat.WEB_UNIT))
+
+    def test_the_watch_logs_where_the_encoder_does(self):
+        # Because it *is* the encoder: timelapse_encode.py --watch.
+        self.assertEqual(plat.LOG_STEMS[plat.WATCH_UNIT],
+                         plat.LOG_STEMS[plat.ENCODE_UNIT])
+
+
+class TestStructureLayout(unittest.TestCase):
+    """The measurement that made these structures fixed-width.
+
+    ctypes.wintypes.DWORD is c_ulong, which is four bytes on Windows and
+    **eight** on 64-bit Linux. Every layout here would be silently wrong on the
+    Linux CI legs, and every test asserting one would agree with it, which is
+    worse than not testing them at all. c_uint32 is four bytes everywhere,
+    which is what makes the numbers below assertable from either leg.
+    """
+
+    def test_service_status_is_seven_dwords(self):
+        self.assertEqual(ctypes.sizeof(plat.SERVICE_STATUS), 28)
+
+    def test_the_extended_status_adds_two_more(self):
+        self.assertEqual(ctypes.sizeof(plat.SERVICE_STATUS_PROCESS), 36)
+
+    def test_a_failure_action_is_a_type_and_a_delay(self):
+        self.assertEqual(ctypes.sizeof(plat.SC_ACTION), 8)
+
+    def test_the_dword_this_project_uses_is_four_bytes_on_both_platforms(self):
+        self.assertEqual(ctypes.sizeof(plat._DWORD), 4)
+
+
+class TestServiceBinpath(unittest.TestCase):
+    """A Python installed per user lives under a path with a space in it."""
+
+    def test_each_element_is_quoted_separately(self):
+        self.assertEqual(
+            plat.service_binpath([r"C:\Program Files\Python\python.exe",
+                                  r"C:\Program Files\timelapse\x.py",
+                                  "--service"]),
+            '"C:\\Program Files\\Python\\python.exe" '
+            '"C:\\Program Files\\timelapse\\x.py" --service')
+
+    def test_a_path_with_no_space_is_left_alone(self):
+        self.assertEqual(plat.service_binpath([r"C:\py\python.exe", "x.py"]),
+                         r"C:\py\python.exe x.py")
+
+    def test_an_empty_argument_survives_as_an_empty_argument(self):
+        self.assertEqual(plat.service_binpath(["a", ""]), 'a ""')
+
+
+class TestTaskDefinitions(unittest.TestCase):
+    """The scheduled half. Every element here has a line in service/*.timer.
+
+    Well-formedness is asserted by parsing rather than by matching text: a
+    definition Task Scheduler will not read is a job that never runs, and the
+    error it gives back is about a value being out of range, which reads as a
+    bug in the schedule rather than in the XML.
+    """
+
+    def parse(self, xml):
+        return ElementTree.fromstring(xml.split("?>", 1)[1])
+
+    def text(self, xml, *names):
+        node = self.parse(xml)
+        for name in names:
+            node = node.find("{%s}%s" % (plat.TASK_NS, name))
+            if node is None:
+                return None
+        return node.text
+
+    def test_a_generated_definition_is_well_formed_xml(self):
+        xml = plat.task_xml("Nightly encode", ["py.exe", "e.py", "cfg"],
+                            plat.daily_trigger(0, 5))
+        self.assertIsNotNone(self.parse(xml))
+
+    def test_the_command_and_its_arguments_are_separate_elements(self):
+        """Task Scheduler splits them; a single string in Command is treated
+
+        as one executable name, spaces and all, and fails to start with a file
+        not found naming the whole command line.
+        """
+        xml = plat.task_xml("x", [r"C:\py\python.exe",
+                                  r"C:\Program Files\t\e.py", "cfg.json"],
+                            plat.daily_trigger(0, 5))
+        self.assertEqual(self.text(xml, "Actions", "Exec", "Command"),
+                         r"C:\py\python.exe")
+        self.assertEqual(self.text(xml, "Actions", "Exec", "Arguments"),
+                         r'"C:\Program Files\t\e.py" cfg.json')
+
+    def test_it_runs_as_the_system_sid_rather_than_by_name(self):
+        # "SYSTEM" is localised; S-1-5-18 is not.
+        xml = plat.task_xml("x", ["a"], plat.daily_trigger(0, 5))
+        self.assertEqual(self.text(xml, "Principals", "Principal", "UserId"),
+                         "S-1-5-18")
+
+    def test_a_named_account_replaces_it(self):
+        xml = plat.task_xml("x", ["a"], plat.daily_trigger(0, 5),
+                            user_id="TOWER\\svc")
+        self.assertEqual(self.text(xml, "Principals", "Principal", "UserId"),
+                         "TOWER\\svc")
+
+    def test_the_nightly_trigger_is_the_calendar_one(self):
+        xml = plat.task_xml("x", ["a"], plat.daily_trigger(0, 5, 5))
+        trigger = self.parse(xml).find("{%s}Triggers/{%s}CalendarTrigger"
+                                       % (plat.TASK_NS, plat.TASK_NS))
+        self.assertIsNotNone(trigger)
+        self.assertIn("T00:05:00", plat.daily_trigger(0, 5))
+
+    def test_the_jitter_maps_onto_randomizeddelaysec(self):
+        self.assertIn("<RandomDelay>PT5M</RandomDelay>",
+                      plat.daily_trigger(0, 5, jitter_minutes=5))
+        self.assertNotIn("RandomDelay", plat.daily_trigger(0, 5))
+
+    def test_the_repeating_trigger_names_no_duration(self):
+        """Which is how the schema spells "for ever". Naming a Duration would
+
+        give the credential watch a stop date some weeks out that nobody would
+        notice passing, and the symptom would be a check that simply stopped.
+        """
+        trigger = plat.repeating_trigger(5)
+        self.assertIn("<Interval>PT5M</Interval>", trigger)
+        self.assertNotIn("Duration>", trigger.replace("StopAtDurationEnd", ""))
+
+    def test_catch_up_is_the_timers_persistent_true(self):
+        on = plat.task_xml("x", ["a"], plat.daily_trigger(0, 5), catch_up=True)
+        off = plat.task_xml("x", ["a"], plat.repeating_trigger(5),
+                            catch_up=False)
+        self.assertIn("<StartWhenAvailable>true</StartWhenAvailable>", on)
+        self.assertIn("<StartWhenAvailable>false</StartWhenAvailable>", off)
+
+    def test_the_default_time_limit_is_none_at_all(self):
+        """TimeoutStartSec=infinity, because a full backlog catch-up
+
+        legitimately takes hours and must not be killed part way through an
+        encode. Task Scheduler's own default is 72 hours, which would.
+        """
+        xml = plat.task_xml("x", ["a"], plat.daily_trigger(0, 5))
+        self.assertIn("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>", xml)
+
+    def test_a_description_with_an_ampersand_does_not_break_the_document(self):
+        xml = plat.task_xml("Encode & notify", ["a"], plat.daily_trigger(0, 5))
+        self.assertIsNotNone(self.parse(xml))
+        self.assertIn("&amp;", xml)
+
+    def test_it_declares_utf16_because_schtasks_rejects_utf8(self):
+        # On some builds, and the error names a value rather than an encoding.
+        self.assertIn('encoding="UTF-16"',
+                      plat.task_xml("x", ["a"], plat.daily_trigger(0, 5)))
+
+
+class TestWindowsCallsDeclineElsewhere(unittest.TestCase):
+    """Every Windows-only call answers on Linux rather than raising.
+
+    These run on the Linux CI legs and are the only assertion there that the
+    guards exist at all: without them a wizard on Linux touching any of this
+    would traceback out of an OSError from a DLL that is not there.
+    """
+
+    CALLS = {
+        "install_service": (plat.CAPTURE_UNIT, "x", ["py.exe"]),
+        "remove_service": (plat.CAPTURE_UNIT,),
+        "start_service": (plat.CAPTURE_UNIT,),
+        "stop_service": (plat.CAPTURE_UNIT,),
+        "install_task": (plat.ENCODE_UNIT, "<Task/>"),
+        "remove_task": (plat.ENCODE_UNIT,),
+    }
+
+    def test_they_decline_with_a_reason(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            for name, args in self.CALLS.items():
+                ok, detail = getattr(plat, name)(*args)
+                self.assertFalse(ok, name)
+                self.assertIn("Windows", detail, name)
+
+    def test_the_queries_answer_unasked_rather_than_no(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.assertIsNone(plat.service_state(plat.CAPTURE_UNIT))
+            self.assertIsNone(plat.task_exists(plat.ENCODE_UNIT))
+            self.assertIsNone(plat.task_info(plat.ENCODE_UNIT))
+
+    def test_hosting_a_service_elsewhere_fails_rather_than_hangs(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.assertEqual(
+                plat.run_as_service(plat.CAPTURE_UNIT, lambda ready: None,
+                                    lambda: None), 1)
+
+    def test_is_elevated_asks_the_kernel_rather_than_assuming_zero(self):
+        """The 0.1.4 bug in one line: getattr(os, "geteuid", lambda: 0)()
+
+        answers 0 on a platform with no such call, so a Windows box looks like
+        root to every check that asks, which is why that test passed here and
+        failed on all three CI legs.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+             mock.patch.object(plat.os, "geteuid", create=True,
+                               return_value=1000):
+            self.assertFalse(plat.is_elevated())
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+             mock.patch.object(plat.os, "geteuid", create=True,
+                               return_value=0):
+            self.assertTrue(plat.is_elevated())
 
 
 class TestSecureSecretFile(unittest.TestCase):

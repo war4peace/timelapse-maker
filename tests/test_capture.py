@@ -5,10 +5,12 @@ depends on, and the DST fall-back collision handling. No network, no threads
 started - HttpCamera is constructed but never run().
 """
 
+import inspect
 import io
 import json
 import logging
 import math
+import re
 import shutil
 import sys
 import tempfile
@@ -17,6 +19,7 @@ import time
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 import _support
 
@@ -717,12 +720,17 @@ class TestCredentialsNeverReachTheLog(unittest.TestCase):
     def test_the_daemons_copy_of_the_path_derivation_has_not_drifted(self):
         """Fourth duplicated thing, and the first one that is platform code.
 
-        The daemon may not import timelapse_platform for the same reason it
-        imports nothing else: a syntax error in a script it does not need must
-        not be able to stop the capture. So it carries the derivation, and this
-        holds the two copies character-identical, which is the only assertion
-        that would notice the *Windows* branch drifting while both platforms'
-        tests still pass on the Linux one.
+        The daemon does not import timelapse_platform to answer this, for the
+        same reason it imports nothing else: a syntax error in a script it does
+        not need must not be able to stop the capture. So it carries the
+        derivation, and this holds the two copies character-identical, which is
+        the only assertion that would notice the *Windows* branch drifting
+        while both platforms' tests still pass on the Linux one.
+
+        (The rule has exactly one exception as of 0.2.0, and it is pinned by
+        TestServiceHosting below rather than left to be noticed: hosting a
+        Windows service needs the SCM handshake, which is neither small enough
+        to duplicate nor reachable on Linux.)
 
         This is also the exception named in test_platform's rule that no file
         outside timelapse_platform tests os.name.
@@ -802,6 +810,160 @@ class TestCredentialsNeverReachTheLog(unittest.TestCase):
         self.assertEqual(
             [(p.pattern, p.flags, r) for p, r in cap.CRED_PATTERNS],
             [(p.pattern, p.flags, r) for p, r in enc.CRED_PATTERNS])
+
+
+class TestServiceHosting(unittest.TestCase):
+    """The daemon as a real Windows service, and the one import that costs.
+
+    The independence rule is bent here rather than broken, and the shape of the
+    bend is what these pin. On Linux this daemon still imports nothing: the
+    import is inside run_service(), which nothing on Linux calls. What the rule
+    was written to prevent is a partial upgrade leaving a stale sibling beside a
+    fresh daemon, and on Windows that is caught by `timelapse version`, which
+    compares all seven installed files including timelapse_platform.py.
+    """
+
+    SOURCE = Path(cap.__file__).read_text(encoding="utf-8")
+
+    def test_the_daemon_has_no_module_level_import_of_a_sibling(self):
+        """The claim, asserted rather than described. Anchored to the start of
+
+        a line, because the 0.2.0 scan for os.replace matched its own docstring
+        and a mention is not an import.
+        """
+        self.assertEqual(
+            re.findall(r"^(?:from|import)\s+timelapse_\w+", self.SOURCE, re.M),
+            [], "the daemon gained a module-level sibling import")
+
+    def test_the_one_import_is_inside_the_windows_only_entry_point(self):
+        import inspect
+        body = inspect.getsource(cap.run_service)
+        self.assertIn("from timelapse_platform import", body)
+
+    def test_running_normally_never_reaches_it(self):
+        """The proof that Linux behaviour is unchanged: no --service, no
+
+        import, so a broken timelapse_platform.py cannot stop a capture that
+        does not need it.
+        """
+        with mock.patch.object(cap, "run_daemon") as daemon, \
+             mock.patch.object(cap, "run_service") as service:
+            with mock.patch.object(cap.sys, "argv",
+                                   ["timelapse_capture.py", "cfg.json"]):
+                self.assertEqual(cap.main(), 0)
+        daemon.assert_called_once_with("cfg.json")
+        service.assert_not_called()
+
+    def test_the_service_flag_is_not_mistaken_for_the_config_path(self):
+        """A short option swallowing its neighbour is a trap this project has
+
+        met before (-e:CAM). Here the risk is the reverse: --service in front
+        of the path would become the config filename and the daemon would look
+        for a file called --service.
+        """
+        for argv in (["--service", "cfg.json"], ["cfg.json", "--service"]):
+            with mock.patch.object(cap, "run_service") as service:
+                with mock.patch.object(cap.sys, "argv",
+                                       ["timelapse_capture.py"] + argv):
+                    cap.main()
+            service.assert_called_once_with("cfg.json")
+
+    def test_the_service_flag_alone_falls_back_to_the_default_config(self):
+        with mock.patch.object(cap, "run_service") as service:
+            with mock.patch.object(cap.sys, "argv",
+                                   ["timelapse_capture.py", "--service"]):
+                cap.main()
+        service.assert_called_once_with(cap.CONFIG_PATH)
+
+    def test_ready_is_called_once_the_camera_threads_are_running(self):
+        """Not once the config parses. A service that reports RUNNING before it
+
+        can do its job reports a fault as health, and the SCM then has no
+        reason to apply its restart actions.
+        """
+        import inspect
+        body = inspect.getsource(cap.run_daemon)
+        started = body.index("for t in threads:\n        t.start()")
+        self.assertLess(started, body.index("ready()"))
+
+    def test_no_enabled_cameras_raises_rather_than_exits(self):
+        """sys.exit() under the SCM writes to a stderr that is nowhere, so the
+
+        service would start, stop and explain nothing. Raised, it reaches the
+        entry point's guard and lands in service-error.log.
+        """
+        source = inspect.getsource(cap.run_daemon)
+        self.assertIn("raise SystemExit", source)
+        # Anchored, because a comment explaining why sys.exit() is wrong here
+        # is not a call to it. The 0.2.0 os.replace scan matched its own prose.
+        self.assertEqual(re.findall(r"^\s*sys\.exit\(", source, re.M), [])
+
+    def test_signal_handlers_are_only_installed_on_the_main_thread(self):
+        """signal.signal refuses anywhere else, and the SCM hands us a thread
+
+        it created. Without the guard the daemon would raise ValueError before
+        starting a single camera, on the one platform where nobody would see it.
+        """
+        cfg = {"paths": {"frames_root": self.tmp, "log_dir": self.tmp},
+               "capture": {"min_free_gb": 0}, "cameras": []}
+        with mock.patch.object(cap, "load_config", return_value=cfg), \
+             mock.patch.object(cap, "setup_logging"), \
+             mock.patch.object(cap.signal, "signal") as signal_call, \
+             mock.patch.object(cap.threading, "main_thread",
+                               return_value=object()):
+            with self.assertRaises(SystemExit):
+                cap.run_daemon("cfg.json")
+        signal_call.assert_not_called()
+
+    def test_they_are_installed_when_it_is_the_main_thread(self):
+        cfg = {"paths": {"frames_root": self.tmp, "log_dir": self.tmp},
+               "capture": {"min_free_gb": 0}, "cameras": []}
+        with mock.patch.object(cap, "load_config", return_value=cfg), \
+             mock.patch.object(cap, "setup_logging"), \
+             mock.patch.object(cap.signal, "signal") as signal_call:
+            with self.assertRaises(SystemExit):
+                cap.run_daemon("cfg.json")
+        self.assertEqual(signal_call.call_count, 2)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+
+class TestServiceError(unittest.TestCase):
+    """The only witness a service failure has before logging exists."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patch = mock.patch.object(cap, "CONFIG_DIR", str(self.tmp))
+        patch.start()
+        self.addCleanup(patch.stop)
+        # The logging half is the RedactingFormatter's job and is tested where
+        # that lives; silenced here so the suite does not print what the file
+        # is being asserted not to contain.
+        quiet = mock.patch.object(cap, "log")
+        quiet.start()
+        self.addCleanup(quiet.stop)
+
+    def test_it_lands_beside_the_config(self):
+        cap.service_error("config.json is not valid JSON")
+        text = (self.tmp / "service-error.log").read_text(encoding="utf-8")
+        self.assertIn("not valid JSON", text)
+
+    def test_it_redacts_like_every_other_thing_that_writes_a_line(self):
+        """The worst defect this project has shipped, met in a new file.
+
+        A config that will not parse is exactly the case where the text being
+        reported is a slice of a config, and a Reolink URL *is* the credential.
+        """
+        cap.service_error("failed on https://cam/x?user=a&password=hunter2")
+        text = (self.tmp / "service-error.log").read_text(encoding="utf-8")
+        self.assertNotIn("hunter2", text)
+
+    def test_a_failure_to_record_a_failure_is_not_itself_a_failure(self):
+        with mock.patch.object(cap, "CONFIG_DIR", str(self.tmp / "nope" / "x")):
+            cap.service_error("something")            # must not raise
 
 
 class TestCaptureState(unittest.TestCase):

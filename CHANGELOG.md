@@ -10,6 +10,27 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Added
+- **The capture daemon can run as a real Windows service, and the nightly
+  encode and credential watch as scheduled tasks.** **Nothing changes on a
+  Linux install.** A plain `python.exe` registered with `sc.exe` is not a
+  service: Windows waits about thirty seconds for it to check in and then kills
+  it, reporting an error that reads as a broken script. The daemon now performs
+  that check-in itself, using nothing outside the Python standard library, so
+  the port needs no extra software and no third-party wrapper. It appears in
+  `services.msc` like anything else, starts automatically after the network is
+  up, and restarts itself if it ever stops unexpectedly. Stopping it is orderly:
+  Windows is told to wait while the camera threads finish, rather than being
+  left to assume the service has hung.
+
+  The two batch jobs stay scheduled tasks, which mirrors the Linux split
+  exactly, because a job that finishes in seconds is not a service. Their
+  schedules are the same ones the Linux timers use, down to the five-minute
+  jitter on the nightly run and the fact that a missed encode is caught up and a
+  missed credential check is not.
+
+  Registering and removing all three is `timelapse_setup.py --install-units` and
+  `--remove-units`, with `--unit-status` for a one-line-per-component summary.
+  The Windows installer will call these rather than reimplement them.
 - **`scripts/timelapse_platform.py`, the one file allowed to know which
   operating system it is running on.** **Nothing changes on a Linux install**:
   every path, every message and every command is byte-for-byte what it was, and

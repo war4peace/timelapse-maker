@@ -145,6 +145,23 @@ jobs:
           python -m json.tool "${env:RUNNER_TEMP}\wizard.json"
           python .github/check_windows_config.py "${env:RUNNER_TEMP}\wizard.json"
 
+      # Registering needs elevation and a runner is not the place to find out
+      # whether it has any, so this exercises the two halves that do not: the
+      # status query answers about services that are not there without
+      # inventing a fault, and the registration path refuses cleanly when it
+      # cannot proceed rather than tracebacking out of a Win32 error.
+      #
+      # --remove-units is checked for the absence of a traceback rather than
+      # for an exit code, because whether a runner is elevated is not this
+      # project's to know: refusing and succeeding are both correct answers,
+      # and a Win32 error escaping as a stack trace is not.
+      - name: Service registration answers without a service installed
+        run: |
+          python scripts/timelapse_setup.py --unit-status
+          $out = python scripts/timelapse_setup.py --remove-units 2>&1 | Out-String
+          Write-Host $out
+          if ($out -match 'Traceback') { throw "it tracebacked" }
+
   shell:
     runs-on: ubuntu-latest
     timeout-minutes: 15

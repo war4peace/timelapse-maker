@@ -34,11 +34,14 @@ from urllib.parse import unquote, urlparse
 # imports the most of this. Names rather than the module: several of them read
 # as ordinary constants at their call sites, which is the point.
 from timelapse_platform import (
-    CONFIG_DIR, CONFIG_PATH, DATA_ROOT_DEFAULT, LINUX_STATE_DIR,
-    LINUX_WEB_STATE_DIR, STATE_DIR_DEFAULT, WEB_STATE_DIR_DEFAULT,
-    is_reserved_name, log_hint, restart_hint, restart_service,
-    scan_filesystems, secure_secret_file, service_is_active, start_hint,
-    stop_hint,
+    CAPTURE_UNIT, CONFIG_DIR, CONFIG_PATH, DATA_ROOT_DEFAULT, ENCODE_UNIT,
+    LINUX_STATE_DIR, LINUX_WEB_STATE_DIR, SERVICE_STATES, STATE_DIR_DEFAULT,
+    WATCH_UNIT, WEB_STATE_DIR_DEFAULT, daily_trigger, elevation_hint,
+    install_service, install_task, is_elevated, is_reserved_name, is_scheduled,
+    log_hint, native_name, remove_service, remove_task, repeating_trigger,
+    restart_hint, restart_service, scan_filesystems, secure_secret_file,
+    service_is_active, service_state, start_hint, stop_hint, stop_service,
+    task_exists, task_info, task_xml,
 )
 
 __version__ = "0.1.9"
@@ -1503,6 +1506,123 @@ def restart_capture_if_running():
         note(f"Apply it with: {restart_hint(unit)}")
         return
     restart_unit(unit, "Capture restarted on the new camera list.")
+
+
+# ----------------------------------------------------------------------------
+# Registering the Windows service and the two scheduled tasks
+#
+# The Linux equivalent is install.sh sync_units(): a shell script writing four
+# unit files. This lives in Python rather than in install.ps1 for one reason,
+# and it is the reason `tools/` was deleted: two installers that both know how
+# to register a service disagree within one release. install.ps1 front-ends
+# this, exactly as item 11c.6b says the GUI must front-end install.ps1.
+#
+# The definitions are one table because the mapping from a unit file matters
+# more than any single field. Every line here has a line in service/*.service
+# or service/*.timer behind it, and the pairs should be read together.
+# ----------------------------------------------------------------------------
+
+def service_definitions(scripts_dir, config_path, python=None):
+    """What to register, as (unit, description, argv, extras) tuples.
+
+    Pure, so both CI legs assert the same table: the argv, the schedule and the
+    mapping onto the unit files are exactly what goes wrong here, and none of it
+    needs a service manager to check.
+    """
+    python = python or sys.executable
+    scripts = Path(scripts_dir)
+    cfg = str(config_path)
+
+    def argv(script, *flags):
+        return [python, str(scripts / script)] + list(flags) + [cfg]
+
+    return [
+        # timelapse-capture.service. --service is what makes the process talk
+        # to the SCM; without it this is the ordinary foreground daemon.
+        (CAPTURE_UNIT, "Camera snapshot capture for timelapse",
+         argv("timelapse_capture.py", "--service"), {}),
+        # timelapse-encode.timer: OnCalendar=*-*-* 00:05:00, Persistent=true,
+        # RandomizedDelaySec=300, TimeoutStartSec=infinity.
+        (ENCODE_UNIT, "Encode yesterday's timelapse frames into daily videos",
+         argv("timelapse_encode.py"),
+         {"triggers": daily_trigger(0, 5, jitter_minutes=5),
+          "catch_up": True, "time_limit": "PT0S"}),
+        # timelapse-watch.timer: every 5 minutes, TimeoutStartSec=60, and
+        # deliberately NOT Persistent, because a missed check is not worth
+        # catching up on.
+        (WATCH_UNIT, "Report cameras that are refusing our credentials",
+         argv("timelapse_encode.py", "--watch"),
+         {"triggers": repeating_trigger(5),
+          "catch_up": False, "time_limit": "PT1M"}),
+    ]
+
+
+def install_units(scripts_dir, config_path, user_id=None):
+    """Register everything. True if all of it landed.
+
+    Failures are reported per unit and do not stop the others, which is the
+    same failure isolation the encoder has: a watch task that will not register
+    must not cost the operator their capture service.
+    """
+    ok_all = True
+    for unit, description, argv, extras in service_definitions(scripts_dir,
+                                                               config_path):
+        native = native_name(unit)
+        if is_scheduled(unit):
+            xml = task_xml(description, argv, user_id=user_id, **extras)
+            ok, detail = install_task(unit, xml)
+        else:
+            ok, detail = install_service(unit, description, argv)
+        if ok:
+            good(f"Registered {native}.")
+            if detail:
+                warn(detail)
+        else:
+            fail(f"Could not register {native}: {detail}")
+            ok_all = False
+    return ok_all
+
+
+def remove_units():
+    """Deregister everything. True if all of it went, absent counting as gone."""
+    ok_all = True
+    for unit in (CAPTURE_UNIT, ENCODE_UNIT, WATCH_UNIT):
+        native = native_name(unit)
+        if is_scheduled(unit):
+            ok, detail = remove_task(unit)
+        else:
+            # Stopping first is not optional: DeleteService on a running
+            # service only marks it for deletion, and it then lingers as
+            # "marked for deletion" until the process exits, which blocks the
+            # next install with a error that names neither cause.
+            stop_service(unit)
+            ok, detail = remove_service(unit)
+        if ok:
+            good(f"Removed {native}.")
+        else:
+            fail(f"Could not remove {native}: {detail}")
+            ok_all = False
+    return ok_all
+
+
+def print_unit_status():
+    """One line per component. Never guesses: unanswerable says so."""
+    for unit in (CAPTURE_UNIT, ENCODE_UNIT, WATCH_UNIT):
+        native = native_name(unit)
+        if is_scheduled(unit):
+            info = task_info(unit)
+            if info is None:
+                state = "not installed" if task_exists(unit) is False \
+                    else "unknown"
+            else:
+                state = f"{info.get('State', '?')}, last result " \
+                        f"{info.get('LastResult', '?')}"
+        else:
+            code = service_state(unit)
+            state = "unknown" if code is None else SERVICE_STATES.get(code,
+                                                                      code)
+        print(f"{native:<20} {state}")
+    return 0
 
 
 def manage_cameras(cfg):
@@ -3425,6 +3545,19 @@ def main():
                     help="print the one path the web UI must be allowed to write")
     ap.add_argument("--print-state-path", metavar="CONFIG",
                     help="print the directory the daemons publish state into")
+    units = ap.add_argument_group(
+        "service registration (Windows)",
+        "What install.sh does with unit files, for the platform that has none. "
+        "install.ps1 calls these; the Linux installer does not.")
+    units.add_argument("--install-units", action="store_true",
+                       help="register the capture service and the two tasks")
+    units.add_argument("--remove-units", action="store_true",
+                       help="deregister them again")
+    units.add_argument("--unit-status", action="store_true",
+                       help="print one line per component, for scripts")
+    units.add_argument("--scripts-dir", default=None,
+                       help="where the scripts are installed "
+                            "(default: beside this one)")
     ap.add_argument("--version", action="version",
                     version=f"%(prog)s {__version__}")
     args = ap.parse_args()
@@ -3485,6 +3618,22 @@ def main():
         configured = (cfg.get("paths", {}).get("state_dir") or "").strip()
         print(Path(configured).as_posix() if configured else LINUX_STATE_DIR)
         return 0
+
+    # Registration, and the status that goes with it. Before init_tty() because
+    # none of the three prompts: install.ps1 drives them, and an installer that
+    # can be blocked on a question it cannot see is an installer that hangs.
+    if args.unit_status:
+        return print_unit_status()
+
+    if args.install_units or args.remove_units:
+        if not is_elevated():
+            fail("This changes how the machine starts, so it needs privilege.")
+            note(elevation_hint())
+            return 1
+        scripts = args.scripts_dir or Path(__file__).resolve().parent
+        if args.remove_units:
+            return 0 if remove_units() else 1
+        return 0 if install_units(scripts, args.output) else 1
 
     init_tty(force_defaults=args.defaults, use_stdin=args.stdin)
 

@@ -215,7 +215,8 @@ destination**. The first is the web UI's Log tab (step 5), the second is
 transfer (step 4). See architecture.md §4.6a for what was settled; the entry
 below is the design that produced it and is left as written.
 
-**2. Service supervision. Real Windows services, not scheduled tasks.**
+**2. Service supervision. Real Windows services, not scheduled tasks. BUILT
+2026-08-16** (the hosting; see 11f step 3a for what is and is not done).
 Requirement from the operator 2026-08-15, and it is right for reasons beyond
 appearance. A first draft of this entry recommended Task Scheduler and that
 recommendation is **withdrawn**.
@@ -470,7 +471,9 @@ Blue Iris is doing hardware work that needs the privilege, and this is a page
 that lists files.
 
 **3. The status page needs a new source, and the project's own rule says
-which.** `systemctl show` was chosen over `systemctl status` because the
+which. HALF BUILT 2026-08-16**: the machine-readable sources exist
+(`service_state()` through `QueryServiceStatusEx`, `task_info()` through
+PowerShell as JSON) and `--unit-status` uses them. The status *page* is step 5. `systemctl show` was chosen over `systemctl status` because the
 human-readable output is not a contract. The identical argument applies twice
 as hard on Windows, where the human output is not merely unstable but
 **localised**: `sc query` and `schtasks /query /FO LIST /V` both print field
@@ -999,6 +1002,69 @@ stops being worth it:
 3. Capture as a real service and encode as a scheduled task, with file
    logging. That is a *useful product on its own*: it captures, it encodes, it
    notifies. Ship or evaluate at this point before going further.
+
+   **3a done 2026-08-16**: the hosting itself. `run_as_service()` in the
+   platform module, the SCM query/control/registration bindings, the scheduled
+   task definitions, and `timelapse_setup.py --install-units / --remove-units /
+   --unit-status`, which is what `install.ps1` will front-end. File logging was
+   already done at step 2. 1,469 tests, zero skips on both platforms.
+   **What remains of step 3 is 3b: `install.ps1`, `timelapse.cmd`, and the
+   wizard's Windows adaptations** (ffmpeg path per 6a, the storage scan per 8,
+   drive-letter resolution per 9). Nothing is shippable until those exist.
+
+   Four decisions taken 2026-08-16 before any of it was written:
+
+   - **Capture runs as LocalSystem**, not as a created service account. 2a's
+     reasoning for an administrative account is entirely about reaching the
+     NAS, and capture never touches it: transfer happens in *encode*, which is
+     a scheduled task. So the whole account-creation apparatus (NetUserAdd,
+     `LsaAddAccountRights`, the deny rights, the registry hiding) is deleted
+     from this step rather than deferred within it, and the machine-account
+     objection in 2a does not apply because nothing here presents on the
+     network. `ChangeServiceConfigW` can change it when step 4 settles
+     transfer. **This does not reopen 2a**; it narrows it to the component the
+     argument was actually about.
+   - **The daemon imports the platform module, on Windows only.** The rule was
+     written about Linux and systemd, and stays exactly true there because the
+     import is inside `run_service()`, which Linux never calls. The alternative
+     was a sixth pinned duplicate of the SCM handshake, which is neither small
+     nor Linux-reachable, and the failure it protects against (a stale sibling
+     from a partial upgrade) is what `timelapse version` already catches.
+   - **Registration lives in Python, not in `install.ps1`.** For the reason
+     `tools/` was deleted: two installers that both know how to register a
+     service disagree within one release. This is the same rule 6b states for
+     the GUI, applied one level down.
+   - **Verification is `temp/step3_check.py`, run from an Administrator
+     prompt.** Everything around the SCM is pure and unit-tested on both CI
+     legs; the lifecycle needs privilege, and a runner's privilege is not this
+     project's to assume.
+
+   Three things measured while building it, all of which changed something:
+
+   - **`ctypes.wintypes` is wrong on Linux.** `wintypes.DWORD` is `c_ulong`,
+     which is **eight** bytes on 64-bit Linux and four on Windows, so every
+     structure layout would have been silently wrong on three of the four CI
+     legs *and every test asserting one would have agreed with it*. The
+     structures use `c_uint32` and friends, which is what makes
+     `sizeof(SERVICE_STATUS) == 28` assertable from either platform. This is
+     the `PIX_FMT` lesson in a new place: a check that cannot fail is not a
+     check.
+   - **The task XML is verified without elevation**, and the technique is worth
+     keeping (`temp/step3_probe.py`). Task Scheduler validates the definition
+     *before* it checks who is asking, so a schema mistake and a privilege
+     refusal give different errors. Registering the same definitions with a
+     least-privilege principal needs no elevation at all and succeeded, and a
+     deliberately broken interval was run as a control, because "Access is
+     denied" everywhere would otherwise prove nothing. Reading the tasks back
+     confirmed the two settings that cannot be expressed on the `schtasks`
+     command line survived as meant: `RandomDelay` PT5M on the nightly job, and
+     a `Repetition` interval with **no** `Duration` on the watch.
+   - **`signal.signal` refuses to run off the main thread**, and the SCM hands
+     the service a thread it created. Without a guard the daemon would raise
+     `ValueError` before starting a single camera, on the one platform where
+     nobody would see it: this is the `-strftime_mkdir` shape again, a call
+     that is correct everywhere it has ever been tested and wrong where it has
+     not.
 4. Transfer via robocopy.
 5. The web UI last, because it carries the status source, the log source and
    the hardening question, which are three of the four hardest problems in
