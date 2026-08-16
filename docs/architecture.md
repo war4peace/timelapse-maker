@@ -2285,6 +2285,26 @@ encode pipeline is shared code the Linux legs exercise on every push, and
 fetching an ffmpeg build would put a download into the one job that otherwise
 has no network dependency at all.
 
+**The encode pipeline was run natively on Windows on 2026-08-16**, for the
+first time, and passed every assertion on the first attempt. That is worth
+recording because it was the largest untested surface left after step 3: CI's
+Windows leg carries no ffmpeg, every previous smoke test had been in WSL, and
+the nightly task had been registered but never fired. It selected `hevc_nvenc`,
+so Windows *hardware* encoding is now exercised too. What it settles, none of
+which had been through this code on that platform before: the concat list with
+native backslash paths (the 0.1.9 research measured ffmpeg accepting them, but
+that was a probe, not `write_concat_list()`), the colour conversion and tagging,
+the `.encoded.json` marker with `--force` and the re-run skip, `tmix` smoothing,
+the `encode.json` run records, and the RTSP writer taking its argv from
+`RtspCamera._cmd()`, including the day directory being created in Python and an
+empty one being discarded. `av1_nvenc` is still unavailable on the development
+GPU, so the AV1 path remains exercised only in the Linux deployment.
+
+Separately confirmed, because the smoke test does not assert it and a scheduled
+task's stdout goes nowhere: the encoder writes `encode-YYYYMMDD.log` through
+`DailyFileHandler`. Without that, a failed nightly run on Windows would leave no
+trace of any kind.
+
 **What CI cannot reach on Windows is the service manager**, because registering
 one needs elevation and whether a runner has any is not this project's to
 assume. So the split is deliberate: everything *around* the SCM is pure and
