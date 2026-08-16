@@ -3606,7 +3606,8 @@ class TestWindowsTransfer(unittest.TestCase):
     that cannot work.
     """
 
-    def drive(self, keystrokes, mapping=None, fixed="D"):
+    def drive(self, keystrokes, mapping=None, fixed="D",
+              probe_ok=True, probe_why=""):
         """`fixed` names the drive letters that are real local disks here.
 
         Patched at plat.drive_kind rather than at setup.drive_is_local, and
@@ -3614,6 +3615,15 @@ class TestWindowsTransfer(unittest.TestCase):
         collaborator with a fixed return value meant the argument never
         reached it, which is exactly how drive_is_local came to want `U:` while
         every caller handed it `U:\\TL`. Patch below the seam you are testing.
+
+        The write probe is stubbed, and that one is not a preference. It is
+        the real thing: it mkdirs the destination and writes a file into it,
+        so an unstubbed run of this class created D:\\timelapse\\out on the
+        developer's disk and wrote to \\\\tower\\cctv\\TL on the author's NAS,
+        from `python -m unittest`. **A unit test must not touch anything
+        outside its own temp directory**, and the two functions are patched on
+        timelapse_encode because that is the module that defines them, which
+        works here only because the wizard imports them inside the function.
         """
         prev_tty, prev_auto = setup._TTY, setup.AUTO
         setup.AUTO = False
@@ -3628,6 +3638,12 @@ class TestWindowsTransfer(unittest.TestCase):
                  mock.patch.object(plat, "drive_kind",
                                    side_effect=lambda root:
                                    plat.DRIVE_FIXED if root[0] in fixed else 1), \
+                 mock.patch.object(enc, "try_destination",
+                                   return_value=(probe_ok, probe_why)), \
+                 mock.patch.object(enc, "reach_destination",
+                                   return_value=(probe_ok, probe_why)), \
+                 mock.patch.object(setup, "disconnect_share",
+                                   return_value=(True, "")), \
                  mock.patch.object(setup, "network_path",
                                    side_effect=lambda p: mapping.get(str(p))):
                 setup.choose_transfer(cfg)
@@ -3645,7 +3661,7 @@ class TestWindowsTransfer(unittest.TestCase):
         self.assertEqual(transfer["destination"], "D:\\timelapse\\out")
 
     def test_a_unc_path_is_stored_as_typed(self):
-        transfer, _ = self.drive("y\n\\\\tower\\cctv\\TL\n")
+        transfer, _ = self.drive("y\n\\\\tower\\cctv\\TL\nn\n")
         self.assertEqual(transfer["destination"], "\\\\tower\\cctv\\TL")
 
     def test_a_mapped_drive_is_stored_as_its_unc_target(self):
@@ -3654,16 +3670,90 @@ class TestWindowsTransfer(unittest.TestCase):
         a path the operator can open in Explorer: drive mappings belong to a
         logon session, and a service gets its own with none in it.
         """
-        transfer, out = self.drive("y\nU:\\TL\n",
+        transfer, out = self.drive("y\nU:\\TL\nn\n",
                                    mapping={"U:\\TL": "\\\\tower\\cctv\\TL"})
         self.assertEqual(transfer["destination"], "\\\\tower\\cctv\\TL")
         self.assertIn("mapped drive", out)
         self.assertIn("\\\\tower\\cctv\\TL", out)
 
     def test_it_says_why_rather_than_silently_substituting(self):
-        _transfer, out = self.drive("y\nU:\\TL\n",
+        _transfer, out = self.drive("y\nU:\\TL\nn\n",
                                     mapping={"U:\\TL": "\\\\t\\c\\TL"})
         self.assertIn("logon session", out)
+
+    def test_a_share_is_told_that_the_encode_runs_as_another_account(self):
+        """The whole difficulty on this platform, said before the question.
+
+        The wizard runs as the operator; the nightly encode runs as the system
+        account, which presents the machine name on the network. A probe that
+        passed here proves nothing about the job that matters, and an operator
+        who is not told that will read a green line as a guarantee.
+        """
+        _transfer, out = self.drive("y\n\\\\tower\\cctv\\TL\nn\n")
+        self.assertIn("system account", out)
+        self.assertIn("\\\\tower\\cctv", out)
+
+    def test_a_local_folder_is_not_asked_about_credentials(self):
+        # There is no share to authenticate to, and LocalSystem is the most
+        # privileged account on this machine, so the probe carries over.
+        _transfer, out = self.drive("y\nD:\\timelapse\\out\n")
+        self.assertNotIn("system account", out)
+        self.assertNotIn("Store credentials", out)
+
+    def test_credentials_are_stored_when_offered(self):
+        transfer, out = self.drive(
+            "y\n\\\\tower\\cctv\\TL\ny\nTOWER\\war\nhunter2\n")
+        self.assertEqual(transfer["username"], "TOWER\\war")
+        self.assertEqual(transfer["password"], "hunter2")
+        self.assertNotIn("hunter2", out, "the password must not be echoed")
+
+    def test_declining_credentials_stores_neither_key(self):
+        # Absent rather than empty: "" is a real answer to "did you set one?"
+        # and an empty username would make reach_destination() think it had
+        # something to try.
+        transfer, out = self.drive("y\n\\\\tower\\cctv\\TL\nn\n")
+        self.assertNotIn("username", transfer)
+        self.assertNotIn("password", transfer)
+        self.assertIn("untested", out)
+
+    def test_a_failed_probe_keeps_the_credentials_for_correction(self):
+        transfer, out = self.drive(
+            "y\n\\\\tower\\cctv\\TL\ny\nwar\nwrong\n",
+            probe_ok=False, probe_why="the password was rejected (error 1326)")
+        self.assertEqual(transfer["username"], "war")
+        self.assertIn("1326", out)
+        self.assertIn("will fail until this passes", out)
+
+    def test_the_existing_connection_is_dropped_before_probing(self):
+        """Or the probe cannot fail.
+
+        Windows permits one identity per server per session, so a connection
+        made earlier by Explorer or by a previous run makes the new credentials
+        answer ERROR_SESSION_CREDENTIAL_CONFLICT, and the write then succeeds
+        over *that* connection and reports the new password as good.
+        """
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY("y\n\\\\tower\\cctv\\TL\ny\nwar\npw\n", tty=False)
+        cfg = setup.default_config()
+        order = []
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 mock.patch.object(setup, "IS_WINDOWS", True), \
+                 mock.patch.object(plat, "IS_WINDOWS", True), \
+                 mock.patch.object(enc, "try_destination",
+                                   return_value=(False, "denied")), \
+                 mock.patch.object(
+                     enc, "reach_destination",
+                     side_effect=lambda *a: (order.append("probe"), (True, ""))[1]), \
+                 mock.patch.object(
+                     setup, "disconnect_share",
+                     side_effect=lambda *a: (order.append("drop"), (True, ""))[1]), \
+                 mock.patch.object(setup, "network_path", return_value=None):
+                setup.choose_transfer(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        self.assertEqual(order, ["drop", "probe"])
 
     def test_a_drive_it_cannot_resolve_is_refused_not_stored(self):
         """The backstop for a mapping made without /persistent, and for a typo.

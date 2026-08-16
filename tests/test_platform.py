@@ -629,6 +629,202 @@ class TestStructureLayout(unittest.TestCase):
     def test_the_dword_this_project_uses_is_four_bytes_on_both_platforms(self):
         self.assertEqual(ctypes.sizeof(plat._DWORD), 4)
 
+    def test_a_netresource_is_four_dwords_and_four_pointers(self):
+        # 16 bytes of counters, then pointers on their own alignment, so the
+        # answer differs by word size and not by platform: 48 on a 64-bit
+        # build of either, 32 on a 32-bit one.
+        expected = 16 + 4 * ctypes.sizeof(ctypes.c_void_p)
+        self.assertEqual(ctypes.sizeof(plat.NETRESOURCE), expected)
+
+    def test_the_remote_name_is_where_the_share_goes(self):
+        # Cheap, and it is the field a typo would silently move: setting
+        # lpLocalName instead asks for a drive letter, which is the entire
+        # mechanism this code exists to avoid.
+        nr = plat.NETRESOURCE()
+        nr.lpRemoteName = r"\\tower\cctv"
+        self.assertEqual(nr.lpRemoteName, r"\\tower\cctv")
+        self.assertIsNone(nr.lpLocalName)
+
+
+class TestShareRoot(unittest.TestCase):
+    """\\\\server\\share from a path inside it, on both platforms.
+
+    Pure string work on purpose: WNetAddConnection2W wants the share and
+    refuses a folder inside it, and every caller here holds the folder.
+    """
+
+    def test_a_folder_inside_a_share(self):
+        self.assertEqual(plat.share_root(r"\\tower\cctv\TL\_temp_"),
+                         r"\\tower\cctv")
+
+    def test_the_share_itself(self):
+        self.assertEqual(plat.share_root(r"\\tower\cctv"), r"\\tower\cctv")
+
+    def test_forward_slashes_are_accepted(self):
+        # Windows accepts them, so an operator who types them should not be
+        # told their path is not a path.
+        self.assertEqual(plat.share_root("//tower/cctv/TL"), r"\\tower\cctv")
+
+    def test_a_bare_server_has_no_share_to_connect_to(self):
+        # Measured, not assumed: the first implementation used
+        # ntpath.splitdrive, which answers "\\\\tower" here and so calls a
+        # server with no share on it a complete drive.
+        self.assertIsNone(plat.share_root(r"\\tower"))
+        self.assertIsNone(plat.share_root("\\\\tower\\"))
+
+    def test_a_local_path_is_not_a_share(self):
+        self.assertIsNone(plat.share_root(r"D:\timelapse\videos"))
+        self.assertIsNone(plat.share_root("/mnt/nas/tl"))
+
+    def test_nothing_at_all(self):
+        self.assertIsNone(plat.share_root(""))
+        self.assertIsNone(plat.share_root(None))
+
+    def test_is_unc_agrees_with_it(self):
+        for path in (r"\\tower\cctv\TL", "//tower/cctv", r"\\tower"):
+            self.assertTrue(plat.is_unc(path), path)
+        for path in (r"D:\out", "/mnt/nas", "", None, r"C:\\"):
+            self.assertFalse(plat.is_unc(path), path)
+
+
+class TestNetErrors(unittest.TestCase):
+    """A network error in words, keeping the number.
+
+    Both halves earn their place: the words say what to go and do, the number
+    is what survives being pasted into a search engine.
+    """
+
+    def test_a_known_code_is_explained(self):
+        text = plat.net_error(plat.ERROR_LOGON_FAILURE)
+        self.assertIn("rejected", text)
+        self.assertIn("1326", text)
+
+    def test_an_unknown_code_still_reports_the_number(self):
+        self.assertEqual(plat.net_error(4242), "error 4242")
+
+    def test_the_three_that_need_different_actions_read_differently(self):
+        # A wrong password, a share that is not there and a server that is not
+        # answering are three separate jobs for whoever reads the log.
+        wrong = plat.net_error(plat.ERROR_LOGON_FAILURE)
+        absent = plat.net_error(plat.ERROR_BAD_NET_NAME)
+        unreachable = plat.net_error(plat.ERROR_NO_NET_OR_BAD_PATH)
+        self.assertEqual(len({wrong, absent, unreachable}), 3)
+
+    def test_a_credential_conflict_explains_itself(self):
+        # The one an operator will otherwise read as a permission problem.
+        text = plat.net_error(plat.ERROR_SESSION_CREDENTIAL_CONFLICT)
+        self.assertIn("different user", text)
+
+
+class TestShareConnections(unittest.TestCase):
+    """connect_share(), with the platform declared rather than inherited.
+
+    Every test here runs on both CI legs, which is the point: patching
+    plat.IS_WINDOWS and plat._win means the real marshalling code is exercised
+    on Linux too, and a skip on one runner is a check that cannot fail there.
+    Patched on plat, the module that owns both names, because a `from ...
+    import IS_WINDOWS` elsewhere makes a second binding that does not move.
+    """
+
+    def windows(self, err=0):
+        """Pretend to be Windows with an SCM that answers `err`."""
+        api = mock.Mock()
+        api.mpr.WNetAddConnection2W.return_value = err
+        api.mpr.WNetCancelConnection2W.return_value = err
+        return api
+
+    def test_it_declines_off_windows(self):
+        # None, never False: a share refusing us and a platform that has no
+        # such mechanism need opposite responses from the caller.
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            ok, why = plat.connect_share(r"\\tower\cctv\TL", "u", "p")
+            gone, _ = plat.disconnect_share(r"\\tower\cctv")
+        self.assertIsNone(ok)
+        self.assertIsNone(gone)
+        self.assertIn("Windows", why)
+
+    def test_a_local_path_is_not_a_share(self):
+        # The other None, and only the detail separates the two.
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win",
+                               side_effect=AssertionError("bound the API")):
+            ok, why = plat.connect_share("D:\\out")
+        self.assertIsNone(ok)
+        self.assertIn("not a network path", why)
+
+    def test_it_connects_to_the_share_not_the_folder(self):
+        api = self.windows()
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win", return_value=api):
+            ok, _ = plat.connect_share(r"\\tower\cctv\TL\_temp_", "war", "pw")
+        self.assertTrue(ok)
+        ref, password, user, flags = api.mpr.WNetAddConnection2W.call_args[0]
+        self.assertEqual(ref._obj.lpRemoteName, r"\\tower\cctv")
+        self.assertEqual((password, user), ("pw", "war"))
+        # Nothing written to the operator's profile: a persistent connection
+        # would be a change to their machine nobody asked this tool to make.
+        self.assertEqual(flags, 0)
+
+    def test_it_asks_for_no_drive_letter(self):
+        """The single most important field, and it is the one left empty.
+
+        A local name would request a drive letter, which belongs to one logon
+        session, which is the entire failure this mechanism routes around.
+        """
+        api = self.windows()
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win", return_value=api):
+            plat.connect_share(r"\\tower\cctv", "u", "p")
+        nr = api.mpr.WNetAddConnection2W.call_args[0][0]._obj
+        self.assertIsNone(nr.lpLocalName)
+        self.assertEqual(nr.dwType, plat.RESOURCETYPE_DISK)
+
+    def test_no_credentials_means_the_current_token(self):
+        # Passing "" would offer an empty password rather than saying "use
+        # whoever I already am", which are different requests.
+        api = self.windows()
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win", return_value=api):
+            plat.connect_share(r"\\tower\cctv", "", "")
+        _ref, password, user, _flags = api.mpr.WNetAddConnection2W.call_args[0]
+        self.assertIsNone(password)
+        self.assertIsNone(user)
+
+    def test_a_rejected_password_is_a_refusal(self):
+        api = self.windows(plat.ERROR_LOGON_FAILURE)
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win", return_value=api):
+            ok, why = plat.connect_share(r"\\tower\cctv", "war", "wrong")
+        self.assertFalse(ok)
+        self.assertIn("rejected", why)
+        self.assertIn("1326", why)
+
+    def test_a_credential_conflict_is_not_a_refusal(self):
+        """Already connected to that server as somebody else.
+
+        Their connection may be the one that works, and tearing down a
+        connection this program did not make is not ours to do, so this has to
+        come back as "not attempted" and let the caller settle it by writing.
+        """
+        api = self.windows(plat.ERROR_SESSION_CREDENTIAL_CONFLICT)
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win", return_value=api):
+            ok, why = plat.connect_share(r"\\tower\cctv", "war", "pw")
+        self.assertIsNone(ok)
+        self.assertIn("different user", why)
+
+    def test_disconnecting_names_the_share(self):
+        api = self.windows()
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win", return_value=api):
+            ok, _ = plat.disconnect_share(r"\\tower\cctv\TL\_temp_")
+        self.assertTrue(ok)
+        name, _flags, force = api.mpr.WNetCancelConnection2W.call_args[0]
+        self.assertEqual(name, r"\\tower\cctv")
+        # Never forced: something else on this machine may be using the share,
+        # and dropping it under them is not this program's call.
+        self.assertFalse(force)
+
 
 class TestServiceBinpath(unittest.TestCase):
     """A Python installed per user lives under a path with a space in it."""

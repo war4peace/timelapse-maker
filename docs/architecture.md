@@ -1786,6 +1786,73 @@ banner comes out as mojibake and the installer's first line looks like a
 corrupted download. A BOM is the usual fix; ASCII is the one that does not make
 this the single file in the repo with its own encoding rule.
 
+### 4.6c Moving the videos on Windows (0.2.0)
+
+There is no rsync here and nothing to mount, so `transfer()` branches once, at
+the top, into `transfer_windows()`. What follows is a copy, a rename and a
+delete, in that order.
+
+**The order is the substance.** `move_video()` copies to `<name>.part`, checks
+the length, renames into place with `replace_atomic()`, and only then deletes
+the original. A copy interrupted part way (the NAS rebooting, wifi dropping,
+the destination filling) otherwise leaves a file with the right name and the
+wrong length, and nothing downstream can tell it from a finished one: the
+library index counts it, the web UI offers it, and it plays as far as it got
+and then stops. Deleting the source last means the failure mode is always a
+duplicate, never a hole. The rename uses the retrying `replace_atomic()`
+rather than `os.replace` because the destination is a library the operator
+watches from, so the file being renamed over can genuinely be open in a media
+player, which is exactly the case that raises `PermissionError` on Windows and
+nowhere else.
+
+**The account is the hard part, and it is not a detail.** A connection to a
+share belongs to a *logon session*, and the nightly encode is a scheduled task
+running as LocalSystem, which presents this **machine's** name on the network
+rather than the operator's. So a destination the operator can open in Explorer
+is not necessarily one the job can write, and the symptom is an access denied
+on a path that demonstrably works. This is the drive-letter trap in its second
+disguise, and unlike that one it cannot be fixed by rewriting the path.
+
+Four ways out were considered; the chosen one is **explicit authentication at
+transfer time** (`connect_share()`, `WNetAddConnection2W`) with an optional
+`username` and `password` in the transfer block. It matches what Linux already
+does, where `install.sh` writes CIFS credentials to a 0600 file and the tool
+owns the secret rather than the OS; the config already holds camera passwords
+and `redact_config()` already covers this key by name. The alternative,
+registering the task under the operator's own account, is proven in production
+(their predecessor script ran that way for years) but needs a Windows password
+stored in Task Scheduler and breaks silently at the next password change. S4U
+does not help: an S4U token carries no network credentials at all.
+
+**The current token is tried first.** `reach_destination()` writes a probe file
+as whoever it already is, and only reaches for a stored credential when that is
+refused. A share that already accepts the machine account needs no password in
+any file, and asking for one to solve a problem the operator does not have is
+how a tool teaches people to store secrets for no reason.
+
+**Everything probes by writing.** `try_destination()` mkdirs the destination,
+writes `.timelapse-write-probe` and deletes it. Existence is not the question
+and neither is reachability: a share can be listable by an account and still
+refuse it a write, and `Path.is_dir()` *raises* on Windows for a directory the
+caller may not read. The wizard, the pre-flight and the encoder all call this
+one function, for the same reason `try_rsync_args()` lives beside the code that
+runs rsync: three opinions about one share is two too many.
+
+**What the wizard can and cannot prove is stated to the operator.** Run without
+credentials, its probe tests the operator's own account and says so; with
+credentials it makes the identical call the encoder will make, and says that
+instead. It also disconnects the share first, because Windows permits one
+identity per server per session, so an existing connection (Explorer's, or a
+previous run's) would make new credentials answer
+`ERROR_SESSION_CREDENTIAL_CONFLICT` and the write then succeed over the *old*
+connection, reporting an untested password as good.
+
+`ERROR_SESSION_CREDENTIAL_CONFLICT` is also why `connect_share()` returns
+`None` rather than `False` for it. Somebody else's connection may be the one
+that works, and tearing down a connection this program did not make is not its
+call, so the write settles it. That is the `try_rsync_args()` three-way answer
+again: refused, and could-not-attempt, are different facts.
+
 ### 4.7 `install.sh`
 
 Bootstrap. Detects the package manager (apt/dnf/yum/pacman/zypper/apk), installs
@@ -2164,9 +2231,11 @@ take an optional path as their first positional argument. See
 ### `transfer`
 | Key | Notes |
 |---|---|
-| `destination` | A local directory or an rsync remote spec; one code path serves both. |
-| `rsync_args` | Defaults include `--remove-source-files`; if you drop that, set `delete_local_after_transfer` accordingly or files accumulate. On a CIFS mount `-a` may exit 23 because owner/group cannot be set; the wizard measures which flags your share accepts and writes those. |
-| `require_mountpoint` | `false` (default), `true`, or an explicit mount path. Refuses to transfer when the destination is not on a mounted filesystem. Only meaningful for a local destination; ignored for a remote spec. |
+| `destination` | A local directory or an rsync remote spec; one code path serves both. On Windows, a local folder or a UNC path: no remote specs, and a mapped drive letter is resolved to its UNC target at wizard time and stored that way. |
+| `rsync_args` | Linux only. Defaults include `--remove-source-files`; if you drop that, set `delete_local_after_transfer` accordingly or files accumulate. On a CIFS mount `-a` may exit 23 because owner/group cannot be set; the wizard measures which flags your share accepts and writes those. |
+| `require_mountpoint` | Linux only. `false` (default), `true`, or an explicit mount path. Refuses to transfer when the destination is not on a mounted filesystem. Only meaningful for a local destination; ignored for a remote spec. |
+| `username`, `password` | Windows only, both optional and absent by default. Credentials for a UNC destination, used with `WNetAddConnection2W` and only after the current account has been refused. Needed because the nightly encode runs as LocalSystem, which presents this machine's name on the network rather than yours; see §4.6c. `redact_config()` masks the password by key name. |
+| `delete_local_after_transfer` | `true` by default. On Windows this is what makes the operation a move rather than a copy, since there is no `--remove-source-files` to imply it. |
 
 ### `notify`
 A list, not a block. Each entry has a `type` and an `enabled`, plus its own
@@ -2674,11 +2743,11 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 install.sh                       bootstrap installer, 971 lines
 install.ps1                      the Windows one, 353 lines
 scripts/timelapse_capture.py     daemon, 1427 lines
-scripts/timelapse_encode.py      batch job, 1846 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 905 lines
-scripts/timelapse_setup.py       configuration wizard, 3969 lines
+scripts/timelapse_encode.py      batch job, 2088 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
+scripts/timelapse_setup.py       configuration wizard, 4190 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_platform.py    the only platform branch, 1672 lines
+scripts/timelapse_platform.py    the only platform branch, 2078 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 367 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes

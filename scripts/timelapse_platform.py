@@ -289,6 +289,62 @@ ERROR_SERVICE_EXISTS = 1073
 ERROR_SERVICE_DOES_NOT_EXIST = 1060
 ERROR_FAILED_SERVICE_CONTROLLER_CONNECT = 1063
 
+# Network errors from WNetAddConnection2W. Each one needs a different thing
+# doing about it, which is the whole reason they are named rather than
+# printed: a wrong password, a share that is not there and a server that is
+# not answering are three separate jobs for whoever reads the log.
+ERROR_ACCESS_DENIED = 5
+ERROR_BAD_NETPATH = 53
+ERROR_NETWORK_BUSY = 54
+ERROR_BAD_NET_NAME = 67
+ERROR_ALREADY_ASSIGNED = 85
+ERROR_INVALID_PASSWORD = 86
+ERROR_NO_NET_OR_BAD_PATH = 1203
+ERROR_SESSION_CREDENTIAL_CONFLICT = 1219
+ERROR_LOGON_FAILURE = 1326
+ERROR_NO_NETWORK = 1222
+
+RESOURCETYPE_DISK = 0x00000001
+
+# Explained in the operator's terms, since these reach the nightly log and the
+# wizard. The wording says what to go and do; the number is kept beside it
+# because it is the only part that survives a web search.
+NET_ERRORS = {
+    ERROR_ACCESS_DENIED:
+        "access denied (the account is known but not allowed to write here)",
+    ERROR_BAD_NETPATH: "the server answered but has no such share",
+    ERROR_NETWORK_BUSY: "the server is too busy to accept the connection",
+    ERROR_BAD_NET_NAME: "no such share on that server",
+    ERROR_ALREADY_ASSIGNED: "that drive letter is already in use",
+    ERROR_INVALID_PASSWORD: "the password was rejected",
+    ERROR_NO_NET_OR_BAD_PATH:
+        "the server name did not resolve, or the network is unreachable",
+    ERROR_SESSION_CREDENTIAL_CONFLICT:
+        "this session is already connected to that server as a different "
+        "user, and Windows permits only one",
+    ERROR_LOGON_FAILURE: "the username or password was rejected",
+    ERROR_NO_NETWORK: "there is no network available",
+}
+
+
+class NETRESOURCE(ctypes.Structure):
+    """The argument to WNetAddConnection2W.
+
+    Fixed-width fields for the reason the whole ctypes layer uses them:
+    ctypes.wintypes.DWORD is c_ulong, which is 8 bytes on 64-bit Linux and 4
+    on Windows, so a structure declared with it has a different layout on
+    three of the four CI legs and every test asserting that layout agrees
+    with the wrong one.
+    """
+    _fields_ = [("dwScope", _DWORD),
+                ("dwType", _DWORD),
+                ("dwDisplayType", _DWORD),
+                ("dwUsage", _DWORD),
+                ("lpLocalName", _LPWSTR),
+                ("lpRemoteName", _LPWSTR),
+                ("lpComment", _LPWSTR),
+                ("lpProvider", _LPWSTR)]
+
 
 class SERVICE_STATUS(ctypes.Structure):
     _fields_ = [("dwServiceType", _DWORD),
@@ -412,6 +468,11 @@ class _WinApi(object):
         self.mpr.WNetGetConnectionW.argtypes = [_LPWSTR, _LPWSTR,
                                                 ctypes.POINTER(_DWORD)]
         self.mpr.WNetGetConnectionW.restype = _DWORD
+        self.mpr.WNetAddConnection2W.argtypes = [ctypes.POINTER(NETRESOURCE),
+                                                 _LPWSTR, _LPWSTR, _DWORD]
+        self.mpr.WNetAddConnection2W.restype = _DWORD
+        self.mpr.WNetCancelConnection2W.argtypes = [_LPWSTR, _DWORD, _BOOL]
+        self.mpr.WNetCancelConnection2W.restype = _DWORD
 
 
 _API = None
@@ -1794,6 +1855,125 @@ def network_path(path, lookup=None):
     if not target:
         return None
     return target.rstrip("\\") + text[2:]
+
+
+# ----------------------------------------------------------------------------
+# Reaching an authenticated share
+#
+# The Linux side never has this problem: install.sh mounts the CIFS share
+# system-wide from a 0600 credentials file, so by the time the encoder runs,
+# the destination is an ordinary directory and every account on the box sees
+# it identically. Windows has no equivalent. A connection to a share belongs
+# to a *logon session*, so the nightly job gets whatever its own account can
+# present, and the capture service and encode task do not share a session
+# with the operator who set them up.
+#
+# LocalSystem presents the **machine** account on the network, which a NAS
+# with real permissions will refuse. Rather than change which account the task
+# runs as (which means storing a Windows password in Task Scheduler and having
+# it break at the next password change), the transfer authenticates itself:
+# WNetAddConnection2W with credentials the config holds, which is the same
+# arrangement as the Linux credentials file, with the tool owning the secret
+# rather than the OS.
+#
+# The order matters and is the reason connect_share() is separate from the
+# copying: the current token is tried first, so a share that is already
+# reachable needs no credentials stored at all.
+# ----------------------------------------------------------------------------
+
+
+def is_unc(path):
+    """True for a \\\\server\\share path, on either platform.
+
+    Pure string work, so a Linux CI leg checks the same predicate the Windows
+    one uses. Forward slashes are accepted because Windows does, and because
+    an operator who types them should not be told their path is not a path.
+    """
+    return str(path or "").replace("/", "\\").startswith("\\\\")
+
+
+def share_root(path):
+    """\\\\server\\share for a UNC path, or None.
+
+    The connection is made to the *share*, never to a folder inside it:
+    WNetAddConnection2W wants \\\\tower\\cctv and refuses
+    \\\\tower\\cctv\\TL\\_temp_, which is the form every caller here holds.
+
+    Split by hand rather than with ntpath.splitdrive, which was the first
+    implementation and was measured wrong: it answers `\\\\tower` for a bare
+    `\\\\tower`, calling a server with no share on it a complete drive. That
+    would have handed WNetAddConnection2W something it cannot connect to and
+    reported the refusal as though the share had said no.
+    """
+    if not is_unc(path):
+        return None
+    parts = [p for p in str(path).replace("/", "\\").split("\\") if p]
+    if len(parts) < 2:
+        return None
+    return "\\\\%s\\%s" % (parts[0], parts[1])
+
+
+def net_error(err):
+    """A network error code in words, keeping the number.
+
+    Both halves earn their place: the words say what to go and do, and the
+    number is the part that survives being pasted into a search engine.
+    """
+    known = NET_ERRORS.get(err)
+    return "%s (error %d)" % (known, err) if known else "error %d" % err
+
+
+def connect_share(path, user=None, password=None):
+    """Authenticate this logon session to the share holding `path`.
+
+    Returns (ok, detail). ok is None for "not attempted", never False, which
+    is the distinction try_rsync_args() had to learn the hard way: a share
+    that refuses us and a check that could not run need opposite responses
+    from whoever reads the result.
+
+    No local drive letter is requested. A letter would be exactly the trap
+    this function exists to route around, and a UNC path needs none.
+    """
+    if not IS_WINDOWS:
+        return None, "connecting to a share is a Windows mechanism"
+    root = share_root(path)
+    if not root:
+        return None, "%s is not a network path" % path
+
+    nr = NETRESOURCE()
+    nr.dwType = RESOURCETYPE_DISK
+    nr.lpRemoteName = root
+    # dwFlags 0 means the connection is not written to the user's profile, so
+    # nothing here outlives the session that made it. Persisting it would be a
+    # change to the operator's machine that this program was not asked to make.
+    err = _win().mpr.WNetAddConnection2W(ctypes.byref(nr), password or None,
+                                         user or None, 0)
+    if err == 0:
+        return True, ""
+    if err == ERROR_SESSION_CREDENTIAL_CONFLICT:
+        # Already connected to that server as somebody else. Theirs may well
+        # be a connection that works, and tearing down a connection this
+        # program did not make is not ours to do, so this is not a refusal:
+        # the caller goes ahead and finds out by copying.
+        return None, net_error(err)
+    return False, net_error(err)
+
+
+def disconnect_share(path):
+    """Drop a connection made by connect_share(). (ok, detail).
+
+    Only ever called after connecting with explicit credentials, and that
+    restraint is the point: connections are per logon session rather than per
+    process, so disconnecting one we merely re-used would reach out and break
+    the Explorer window of whoever is signed in.
+    """
+    if not IS_WINDOWS:
+        return None, "connecting to a share is a Windows mechanism"
+    root = share_root(path)
+    if not root:
+        return None, "%s is not a network path" % path
+    err = _win().mpr.WNetCancelConnection2W(root, 0, False)
+    return (True, "") if err == 0 else (False, net_error(err))
 
 
 # ----------------------------------------------------------------------------

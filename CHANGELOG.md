@@ -10,6 +10,23 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Added
+- **Finished videos are moved to their destination on Windows.** **Nothing
+  changes on a Linux install**, which still uses rsync. The destination can be
+  a folder on this machine or a network path such as `\\tower\videos\timelapse`;
+  each video is copied under a temporary name, renamed into place once all of
+  it has arrived, and only then removed locally, so an interrupted transfer
+  can never leave a half-written file that looks complete.
+
+  **If the share needs a sign-in, the wizard now asks for it**, and this is
+  worth understanding because it is the most likely thing to go wrong. The
+  nightly encode runs as the system account, which introduces itself to your
+  server with this *computer's* name rather than yours, so a folder you open in
+  Explorer every day may still be refused. Storing a username and password for
+  the share removes the doubt: the encode signs in with them itself, and the
+  wizard tests exactly that before saving. Your existing sign-in is tried
+  first, so a share that is already open to everyone needs no password stored
+  at all. `timelapse test` reports the same thing, and says which account it
+  just proved it for.
 - **`install.ps1`, and a `timelapse` command to go with it.** **Nothing changes
   on a Linux install.** The Windows installer checks for an Administrator
   prompt, finds Python and records where it is, places the scripts, restricts

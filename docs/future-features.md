@@ -1120,7 +1120,50 @@ stops being worth it:
      nobody would see it: this is the `-strftime_mkdir` shape again, a call
      that is correct everywhere it has ever been tested and wrong where it has
      not.
-4. Transfer via robocopy.
+4. ~~Transfer via robocopy.~~ **BUILT 2026-08-16**, and **not with robocopy**,
+   which was refused on the same grounds as parsing `sc query`: its exit code
+   is a bitmask where anything under 8 means success, its output is localised,
+   and neither CI leg could exercise it. The mover is stdlib: copy to
+   `<name>.part`, verify the length, `replace_atomic()` into place, then delete
+   the original, so an interrupted copy can never leave a file that looks
+   finished under a name the library index will count. See architecture.md
+   §4.6c.
+
+   **The account was the real work, not the copying**, which is what this entry
+   under-priced by calling itself "transfer via robocopy". The nightly encode
+   is a scheduled task running as LocalSystem, which presents the *machine*
+   account on the network, so a destination the operator opens in Explorer
+   every day is not necessarily one the job may write, and the symptom is an
+   access denied on a demonstrably working path: the drive-letter trap in a
+   second disguise, and this one cannot be fixed by rewriting the path.
+   Resolved with **option 4 of the four listed above**, explicit
+   `WNetAddConnection2W` at transfer time using optional credentials in the
+   config, which is what the Linux side already does with its 0600 CIFS
+   credentials file. The current token is tried first, so a share that already
+   accepts the machine account needs no password stored anywhere.
+
+   The write probe that 11c.9 left for this step is here too, as
+   `try_destination()`: it mkdirs the destination, writes a file and deletes
+   it, and the wizard, the pre-flight and the encoder all call that one
+   function. Existence was never the question, `Path.is_dir()` *raises* on
+   Windows for a directory you may not read, and a share can be listable by an
+   account that cannot write to it.
+
+   Three things worth keeping. **The wizard disconnects before it probes**, or
+   the probe cannot fail: Windows permits one identity per server per session,
+   so an existing connection makes new credentials answer
+   `ERROR_SESSION_CREDENTIAL_CONFLICT` and the write then succeeds over the old
+   connection, reporting an untested password as good. **That same error comes
+   back as `None`, not `False`**, because somebody else's connection may be the
+   one that works, which is `try_rsync_args()`'s three-way answer again.
+   And **`ntpath.splitdrive` answers `\\tower` for a bare `\\tower`**, calling a
+   server with no share on it a complete drive, so `share_root()` splits by
+   hand; measured, after the first implementation used it.
+
+   1,678 tests, zero skips on both platforms. `temp/step4_check.py` is the
+   elevated harness, and the question it exists for is the one no test can
+   answer: it registers a throwaway task **as LocalSystem**, runs it, and reads
+   back whether that account could write to the real share.
 5. The web UI last, because it carries the status source, the log source and
    the hardening question, which are three of the four hardest problems in
    this entry.

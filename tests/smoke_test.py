@@ -288,8 +288,65 @@ def second_night(tmp, cfg, cfg_path, videos):
           len(runs) > 1 and runs[1]["days"] == [] and not runs[1]["error"])
 
     smoothed_night(tmp, cfg, cfg_path, videos)
+    transfer_night(tmp, cfg, cfg_path, videos)
     rtsp_writer_check(tmp)
     return finish(tmp)
+
+
+def transfer_night(tmp, cfg, cfg_path, videos):
+    """A real encode, then a real move, with a local destination.
+
+    Every other night here leaves transfer off, so until 0.2.0 the mover had
+    never once run on a file ffmpeg produced: the unit tests write their own
+    bytes, and the videos this program actually moves are hundreds of
+    megabytes written moments earlier by another process.
+
+    A local destination rather than a share, deliberately. The copy, the
+    length check, the rename and the delete are the same code either way, and
+    the half that needs a network is the half no automated run can have.
+    That part is `temp/step4_check.py`, run by hand against a real NAS.
+    """
+    frames_root = Path(cfg["paths"]["frames_root"])
+    day = (date.today() - timedelta(days=4)).isoformat()
+    day_dir = frames_root / "TestCam" / day
+    dest = tmp / "library"
+
+    print("\nFourth night, with transfer on...")
+    build_frames(day_dir)
+    cfg["cameras"][0].pop("smooth_frames", None)
+    cfg["transfer"] = {"enabled": True, "destination": str(dest)}
+    cfg_path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+    proc = subprocess.run([sys.executable, str(ENCODE), str(cfg_path)],
+                          capture_output=True, text=True, timeout=900)
+    name = f"TestCam.{day.replace('-', '')}.mkv"
+    print("Assertions:")
+    check("transfer run exits 0", proc.returncode == 0, f"rc={proc.returncode}")
+    check("the destination was created", dest.is_dir())
+    check("the video arrived", (dest / name).is_file(), name)
+    check("nothing was left in the videos folder",
+          not (videos / name).exists())
+    # The whole reason for the temporary name: an interrupted copy must never
+    # leave something under a name the library will read as finished.
+    check("no .part file survived",
+          not list(dest.glob("*.part")),
+          ", ".join(p.name for p in dest.glob("*.part")))
+    if (dest / name).is_file():
+        check("the moved video is non-trivial",
+              (dest / name).stat().st_size > 1024,
+              f"{(dest / name).stat().st_size} B")
+        check("it still plays as a video",
+              ffprobe_field(dest / name, "stream=pix_fmt") == "yuv420p")
+
+    # A second run with nothing to encode must still ship a backlog, which is
+    # the branch that strands videos when it is missing: fixing a share by hand
+    # and re-running the encode was once the one path that never retried.
+    (videos / "Stranded.20260101.mkv").write_bytes(b"x" * 4096)
+    again = subprocess.run([sys.executable, str(ENCODE), str(cfg_path)],
+                           capture_output=True, text=True, timeout=900)
+    check("an empty run still ships the backlog",
+          again.returncode == 0 and (dest / "Stranded.20260101.mkv").is_file(),
+          f"rc={again.returncode}")
 
 
 def smoothed_night(tmp, cfg, cfg_path, videos):

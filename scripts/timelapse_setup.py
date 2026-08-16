@@ -37,13 +37,13 @@ from timelapse_platform import (
     CAPTURE_UNIT, CONFIG_DIR, CONFIG_PATH, DATA_ROOT_DEFAULT, ENCODE_UNIT,
     FFMPEG_URL, IS_WINDOWS, LINUX_STATE_DIR, LINUX_WEB_STATE_DIR,
     SERVICE_STATES, STATE_DIR_DEFAULT, WATCH_UNIT, WEB_STATE_DIR_DEFAULT,
-    daily_trigger, drive_is_local, elevation_hint, find_tool, install_service,
-    install_task, is_elevated, is_reserved_name, is_scheduled, log_hint,
-    native_name, network_path, os_disk_mount, remove_service, remove_task,
-    repeating_trigger, resolve_tool, restart_hint, restart_service,
-    same_file_name, scan_filesystems, secure_secret_file, service_is_active,
-    service_state, start_hint, stop_hint, stop_service, task_exists, task_info,
-    task_result, task_xml, use_colour,
+    daily_trigger, disconnect_share, drive_is_local, elevation_hint, find_tool,
+    install_service, install_task, is_elevated, is_reserved_name, is_scheduled,
+    is_unc, log_hint, native_name, network_path, os_disk_mount, remove_service,
+    remove_task, repeating_trigger, resolve_tool, restart_hint,
+    restart_service, same_file_name, scan_filesystems, secure_secret_file,
+    service_is_active, service_state, share_root, start_hint, stop_hint,
+    stop_service, task_exists, task_info, task_result, task_xml, use_colour,
 )
 
 __version__ = "0.1.9"
@@ -2144,23 +2144,90 @@ def choose_windows_destination(cfg):
     # Linux flag guards against a dropped mount turning a share back into an
     # empty local directory; a UNC path that is unreachable simply fails.
     cfg["transfer"]["require_mountpoint"] = False
-    if Path(dest).is_dir():
-        good(f"{dest} exists")
-    else:
-        warn(f"{dest} does not exist yet.")
-        note("The encoder will try to create it on the first transfer. If it")
-        note("is a network path, check the name now: this is the point where")
-        note("a typo is cheap.")
+    check_windows_destination(cfg, dest)
+
+
+def check_windows_destination(cfg, dest):
+    """Write a file to the destination, and settle the credentials question.
+
+    Two separate things, and conflating them is the mistake available here.
+    The probe answers "can *this* account write there". The nightly encode
+    runs as LocalSystem, which presents the machine account on the network and
+    is a different principal entirely, so on a UNC path a probe that passes
+    proves nothing about the job that matters. That is probe_as() met on a
+    platform where the account is not a formality.
+
+    Storing credentials is what closes the gap, because then the wizard and
+    the encoder make the same WNetAddConnection2W call with the same secret,
+    and the probe becomes authoritative for both.
+    """
+    from timelapse_encode import reach_destination, try_destination
+
     print()
-    # Said plainly rather than left to be discovered at 00:05. The nightly job
-    # moves videos with rsync, which Windows does not have, so tonight it would
-    # encode correctly and then log a failure naming a package manager that
-    # does not exist here. Recording the destination is still worth doing: it
-    # is the answer the step that builds this will use.
-    warn("Moving the videos is not implemented on Windows yet.")
-    note("The destination is saved and the nightly encode will use it once it")
-    note("is. Until then the videos stay in the videos folder above, and the")
-    note("nightly summary will report the transfer as not done.")
+    ok, why = try_destination(dest)
+    if ok:
+        good(f"{dest} is writable")
+    else:
+        warn(f"Could not write to {dest}: {why}")
+
+    if not is_unc(dest):
+        # A local folder. LocalSystem is the most privileged account on this
+        # machine, so what the wizard just measured carries over.
+        if not ok:
+            note("Check the path and the permissions on it; the nightly")
+            note("encode will report this the same way until it can write.")
+        return
+
+    print()
+    note("The nightly encode runs as the system account, which presents this")
+    note(f"machine's name to {share_root(dest)}, not yours. That is a")
+    note("different account from the one you are signed in as, so it may be")
+    note("refused where you are allowed.")
+    print()
+    note("Storing a username and password for the share removes the doubt:")
+    note("the encode connects with them itself, exactly as this wizard is")
+    note("about to, so what gets tested here is what runs at 00:05.")
+    print()
+    # Defaulted to yes even when the probe just passed, because the probe
+    # passing is the case most likely to mislead: it says the operator may
+    # write there, and the operator is not who runs at 00:05. Declining costs
+    # a keystroke; the other error costs a silent nightly failure.
+    if not ask_yes("Store credentials for the share?", True):
+        cfg["transfer"].pop("username", None)
+        cfg["transfer"].pop("password", None)
+        print()
+        if ok:
+            warn("Saved without credentials, and untested for the account")
+            warn("that will actually run.")
+        note("If the nightly transfer is refused, re-run 'timelapse setup'")
+        note("and answer yes here. 'timelapse test' reports it too.")
+        return
+
+    user = ask("Share username (DOMAIN\\user, or user)", "")
+    password = ask_secret("Share password")
+    cfg["transfer"]["username"] = user
+    cfg["transfer"]["password"] = password
+
+    # Drop any existing connection to this server first, or the probe below
+    # cannot fail. Windows permits one identity per server per session, so a
+    # connection made earlier (by Explorer, or by a previous run of this
+    # wizard under a different username) makes WNetAddConnection2W answer
+    # ERROR_SESSION_CREDENTIAL_CONFLICT, and the write that follows then
+    # succeeds over *that* connection and reports the new credentials as good.
+    # Explorer re-establishes its own on next use, so the cost is nil.
+    disconnect_share(dest)
+
+    print()
+    ok, why = reach_destination(cfg["transfer"], dest)
+    if ok:
+        good(f"Connected to {share_root(dest)} as {user} and wrote a file.")
+        note("That is the same connection the nightly encode makes, so this")
+        note("result is the one that counts.")
+    else:
+        fail(f"Could not write to {dest} as {user}: {why}")
+        note("The credentials are saved so you can correct them with")
+        note("'timelapse setup' rather than retyping everything, but the")
+        note("nightly transfer will fail until this passes.")
 
 
 def choose_transfer(cfg, svcuser=None):

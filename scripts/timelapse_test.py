@@ -35,8 +35,9 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-from timelapse_platform import (CONFIG_PATH, admin_cmd,  # noqa: E402
-                                is_reserved_name, use_colour)
+from timelapse_platform import (CONFIG_PATH, IS_WINDOWS,  # noqa: E402
+                                admin_cmd, is_reserved_name, is_unc,
+                                use_colour)
 
 __version__ = "0.1.9"
 
@@ -668,6 +669,12 @@ def test_transfer(cfg):
         info("transfer disabled in config")
         return
     dest = t["destination"]
+    if IS_WINDOWS:
+        # Before the SSH branch, and that ordering is load-bearing: "D:\\out"
+        # contains a colon and does not start with "/", so the remote-spec test
+        # below would call it a hostname and run ssh at a drive letter.
+        check_windows_transfer(t, dest)
+        return
     if ":" in dest and not dest.startswith("/"):
         host = dest.split(":")[0]
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -709,6 +716,45 @@ def test_transfer(cfg):
         ok(f"backed by a mount at {mp}")
 
     check_rsync_args(cfg, dest)
+
+
+def check_windows_transfer(t, dest):
+    """Write a file to the destination, exactly as the nightly encode will.
+
+    Nothing here is inferred. is_dir() would answer a question nobody asked
+    (and raises outright on Windows for a directory this account may not
+    read), while a share can be perfectly listable and still refuse a write.
+
+    The account caveat is stated rather than glossed, because it is the whole
+    difficulty on this platform: run by hand this tests *you*, and the encode
+    runs as the system account. Stored credentials close that gap, since both
+    then make the same connection with the same secret, so the check says
+    which of the two it just did.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from timelapse_encode import reach_destination
+
+    user = (t.get("username") or "").strip()
+    good, why = reach_destination(t, dest)
+    if not good:
+        bad(f"cannot write to {dest}: {why}")
+        if is_unc(dest) and not user:
+            info("If the share needs a sign-in, re-run 'timelapse setup' and")
+            info("give a username and password for it.")
+        return
+
+    ok(f"{dest} is writable")
+    if not is_unc(dest):
+        return
+    if user:
+        info(f"connected as {user}, from the credentials in the config, which")
+        info("is what the nightly encode does too, so this result holds for it")
+    else:
+        warn("this was tested as the account running this command.")
+        info("The nightly encode runs as the system account, which presents")
+        info("this machine's name to the server rather than yours, so it may")
+        info("be refused where you are allowed. Storing a username and")
+        info(f"password with '{admin_cmd('timelapse setup')}' removes the doubt.")
 
 
 def check_rsync_args(cfg, dest):

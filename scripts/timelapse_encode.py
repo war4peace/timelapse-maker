@@ -36,8 +36,9 @@ from urllib import request as urlrequest
 
 # Names, not the module: `platform` above is the stdlib one, and two things
 # called platform in one file is a trap waiting for a reader in a hurry.
-from timelapse_platform import (CONFIG_PATH, IS_WINDOWS, STATE_DIR_DEFAULT,
-                                log_handler)
+from timelapse_platform import (CONFIG_PATH, IS_WINDOWS, NET_ERRORS,
+                                STATE_DIR_DEFAULT, connect_share, is_unc,
+                                log_handler, net_error, share_root)
 
 __version__ = "0.1.9"
 
@@ -1142,6 +1143,189 @@ def probe_rsync_flags(dest, svcuser=None):
     return []
 
 
+# ----------------------------------------------------------------------------
+# Moving the finished videos, the Windows way
+#
+# There is no rsync here and nothing to mount: a UNC path is reachable as it
+# stands, given an account that may read it. So the transfer is a copy, a
+# rename and a delete, done in that order for a reason given at move_video().
+#
+# Everything in this section obeys the rule the encoder has obeyed since the
+# first release: a failed transfer must never turn a successful encode into a
+# failure, and one file failing must not stop the rest. The videos are already
+# safe in video_output; the worst outcome available is that they stay there and
+# tomorrow's run ships them.
+# ----------------------------------------------------------------------------
+
+# Named so it cannot collide with a video, and dotted so it does not show up
+# in the operator's file browser next to five years of timelapses.
+PROBE_NAME = ".timelapse-write-probe"
+PART_SUFFIX = ".part"
+
+
+def path_problem(exc):
+    """An OSError from a network path, in the words connect_share() uses.
+
+    The same numbers arrive by two routes, WNetAddConnection2W returning them
+    and the filesystem raising them, and an operator reading the log should not
+    have to notice that "access denied" and "error 5" are the same sentence.
+    """
+    code = getattr(exc, "winerror", None)
+    if code in NET_ERRORS:
+        return net_error(code)
+    return " ".join(str(exc).split())[:200]
+
+
+def try_destination(dest):
+    """(ok, why): can this account create a file in dest right now?
+
+    By writing one, which is the only way to know. Existence is not the
+    question and neither is reachability: a share can be listable by the
+    machine account and refuse it a write, and a check that stopped at
+    is_dir() would report that setup as fine and let it fail at 00:05.
+
+    This is `try_rsync_args()` carried to a platform where the account
+    actually matters, and it lives beside the code that does the moving for
+    the same reason: the wizard and the pre-flight import it, so none of the
+    three can hold a different opinion about the same share.
+    """
+    try:
+        d = Path(dest)
+        d.mkdir(parents=True, exist_ok=True)
+        probe = d / PROBE_NAME
+        probe.write_bytes(b"timelapse")
+        probe.unlink()
+    except OSError as exc:
+        return False, path_problem(exc)
+    return True, ""
+
+
+def reach_destination(t, dest):
+    """Make dest writable by this process if it can be. (ok, detail)
+
+    The current token is tried first, deliberately. A share that already
+    accepts us needs no credentials stored anywhere, and asking the operator
+    for a password to solve a problem they do not have is how a tool teaches
+    people to put passwords in files for no reason.
+    """
+    ok, why = try_destination(dest)
+    if ok:
+        return True, ""
+    if not is_unc(dest):
+        return False, why
+
+    user = (t.get("username") or "").strip()
+    if not user:
+        return False, ("%s, and no transfer.username is configured, so there "
+                       "is nothing else to try" % why)
+
+    log.info("  %s refused this account; connecting as %s", share_root(dest),
+             user)
+    made, detail = connect_share(dest, user, t.get("password") or "")
+    if made is False:
+        return False, "could not connect to %s as %s: %s" % (
+            share_root(dest), user, detail)
+    if made is None and detail:
+        # Not a refusal. Most often the session is already connected to that
+        # server as somebody else, and that connection may be the one that
+        # works, so the write below settles it rather than this branch.
+        log.info("  %s", detail)
+
+    ok, why = try_destination(dest)
+    return (True, "") if ok else (False, why)
+
+
+def move_video(src_file, dest_dir, delete_source=True):
+    """Copy one video into place, then rename it, then drop the original.
+
+    (ok, detail). The temporary name is the whole point of this function.
+
+    A copy interrupted part way - the NAS rebooting, wifi dropping, the
+    destination disk filling - leaves a file with the right name and the wrong
+    length, and nothing downstream can tell it from a finished one: the
+    library index counts it, the web UI offers it, and it plays as far as it
+    got and then stops. Writing to <name>.part and renaming only after the
+    bytes are all there means the destination never holds a partial file under
+    a name anything will read.
+
+    The source is deleted last and only on success, so the failure mode is
+    always a duplicate rather than a hole.
+    """
+    tmp = dest_dir / (src_file.name + PART_SUFFIX)
+    final = dest_dir / src_file.name
+    try:
+        shutil.copyfile(str(src_file), str(tmp))
+        # Length is the one corruption a copy can hand back without raising,
+        # and it costs a stat to rule out.
+        want, got = src_file.stat().st_size, tmp.stat().st_size
+        if want != got:
+            tmp.unlink(missing_ok=True)
+            return False, "copied %d of %d bytes" % (got, want)
+        try:
+            shutil.copystat(str(src_file), str(tmp))
+        except OSError:
+            # Timestamps are a courtesy to a library the operator has kept for
+            # years, and plenty of shares refuse to set them. Never a failure:
+            # filenames are the sort key here, not mtime.
+            pass
+        # The retrying one, not os.replace: the destination is a library the
+        # operator watches from, so the file being renamed over can genuinely
+        # be open in a media player, which is precisely the case that raises
+        # PermissionError on Windows and nowhere else.
+        replace_atomic(str(tmp), str(final))
+    except OSError as exc:
+        # Leave nothing half-written behind, including when the failure was
+        # the rename rather than the copy.
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, path_problem(exc)
+
+    if delete_source:
+        try:
+            src_file.unlink()
+        except OSError as exc:
+            # It arrived, which is what the run was for. Say so and move on:
+            # tomorrow copies it again over the top of an identical file.
+            return True, "copied, but the local file could not be removed: %s" \
+                % path_problem(exc)
+    return True, ""
+
+
+def transfer_windows(t, files, dest, dry_run):
+    """Move the finished videos to a folder or a UNC path. (result dict)"""
+    log.info("Transferring %d file(s) to %s", len(files), dest)
+    if dry_run:
+        return {"ok": True, "moved": 0, "detail": "dry run"}
+
+    ok, detail = reach_destination(t, dest)
+    if not ok:
+        # Deliberately not an exception, and deliberately not fatal: the encode
+        # succeeded, the videos are safe where they are, and the next run ships
+        # them once the share is back.
+        log.error("Cannot write to %s - %s", dest, detail)
+        return {"ok": False, "moved": 0, "detail": detail}
+
+    dest_dir = Path(dest)
+    delete = t.get("delete_local_after_transfer", True)
+    moved, problems = 0, []
+    for f in files:
+        good, why = move_video(f, dest_dir, delete)
+        if good:
+            moved += 1
+            if why:
+                log.warning("  %s: %s", f.name, why)
+        else:
+            problems.append("%s: %s" % (f.name, why))
+            log.error("  %s: %s", f.name, why)
+
+    if problems:
+        return {"ok": False, "moved": moved,
+                "detail": " | ".join(problems)[:400]}
+    return {"ok": True, "moved": moved, "detail": ""}
+
+
 def transfer(cfg, dry_run):
     """rsync the video folder to the destination. Works for both a local mount
     path and a remote user@host:/path spec."""
@@ -1154,6 +1338,12 @@ def transfer(cfg, dry_run):
         return {"ok": True, "moved": 0, "detail": "nothing to transfer"}
 
     dest = t["destination"]
+
+    if IS_WINDOWS:
+        # A different mechanism, not a different flavour of the same one.
+        # rsync is absent, there is nothing to mount, and an SSH remote spec
+        # is refused by the wizard before it can get this far.
+        return transfer_windows(t, files, dest, dry_run)
 
     problem = mount_problem(t, dest)
     if problem:
@@ -1173,14 +1363,8 @@ def transfer(cfg, dry_run):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
-        # Two different facts wearing one error. On Linux rsync is missing and
-        # installing it fixes this; on Windows it is not a package that exists,
-        # the transfer is simply not built yet, and telling an operator there
-        # to run apt is advice that names a thing they do not have.
-        if IS_WINDOWS:
-            log.error("Moving videos is not implemented on Windows yet; "
-                      "they stay in %s", src)
-            return {"ok": False, "moved": 0, "detail": "not implemented yet"}
+        # Linux only now: Windows returns above, through transfer_windows(),
+        # and never reaches the code that looks for rsync.
         log.error("rsync is not installed (sudo apt install rsync)")
         return {"ok": False, "moved": 0, "detail": "rsync not installed"}
     except Exception as exc:

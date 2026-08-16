@@ -46,9 +46,9 @@ script before running it as root.
 
 ### Windows (early preview)
 
-Capture and encode run on Windows 10, 11 and Server. The web UI does not yet,
-and neither does upgrading in place. Everything else below applies: the same
-config file, the same wizard, the same `timelapse` command, the same
+Capture, encode and transfer run on Windows 10, 11 and Server. The web UI does
+not yet, and neither does upgrading in place. Everything else below applies:
+the same config file, the same wizard, the same `timelapse` command, the same
 `timelapse test`.
 
 Get the prerequisites first, because the installer deliberately supplies
@@ -105,6 +105,16 @@ Two differences worth knowing:
   so `U:\Videos` fails with "path not found" on a folder you can open in
   Explorer. The wizard resolves a letter to its `\\server\share` form and
   stores that; if you edit the config by hand, write the UNC path yourself.
+- **A network destination probably needs its own sign-in.** The nightly encode
+  runs as the system account, which introduces itself to your server as this
+  *computer* rather than as you, so a share you have used for years may refuse
+  it, and the error is an access denial on a path that demonstrably works. The
+  wizard offers to store a username and password for the share, tests them by
+  writing a file with them, and says so; the encode then signs in the same way.
+  Your current sign-in is tried first, so a share that is open to everyone
+  needs no password stored at all. `timelapse test` reports which of the two
+  it just proved. If you get this wrong, nothing is lost: the videos stay in
+  the local videos folder and the next night's run ships them.
 
 > **Piping straight to bash** (`curl -sL … | sudo bash`) also works; the
 > installer and wizard read prompts from `/dev/tty` rather than stdin, because

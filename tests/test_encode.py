@@ -3,11 +3,14 @@
 The end-to-end encode is covered separately by tests/smoke_test.py.
 """
 
+import contextlib
 import inspect
+import io
 import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
 import time
 import unittest
@@ -765,13 +768,12 @@ class TestWebhookRequest(unittest.TestCase):
 
 
 class TestTransferWithoutRsync(unittest.TestCase):
-    """What the nightly job says when it cannot move the videos.
+    """What the nightly job says when rsync is missing. Linux only.
 
-    The same missing binary means two different things. On Linux rsync is a
-    package and installing it fixes this. On Windows it is not the mechanism at
-    all: transfer is not built yet (item 11f step 4), so telling an operator
-    there to run apt names a thing they do not have, and the videos are not
-    lost, they are simply still in the videos folder.
+    Windows returns through transfer_windows() long before anything looks for
+    rsync, so this branch is now one platform's answer rather than two, and
+    the test declares that rather than inheriting it from whatever is running
+    the suite.
     """
 
     def setUp(self):
@@ -782,37 +784,367 @@ class TestTransferWithoutRsync(unittest.TestCase):
                     "transfer": {"enabled": True, "destination": "/dest",
                                  "require_mountpoint": False}}
 
-    def run_transfer(self, windows):
-        with mock.patch.object(enc, "IS_WINDOWS", windows), \
+    def run_transfer(self):
+        with mock.patch.object(enc, "IS_WINDOWS", False), \
              mock.patch.object(enc, "mount_problem", return_value=None), \
              mock.patch.object(enc.subprocess, "run",
                                side_effect=FileNotFoundError(2, "no rsync")):
             return enc.transfer(self.cfg, dry_run=False)
 
-    def test_linux_says_install_rsync(self):
-        result = self.run_transfer(windows=False)
+    def test_it_says_install_rsync(self):
+        result = self.run_transfer()
         self.assertFalse(result["ok"])
         self.assertIn("rsync", result["detail"])
 
-    def test_windows_says_it_is_not_built_yet(self):
-        result = self.run_transfer(windows=True)
-        self.assertFalse(result["ok"])
-        self.assertNotIn("rsync", result["detail"])
-        self.assertIn("not implemented", result["detail"])
+    def test_it_does_not_raise(self):
+        """Failure isolation, the older rule: a failed transfer must not turn
 
-    def test_neither_raises(self):
-        """Failure isolation, which is the older rule: a failed transfer must
-
-        not turn a successful encode into a failure. The videos are safe where
-        they are and the next run ships them.
+        a successful encode into a failure. The videos are safe where they are
+        and the next run ships them.
         """
-        for windows in (True, False):
-            self.assertIsInstance(self.run_transfer(windows), dict)
+        self.assertIsInstance(self.run_transfer(), dict)
 
-    def test_nothing_is_deleted_either_way(self):
-        for windows in (True, False):
-            self.run_transfer(windows)
-            self.assertTrue((self.tmp / "Roof.20260816.mkv").exists())
+    def test_nothing_is_deleted(self):
+        self.run_transfer()
+        self.assertTrue((self.tmp / "Roof.20260816.mkv").exists())
+
+
+class TestMoveVideo(unittest.TestCase):
+    """One file, copied to a .part name, renamed, then the original dropped.
+
+    The order is the substance. A copy interrupted part way leaves a file with
+    the right name and the wrong length, which nothing downstream can tell
+    from a finished one: the library index counts it, the web UI offers it,
+    and it plays as far as it got. The rename is what makes that impossible.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.src_dir = self.tmp / "videos"
+        self.dest = self.tmp / "library"
+        self.src_dir.mkdir()
+        self.dest.mkdir()
+        self.src = self.src_dir / "Roof.20260815.mkv"
+        self.src.write_bytes(b"video bytes" * 100)
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def test_it_arrives_and_the_original_goes(self):
+        ok, detail = enc.move_video(self.src, self.dest)
+        self.assertTrue(ok, detail)
+        self.assertEqual((self.dest / self.src.name).read_bytes(),
+                         b"video bytes" * 100)
+        self.assertFalse(self.src.exists())
+
+    def test_it_can_keep_the_original(self):
+        ok, _ = enc.move_video(self.src, self.dest, delete_source=False)
+        self.assertTrue(ok)
+        self.assertTrue(self.src.exists())
+        self.assertTrue((self.dest / self.src.name).exists())
+
+    def test_no_part_file_is_left_behind_on_success(self):
+        enc.move_video(self.src, self.dest)
+        self.assertEqual([p.name for p in self.dest.iterdir()],
+                         [self.src.name])
+
+    def test_a_failed_copy_leaves_nothing_under_the_real_name(self):
+        # The whole reason for the temporary name. Half a file under the real
+        # name is worse than no file, because it looks finished.
+        with mock.patch.object(enc.shutil, "copyfile",
+                               side_effect=OSError(28, "No space left")):
+            ok, detail = enc.move_video(self.src, self.dest)
+        self.assertFalse(ok)
+        self.assertIn("space", detail)
+        self.assertFalse((self.dest / self.src.name).exists())
+        self.assertTrue(self.src.exists(), "the original must survive")
+
+    def test_a_failed_copy_cleans_up_its_part_file(self):
+        def half(src, dst, *a, **kw):
+            Path(dst).write_bytes(b"half")
+            raise OSError(28, "No space left")
+
+        with mock.patch.object(enc.shutil, "copyfile", side_effect=half):
+            enc.move_video(self.src, self.dest)
+        self.assertEqual(list(self.dest.iterdir()), [])
+
+    def test_a_short_copy_is_caught_by_length(self):
+        # The one corruption a copy can hand back without raising.
+        def short(src, dst, *a, **kw):
+            Path(dst).write_bytes(b"trunc")
+
+        with mock.patch.object(enc.shutil, "copyfile", side_effect=short):
+            ok, detail = enc.move_video(self.src, self.dest)
+        self.assertFalse(ok)
+        self.assertIn("bytes", detail)
+        self.assertFalse((self.dest / self.src.name).exists())
+        self.assertTrue(self.src.exists())
+
+    def test_a_failed_rename_does_not_delete_the_original(self):
+        with mock.patch.object(enc, "replace_atomic",
+                               side_effect=OSError(5, "Access is denied")):
+            ok, _ = enc.move_video(self.src, self.dest)
+        self.assertFalse(ok)
+        self.assertTrue(self.src.exists())
+        self.assertEqual(list(self.dest.iterdir()), [])
+
+    def test_an_undeletable_original_still_counts_as_arrived(self):
+        """It got there, which is what the run was for.
+
+        Reporting a failure would make tomorrow's run copy it again and call
+        that a failure too, for ever. Saying so and moving on means the worst
+        case is a duplicate, never a hole.
+        """
+        with mock.patch.object(Path, "unlink",
+                               side_effect=OSError(13, "in use")):
+            ok, detail = enc.move_video(self.src, self.dest)
+        self.assertTrue(ok)
+        self.assertIn("could not be removed", detail)
+        self.assertTrue((self.dest / self.src.name).exists())
+
+    def test_timestamps_are_a_courtesy_not_a_requirement(self):
+        # Plenty of shares refuse to set them, and filenames are the sort key
+        # here, so a refusal must never fail the transfer.
+        with mock.patch.object(enc.shutil, "copystat",
+                               side_effect=OSError(1, "not permitted")):
+            ok, _ = enc.move_video(self.src, self.dest)
+        self.assertTrue(ok)
+        self.assertTrue((self.dest / self.src.name).exists())
+
+
+class TestTransferWindows(unittest.TestCase):
+    """The whole Windows branch: reach the destination, then move each file."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.videos = self.tmp / "videos"
+        self.dest = self.tmp / "library"
+        self.videos.mkdir()
+        for name in ("A.20260815.mkv", "B.20260815.mkv"):
+            (self.videos / name).write_bytes(b"x" * 512)
+        self.cfg = {"paths": {"video_output": str(self.videos)},
+                    "transfer": {"enabled": True, "destination": str(self.dest)}}
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def run_transfer(self, dry_run=False):
+        with mock.patch.object(enc, "IS_WINDOWS", True):
+            return enc.transfer(self.cfg, dry_run)
+
+    def test_it_moves_everything_and_creates_the_destination(self):
+        result = self.run_transfer()
+        self.assertTrue(result["ok"], result["detail"])
+        self.assertEqual(result["moved"], 2)
+        self.assertEqual(sorted(p.name for p in self.dest.iterdir()),
+                         ["A.20260815.mkv", "B.20260815.mkv"])
+        self.assertEqual(list(self.videos.iterdir()), [])
+
+    def test_a_dry_run_moves_nothing(self):
+        result = self.run_transfer(dry_run=True)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["moved"], 0)
+        self.assertFalse(self.dest.exists())
+        self.assertEqual(len(list(self.videos.iterdir())), 2)
+
+    def test_one_file_failing_does_not_stop_the_other(self):
+        """Failure isolation, per file. The rule the encoder has had since the
+
+        first release, applied one level down: a single unwritable video must
+        not strand the ones that would have gone fine.
+        """
+        real = enc.shutil.copyfile
+        calls = []
+
+        def flaky(src, dst, *a, **kw):
+            calls.append(src)
+            if "A.2026" in str(src):
+                raise OSError(5, "Access is denied")
+            return real(src, dst, *a, **kw)
+
+        with mock.patch.object(enc.shutil, "copyfile", side_effect=flaky):
+            result = self.run_transfer()
+        self.assertEqual(len(calls), 2, "it must try both")
+        self.assertEqual(result["moved"], 1)
+        self.assertFalse(result["ok"])
+        self.assertIn("A.20260815.mkv", result["detail"])
+        self.assertTrue((self.videos / "A.20260815.mkv").exists())
+        self.assertTrue((self.dest / "B.20260815.mkv").exists())
+
+    def test_an_unreachable_destination_keeps_the_videos(self):
+        self.cfg["transfer"]["destination"] = str(self.tmp / "nope")
+        with mock.patch.object(enc, "try_destination",
+                               return_value=(False, "the server did not answer")):
+            result = self.run_transfer()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["moved"], 0)
+        self.assertIn("did not answer", result["detail"])
+        self.assertEqual(len(list(self.videos.iterdir())), 2)
+
+    def test_it_never_reaches_rsync(self):
+        with mock.patch.object(enc.subprocess, "run",
+                               side_effect=AssertionError("rsync was run")):
+            self.assertTrue(self.run_transfer()["ok"])
+
+    def test_nothing_to_transfer_says_so_without_touching_the_share(self):
+        for f in self.videos.iterdir():
+            f.unlink()
+        with mock.patch.object(enc, "try_destination",
+                               side_effect=AssertionError("probed anyway")):
+            result = self.run_transfer()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["moved"], 0)
+
+
+class TestPreflightWindowsTransfer(unittest.TestCase):
+    """What 'timelapse test' says about the destination on Windows.
+
+    Two things it must get right, and the second is the one that matters:
+    "D:\\out" must not be mistaken for an SSH host, and a pass has to say
+    *which account* it passed for.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, str(_support.SCRIPTS))
+        import timelapse_test
+        self.checker = timelapse_test
+
+    def run_check(self, t, reached=(True, "")):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+             mock.patch.object(self.checker, "IS_WINDOWS", True), \
+             mock.patch.object(enc, "reach_destination", return_value=reached), \
+             mock.patch.object(self.checker.subprocess, "run",
+                               side_effect=AssertionError("ran a subprocess")):
+            self.checker.test_transfer({"transfer": dict(t, enabled=True)})
+        return buf.getvalue()
+
+    def test_a_drive_letter_is_not_mistaken_for_an_ssh_host(self):
+        """"D:\\out" contains a colon and does not start with "/".
+
+        The Linux branch reads that as user@host:/path and would run ssh at a
+        drive letter, so the Windows branch has to come first.
+        """
+        out = self.run_check({"destination": "D:\\out"})
+        self.assertIn("writable", out)
+        self.assertNotIn("SSH", out)
+
+    def test_a_local_path_needs_no_account_caveat(self):
+        out = self.run_check({"destination": "D:\\out"})
+        self.assertNotIn("system account", out)
+
+    def test_a_share_without_credentials_says_what_was_not_proven(self):
+        out = self.run_check({"destination": "\\\\tower\\cctv\\TL"})
+        self.assertIn("system account", out)
+        self.assertIn("account running this command", out)
+
+    def test_a_share_with_credentials_says_the_result_holds(self):
+        out = self.run_check({"destination": "\\\\tower\\cctv\\TL",
+                              "username": "war", "password": "hunter2"})
+        self.assertIn("war", out)
+        self.assertIn("holds", out)
+        self.assertNotIn("account running this command", out)
+        # This output gets pasted into bug reports. Names, never values, the
+        # same rule summarise() had to learn about webhook URLs.
+        self.assertNotIn("hunter2", out)
+
+    def test_a_refusal_points_at_the_wizard(self):
+        out = self.run_check({"destination": "\\\\tower\\cctv\\TL"},
+                             reached=(False, "access denied (error 5)"))
+        self.assertIn("access denied", out)
+        self.assertIn("timelapse setup", out)
+
+    def test_a_refused_local_path_does_not_suggest_credentials(self):
+        out = self.run_check({"destination": "D:\\out"},
+                             reached=(False, "no such directory"))
+        self.assertIn("no such directory", out)
+        self.assertNotIn("username and password", out)
+
+    def test_disabled_transfer_probes_nothing(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+             mock.patch.object(enc, "reach_destination",
+                               side_effect=AssertionError("probed anyway")):
+            self.checker.test_transfer({"transfer": {"enabled": False}})
+        self.assertIn("disabled", buf.getvalue())
+
+
+class TestReachDestination(unittest.TestCase):
+    """Try this account first; only then spend a stored credential.
+
+    A share that already accepts us needs no password in any file, and asking
+    for one to solve a problem the operator does not have is how a tool
+    teaches people to store secrets for no reason.
+    """
+
+    def setUp(self):
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def test_a_working_destination_never_connects(self):
+        with mock.patch.object(enc, "try_destination", return_value=(True, "")), \
+             mock.patch.object(enc, "connect_share",
+                               side_effect=AssertionError("connected anyway")):
+            ok, detail = enc.reach_destination({"username": "u"}, r"\\t\s\d")
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+
+    def test_a_local_path_is_not_retried_with_credentials(self):
+        # There is no share to authenticate to, so a stored credential cannot
+        # be the answer and offering it would be noise.
+        with mock.patch.object(enc, "try_destination",
+                               return_value=(False, "access denied")), \
+             mock.patch.object(enc, "connect_share",
+                               side_effect=AssertionError("connected anyway")):
+            ok, detail = enc.reach_destination({"username": "u"}, "D:\\out")
+        self.assertFalse(ok)
+        self.assertIn("access denied", detail)
+
+    def test_a_share_with_no_username_says_there_is_nothing_to_try(self):
+        with mock.patch.object(enc, "try_destination",
+                               return_value=(False, "access denied")):
+            ok, detail = enc.reach_destination({}, r"\\tower\cctv\TL")
+        self.assertFalse(ok)
+        self.assertIn("transfer.username", detail)
+
+    def test_credentials_are_spent_only_after_the_first_refusal(self):
+        attempts = [(False, "access denied"), (True, "")]
+        with mock.patch.object(enc, "try_destination",
+                               side_effect=attempts), \
+             mock.patch.object(enc, "connect_share",
+                               return_value=(True, "")) as connect:
+            ok, _ = enc.reach_destination({"username": "war", "password": "s"},
+                                          r"\\tower\cctv\TL")
+        self.assertTrue(ok)
+        connect.assert_called_once_with(r"\\tower\cctv\TL", "war", "s")
+
+    def test_a_refused_connection_reports_the_share_and_the_account(self):
+        with mock.patch.object(enc, "try_destination",
+                               return_value=(False, "access denied")), \
+             mock.patch.object(enc, "connect_share",
+                               return_value=(False, "the password was "
+                                                    "rejected (error 1326)")):
+            ok, detail = enc.reach_destination({"username": "war"},
+                                               r"\\tower\cctv\TL")
+        self.assertFalse(ok)
+        self.assertIn("tower", detail)
+        self.assertIn("war", detail)
+        self.assertIn("1326", detail)
+
+    def test_a_credential_conflict_is_not_treated_as_a_refusal(self):
+        """Already connected to that server as somebody else.
+
+        Their connection may be the one that works, and tearing down a
+        connection this program did not make is not ours to do, so the write
+        settles it rather than this branch.
+        """
+        attempts = [(False, "access denied"), (True, "")]
+        with mock.patch.object(enc, "try_destination", side_effect=attempts), \
+             mock.patch.object(enc, "connect_share",
+                               return_value=(None, "already connected")):
+            ok, detail = enc.reach_destination({"username": "war"},
+                                               r"\\tower\cctv\TL")
+        self.assertTrue(ok, detail)
 
 
 class TestMountGuard(unittest.TestCase):
@@ -880,7 +1212,8 @@ class TestMountGuard(unittest.TestCase):
                "transfer": {"enabled": True,
                             "destination": "/definitely/not/mounted/tl/",
                             "require_mountpoint": True}}
-        result = enc.transfer(cfg, dry_run=False)
+        with mock.patch.object(enc, "IS_WINDOWS", False):
+            result = enc.transfer(cfg, dry_run=False)
         self.assertFalse(result["ok"])
         self.assertEqual(result["moved"], 0)
 
@@ -894,7 +1227,8 @@ class TestMountGuard(unittest.TestCase):
                "transfer": {"enabled": True,
                             "destination": "/definitely/not/mounted/tl/",
                             "require_mountpoint": True}}
-        enc.transfer(cfg, dry_run=False)
+        with mock.patch.object(enc, "IS_WINDOWS", False):
+            enc.transfer(cfg, dry_run=False)
         self.assertTrue(keep.exists(), "videos must not be deleted or moved")
 
     def test_nothing_to_transfer_short_circuits_before_the_guard(self):
