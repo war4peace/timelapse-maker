@@ -1017,7 +1017,12 @@ stops being worth it:
    --unit-status`, which is what `install.ps1` will front-end. File logging was
    **3b done 2026-08-16**: `install.ps1`, `timelapse_cli.py` behind a
    `timelapse.cmd` shim, and the wizard's three Windows adaptations (6a's
-   ffmpeg question, 8's drive scan, 9's drive-letter resolution). 1,550 tests.
+   ffmpeg question, 8's drive scan, 9's drive-letter resolution). 1,555 tests,
+   and the **elevated install passed on the second run**: 21 checks covering a
+   real install, the ACL, the PATH entry, the service and both tasks, the
+   `timelapse` command through its own `.cmd` wrapper, and an uninstall that
+   left the configuration alone. The first run failed 11 of 18, all of it one
+   quoting bug cascading rather than eleven defects.
    Four decisions, all put to the user first: the CLI is a **Python dispatcher**
    rather than PowerShell or batch, because it is the only one of the three
    either CI leg can test and because a batch help text would rot; the

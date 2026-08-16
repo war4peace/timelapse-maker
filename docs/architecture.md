@@ -2308,6 +2308,16 @@ checks that it removed all of that and left the recordings alone. CI parses
 both PowerShell files and asserts `install.ps1` is ASCII, which is the Windows
 analogue of the `shell` job's `bash -n` and shellcheck.
 
+All 21 of its checks passed on 2026-08-16, on the second run. The first failed
+11 of 18, and every one of those was the same quoting bug cascading rather than
+eleven defects: the interpreter check produced an empty version, so the floor
+check stopped the install, so nothing after it had anything to measure. Worth
+stating because the opposite reading is expensive. **Count causes, not failed
+assertions.** It also produced two findings about the harness itself, both of
+the kind that make a check worthless rather than wrong: a helper whose return
+value leaked into the output, and a check that asserted the *absence* of a
+string and therefore passed against no output at all.
+
 All 17 of `step3_check.py`'s checks passed on the first elevated run,
 2026-08-16. Two of the
 numbers matter beyond a tick: RUNNING was reported **0.7 seconds** after
