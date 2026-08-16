@@ -318,6 +318,29 @@ class TestInstallerText(unittest.TestCase):
         for forbidden in ("New-Service", "Register-ScheduledTask"):
             self.assertNotIn(forbidden, body, forbidden)
 
+    def test_the_closing_advice_says_new_and_says_administrator(self):
+        """It said "Open a NEW terminal" and stopped there, so the operator's
+
+        next action was a command that refuses. Both halves need saying: new,
+        because PATH only reaches windows opened afterwards, and administrator,
+        because the two commands named read the file holding camera passwords.
+        """
+        text = self.SOURCE.decode("ascii")
+        steps = text.split("Step 'Next steps'", 1)[1]
+        self.assertIn("NEW", steps)
+        self.assertIn("ADMINISTRATOR", steps)
+
+    def test_the_commands_it_names_are_ones_the_cli_has(self):
+        text = self.SOURCE.decode("ascii")
+        steps = text.split("Step 'Next steps'", 1)[1]
+        named = set(re.findall(r"^\s*Say '  (timelapse \w[\w-]*)", steps,
+                               re.M))
+        self.assertTrue(named, "it names no commands at all")
+        for line in named:
+            command = line.split()[1]
+            self.assertIn(command, set(cli.COMMANDS) | set(cli.SPECIAL),
+                          "install.ps1 recommends a command that does not exist")
+
     def test_uninstalling_leaves_the_recordings_alone(self):
         text = self.SOURCE.decode("ascii")
         uninstall = text.split("function Invoke-Uninstall", 1)[1] \

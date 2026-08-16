@@ -370,10 +370,19 @@ if (-not $NoWizard) {
 }
 
 Step 'Next steps'
-Say 'Open a NEW terminal, then:'
+# Both halves of this were wrong to leave implicit. NEW, because a PATH change
+# reaches only processes started after it, and ADMINISTRATOR, because the two
+# commands named here read the configuration file that holds the camera
+# passwords and refuse without it. Telling somebody to open a terminal and then
+# watching them be refused is a worse first five minutes than saying so.
+Say 'Open a NEW Command Prompt or PowerShell, AS ADMINISTRATOR, then:'
 Say '  timelapse test        check the cameras, ffmpeg and the disk'
 Say '  timelapse cameras     add or edit a camera'
+Note 'New, because PATH only reaches windows opened after it changed.'
+Note 'Administrator, because those two read the file holding your camera'
+Note 'passwords. These need neither, from any window:'
 Say '  timelapse status      is the service running'
+Say '  timelapse version     what is installed'
 Write-Host ''
 Say 'Start capturing:'
 Say '  sc start "TimelapseCapture"'
