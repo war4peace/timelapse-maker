@@ -250,6 +250,124 @@ class TestLogSelection(unittest.TestCase):
         self.assertIn("log_dir", out.getvalue())
 
 
+class TestEveryPowerShellFile(unittest.TestCase):
+    """Two properties that hold for any .ps1 this project ships, not just one.
+
+    Both were paid for by install.ps1 and neither is specific to it, so they
+    are asserted across the set: a second PowerShell file that quietly opts out
+    of a rule the first one bled for is exactly how this comes back.
+    """
+
+    @staticmethod
+    def files():
+        found = sorted(ROOT.glob("*.ps1"))
+        assert found, "no PowerShell files found to check"
+        return found
+
+    def test_they_are_pure_ascii(self):
+        """Windows PowerShell 5.1 reads a .ps1 with no byte order mark as ANSI.
+
+        Measured: install.sh's box-drawing banner comes out as mojibake, so the
+        first line an operator sees looks like a corrupted download.
+        """
+        for path in self.files():
+            data = path.read_bytes()
+            offenders = [(data[:i].count(b"\n") + 1, byte)
+                         for i, byte in enumerate(data) if byte > 127]
+            self.assertEqual(offenders, [],
+                             "non-ASCII in %s renders as mojibake on 5.1"
+                             % path.name)
+
+    def test_no_python_one_liner_contains_a_quote(self):
+        """PowerShell strips embedded double quotes on the way to a native exe.
+
+        Measured on the first real elevated install: `-c 'import sys;
+        print("%d.%d" % sys.version_info[:2])'` arrived at Python as
+        `print(%d.%d % sys.version_info[:2])` and died with a SyntaxError
+        pointing at a percent sign. Eleven of eighteen harness checks failed
+        downstream of that one line.
+
+        Banned outright rather than reasoned about per call site, and in both
+        quoting forms, since the stripping does not care which one wrapped it.
+        """
+        for path in self.files():
+            text = path.read_text(encoding="ascii")
+            for snippet in re.findall(r"-c '([^']*)'", text):
+                self.assertNotIn('"', snippet,
+                                 "%s: a double quote here is silently eaten: %s"
+                                 % (path.name, snippet))
+            for snippet in re.findall(r'-c "([^"]*)"', text):
+                self.assertNotIn("'", snippet,
+                                 "%s: quote the other way round and the same "
+                                 "stripping applies: %s" % (path.name, snippet))
+
+
+class TestSetupLauncher(unittest.TestCase):
+    """setup-gui.ps1: the stage that can speak before Python exists.
+
+    Its whole reason for being is an ordering problem the GUI cannot solve
+    itself: the wizard is Python, and the person it is for may not have Python,
+    so something that is not Python has to be able to say so.
+    """
+
+    SOURCE = (ROOT / "setup-gui.ps1").read_text(encoding="ascii")
+    CMD = (ROOT / "timelapse-setup.cmd").read_text(encoding="ascii")
+
+    def test_it_names_where_to_get_python(self):
+        # A failure with no next step is the thing this file exists to avoid.
+        self.assertIn("python.org", self.SOURCE)
+
+    @staticmethod
+    def code_only(text):
+        """The source with comment lines dropped.
+
+        Because the property is about what the script *does*, and the first
+        version of this test failed on a comment that explained the rule it was
+        enforcing. Same mistake as scanning timelapse_gui.py's docstring for
+        the word tkinter: prose that describes a constraint is not a breach
+        of it.
+        """
+        return "\n".join(line for line in text.splitlines()
+                         if not line.lstrip().startswith("#"))
+
+    def test_it_registers_nothing_itself(self):
+        """The rule tools/ was deleted over, and 11c.6b restates for the GUI.
+
+        This launcher finds Python, elevates and starts the wizard. Anything
+        that installs or registers belongs to install.ps1, or there are two
+        programs that know how to do it and they disagree within a release.
+        """
+        code = self.code_only(self.SOURCE)
+        self.assertIn("timelapse_gui.py", code, "the scan found no code")
+        for forbidden in ("sc.exe", "New-Service", "schtasks",
+                          "Register-ScheduledTask"):
+            self.assertNotIn(forbidden, code)
+
+    def test_it_elevates_rather_than_failing_at_the_write(self):
+        # Thirty answers and then "you cannot write that" is the worst possible
+        # moment to discover the prompt was not elevated.
+        self.assertIn("RunAs", self.SOURCE)
+        self.assertIn("WindowsBuiltInRole", self.SOURCE)
+
+    def test_it_skips_the_windows_store_python_stub(self):
+        # It reports a version quite happily and is not an interpreter.
+        self.assertIn("WindowsApps", self.SOURCE)
+
+    def test_the_batch_shim_bypasses_the_execution_policy(self):
+        """Without it the window opens and closes with nothing said, which
+
+        reads as the download being broken rather than as a policy refusing.
+        """
+        self.assertIn("ExecutionPolicy Bypass", self.CMD)
+        self.assertIn("setup-gui.ps1", self.CMD)
+
+    def test_the_shim_finds_the_script_beside_itself(self):
+        # %~dp0, not a baked path: the pair is copied into the install
+        # directory, and a wrapper pointing at the source tree would work on
+        # the developer's machine and nowhere else.
+        self.assertIn("%~dp0", self.CMD)
+
+
 class TestInstallerText(unittest.TestCase):
     """install.ps1's encoding and its file list, which no unit test can run.
 

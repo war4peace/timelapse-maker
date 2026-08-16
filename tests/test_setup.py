@@ -3810,8 +3810,8 @@ class TestWindowsTransfer(unittest.TestCase):
 class TestWindowsFfmpeg(unittest.TestCase):
     """The wizard asks; the installer does not provide (item 11c.6a)."""
 
-    def drive(self, keystrokes, found="", resolve=None, encoders=("libx264",
-                                                                  [])):
+    def drive(self, keystrokes, found="", resolve=None,
+              encoders=("libx264", [], "")):
         prev_tty, prev_auto = setup._TTY, setup.AUTO
         setup.AUTO = False
         setup._TTY = FakeTTY(keystrokes, tty=False)
@@ -3856,9 +3856,58 @@ class TestWindowsFfmpeg(unittest.TestCase):
 
     def test_no_usable_encoder_names_the_consequence(self):
         _paths, out = self.drive("C:\\ff\\ffmpeg.exe\nC:\\ff\\ffprobe.exe\n",
-                                 encoders=(None, []))
+                                 encoders=(None, [], ""))
         self.assertIn("no product", out)
         self.assertIn("ffmpeg.org", out)
+
+    def test_an_ffmpeg_that_will_not_run_says_so_separately(self):
+        """"Could not run it" and "it ran and nothing worked" want different
+
+        things doing about them, and until 0.2.0 both came back as (None, [])
+        with the difference printed from inside the probe, where a GUI could
+        not see it. Fifth instance of a falsy return meaning several things.
+        """
+        _paths, out = self.drive(
+            "C:\\ff\\ffmpeg.exe\nC:\\ff\\ffprobe.exe\n",
+            encoders=(None, [], "could not run C:\\ff\\ffmpeg.exe - is the "
+                                "path right?"))
+        self.assertIn("is the path right", out)
+
+
+class TestEncoderDetection(unittest.TestCase):
+    """detect_encoders() decides and does not print (11c.6b's rule).
+
+    Anything a GUI has to reuse must return its findings rather than write
+    them to a terminal it does not own.
+    """
+
+    def test_it_prints_nothing_on_any_path(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), \
+             mock.patch.object(enc, "list_encoders", return_value=None):
+            chosen, failures, problem = setup.detect_encoders("nosuchffmpeg")
+        self.assertEqual(buf.getvalue(), "")
+        self.assertIsNone(chosen)
+        self.assertEqual(failures, [])
+        self.assertIn("could not run", problem)
+
+    def test_a_working_encoder_reports_no_problem(self):
+        with mock.patch.object(enc, "list_encoders", return_value=["libx264"]), \
+             mock.patch.object(enc, "probe_encoder_detail",
+                               return_value=(True, "")):
+            chosen, failures, problem = setup.detect_encoders("ffmpeg")
+        self.assertEqual(chosen, "av1_nvenc")
+        self.assertEqual((failures, problem), ([], ""))
+
+    def test_ran_but_nothing_worked_is_not_the_same_as_could_not_run(self):
+        with mock.patch.object(enc, "list_encoders", return_value=[]), \
+             mock.patch.object(enc, "probe_encoder_detail",
+                               return_value=(False, "Unknown encoder")):
+            chosen, failures, problem = setup.detect_encoders("ffmpeg")
+        self.assertIsNone(chosen)
+        self.assertEqual(len(failures), 3)
+        self.assertEqual(problem, "", "ffmpeg ran; that is not a problem "
+                                      "with reaching it")
 
 
 class TestFfprobeFollowsFfmpeg(unittest.TestCase):

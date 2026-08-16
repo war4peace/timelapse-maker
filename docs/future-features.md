@@ -1186,6 +1186,37 @@ stops being worth it:
    steps 1 to 4 done the audience is the thing that arrives next: someone who
    chose Windows, downloaded a release and has not got an Administrator prompt
    open. The console wizard serves the author; it does not serve them.
+
+   **The wizard half is BUILT 2026-08-16**: `scripts/timelapse_gui.py` behind
+   `setup-gui.ps1` and `timelapse-setup.cmd`, with a Start menu entry, reached
+   as `timelapse gui` as well. Seven pages, the same questions as the console
+   wizard and none of its own. **The installer stays a `.ps1`**, which was the
+   operator's choice of first slice and the right one: `install.ps1` is already
+   a double-click, while the wizard was thirty console questions including
+   typed camera passwords.
+
+   Three decisions, all put to the operator first. A **PowerShell launcher then
+   a tkinter GUI**, which is image-toolbox's staging and needs no build step:
+   the wizard is Python and the person it is for may not have Python, so
+   something that is not Python has to be able to say so. **The wizard before
+   the installer**, above. And **decide split from show, with a checklist for
+   the rest**: everything above a banner comment in that file is pure and
+   tested on both CI legs, the widget half is built end to end by
+   `temp/gui_smoke.py`, and what neither reaches is a nine-step click-through
+   in architecture.md §9.
+
+   **One defect came out of building it, in code that predates it.**
+   `detect_encoders()` printed "could not run ffmpeg" itself and returned
+   `(None, [])`, which also meant "the import failed" and sat beside "ffmpeg
+   ran and refused every encoder". Three states behind one falsy answer,
+   distinguished only by something a window cannot see. Fifth instance of that
+   shape. A GUI is a good way to find them, because it cannot fall back on a
+   terminal the way every other caller quietly did.
+
+   **Still to do here:** a compiled `.exe` so the release page offers a
+   download-and-double-click artifact rather than a `.cmd`, which is packaging
+   rather than function and brings a signing question with it; and an installer
+   front end over `install.ps1`, which is the other half of 6b.
 6. ~~The web UI.~~ **Deferred indefinitely on the operator's scope decision,
    2026-08-16**, together with the monitoring client that was weighed against
    it. Both are written up in decided-against.md; the short form is that

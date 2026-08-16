@@ -1853,6 +1853,59 @@ that works, and tearing down a connection this program did not make is not its
 call, so the write settles it. That is the `try_rsync_args()` three-way answer
 again: refused, and could-not-attempt, are different facts.
 
+### 4.6d `timelapse_gui.py` and its launcher (0.2.0)
+
+The same wizard in a window, for the operator who chose Windows and would
+rather click than type. Same questions, same checks, same config file, same
+backup, and `timelapse setup` is untouched: 11c.6b's rule that the GUI must
+never become the only way in.
+
+**It decides nothing.** Every check calls a function in `timelapse_setup.py` or
+its neighbours: `sanitise_name`, `name_taken`, `is_reserved_name`,
+`network_path`, `drive_is_local`, `looks_like_ssh_spec`, `detect_encoders`,
+`sibling_tool`, `test_camera`, `reach_destination`, `write_config`,
+`create_directories`, `restart_units`. The project has been bitten by a second
+implementation before (`tools/` duplicated the wizard, drifted, and was
+deleted), and two wizards that both know what a valid camera name is will
+disagree inside one release.
+
+**Deciding is separated from showing**, which is what makes any of it testable.
+Everything above the `# THE SHOW LAYER` banner takes strings and returns
+`(level, message)`; below it there are widgets and calls upward. See §9 for how
+that line is held, and for the click-through checklist that covers the half no
+test reaches.
+
+**tkinter is imported inside `run()`**, not at module scope, for the reason the
+Win32 bindings are lazy: the suite is collected on three Linux legs and in WSL,
+none of which has a window station, and an import at the top would take all of
+them down at collection time.
+
+**Getting one change right needed `detect_encoders()` to stop printing.** It
+used to write "could not run ffmpeg" to stdout itself and return `(None, [])`,
+which collided with two other outcomes: an import failure, and ffmpeg running
+perfectly while every encoder was refused. Three states behind one falsy answer,
+told apart only by something a window cannot see. It returns
+`(codec, failures, problem)` now. Fifth instance of that shape here, after
+`try_rsync_args`, `service_state`, `sync_unit_readwritepaths` and the update
+checker's cached failure.
+
+**The launcher exists because of an ordering problem the GUI cannot solve.**
+The wizard is Python and the person it is for may not have Python, so something
+that is not Python has to be able to say so. `setup-gui.ps1` finds the
+interpreter (skipping the WindowsApps stub, which reports a version and is not
+an interpreter), elevates through UAC, and starts the wizard with `pythonw.exe`
+so no console flashes behind it. `timelapse-setup.cmd` is two lines so that
+double-clicking works, and passes `-ExecutionPolicy Bypass` for that invocation
+only: without it the default policy refuses a downloaded script and the window
+opens and closes with nothing said, which reads as a broken download. The
+launcher registers nothing and installs nothing, pinned by a test, for the same
+reason `install.ps1` contains no `sc.exe`.
+
+`install.ps1` places both, and creates an all-users Start menu shortcut, since
+a wizard nobody can find is a wizard nobody uses. Failing to create it is a
+warning and never fatal: a shortcut is a convenience, and a locked-down profile
+refusing one must not cost an install.
+
 ### 4.7 `install.sh`
 
 Bootstrap. Detects the package manager (apt/dnf/yum/pacman/zypper/apk), installs
@@ -2470,6 +2523,55 @@ twelve seconds at a two second cadence**, which is exactly right rather than
 approximately right, so the tick grid survived being hosted on a thread the SCM
 owns.
 
+**The graphical wizard is tested by splitting it, not by driving it.**
+`timelapse_gui.py` is in two halves separated by a banner comment, and the
+split is the testing strategy rather than a tidiness preference. Everything
+above `# THE SHOW LAYER` takes strings and returns `(level, message)`, so
+`test_gui.py` checks every rule the wizard applies without a display; below it
+is widgets and calls upward, and nothing there decides anything. Three
+structural tests hold that line: no `tkinter` import at module scope (asserted
+against the AST, because the module *docstring* legitimately mentions it), no
+widget identifiers among the tokens of the upper half (from `tokenize`, for the
+same reason), and the colour table covering exactly the levels the checks can
+return. A fourth pins the reuse: patching `setup.name_taken` must change what
+the GUI's name check answers, which it only can if the GUI has no copy of that
+rule.
+
+That leaves the widget layer, which no automated test here reaches.
+`temp/gui_smoke.py` builds every page and the camera dialog and then closes the
+window, which catches the class of mistake unit tests structurally cannot: a
+widget method that does not exist, two geometry managers mixed in one
+container, a trace firing before the widget it writes to exists. It clicks
+nothing and asserts nothing about appearance. The rest is a click-through
+checklist run by hand, below.
+
+**The click-through checklist**, in the order that finds problems soonest:
+
+1. Start it with no config present. Every page opens, Back is disabled on the
+   first page, and Finish is the last button rather than Next.
+2. Storage: type a relative path and a nonexistent drive. Both are refused
+   before Next, and the three derived directories update as you type.
+3. ffmpeg: point it at a folder rather than an executable. It finds both
+   binaries and names the encoder it will use. Point it at nothing and the
+   download page is offered.
+4. Cadence: enter 900. It refuses and says a day of that produces no video,
+   which is the failure that is otherwise silent for ever.
+5. Cameras: add one named `NUL`, one named `Roof Top!`, and a duplicate of an
+   existing name. Refused, corrected with a warning, refused. Test reaches a
+   real camera.
+6. Transfer: type a local folder, then a UNC path. The username and password
+   rows appear only for the UNC one and appear *above* the Test button, not
+   below it. Test reports which account it just proved.
+7. Notifications: leave all three off and continue.
+8. Review: it lists no password and no webhook URL. Finish writes the config,
+   the previous one is backed up, and the services restart.
+9. Run it again with that config present. Every page opens on the saved
+   answers rather than on defaults.
+
+Steps 5 and 6 are the ones worth repeating after any change: they are where the
+GUI has to agree with the console wizard, and where disagreeing would be
+invisible until an install fails.
+
 `test_web.py` drives the real handler through a fake socket rather than binding
 a port: a listening socket in a unit test is a flake waiting for a busy CI
 runner. The fake implements `sendall`, not a writable `makefile`, because
@@ -2740,21 +2842,25 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 971 lines
-install.ps1                      the Windows one, 353 lines
+install.sh                       bootstrap installer, 978 lines
+install.ps1                      the Windows one, 459 lines
+setup-gui.ps1                    launcher for the graphical wizard, 111 lines
+timelapse-setup.cmd              double-click shim for the above
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
-scripts/timelapse_setup.py       configuration wizard, 4190 lines
+scripts/timelapse_setup.py       configuration wizard, 4204 lines
+scripts/timelapse_gui.py         the same wizard in a window, 946 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2078 lines
-scripts/timelapse_cli.py         the `timelapse` command on Windows, 367 lines
+scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_cli.py                unit tests
 tests/test_encode.py             unit tests
 tests/test_grammar.py            the 3.9 floor, incl. the PEP 701 gap
+tests/test_gui.py                the graphical wizard's decide layer
 tests/test_platform.py           unit tests
 tests/test_setup.py              unit tests
 tests/test_update.py             unit tests

@@ -96,6 +96,14 @@ time with `sc start "TimelapseCapture"`; after a reboot it starts itself.
 **Open a new terminal before using `timelapse`.** A PATH change only reaches
 processes started after it.
 
+**There is a graphical wizard, if you would rather click than type.** The
+installer adds **Timelapse Setup** to the Start menu, under timelapse-maker. It
+asks the same questions as `timelapse setup`, applies the same checks and
+writes the same file, including backing up the configuration you already have.
+Use it for a first setup or to change something later; the console commands
+keep working and neither replaces the other. It elevates itself, so you do not
+need an Administrator prompt open first.
+
 Two differences worth knowing:
 
 - **Logs are files, not a journal.** One per day, in `logs` under your data

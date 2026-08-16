@@ -74,7 +74,7 @@ $PYTHONURL = 'https://www.python.org/downloads/windows/'
 $SCRIPTS = @(
     'timelapse_capture.py', 'timelapse_encode.py', 'timelapse_test.py',
     'timelapse_setup.py', 'timelapse_update.py', 'timelapse_platform.py',
-    'timelapse_web.py', 'timelapse_cli.py'
+    'timelapse_web.py', 'timelapse_cli.py', 'timelapse_gui.py'
 )
 
 function Say  { param($m) Write-Host "  $m" }
@@ -215,6 +215,41 @@ function Remove-FromPath {
     [Environment]::SetEnvironmentVariable('Path', ($kept -join ';'), 'Machine')
 }
 
+function New-StartMenuShortcut {
+    # The whole point of a GUI is being findable without a command, so a
+    # wizard nobody can locate is a wizard nobody uses. All-users Start menu,
+    # matching the all-users install everything else here does.
+    #
+    # Never fatal: a shortcut is a convenience, and a policy or a locked-down
+    # profile that refuses one must not cost the operator their install.
+    try {
+        $menu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\timelapse-maker'
+        New-Item -ItemType Directory -Force -Path $menu | Out-Null
+        $shell = New-Object -ComObject WScript.Shell
+        $link = $shell.CreateShortcut((Join-Path $menu 'Timelapse Setup.lnk'))
+        $link.TargetPath = Join-Path $Prefix 'timelapse-setup.cmd'
+        $link.WorkingDirectory = $Prefix
+        $link.Description = 'Configure timelapse-maker'
+        $link.Save()
+        Ok 'Start menu -> timelapse-maker \ Timelapse Setup'
+    } catch {
+        Warn 'Could not create the Start menu shortcut.'
+        Note "Run it directly instead: $(Join-Path $Prefix 'timelapse-setup.cmd')"
+    }
+}
+
+function Remove-StartMenuShortcut {
+    $menu = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\timelapse-maker'
+    if (Test-Path $menu) {
+        try {
+            Remove-Item -Recurse -Force $menu
+            Ok 'Removed the Start menu entry'
+        } catch {
+            Warn "Could not remove $menu"
+        }
+    }
+}
+
 function Invoke-Uninstall {
     param($Python)
     Step 'Removing'
@@ -237,6 +272,7 @@ function Invoke-Uninstall {
         Remove-FromPath
         Ok 'Removed the command wrapper and its PATH entry'
     }
+    Remove-StartMenuShortcut
     Write-Host ''
     # Same promise install.sh makes: an uninstall removes the program, never
     # the recordings. Deleting a fortnight of frames because somebody wanted to
@@ -337,6 +373,18 @@ foreach ($name in $SCRIPTS) {
     Copy-Item (Join-Path $SRC "scripts\$name") (Join-Path $Prefix $name) -Force
 }
 Ok "Scripts -> $Prefix"
+
+# The graphical wizard's launcher. Copied only when it is there, so that an
+# older release tree or a partial checkout installs everything else rather than
+# dying on a file this one added.
+foreach ($name in @('setup-gui.ps1', 'timelapse-setup.cmd')) {
+    $from = Join-Path $SRC $name
+    if (Test-Path $from) { Copy-Item $from (Join-Path $Prefix $name) -Force }
+}
+if (Test-Path (Join-Path $Prefix 'timelapse-setup.cmd')) {
+    Ok "Setup wizard -> $(Join-Path $Prefix 'timelapse-setup.cmd')"
+    New-StartMenuShortcut
+}
 
 # Refreshed on every install, which is the only place an operator sees keys
 # added by a new version: the real config is kept as it is, on purpose.

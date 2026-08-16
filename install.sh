@@ -235,10 +235,11 @@ install_files() {
     # to catch.
     #
     # timelapse_cli.py is the Windows front door and is dead weight here, where
-    # this wrapper does that job. Installed anyway, so that the two platforms
-    # have one file set rather than two: a version listing that differs by
-    # platform is a listing somebody has to remember the exception to, and the
-    # file is a few kilobytes of text.
+    # this wrapper does that job. timelapse_gui.py is the same: it refuses to
+    # run off Windows and says which command to use instead. Both installed
+    # anyway, so that the two platforms have one file set rather than two: a
+    # version listing that differs by platform is a listing somebody has to
+    # remember the exception to, and they are a few kilobytes of text.
     install -m 0755 "$SRC/scripts/timelapse_capture.py" \
                     "$SRC/scripts/timelapse_encode.py" \
                     "$SRC/scripts/timelapse_test.py" \
@@ -246,6 +247,7 @@ install_files() {
                     "$SRC/scripts/timelapse_update.py" \
                     "$SRC/scripts/timelapse_platform.py" \
                     "$SRC/scripts/timelapse_cli.py" \
+                    "$SRC/scripts/timelapse_gui.py" \
                     "$SRC/scripts/timelapse_web.py" "$PREFIX/"
     ok "Scripts -> $PREFIX"
 
@@ -386,6 +388,11 @@ case "\${1:-}" in
     setup)     shift; exec python3 $PREFIX/timelapse_setup.py --output "$CONFIG" \\
                           --template "$CONFDIR/config.example.json" \\
                           --owner "$SVCUSER" "\$@" ;;
+    gui)       echo "  The graphical wizard is Windows only: there the console"
+               echo "  wizard cannot be assumed to have a terminal in front of"
+               echo "  it, and here it can."
+               echo "  Run:  sudo timelapse setup"
+               exit 2 ;;
     usage)     shift; exec python3 $PREFIX/timelapse_test.py "$CONFIG" --usage "\$@" ;;
     cameras)   shift; exec python3 $PREFIX/timelapse_setup.py --cameras-only \\
                           --output "$CONFIG" --owner "$SVCUSER" "\$@" ;;

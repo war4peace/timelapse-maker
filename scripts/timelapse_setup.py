@@ -352,8 +352,10 @@ def choose_tools(cfg):
         cfg["paths"]["ffprobe"] = resolve_tool(
             ask("Path to ffprobe", ffprobe_default), "ffprobe")
 
-    chosen, failures = detect_encoders(cfg["paths"]["ffmpeg"])
+    chosen, failures, problem = detect_encoders(cfg["paths"]["ffmpeg"])
 
+    if problem:
+        fail(problem[0].upper() + problem[1:])
     if chosen is None:
         fail("No usable encoder at all - ffmpeg cannot encode here.")
         if IS_WINDOWS:
@@ -400,28 +402,40 @@ def sibling_tool(ffmpeg, name):
 
 
 def detect_encoders(ffmpeg):
-    """(chosen codec or None, [(codec, ffmpeg message, hint), ...])."""
+    """(chosen codec or None, [(codec, ffmpeg message, hint), ...], problem).
+
+    `problem` is "" when ffmpeg ran, and a reason when it could not be asked at
+    all. It exists because the first version printed that reason itself and
+    returned `(None, [])`, which collided with two other outcomes: an import
+    failure, and ffmpeg running fine while every encoder was refused. Three
+    states behind one falsy answer, distinguished only by something the caller
+    could not see, so the GUI could not report it and neither could anything
+    else that does not own a terminal. Fifth instance of that shape in this
+    project, after try_rsync_args, service_state,
+    sync_unit_readwritepaths and the update checker's cached failure.
+
+    Deciding, never printing: 11c.6b's rule for anything a GUI has to reuse.
+    """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         from timelapse_encode import (encoder_hint, list_encoders,
                                       probe_encoder_detail)
-    except ImportError:
-        return None, []
+    except ImportError as exc:
+        return None, [], f"could not load the encoder probe: {exc}"
 
     built = list_encoders(ffmpeg)
     if built is None:
-        fail(f"Could not run {ffmpeg} - is the path right?")
-        return None, []
+        return None, [], f"could not run {ffmpeg} - is the path right?"
 
     failures = []
     for codec in ("av1_nvenc", "hevc_nvenc", "libx264"):
         ok, message = probe_encoder_detail(
             ffmpeg, {"codec": codec, "args": ["-c:v", codec]})
         if ok:
-            return codec, failures
+            return codec, failures, ""
         failures.append((codec, message,
                          encoder_hint(codec, message, codec in built)))
-    return None, failures
+    return None, failures, ""
 
 
 def choose_capture(cfg, disk):

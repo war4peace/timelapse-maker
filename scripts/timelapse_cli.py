@@ -41,7 +41,7 @@ __version__ = "0.1.9"
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = ("capture", "encode", "test", "setup", "update", "platform", "web",
-           "cli")
+           "cli", "gui")
 
 # command -> (script, flags before the config, takes the config, needs admin)
 #
@@ -52,6 +52,10 @@ SCRIPTS = ("capture", "encode", "test", "setup", "update", "platform", "web",
 # one query that needs no elevation at all.
 COMMANDS = {
     "setup":     ("setup", [], True, True),
+    # The same questions in a window (item 11c.6b). Windows only, because on a
+    # machine with a terminal in front of it the console wizard is the better
+    # tool; `timelapse_gui.py` says so and exits rather than opening anything.
+    "gui":       ("gui", [], True, True),
     "cameras":   ("setup", ["--cameras-only"], True, True),
     "transfer":  ("setup", ["--transfer-only"], True, True),
     "notify":    ("setup", ["--notify-only"], True, True),
@@ -214,6 +218,9 @@ opened, so right-click PowerShell in the Start menu and choose "Run as
 administrator".
 
 CONFIGURING
+  gui          [admin]  The same wizard in a window, which is the one to use if
+                        you would rather click than type. Same questions, same
+                        checks, same config file and the same backup.
   setup        [admin]  The full wizard: storage, capture interval, cameras,
                         transfer, notifications and the web UI. It rewrites the
                         whole config, backing up the old one first, so prefer

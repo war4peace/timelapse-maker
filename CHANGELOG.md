@@ -10,6 +10,22 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Added
+- **A setup wizard with a window, on Windows.** **Nothing changes on Linux**,
+  where the console wizard is the right tool for a machine you reach over a
+  terminal. The installer adds **Timelapse Setup** to the Start menu; it
+  elevates itself, so there is no need to have an Administrator prompt open
+  first. It asks the same questions as `timelapse setup`, applies the same
+  checks and writes the same file, backing up the configuration you already
+  have, and it opens on your existing answers when you run it again to change
+  something. `timelapse setup` and every other command keep working exactly as
+  before: this is another way in, never the only one.
+
+  It refuses the same things at the point you type them rather than at the
+  first nightly run: a camera name Windows reserves for a device, a duplicate
+  name, a snapshot interval so slow that no video would ever be produced, and a
+  mapped drive letter as a destination. Cameras and the transfer destination
+  both have a Test button that reaches the real hardware, and the transfer one
+  tells you which account it just proved it for.
 - **Finished videos are moved to their destination on Windows.** **Nothing
   changes on a Linux install**, which still uses rsync. The destination can be
   a folder on this machine or a network path such as `\\tower\videos\timelapse`;
