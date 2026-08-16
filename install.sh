@@ -233,12 +233,19 @@ install_files() {
     # a stale copy left behind by a partial upgrade breaks a daemon exactly as
     # a stale script does, and that is the failure `timelapse version` exists
     # to catch.
+    #
+    # timelapse_cli.py is the Windows front door and is dead weight here, where
+    # this wrapper does that job. Installed anyway, so that the two platforms
+    # have one file set rather than two: a version listing that differs by
+    # platform is a listing somebody has to remember the exception to, and the
+    # file is a few kilobytes of text.
     install -m 0755 "$SRC/scripts/timelapse_capture.py" \
                     "$SRC/scripts/timelapse_encode.py" \
                     "$SRC/scripts/timelapse_test.py" \
                     "$SRC/scripts/timelapse_setup.py" \
                     "$SRC/scripts/timelapse_update.py" \
                     "$SRC/scripts/timelapse_platform.py" \
+                    "$SRC/scripts/timelapse_cli.py" \
                     "$SRC/scripts/timelapse_web.py" "$PREFIX/"
     ok "Scripts -> $PREFIX"
 
@@ -437,7 +444,7 @@ case "\${1:-}" in
                     timelapse-encode.timer timelapse-encode.service \\
                     timelapse-web.service ;;
     version)
-        for f in capture encode test setup update platform web; do
+        for f in capture encode test setup update platform cli web; do
             printf '  %-8s %s\n' "\$f" \\
                 "\$(sed -n 's/^__version__ = "\(.*\)"/\1/p' $PREFIX/timelapse_\$f.py)"
         done

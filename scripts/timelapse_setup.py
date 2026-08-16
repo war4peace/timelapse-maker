@@ -35,13 +35,15 @@ from urllib.parse import unquote, urlparse
 # as ordinary constants at their call sites, which is the point.
 from timelapse_platform import (
     CAPTURE_UNIT, CONFIG_DIR, CONFIG_PATH, DATA_ROOT_DEFAULT, ENCODE_UNIT,
-    LINUX_STATE_DIR, LINUX_WEB_STATE_DIR, SERVICE_STATES, STATE_DIR_DEFAULT,
-    WATCH_UNIT, WEB_STATE_DIR_DEFAULT, daily_trigger, elevation_hint,
-    install_service, install_task, is_elevated, is_reserved_name, is_scheduled,
-    log_hint, native_name, remove_service, remove_task, repeating_trigger,
-    restart_hint, restart_service, scan_filesystems, secure_secret_file,
-    service_is_active, service_state, start_hint, stop_hint, stop_service,
-    task_exists, task_info, task_xml,
+    FFMPEG_URL, IS_WINDOWS, LINUX_STATE_DIR, LINUX_WEB_STATE_DIR,
+    SERVICE_STATES, STATE_DIR_DEFAULT, WATCH_UNIT, WEB_STATE_DIR_DEFAULT,
+    daily_trigger, elevation_hint, find_tool, install_service, install_task,
+    is_elevated, is_reserved_name, is_scheduled, log_hint, native_name,
+    network_path, os_disk_mount, remove_service, remove_task,
+    repeating_trigger, resolve_tool, restart_hint, restart_service,
+    same_file_name, scan_filesystems, secure_secret_file, service_is_active,
+    service_state, start_hint, stop_hint, stop_service, task_exists, task_info,
+    task_xml,
 )
 
 __version__ = "0.1.9"
@@ -223,19 +225,30 @@ def human(n):
 # question on either platform.
 # ----------------------------------------------------------------------------
 
+def is_os_disk(disk):
+    """The one not to fill. "/" on Linux, %SystemDrive% on Windows.
+
+    Asked of the platform rather than spelled as a literal, because C: is only
+    usually right and a wizard that recommends the boot drive on the one
+    machine where it is wrong has recommended filling it.
+    """
+    return same_file_name(disk["mount"], os_disk_mount())
+
+
 def recommend(disks):
-    """Prefer the roomiest non-root filesystem; don't fill the OS disk."""
+    """Prefer the roomiest filesystem that is not the OS disk."""
     if not disks:
         return None
-    non_root = [d for d in disks if d["mount"] != "/"]
-    if non_root and non_root[0]["free"] >= 20 * 1024 ** 3:
-        return non_root[0]
+    others = [d for d in disks if not is_os_disk(d)]
+    if others and others[0]["free"] >= 20 * 1024 ** 3:
+        return others[0]
     return disks[0]
 
 
 def show_disks(disks, best):
     print()
-    print("   " + bold(f"{'#':<3}{'Mount':<22}{'Type':<8}{'Free':>10}"
+    label = "Drive" if os_disk_mount() != "/" else "Mount"
+    print("   " + bold(f"{'#':<3}{label:<22}{'Type':<8}{'Free':>10}"
                        f"{'Total':>11}   Notes"))
     for i, d in enumerate(disks, 1):
         notes = []
@@ -243,7 +256,7 @@ def show_disks(disks, best):
             notes.append("HDD")
         elif d["rotational"] is False:
             notes.append("SSD")
-        if d["mount"] == "/":
+        if is_os_disk(d):
             notes.append("OS disk")
         mark = green(" <- recommended") if d is best else ""
         print(f"   {i:<3}{d['mount']:<22}{d['fstype']:<8}"
@@ -274,7 +287,7 @@ def choose_storage(cfg):
         idx = ask_int("Which filesystem should hold the frames?",
                       default_idx, 1, len(disks))
         chosen = disks[idx - 1]
-        suggested = (DATA_ROOT_DEFAULT if chosen["mount"] == "/"
+        suggested = (DATA_ROOT_DEFAULT if is_os_disk(chosen)
                      else str(Path(chosen["mount"]) / "timelapse"))
         base = ask("Base directory", suggested)
 
@@ -289,21 +302,62 @@ def choose_storage(cfg):
 
 
 def find_binary(name, fallback):
-    found = shutil.which(name)
-    return found or fallback
+    """Where this machine already has `name`, or the given fallback.
+
+    The fallback is what makes the two platforms differ, and it is not a
+    cosmetic difference: on Linux the installer has already put ffmpeg at
+    /usr/bin/ffmpeg by the time this runs, so a default that is wrong is
+    merely unhelpful. On Windows nothing installed it (item 11c.6a), so a
+    made-up default would be a path that does not exist offered as though it
+    did, and the operator would accept it and find out at the first encode.
+    Empty means "no default", and ask() then insists on an answer.
+    """
+    return find_tool(name) or fallback
 
 
 def choose_tools(cfg):
     heading("ffmpeg")
-    ffmpeg = find_binary("ffmpeg", "/usr/bin/ffmpeg")
-    ffprobe = find_binary("ffprobe", "/usr/bin/ffprobe")
-    cfg["paths"]["ffmpeg"] = ask("Path to ffmpeg", ffmpeg)
-    cfg["paths"]["ffprobe"] = ask("Path to ffprobe", ffprobe)
+    ffmpeg_default = find_binary("ffmpeg", "" if IS_WINDOWS
+                                 else "/usr/bin/ffmpeg")
+    if IS_WINDOWS:
+        note("A folder is fine: give the one holding ffmpeg.exe and")
+        note("ffprobe.exe and both will be taken from it.")
+        if not ffmpeg_default:
+            warn("No ffmpeg found on this machine.")
+            note(f"Builds for Windows: {FFMPEG_URL}")
+            note("Get one with NVENC if this box has an NVIDIA card, or the")
+            note("encoder probe below will report the slow CPU fallback and")
+            note("nothing will say why.")
+
+    answer = ask("Path to ffmpeg (or its folder)" if IS_WINDOWS
+                 else "Path to ffmpeg", ffmpeg_default)
+    cfg["paths"]["ffmpeg"] = resolve_tool(answer, "ffmpeg")
+
+    # Derived from the same answer rather than asked again. Given a folder they
+    # came from one place by construction; given a file, the sibling beside it
+    # is a far better guess than PATH, because a machine can easily have two
+    # ffmpeg builds and taking one binary from each is the kind of mismatch
+    # that produces an unreadable error much later.
+    beside = sibling_tool(cfg["paths"]["ffmpeg"], "ffprobe")
+    ffprobe_default = beside or find_binary("ffprobe",
+                                            "" if IS_WINDOWS
+                                            else "/usr/bin/ffprobe")
+    if beside:
+        cfg["paths"]["ffprobe"] = beside
+        note(f"ffprobe -> {beside}")
+    else:
+        cfg["paths"]["ffprobe"] = resolve_tool(
+            ask("Path to ffprobe", ffprobe_default), "ffprobe")
 
     chosen, failures = detect_encoders(cfg["paths"]["ffmpeg"])
 
     if chosen is None:
         fail("No usable encoder at all - ffmpeg cannot encode here.")
+        if IS_WINDOWS:
+            note("Without a working ffmpeg there is no product: capture will")
+            note("collect frames and nothing will ever turn them into a video.")
+            note(f"Builds for Windows: {FFMPEG_URL}")
+            note("Re-run 'timelapse setup' once it is installed.")
     elif chosen == "av1_nvenc":
         good("av1_nvenc available - AV1 hardware encoding will be used.")
     elif chosen == "hevc_nvenc":
@@ -322,6 +376,24 @@ def choose_tools(cfg):
             note(hint)
         if message:
             note(f"ffmpeg said: {message[:150]}")
+
+
+def sibling_tool(ffmpeg, name):
+    """The companion binary next to the one just chosen, or "" if not there.
+
+    ffprobe ships in the same folder as ffmpeg in every build of either, so the
+    neighbour is a better answer than PATH: a machine with two ffmpeg builds
+    would otherwise get ffmpeg from one and ffprobe from the other, and the two
+    disagreeing shows up as an error about a stream much later.
+    """
+    path = str(ffmpeg).strip()
+    if not path:
+        return ""
+    folder = os.path.dirname(path)
+    if not folder:
+        return ""
+    candidate = resolve_tool(folder, name)
+    return candidate if os.path.exists(candidate) else ""
 
 
 def detect_encoders(ffmpeg):
@@ -1955,6 +2027,81 @@ def is_root():
     return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
+def looks_like_ssh_spec(dest):
+    """user@host:/path, which is an rsync destination and only rsync's.
+
+    Deliberately not a test for "remote": \\\\tower\\cctv is remote and is
+    perfectly usable. This asks whether the string is the *Linux* shape, so
+    that a config written there and carried to a Windows box is refused with
+    its reason rather than treated as a relative path, which would silently
+    create a folder called `user@nas:` next to the videos.
+
+    A bare drive letter is excluded by requiring an @ before the colon, so
+    C:\\videos is never mistaken for a host.
+    """
+    text = str(dest)
+    head = text.split(":", 1)[0] if ":" in text else ""
+    return "@" in head and "/" not in head and "\\" not in head
+
+
+def choose_windows_destination(cfg):
+    """One question: a path this machine can write. (item 11c.5)
+
+    No SSH and no mounting, because neither exists here. A UNC path needs no
+    mount at all, which deletes most of what the Linux branch does, and a
+    remote destination is required to be an existing writable network path
+    rather than something this tool sets up.
+    """
+    print()
+    note("A folder on this machine, or a network path such as")
+    note(r"\\tower\videos\timelapse. A network path must already exist and")
+    note("be writable; this does not create shares or map drives.")
+    print()
+    dest = ask("Destination path", "")
+    if not dest.strip():
+        warn("Nothing given. Transfer left disabled.")
+        cfg["transfer"]["enabled"] = False
+        return
+
+    if looks_like_ssh_spec(dest):
+        fail("That is an rsync-over-SSH destination, which is Linux only.")
+        note("Windows has no equivalent and none is planned. Give a folder")
+        note("or a network path instead.")
+        cfg["transfer"]["enabled"] = False
+        return
+
+    # The single most likely way a Windows install fails, and it fails in a
+    # way that reads as this tool being broken: drive mappings are per logon
+    # session, so U:\TL is something the operator can open in Explorer and a
+    # service cannot see at all.
+    unc = network_path(dest)
+    if unc:
+        print()
+        warn(f"{dest[:2]} is a mapped drive, which exists only for you.")
+        note("A service or a scheduled task gets its own logon session and no")
+        note("mappings at all, so it would fail with 'path not found' on a")
+        note("path you can open perfectly well. Storing where it really points:")
+        note(f"  {unc}")
+        dest = unc
+
+    cfg["transfer"]["destination"] = dest
+    # Nothing to mount, so nothing to check for having been unmounted. The
+    # Linux flag guards against a dropped mount turning a share back into an
+    # empty local directory; a UNC path that is unreachable simply fails.
+    cfg["transfer"]["require_mountpoint"] = False
+    if Path(dest).is_dir():
+        good(f"{dest} exists")
+    else:
+        warn(f"{dest} does not exist yet.")
+        note("The encoder will try to create it on the first transfer. If it")
+        note("is a network path, check the name now: this is the point where")
+        note("a typo is cheap.")
+    print()
+    note("Whether the account that runs the nightly encode can actually write")
+    note("there is tested when transfer itself is built. Until then, 'timelapse")
+    note("test' reports what it can see from your own account.")
+
+
 def choose_transfer(cfg, svcuser=None):
     heading("Transfer (optional)")
     note("After encoding, videos can be moved to a NAS or another host.")
@@ -1964,6 +2111,13 @@ def choose_transfer(cfg, svcuser=None):
         cfg["transfer"]["enabled"] = False
         return
     cfg["transfer"]["enabled"] = True
+
+    if IS_WINDOWS:
+        # Mounting a CIFS share and an rsync remote spec are both Linux-only
+        # mechanisms, so offering them here would be offering two of three
+        # options that cannot work.
+        choose_windows_destination(cfg)
+        return
 
     print()
     print("    1  A network share (SMB/CIFS) - set it up for me")

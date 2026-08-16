@@ -131,6 +131,7 @@ jobs:
           python scripts/timelapse_setup.py --version
           python scripts/timelapse_update.py --version
           python scripts/timelapse_platform.py --version
+          python scripts/timelapse_cli.py --version
 
       # The one place the Windows locations get written into a real file
       # rather than asserted about. No --template here, unlike the Linux leg:
@@ -161,6 +162,30 @@ jobs:
           $out = python scripts/timelapse_setup.py --remove-units 2>&1 | Out-String
           Write-Host $out
           if ($out -match 'Traceback') { throw "it tracebacked" }
+
+      # The Windows analogue of the `shell` job's bash -n and shellcheck.
+      # install.ps1 cannot be *run* here (it registers services and needs
+      # elevation) but it can be parsed, which catches the whole class of
+      # mistake that would otherwise be found by an operator mid-install.
+      - name: install.ps1 parses
+        run: |
+          foreach ($file in @('install.ps1', 'temp/step3b_check.ps1')) {
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $file), [ref]$null, [ref]$errors)
+            if ($errors) {
+              $errors | ForEach-Object { Write-Host $_.Message }
+              throw "$file does not parse"
+            }
+            Write-Host "$file parses"
+          }
+
+      - name: The command wrapper dispatches
+        run: |
+          python scripts/timelapse_cli.py --help
+          python scripts/timelapse_cli.py version
+          $out = python scripts/timelapse_cli.py nonsense 2>&1 | Out-String
+          if ($out -notmatch 'unknown command') { throw "no usage error" }
 
   shell:
     runs-on: ubuntu-latest

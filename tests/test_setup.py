@@ -31,6 +31,17 @@ import timelapse_setup as setup
 
 
 class TestRecommend(unittest.TestCase):
+    """Which disk to offer, and the OS disk is the one not to fill.
+
+    The mountpoints below are Linux ones, so "which is the OS disk" is forced
+    rather than inherited: on the Windows CI leg the real answer is C:\\ and
+    every case here would silently stop testing the rule it was written for.
+    """
+
+    def setUp(self):
+        patch = mock.patch.object(setup, "os_disk_mount", return_value="/")
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def disk(self, mount, free_gb):
         return {"mount": mount, "free": int(free_gb * 1024 ** 3),
@@ -874,7 +885,12 @@ class TestNarrowStdout(unittest.TestCase):
 
 
 class TestTransferDestinationKind(unittest.TestCase):
-    """SSH guidance must appear only for the SSH option."""
+    """SSH guidance must appear only for the SSH option.
+
+    Linux is forced, on both legs. This whole menu is Linux-only: mounting a
+    CIFS share and an rsync remote spec are mechanisms Windows does not have,
+    and the Windows branch is a different set of questions tested below.
+    """
 
     def drive(self, keystrokes):
         prev_tty, prev_auto = setup._TTY, setup.AUTO
@@ -883,7 +899,8 @@ class TestTransferDestinationKind(unittest.TestCase):
         cfg = setup.default_config()
         buf = io.StringIO()
         try:
-            with contextlib.redirect_stdout(buf):
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "IS_WINDOWS", False):
                 setup.choose_transfer(cfg)
         finally:
             setup._TTY, setup.AUTO = prev_tty, prev_auto
@@ -3368,6 +3385,209 @@ class TestIPv6CameraAddresses(unittest.TestCase):
         parsed = urlparse(url)
         self.assertEqual(parsed.hostname, "fdd2::1")
         self.assertEqual(parsed.port, 554)
+
+
+class TestSshSpecDetection(unittest.TestCase):
+    """user@host:/path is rsync's shape and only rsync's."""
+
+    def test_it_recognises_an_rsync_remote_spec(self):
+        for dest in ("user@nas:/vol/tl/", "root@192.0.2.9:/srv",
+                     "backup@tower:timelapse"):
+            self.assertTrue(setup.looks_like_ssh_spec(dest), dest)
+
+    def test_a_drive_letter_is_not_a_host(self):
+        """The case that makes a naive "contains a colon" test wrong, and it
+
+        would refuse the most ordinary Windows answer there is.
+        """
+        for dest in (r"C:\videos", r"D:\timelapse\out", "C:/videos"):
+            self.assertFalse(setup.looks_like_ssh_spec(dest), dest)
+
+    def test_a_unc_path_is_not_a_host(self):
+        self.assertFalse(setup.looks_like_ssh_spec(r"\\tower\cctv\TL"))
+
+    def test_a_plain_path_is_not(self):
+        for dest in ("/mnt/nas/timelapse", "videos", ""):
+            self.assertFalse(setup.looks_like_ssh_spec(dest), dest)
+
+    def test_an_email_shaped_folder_deeper_in_the_path_is_not(self):
+        # The @ has to be before the colon, in the host part. A folder called
+        # "a@b" further along is just a folder.
+        self.assertFalse(setup.looks_like_ssh_spec("/srv/a@b:c"))
+
+
+class TestWindowsTransfer(unittest.TestCase):
+    """One question on Windows: a path this machine can write.
+
+    Mounting a CIFS share and an rsync remote spec are both mechanisms Windows
+    does not have, so the Linux menu would be offering two of three options
+    that cannot work.
+    """
+
+    def drive(self, keystrokes, mapping=None):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=False)
+        cfg = setup.default_config()
+        buf = io.StringIO()
+        mapping = mapping or {}
+        try:
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "IS_WINDOWS", True), \
+                 mock.patch.object(setup, "network_path",
+                                   side_effect=lambda p: mapping.get(str(p))):
+                setup.choose_transfer(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return cfg["transfer"], buf.getvalue()
+
+    def test_declining_leaves_it_disabled(self):
+        transfer, _ = self.drive("n\n")
+        self.assertFalse(transfer["enabled"])
+
+    def test_a_local_folder_is_stored_as_typed(self):
+        transfer, _ = self.drive("y\nD:\\timelapse\\out\n")
+        self.assertTrue(transfer["enabled"])
+        self.assertEqual(transfer["destination"], "D:\\timelapse\\out")
+
+    def test_a_unc_path_is_stored_as_typed(self):
+        transfer, _ = self.drive("y\n\\\\tower\\cctv\\TL\n")
+        self.assertEqual(transfer["destination"], "\\\\tower\\cctv\\TL")
+
+    def test_a_mapped_drive_is_stored_as_its_unc_target(self):
+        """The single most likely way a Windows install fails, and it fails on
+
+        a path the operator can open in Explorer: drive mappings belong to a
+        logon session, and a service gets its own with none in it.
+        """
+        transfer, out = self.drive("y\nU:\\TL\n",
+                                   mapping={"U:\\TL": "\\\\tower\\cctv\\TL"})
+        self.assertEqual(transfer["destination"], "\\\\tower\\cctv\\TL")
+        self.assertIn("mapped drive", out)
+        self.assertIn("\\\\tower\\cctv\\TL", out)
+
+    def test_it_says_why_rather_than_silently_substituting(self):
+        _transfer, out = self.drive("y\nU:\\TL\n",
+                                    mapping={"U:\\TL": "\\\\t\\c\\TL"})
+        self.assertIn("logon session", out)
+
+    def test_an_rsync_spec_is_refused_with_its_reason(self):
+        """A config written on Linux and carried over. Treated as a relative
+
+        path it would silently create a folder called `user@nas:` beside the
+        videos, which is a fault nobody would ever look for.
+        """
+        transfer, out = self.drive("y\nuser@nas:/vol/tl/\n")
+        self.assertFalse(transfer["enabled"])
+        self.assertIn("Linux only", out)
+
+    def test_an_empty_answer_disables_rather_than_storing_nothing(self):
+        transfer, out = self.drive("y\n\n")
+        self.assertFalse(transfer["enabled"])
+        self.assertIn("left disabled", out)
+
+    def test_it_never_offers_to_mount_anything(self):
+        _transfer, out = self.drive("y\nD:\\out\n")
+        for absent in ("SMB/CIFS", "set it up for me", "SSH key", "rsync"):
+            self.assertNotIn(absent, out, absent)
+
+    def test_there_is_no_mountpoint_to_require(self):
+        # The Linux flag guards against a dropped mount turning a share back
+        # into an empty local directory. A UNC path that is unreachable simply
+        # fails, so there is nothing to guard.
+        transfer, _ = self.drive("y\n\\\\tower\\cctv\\TL\n")
+        self.assertFalse(transfer["require_mountpoint"])
+
+
+class TestWindowsFfmpeg(unittest.TestCase):
+    """The wizard asks; the installer does not provide (item 11c.6a)."""
+
+    def drive(self, keystrokes, found="", resolve=None, encoders=("libx264",
+                                                                  [])):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=False)
+        cfg = setup.default_config()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "IS_WINDOWS", True), \
+                 mock.patch.object(setup, "find_tool", return_value=found), \
+                 mock.patch.object(setup, "resolve_tool",
+                                   side_effect=resolve or (lambda a, n: a)), \
+                 mock.patch.object(setup, "sibling_tool", return_value=""), \
+                 mock.patch.object(setup, "detect_encoders",
+                                   return_value=encoders):
+                setup.choose_tools(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return cfg["paths"], buf.getvalue()
+
+    def test_it_offers_no_default_when_nothing_is_installed(self):
+        """Not /usr/bin/ffmpeg and not a guess. A made-up default would be
+
+        offered as though it existed, accepted, and found out about at the
+        first encode: on Linux the installer has already put one there, and
+        here nothing has.
+        """
+        _paths, out = self.drive("C:\\ff\\ffmpeg.exe\nC:\\ff\\ffprobe.exe\n")
+        self.assertNotIn("/usr/bin/ffmpeg", out)
+
+    def test_it_says_where_to_get_one_when_there_is_none(self):
+        _paths, out = self.drive("C:\\ff\\ffmpeg.exe\nC:\\ff\\ffprobe.exe\n")
+        self.assertIn("ffmpeg.org", out)
+        self.assertIn("NVENC", out)
+
+    def test_it_says_a_folder_is_acceptable(self):
+        _paths, out = self.drive("C:\\ff\\bin\nC:\\ff\\bin\n")
+        self.assertIn("folder", out.lower())
+
+    def test_an_existing_ffmpeg_becomes_the_default(self):
+        paths, _out = self.drive("\n\n", found="C:\\ffmpeg\\bin\\ffmpeg.exe")
+        self.assertEqual(paths["ffmpeg"], "C:\\ffmpeg\\bin\\ffmpeg.exe")
+
+    def test_no_usable_encoder_names_the_consequence(self):
+        _paths, out = self.drive("C:\\ff\\ffmpeg.exe\nC:\\ff\\ffprobe.exe\n",
+                                 encoders=(None, []))
+        self.assertIn("no product", out)
+        self.assertIn("ffmpeg.org", out)
+
+
+class TestFfprobeFollowsFfmpeg(unittest.TestCase):
+    """One answer, two binaries."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+
+    def test_the_neighbour_is_preferred_over_path(self):
+        """A machine can easily have two ffmpeg builds, and taking one binary
+
+        from each is a mismatch that shows up as an error about a stream, much
+        later, with nothing pointing back here.
+        """
+        (self.tmp / "ffmpeg").write_text("x", encoding="utf-8")
+        (self.tmp / "ffprobe").write_text("x", encoding="utf-8")
+        # plat, not setup. `from timelapse_platform import IS_WINDOWS` makes
+        # two bindings to one value, and resolve_tool resolves names in the
+        # module that defines it: patching the wizard's copy would leave the
+        # platform module still answering "Windows" and this looking for
+        # ffprobe.exe. Same trap the update checker's four tests fell into.
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            found = setup.sibling_tool(str(self.tmp / "ffmpeg"), "ffprobe")
+        self.assertEqual(Path(found), self.tmp / "ffprobe")
+
+    def test_a_missing_neighbour_is_reported_as_absent(self):
+        (self.tmp / "ffmpeg").write_text("x", encoding="utf-8")
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.assertEqual(setup.sibling_tool(str(self.tmp / "ffmpeg"),
+                                                "ffprobe"), "")
+
+    def test_an_empty_answer_has_no_neighbour(self):
+        self.assertEqual(setup.sibling_tool("", "ffprobe"), "")
+
+    def test_a_bare_name_with_no_folder_has_no_neighbour(self):
+        self.assertEqual(setup.sibling_tool("ffmpeg", "ffprobe"), "")
 
 
 class TestServiceDefinitions(unittest.TestCase):

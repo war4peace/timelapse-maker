@@ -139,7 +139,10 @@ so either can be stopped, replaced or rewritten without touching the other.
 
 ## Requirements
 
-- Linux with systemd (developed on Ubuntu Server; nothing is distro-specific)
+- Linux with systemd (developed on Ubuntu Server; nothing is distro-specific),
+  or **Windows 10/11 and Server, as an early preview**: capture and encode run
+  there, as a real service and two scheduled tasks. The web UI does not yet.
+  See "Windows" under Install below.
 - **Python 3.9 or newer.** The floor is deliberate and machine-checked: RHEL 9
   and its rebuilds ship 3.9 as the system `python3`, and that is the
   interpreter their packaged `requests` is built for, so a newer one would mean
@@ -213,6 +216,32 @@ cd timelapse-maker && sudo ./install.sh
 ```
 
 For a fully manual install, see [docs/install.md](docs/install.md).
+</details>
+
+<details>
+<summary>Windows (early preview)</summary>
+
+Download or clone the repository, open **PowerShell as administrator** and run:
+
+```powershell
+.\install.ps1
+```
+
+It finds your Python, places the scripts, registers the capture daemon as a
+real Windows service and the nightly encode and credential check as scheduled
+tasks, then runs the same wizard. `.\install.ps1 -Uninstall` removes all of
+that and leaves your configuration, frames and videos alone.
+
+Two things it does **not** install, deliberately. **ffmpeg**: Windows has no
+package manager worth relying on, and a recorder usually already has one you
+chose, so the wizard asks where it is and verifies it by running it. Get a
+build from [ffmpeg.org](https://ffmpeg.org/download.html) first, with NVENC if
+the machine has an NVIDIA card. And **Python**: install 3.9 or newer from
+python.org, preferably "for all users".
+
+What is not there yet: the web UI, and upgrading in place. To upgrade, download
+the new release and run `install.ps1` again; it keeps everything.
+
 </details>
 
 After installing, a `timelapse` command wraps the common operations. Run

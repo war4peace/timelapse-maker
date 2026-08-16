@@ -1535,7 +1535,9 @@ different name:
 | secure a file holding passwords | `secure_secret_file()` |
 | is this name usable as a filename | `is_reserved_name()`, `same_file_name()` |
 | how a log file is kept | `log_handler()`, `DailyFileHandler` |
-| which disks could hold frames | `scan_filesystems()` |
+| which disks could hold frames | `scan_filesystems()`, `os_disk_mount()` |
+| is this path really on the network | `network_path()`, `unc_for_drive()` |
+| where ffmpeg might be | `find_tool()`, `resolve_tool()` |
 
 Four properties are load-bearing.
 
@@ -1669,6 +1671,67 @@ Registration itself lives in `timelapse_setup.py` (`--install-units`,
 disagree within one release. `service_definitions()` is a pure table mapping
 each unit file onto its Windows form, so both CI legs assert the same schedule,
 argv and account.
+
+### 4.6b `install.ps1` and `timelapse_cli.py` (0.2.0)
+
+The Windows front door: the counterpart to `install.sh` and to the bash wrapper
+it generates. Three properties are load-bearing.
+
+**The installer decides nothing.** It checks privilege, finds an interpreter,
+places files, restricts an ACL, writes a two-line wrapper, and then calls
+`timelapse_setup.py --install-units`. It contains no `sc.exe`, no `schtasks`
+and no `New-Service`, and a test asserts that: two installers that both know
+how to register a service disagree within one release, which is why `tools/`
+was deleted. When the GUI installer of item 11c.6b arrives it front-ends this
+file for the same reason, one level up.
+
+**Three things it deliberately does not do**, each decided rather than skipped.
+It does not install **ffmpeg** (§11c.6a: Windows has no package manager worth
+relying on, and a recorder usually already has an ffmpeg the operator chose, so
+installing a second copy would override a decision that was not ours). It does
+not install **Python**; it finds one, records its absolute path, and names
+python.org when there is none. And it does not carry service state across an
+**upgrade** the way `install.sh` does, because registration overwrites and
+there is no field of Windows installs whose states need preserving yet.
+`timelapse update` is correspondingly Linux-only, and says so rather than
+half-working.
+
+**A per-user Python is warned about, not refused.** It demonstrably works, and
+refusing a working configuration is the `try_rsync_args` error. But the service
+runs as LocalSystem reading an interpreter out of another account's profile, so
+removing that profile or reinstalling Python for a different user stops the
+service starting, weeks later, with nothing connecting the two events.
+
+`timelapse_cli.py` is the `timelapse` command. It exists because a batch file
+has no heredoc and its escaping would turn a page of help text into a wall of
+`echo` lines that would rot; `timelapse.cmd` is two lines calling it. Like the
+installer it is a **dispatcher**: every command builds an argv and runs a
+sibling, so there is no second implementation of any behaviour. Its locations
+are derived rather than baked, the scripts being beside it by construction and
+the config coming from the platform module, so moving the install directory
+cannot leave the wrapper pointing at the old layout.
+
+Two front doors onto one set of commands is a drift risk, and it is answered by
+a test rather than by a promise: `test_cli.py` reads the command labels out of
+`install.sh`'s generated wrapper and holds them against this file's table, with
+an explicit list of what is Linux-only and why. A command that exists on one
+platform and not the other must also be *answered* rather than reported as
+unknown, because "unknown command" reads as a typo and the operator retypes it.
+
+**The file-permission model does not translate, and the Windows shape is
+better.** On Linux `timelapse config` has to restore 0640 root:timelapse after
+`$EDITOR`, because an editor that saves by rename leaves root's umask on a brand
+new file and the config loses its group. On Windows a new file inherits the
+*directory's* ACL, so `install.ps1` breaks inheritance on
+`%ProgramData%\timelapse` once and grants only SYSTEM and Administrators; every
+file created there afterwards, including an editor's temporary copies, is
+covered by where it is rather than by what the editor did.
+
+**`install.ps1` is pure ASCII, and that is measured.** Windows PowerShell 5.1
+reads a `.ps1` with no byte order mark as ANSI, so `install.sh`'s box-drawing
+banner comes out as mojibake and the installer's first line looks like a
+corrupted download. A BOM is the usual fix; ASCII is the one that does not make
+this the single file in the repo with its own encoding rule.
 
 ### 4.7 `install.sh`
 
@@ -2192,7 +2255,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,469 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,550 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -2227,7 +2290,17 @@ two failure modes: if the daemon captures in the foreground and the dispatcher
 is refused with the documented 1063, then anything still broken is in the
 hosting and nowhere else.
 
-All 17 of its checks passed on the first elevated run, 2026-08-16. Two of the
+`temp/step3b_check.ps1` is the same idea for the installer: a real install with
+`-NoWizard`, checks that the files, the wrapper, the PATH entry, the ACL and
+the registrations all landed, a run of `timelapse version` **through the
+wrapper** rather than through Python (a broken `.cmd` is invisible to every
+other check and is the first thing anybody touches), then a real uninstall and
+checks that it removed all of that and left the recordings alone. CI parses
+both PowerShell files and asserts `install.ps1` is ASCII, which is the Windows
+analogue of the `shell` job's `bash -n` and shellcheck.
+
+All 17 of `step3_check.py`'s checks passed on the first elevated run,
+2026-08-16. Two of the
 numbers matter beyond a tick: RUNNING was reported **0.7 seconds** after
 `StartService`, against roughly thirty seconds of SCM patience, so the 1053
 failure is not being narrowly avoided; and the service captured **six frames in
@@ -2505,16 +2578,19 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 964 lines
+install.sh                       bootstrap installer, 971 lines
+install.ps1                      the Windows one, 353 lines
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 1846 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 905 lines
-scripts/timelapse_setup.py       configuration wizard, 3815 lines
+scripts/timelapse_setup.py       configuration wizard, 3969 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_platform.py    the only platform branch, 1398 lines
+scripts/timelapse_platform.py    the only platform branch, 1672 lines
+scripts/timelapse_cli.py         the `timelapse` command on Windows, 367 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
+tests/test_cli.py                unit tests
 tests/test_encode.py             unit tests
 tests/test_grammar.py            the 3.9 floor, incl. the PEP 701 gap
 tests/test_platform.py           unit tests

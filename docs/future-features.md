@@ -553,7 +553,7 @@ can name `user@nas:/path`. The Windows tool must **refuse that clearly**,
 naming it as a Linux-only destination shape, rather than treating it as a
 relative path and silently creating a directory called `user@nas:` somewhere.
 
-**6. Bootstrap.** `install.ps1` beside `install.sh`, not instead of it. It
+**6. Bootstrap. BUILT 2026-08-16.** `install.ps1` beside `install.sh`, not instead of it. It
 does: check for an elevated shell, find Python, lay files under
 `%ProgramFiles%\timelapse`, create `%ProgramData%\timelapse`, register the
 service and the tasks, run the wizard. ffmpeg is **not** its problem; see 6a.
@@ -565,7 +565,7 @@ syntax check is parsing without executing, via
 `[ScriptBlock]::Create((Get-Content -Raw $path))`.
 
 **6a. ffmpeg is the operator's to supply, and the installer must not pretend
-otherwise.** Decided 2026-08-15. On Linux `install.sh` installs ffmpeg from
+otherwise. BUILT 2026-08-16.** Decided 2026-08-15. On Linux `install.sh` installs ffmpeg from
 the distro, which works because there is exactly one ffmpeg per distro and the
 package manager owns it. Windows has no equivalent worth relying on: `winget`
 exists on Windows 11 but not on Server, the builds people actually run come
@@ -667,7 +667,14 @@ the author. It is also **cheaper than this entry first priced it**, per the two
 corrections above, which is a reason to keep the deferral honest: it is
 deferred because the prototype comes first, not because the item is expensive.
 
-**7. The file-permission model, which does not translate.** `0640
+**7. The file-permission model, which does not translate. BUILT 2026-08-16**,
+and it turned out to need *less* than this entry expected, for a reason worth
+keeping: a new file inherits the **directory's** ACL, so restricting
+`%ProgramData%\timelapse` once in `install.ps1` covers `config.json` and every
+temporary copy an editor makes in it. The Linux side has to restore the mode
+after `$EDITOR` precisely because a rename does *not* inherit anything there;
+here the protection is a property of where the file is. `timelapse config`
+therefore needs no fix-up step at all on Windows. `0640
 root:timelapse` on `config.json` is a claim this project makes repeatedly and
 tests for. Windows has no mode bits worth using; the equivalent is breaking
 ACL inheritance and granting only SYSTEM, Administrators and the service
@@ -677,7 +684,7 @@ rename creates a **new** file that inherits the *parent directory's* ACL
 rather than the original's, which is the same class of bug as the umask one,
 with a different mechanism.
 
-**8. The storage scan.** `scan_filesystems()` parses `/proc/mounts` and is
+**8. The storage scan. BUILT 2026-08-16.** `scan_filesystems()` parses `/proc/mounts` and is
 entirely Linux. The Windows shape is different rather than harder: enumerate
 drive roots (`os.listdrives()` is 3.12+ and the floor here is 3.9, so either
 an `A:` to `Z:` existence loop or `GetLogicalDrives` through `ctypes`, which
@@ -685,7 +692,8 @@ is stdlib), then `shutil.disk_usage()` per drive, and `GetDriveTypeW` through
 `ctypes` to tell fixed from removable from network. The rotational check has
 no cheap equivalent and should simply be dropped rather than approximated.
 
-**9. Share setup, which mostly disappears.** `setup_cifs_share()` installs
+**9. Share setup, which mostly disappears. BUILT 2026-08-16**, minus the
+write probe, which belongs with the transfer it probes for (step 4). `setup_cifs_share()` installs
 `cifs-utils`, mounts, writes a 0600 credential file and persists to
 `/etc/fstab`. On Windows a UNC path needs no mounting at all, so most of that
 function has no counterpart. Given the decision in item 5, what is left is
@@ -704,7 +712,7 @@ small and specific:
   operator). Whether this is needed at all depends on the account decision in
   item 2a.
 
-**10. The CLI wrapper.** `timelapse.cmd` plus a PATH entry. The `[sudo]`
+**10. The CLI wrapper. BUILT 2026-08-16.** `timelapse.cmd` plus a PATH entry. The `[sudo]`
 markers throughout the help text become an elevation check;
 `ctypes.windll.shell32.IsUserAnAdmin()` is stdlib and there is no `sudo` to
 suggest, so the message has to be "open an Administrator prompt", not a
@@ -1007,7 +1015,43 @@ stops being worth it:
    platform module, the SCM query/control/registration bindings, the scheduled
    task definitions, and `timelapse_setup.py --install-units / --remove-units /
    --unit-status`, which is what `install.ps1` will front-end. File logging was
-   already done at step 2. 1,469 tests, zero skips on both platforms, and the
+   **3b done 2026-08-16**: `install.ps1`, `timelapse_cli.py` behind a
+   `timelapse.cmd` shim, and the wizard's three Windows adaptations (6a's
+   ffmpeg question, 8's drive scan, 9's drive-letter resolution). 1,550 tests.
+   Four decisions, all put to the user first: the CLI is a **Python dispatcher**
+   rather than PowerShell or batch, because it is the only one of the three
+   either CI leg can test and because a batch help text would rot; the
+   installer covers install, uninstall and unattended but **not upgrade state**,
+   since there is no field of Windows installs to preserve and re-running
+   overwrites; Python is **required and its path baked**, with a per-user
+   install warned about rather than refused; and the transfer question is
+   **local path only**, with network destinations arriving at step 4 where the
+   copying does.
+
+   Three things measured while building it:
+
+   - **A `.ps1` with no byte order mark is read as ANSI by Windows PowerShell
+     5.1**, so install.sh's box-drawing banner arrives as mojibake and the
+     installer's first line looks like a corrupted download. Caught by running
+     it, not by reading it. `install.ps1` is ASCII throughout and a test
+     asserts that, which is cheaper than making it the one file in the repo
+     with its own encoding rule.
+   - **`os.path` is `ntpath` on the Windows CI leg**, so a Linux path built
+     with `os.path.join` comes back as `/opt/b\ffmpeg` and every Linux
+     assertion about it fails on one runner only. The module already knew this
+     for `locations()`; `find_tool()` and `resolve_tool()` learned it the same
+     way, from a test that would otherwise have been quietly platform-specific.
+     `posixpath.join` and `ntpath.join` by name, never `os.path`.
+   - **`from timelapse_platform import IS_WINDOWS` makes two bindings**, and
+     patching the wizard's copy leaves the platform module still answering
+     "Windows". Same shape as the four update-checker tests that silently
+     started hitting api.github.com: patch the module that owns the name.
+
+   **What is left of the port is item 11f steps 4 to 6**: transfer, the web UI,
+   and the GUI installer. Step 3's own goal is met: capture, encode and notify,
+   installable and removable.
+
+   1,469 tests, zero skips on both platforms, and the
    **elevated lifecycle passed first time**: registered as LocalSystem, RUNNING
    in 0.7s, six frames in twelve seconds at a two second cadence, a
    date-stamped log and a heartbeat written by the service rather than by the

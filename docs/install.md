@@ -44,6 +44,68 @@ and offers to keep your existing config.
 The download and the execution are deliberately two steps, so you can read the
 script before running it as root.
 
+### Windows (early preview)
+
+Capture and encode run on Windows 10, 11 and Server. The web UI does not yet,
+and neither does upgrading in place. Everything else below applies: the same
+config file, the same wizard, the same `timelapse` command, the same
+`timelapse test`.
+
+Get the prerequisites first, because the installer deliberately supplies
+neither:
+
+- **Python 3.9 or newer** from [python.org](https://www.python.org/downloads/windows/).
+  Prefer "install for all users". A per-user Python works, and the installer
+  says so, but it lives inside one account's profile and the service reads it
+  from outside: remove that profile, or reinstall Python for somebody else, and
+  the service stops starting weeks later with nothing to connect the two.
+- **ffmpeg** from [ffmpeg.org](https://ffmpeg.org/download.html), with NVENC if
+  the machine has an NVIDIA card. Windows has no package manager worth relying
+  on, and a recorder very often already has an ffmpeg its owner chose; putting
+  a second one on the machine would override a decision that was not ours. The
+  wizard asks where it is and checks it by running it, and it accepts the
+  folder holding `ffmpeg.exe` rather than making you type both paths.
+
+Then, from **PowerShell running as administrator**:
+
+```powershell
+.\install.ps1
+```
+
+| Flag | Effect |
+|---|---|
+| `-Unattended` | No questions. Defaults everywhere. |
+| `-NoWizard` | Place files and register services only. |
+| `-Prefix DIR` | Install somewhere other than `%ProgramFiles%\timelapse`. |
+| `-Uninstall` | Remove programs and services. Captured data is never deleted. |
+
+It places the scripts, restricts `%ProgramData%\timelapse` so that only the
+system and administrators can read the camera passwords in it, adds `timelapse`
+to the system PATH, and registers three things:
+
+| Component | Windows | Linux equivalent |
+|---|---|---|
+| `TimelapseCapture` | a service, automatic (delayed) start | `timelapse-capture.service` |
+| `Timelapse Encode` | a scheduled task, daily at 00:05 | `timelapse-encode.timer` |
+| `Timelapse Watch` | a scheduled task, every 5 minutes | `timelapse-watch.timer` |
+
+The service runs as LocalSystem and restarts itself if it stops unexpectedly,
+which is the equivalent of `Restart=always RestartSec=15`. Start it the first
+time with `sc start "TimelapseCapture"`; after a reboot it starts itself.
+
+**Open a new terminal before using `timelapse`.** A PATH change only reaches
+processes started after it.
+
+Two differences worth knowing:
+
+- **Logs are files, not a journal.** One per day, in `logs` under your data
+  directory: `capture-20260816.log`. `timelapse logs` follows the current one.
+- **A mapped drive letter is not a destination.** Drive mappings belong to
+  whoever signed in, and a service gets its own logon session with none in it,
+  so `U:\Videos` fails with "path not found" on a folder you can open in
+  Explorer. The wizard resolves a letter to its `\\server\share` form and
+  stores that; if you edit the config by hand, write the UNC path yourself.
+
 > **Piping straight to bash** (`curl -sL … | sudo bash`) also works; the
 > installer and wizard read prompts from `/dev/tty` rather than stdin, because
 > under a pipe stdin *is* the script. If no terminal is reachable at all, both

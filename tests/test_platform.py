@@ -44,7 +44,7 @@ def no_rotational(_source):
     return None
 
 
-class TestScanFilesystems(unittest.TestCase):
+class TestScanMounts(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -53,9 +53,8 @@ class TestScanFilesystems(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def scan(self, lines, statvfs=fake_statvfs):
-        return plat.scan_filesystems(write_mounts(self.tmp, lines),
-                                      statvfs=statvfs,
-                                      rotational=no_rotational)
+        return plat.scan_mounts(write_mounts(self.tmp, lines),
+                                statvfs=statvfs, rotational=no_rotational)
 
     def test_accepts_a_plain_disk(self):
         disks = self.scan(["/dev/sda1 /mnt/data ext4 rw,relatime 0 0"])
@@ -173,7 +172,7 @@ class TestScanFilesystems(unittest.TestCase):
         self.assertEqual([d["mount"] for d in disks], ["/mnt/data"])
 
     def test_missing_mounts_file_returns_empty(self):
-        self.assertEqual(plat.scan_filesystems("/nonexistent/mounts"), [])
+        self.assertEqual(plat.scan_mounts("/nonexistent/mounts"), [])
 
     def test_reports_free_and_total_in_bytes(self):
         disks = self.scan(["/dev/sda1 /mnt/data ext4 rw 0 0"])
@@ -1021,6 +1020,263 @@ class TestDailyFileHandler(unittest.TestCase):
             self.log.info("during")
         body = Path(handler.baseFilename).read_text(encoding="utf-8")
         self.assertIn("during", body)
+
+
+class TestScanDrives(unittest.TestCase):
+    """The Windows half of the storage scan, asserted from either leg.
+
+    Every input is injected, for the same reason the Linux half's are: a CD
+    drive, an empty card reader, a mapped share and a disk that refuses to
+    report its size are exactly the cases worth testing and exactly the ones no
+    CI runner will happen to have.
+    """
+
+    def scan(self, drives, sizes=None, kinds=None, names=None):
+        mask = 0
+        for letter in drives:
+            mask |= 1 << (ord(letter) - ord("A"))
+        sizes = sizes or {}
+        kinds = kinds or {}
+        names = names or {}
+
+        def usage(root):
+            if root not in sizes:
+                raise OSError("not ready")
+            total, free = sizes[root]
+            return (total, total - free, free)
+
+        return plat.scan_drives(
+            mask=mask,
+            kind=lambda root: kinds.get(root, plat.DRIVE_FIXED),
+            usage=usage,
+            volume=lambda root: names.get(root, "NTFS"))
+
+    def test_a_plain_fixed_disk_is_offered(self):
+        disks = self.scan("C", {"C:\\": (100, 40)})
+        self.assertEqual([d["mount"] for d in disks], ["C:\\"])
+        self.assertEqual(disks[0]["free"], 40)
+        self.assertEqual(disks[0]["total"], 100)
+        self.assertEqual(disks[0]["source"], "C:")
+        self.assertEqual(disks[0]["fstype"], "NTFS")
+
+    def test_removable_network_and_optical_drives_are_not(self):
+        """The same exclusions the Linux half makes, for the same reasons: 17k
+
+        small writes per camera per day over the wire is painful, and a disk
+        whose media can be ejected is worse.
+        """
+        sizes = {r"%s:\\" % c: (100, 50) for c in "CDEF"}
+        sizes = {"C:\\": (100, 50), "D:\\": (100, 50), "E:\\": (100, 50),
+                 "F:\\": (100, 50)}
+        kinds = {"D:\\": plat.DRIVE_REMOVABLE, "E:\\": plat.DRIVE_REMOTE,
+                 "F:\\": plat.DRIVE_CDROM}
+        disks = self.scan("CDEF", sizes, kinds)
+        self.assertEqual([d["mount"] for d in disks], ["C:\\"])
+
+    def test_a_drive_with_no_media_is_skipped_rather_than_fatal(self):
+        # An empty card reader reports DRIVE_REMOVABLE, but a letter that is
+        # merely not ready raises from disk_usage, and one bad drive must not
+        # cost the operator the listing.
+        disks = self.scan("CD", {"C:\\": (100, 40)})
+        self.assertEqual([d["mount"] for d in disks], ["C:\\"])
+
+    def test_a_zero_sized_drive_is_skipped(self):
+        self.assertEqual(self.scan("C", {"C:\\": (0, 0)}), [])
+
+    def test_sorted_by_free_space_descending(self):
+        sizes = {"C:\\": (500, 10), "D:\\": (500, 400), "E:\\": (500, 100)}
+        disks = self.scan("CDE", sizes)
+        self.assertEqual([d["mount"] for d in disks], ["D:\\", "E:\\", "C:\\"])
+
+    def test_a_drive_that_will_not_name_its_filesystem_is_still_offered(self):
+        disks = self.scan("C", {"C:\\": (100, 40)}, names={"C:\\": ""})
+        self.assertEqual(len(disks), 1)
+        self.assertEqual(disks[0]["fstype"], "")
+
+    def test_rotational_is_none_rather_than_guessed(self):
+        """Dropped deliberately (item 11c.8): there is no cheap equivalent of
+
+        /sys/block/*/queue/rotational, and "HDD" is a note beside a number, so
+        a wrong note is worth less than a blank one.
+        """
+        disks = self.scan("C", {"C:\\": (100, 40)})
+        self.assertIsNone(disks[0]["rotational"])
+
+    def test_the_letters_come_from_the_bitmask(self):
+        self.assertEqual(plat.drive_letters(0b101), ["A", "C"])
+        self.assertEqual(plat.drive_letters(1 << 25), ["Z"])
+        self.assertEqual(plat.drive_letters(0), [])
+
+    def test_both_halves_return_the_same_shape(self):
+        """The wizard reads one dict from either platform, so a key missing on
+
+        one side is a KeyError that only happens there.
+        """
+        windows = self.scan("C", {"C:\\": (100, 40)})[0]
+        self.assertEqual(set(windows),
+                         {"mount", "source", "fstype", "free", "total",
+                          "rotational"})
+
+
+class TestOsDiskMount(unittest.TestCase):
+    """Which disk not to fill."""
+
+    def test_linux_is_root(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.assertEqual(plat.os_disk_mount(), "/")
+
+    def test_windows_reads_the_environment(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertEqual(plat.os_disk_mount({"SystemDrive": "D:"}), "D:\\")
+
+    def test_it_tolerates_the_shapes_an_environment_variable_can_take(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            for given in ("C:", "c:", "C:\\", " C: ", "C"):
+                self.assertEqual(plat.os_disk_mount({"SystemDrive": given}),
+                                 "C:\\", given)
+
+    def test_it_falls_back_when_nothing_says(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertEqual(plat.os_disk_mount({}), "C:\\")
+
+
+class TestNetworkPath(unittest.TestCase):
+    """A mapped drive letter does not exist for a service.
+
+    Item 11d calls this the single most likely way a Windows install fails, and
+    the reason it is nasty is that it fails on a path the operator can open in
+    Explorer: mappings belong to a logon session, and a service gets its own.
+    """
+
+    def rewrite(self, path, mapping):
+        return plat.network_path(path, lookup=mapping.get)
+
+    def test_a_mapped_drive_becomes_its_unc_target(self):
+        self.assertEqual(self.rewrite(r"U:\TL", {"U:": r"\\tower\cctv"}),
+                         r"\\tower\cctv\TL")
+
+    def test_a_trailing_separator_on_the_target_is_not_doubled(self):
+        self.assertEqual(self.rewrite(r"U:\TL", {"U:": "\\\\tower\\cctv\\"}),
+                         r"\\tower\cctv\TL")
+
+    def test_the_drive_root_alone_works(self):
+        self.assertEqual(self.rewrite("U:", {"U:": r"\\tower\cctv"}),
+                         r"\\tower\cctv")
+
+    def test_a_local_drive_is_left_alone(self):
+        self.assertIsNone(self.rewrite(r"C:\videos", {}))
+
+    def test_a_unc_path_is_already_right(self):
+        self.assertIsNone(self.rewrite(r"\\tower\cctv\TL", {}))
+
+    def test_a_posix_path_is_not_mistaken_for_a_drive(self):
+        self.assertIsNone(self.rewrite("/mnt/nas/timelapse", {}))
+
+    def test_it_returns_none_rather_than_the_input_when_unchanged(self):
+        """Deliberate: the caller has to tell the operator that a substitution
+
+        happened, and a function that hands back either the same path or a
+        different one makes that impossible to say.
+        """
+        self.assertIsNone(self.rewrite(r"C:\x", {}))
+
+    def test_the_lookup_declines_off_windows(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.assertIsNone(plat.unc_for_drive("U:"))
+
+    def test_the_lookup_refuses_anything_that_is_not_a_drive(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            for given in ("U", r"\\tower\cctv", "", "C:\\videos"):
+                self.assertIsNone(plat.unc_for_drive(given), given)
+
+    def test_the_lookup_accepts_a_drive_written_either_way(self):
+        # WNetGetConnectionW wants "U:", but "U:\" is what a path starts with
+        # and what an operator types, so the separator is trimmed rather than
+        # being grounds for refusal.
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win") as api:
+            api.return_value.mpr.WNetGetConnectionW.return_value = 1
+            for given in ("U:", "U:\\", "U:/"):
+                plat.unc_for_drive(given)
+                called = api.return_value.mpr.WNetGetConnectionW.call_args[0]
+                self.assertEqual(called[0], "U:", given)
+
+
+class TestFindingTools(unittest.TestCase):
+    """Where ffmpeg is, and what an operator is allowed to type."""
+
+    def test_path_wins(self):
+        found = plat.find_tool("ffmpeg", roots=["/nowhere"],
+                               which=lambda n: "/usr/bin/ffmpeg",
+                               exists=lambda p: True)
+        self.assertEqual(found, "/usr/bin/ffmpeg")
+
+    def test_the_roots_are_tried_when_it_is_not_on_path(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            found = plat.find_tool("ffmpeg", roots=["/opt/a", "/opt/b"],
+                                   which=lambda n: None,
+                                   exists=lambda p: p == "/opt/b/ffmpeg")
+        self.assertEqual(found, "/opt/b/ffmpeg")
+
+    def test_nothing_found_is_an_empty_string_not_a_guess(self):
+        """Empty means "no default", and the wizard then insists on an answer.
+
+        A made-up path would be offered as though it existed, the operator
+        would accept it, and the first encode would be where they found out.
+        """
+        self.assertEqual(plat.find_tool("ffmpeg", roots=[],
+                                        which=lambda n: None,
+                                        exists=lambda p: False), "")
+
+    def test_the_windows_roots_are_the_places_builds_actually_land(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            roots = plat.ffmpeg_roots({"ProgramFiles": r"C:\Program Files",
+                                       "LOCALAPPDATA": r"C:\Users\x\AppData\Local"})
+        self.assertIn(r"C:\Program Files\ffmpeg\bin", roots)
+        self.assertIn(r"C:\ffmpeg\bin", roots)
+        self.assertTrue(any("WinGet" in r for r in roots))
+
+    def test_a_missing_environment_variable_drops_that_root(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            roots = plat.ffmpeg_roots({})
+        self.assertEqual(roots, ["C:\\ffmpeg\\bin"])
+
+    def test_a_file_is_taken_as_given(self):
+        self.assertEqual(
+            plat.resolve_tool(r"C:\ffmpeg\bin\ffmpeg.exe", "ffmpeg",
+                              isdir=lambda p: False),
+            r"C:\ffmpeg\bin\ffmpeg.exe")
+
+    def test_a_directory_is_accepted_and_resolved(self):
+        """The Windows-shaped part: the zip unpacks a bin folder holding
+
+        ffmpeg.exe, ffprobe.exe and ffplay.exe together, and "the ffmpeg
+        binaries path" is how operators there describe it.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            found = plat.resolve_tool(r"C:\ffmpeg\bin", "ffmpeg",
+                                      isdir=lambda p: p == r"C:\ffmpeg\bin",
+                                      exists=lambda p: p.endswith("ffmpeg.exe"))
+        self.assertEqual(found, r"C:\ffmpeg\bin\ffmpeg.exe")
+
+    def test_the_unpacked_folder_above_bin_works_too(self):
+        # What you get by unzipping the download and pointing at the result.
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            found = plat.resolve_tool(
+                r"C:\ffmpeg", "ffprobe",
+                isdir=lambda p: p == r"C:\ffmpeg",
+                exists=lambda p: p == r"C:\ffmpeg\bin\ffprobe.exe")
+        self.assertEqual(found, r"C:\ffmpeg\bin\ffprobe.exe")
+
+    def test_quotes_are_stripped(self):
+        # Explorer's "Copy as path" wraps the result in double quotes, and
+        # pasting that is the most likely way this answer arrives.
+        self.assertEqual(plat.resolve_tool('"C:\\ff\\ffmpeg.exe"', "ffmpeg",
+                                           isdir=lambda p: False),
+                         r"C:\ff\ffmpeg.exe")
+
+    def test_an_empty_answer_stays_empty(self):
+        self.assertEqual(plat.resolve_tool("  ", "ffmpeg"), "")
 
 
 class TestNoPlatformBranchesElsewhere(unittest.TestCase):

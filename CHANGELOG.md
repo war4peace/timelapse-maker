@@ -10,6 +10,30 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Added
+- **`install.ps1`, and a `timelapse` command to go with it.** **Nothing changes
+  on a Linux install.** The Windows installer checks for an Administrator
+  prompt, finds Python and records where it is, places the scripts, restricts
+  the configuration folder so only the system and administrators can read your
+  camera passwords, adds `timelapse` to the PATH, registers the service and the
+  two scheduled tasks, and runs the wizard. `install.ps1 -Uninstall` takes all
+  of that away again and leaves your configuration, frames and videos exactly
+  where they are.
+
+  Three things it does not do, each on purpose. It does not install **ffmpeg**:
+  Windows has no package manager worth relying on and a recorder usually
+  already has one the owner chose, so the wizard asks where it is and checks it
+  by running it. It does not install **Python**; it tells you where to get one.
+  And **upgrading in place is still Linux-only**: on Windows, download the new
+  release and run the installer again, which keeps everything.
+- **The wizard now asks Windows questions on Windows.** It lists real fixed
+  drives rather than nothing, offers the ffmpeg you already have and accepts
+  the folder holding it rather than making you type two paths, and asks one
+  transfer question instead of three, since mounting a network share and
+  copying over SSH are both mechanisms that platform does not have. **A mapped
+  drive letter is stored as its `\\server\share` form, and says so.** That one
+  matters more than it sounds: drive letters belong to whoever signed in, so a
+  service sees none of them, and a destination of `U:\Videos` would fail with
+  "path not found" on a folder you can open perfectly well in Explorer.
 - **The capture daemon can run as a real Windows service, and the nightly
   encode and credential watch as scheduled tasks.** **Nothing changes on a
   Linux install.** A plain `python.exe` registered with `sc.exe` is not a

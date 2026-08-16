@@ -26,6 +26,8 @@ different name:
     is this name usable as a filename   is_reserved_name(), same_file_name()
     how is a log file kept              log_handler()
     which disks could hold frames       scan_filesystems()
+    is this path really on the network  network_path(), unc_for_drive()
+    where might ffmpeg be               find_tool(), resolve_tool()
 
 Not answered here yet, deliberately, because each is the substance of a later
 step rather than a mechanical move (item 11f): the transfer, and the log source
@@ -51,6 +53,7 @@ import logging
 import logging.handlers
 import ntpath
 import os
+import posixpath
 import shutil
 import subprocess
 import tempfile
@@ -314,6 +317,8 @@ class _WinApi(object):
     def __init__(self):
         self.advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
         self.shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.mpr = ctypes.WinDLL("mpr", use_last_error=True)
         self.MAIN = ctypes.WINFUNCTYPE(None, _DWORD, ctypes.POINTER(_LPWSTR))
         self.HANDLER = ctypes.WINFUNCTYPE(_DWORD, _DWORD, _DWORD,
                                           ctypes.c_void_p, ctypes.c_void_p)
@@ -358,6 +363,20 @@ class _WinApi(object):
 
         self.shell32.IsUserAnAdmin.argtypes = []
         self.shell32.IsUserAnAdmin.restype = _BOOL
+
+        k = self.kernel32
+        k.GetLogicalDrives.argtypes = []
+        k.GetLogicalDrives.restype = _DWORD
+        k.GetDriveTypeW.argtypes = [_LPWSTR]
+        k.GetDriveTypeW.restype = _DWORD
+        k.GetVolumeInformationW.argtypes = [
+            _LPWSTR, _LPWSTR, _DWORD, ctypes.POINTER(_DWORD),
+            ctypes.POINTER(_DWORD), ctypes.POINTER(_DWORD), _LPWSTR, _DWORD]
+        k.GetVolumeInformationW.restype = _BOOL
+
+        self.mpr.WNetGetConnectionW.argtypes = [_LPWSTR, _LPWSTR,
+                                                ctypes.POINTER(_DWORD)]
+        self.mpr.WNetGetConnectionW.restype = _DWORD
 
 
 _API = None
@@ -1255,12 +1274,16 @@ def log_handler(log_dir, stem, max_bytes=8 * 1024 * 1024, backups=3):
 # ----------------------------------------------------------------------------
 # Storage discovery
 #
-# Which filesystems could hold frames. Linux reads /proc/mounts; the Windows
-# shape is different rather than harder (drive roots, shutil.disk_usage,
-# GetDriveTypeW) and arrives with the wizard at step 3. Until then this returns
-# nothing there, which the wizard already handles by asking for a directory
-# instead: that path exists because a machine can also have nothing worth
-# offering.
+# Which filesystems could hold frames. Two implementations answering one
+# question, and the dispatcher is `scan_filesystems()`; each half is named for
+# what it actually reads, so a test naming `scan_mounts` is visibly a test
+# about /proc/mounts rather than about storage in general.
+#
+# The Windows shape is different rather than harder: enumerate the drive roots,
+# ask GetDriveTypeW which are real fixed disks, and take the sizes from
+# shutil.disk_usage. The rotational check has no cheap equivalent and is simply
+# dropped rather than approximated, because "HDD" is a note beside a number and
+# a wrong note is worse than no note.
 # ----------------------------------------------------------------------------
 
 PSEUDO_FS = {
@@ -1322,7 +1345,7 @@ def _is_rotational(source, sys_block="/sys/block"):
         return None
 
 
-def scan_filesystems(mounts_path="/proc/mounts", statvfs=None, rotational=None):
+def scan_mounts(mounts_path="/proc/mounts", statvfs=None, rotational=None):
     """Real, writable, local filesystems that could hold frames.
 
     The three inputs are injectable so the filtering can be tested against a
@@ -1384,6 +1407,257 @@ def scan_filesystems(mounts_path="/proc/mounts", statvfs=None, rotational=None):
 
     disks = sorted(found.values(), key=lambda d: -d["free"])
     return disks
+
+
+DRIVE_REMOVABLE = 2
+DRIVE_FIXED = 3
+DRIVE_REMOTE = 4
+DRIVE_CDROM = 5
+
+
+def drive_letters(mask=None):
+    """The drive letters that exist, from GetLogicalDrives' bitmask.
+
+    A bitmask rather than `os.listdrives`, which is 3.12 and the floor here is
+    3.9, and rather than probing A: to Z: by hand, which spins up a floppy
+    controller on hardware old enough to have one and pauses for a removable
+    drive with no media in it.
+    """
+    if mask is None:
+        if not IS_WINDOWS:
+            return []
+        mask = _win().kernel32.GetLogicalDrives()
+    return [chr(ord("A") + bit) for bit in range(26) if mask & (1 << bit)]
+
+
+def drive_kind(root):
+    """GetDriveTypeW, or DRIVE_FIXED off Windows so a test can stand in."""
+    if not IS_WINDOWS:
+        return DRIVE_FIXED
+    return int(_win().kernel32.GetDriveTypeW(root))
+
+
+def volume_name(root):
+    """The filesystem on a drive (NTFS, exFAT, ...), or "" if it will not say.
+
+    Cosmetic: it fills the Type column the Linux listing takes from
+    /proc/mounts. A drive that refuses the question still gets offered.
+    """
+    if not IS_WINDOWS:
+        return ""
+    name = ctypes.create_unicode_buffer(261)
+    fs = ctypes.create_unicode_buffer(261)
+    ok = _win().kernel32.GetVolumeInformationW(
+        root, name, ctypes.sizeof(name) // 2, None, None, None, fs,
+        ctypes.sizeof(fs) // 2)
+    return fs.value if ok else ""
+
+
+def scan_drives(mask=None, kind=None, usage=None, volume=None):
+    """Fixed local drives that could hold frames, in the shape scan_mounts uses.
+
+    Every input is injectable for the same reason the Linux half's are: the
+    cases worth testing (a CD drive, an empty card reader, a mapped share, a
+    drive that refuses to report its size) are ones no CI runner will happen to
+    have, and this has to be assertable from the Linux legs as well.
+
+    Removable, network and optical drives are excluded, which matches the Linux
+    half rather than merely resembling it: a network share is a bad place for
+    17k small writes per camera per day, and a drive whose media can be ejected
+    is a worse one.
+    """
+    kind = drive_kind if kind is None else kind
+    usage = shutil.disk_usage if usage is None else usage
+    volume = volume_name if volume is None else volume
+
+    disks = []
+    for letter in drive_letters(mask):
+        root = letter + ":\\"
+        if kind(root) != DRIVE_FIXED:
+            continue
+        try:
+            total, _used, free = usage(root)
+        except OSError:
+            continue
+        if not total:
+            continue
+        disks.append({
+            "mount": root,
+            "source": letter + ":",
+            "fstype": volume(root),
+            "free": free,
+            "total": total,
+            # No cheap equivalent of /sys/block/*/queue/rotational, and an
+            # expensive wrong guess is worth less than an honest blank.
+            "rotational": None,
+        })
+    return sorted(disks, key=lambda d: -d["free"])
+
+
+def scan_filesystems():
+    """Which disks could hold frames, on whichever platform this is."""
+    return scan_drives() if IS_WINDOWS else scan_mounts()
+
+
+def os_disk_mount(env=None):
+    """Where the operating system lives, which is the disk not to fill.
+
+    "/" on Linux, which the wizard used to spell inline; %SystemDrive% plus a
+    separator on Windows, which it cannot, because C: is only usually right and
+    a wizard that recommends the boot drive on the machine where it is wrong
+    has recommended filling it.
+    """
+    if not IS_WINDOWS:
+        return "/"
+    env = os.environ if env is None else env
+    # %SystemDrive% is already "C:", with no separator and no trailing colon to
+    # add. Spelled defensively anyway: this reads an environment variable, and
+    # the one thing an environment variable is never guaranteed to be is the
+    # shape the documentation says.
+    root = (env.get("SystemDrive") or "C:").strip().rstrip("\\/").upper()
+    if not root.endswith(":"):
+        root += ":"
+    return root + "\\"
+
+
+# ----------------------------------------------------------------------------
+# Network paths
+#
+# A mapped drive letter does not exist for a service. Mappings are per logon
+# session, so `U:\TL` is something the operator can open in Explorer and the
+# encoder cannot see at all, and the failure is "path not found" on a path that
+# demonstrably works: item 11d calls this the single most likely way a Windows
+# install fails. The wizard therefore stores the UNC target and says it did.
+# ----------------------------------------------------------------------------
+
+ERROR_NOT_CONNECTED = 2250
+
+
+def unc_for_drive(letter):
+    """Where a mapped drive letter really points, or None if it is local.
+
+    None means "not a mapping", which covers a local disk, a letter that does
+    not exist, and a machine where the question cannot be asked. All three want
+    the same thing from the caller: leave the path alone.
+    """
+    if not IS_WINDOWS:
+        return None
+    local = str(letter).rstrip("\\/")
+    if len(local) != 2 or local[1] != ":":
+        return None
+    size = _DWORD(1024)
+    buf = ctypes.create_unicode_buffer(size.value)
+    rc = _win().mpr.WNetGetConnectionW(local, buf, ctypes.byref(size))
+    if rc != 0:
+        return None
+    return buf.value or None
+
+
+def network_path(path, lookup=None):
+    """Rewrite a path on a mapped drive to its UNC form. None if unchanged.
+
+    Returning None rather than the input is deliberate: the caller has to tell
+    the operator that a substitution happened, and a function that quietly hands
+    back either the same path or a different one makes that impossible to say.
+    """
+    lookup = unc_for_drive if lookup is None else lookup
+    text = str(path)
+    if len(text) < 2 or text[1] != ":":
+        return None
+    target = lookup(text[:2])
+    if not target:
+        return None
+    return target.rstrip("\\") + text[2:]
+
+
+# ----------------------------------------------------------------------------
+# Finding ffmpeg
+#
+# The Linux installer installs it from the distro, so the wizard's default is
+# simply /usr/bin/ffmpeg. Windows has no package manager worth relying on, the
+# builds people run come from gyan.dev or BtbN rather than from any package
+# source, and a recorder very often already has an ffmpeg the operator chose
+# deliberately. So the installer does not provide one (item 11c.6a): the wizard
+# asks, defaulting to whatever is already here, and verifies by running it.
+# ----------------------------------------------------------------------------
+
+FFMPEG_URL = "https://ffmpeg.org/download.html"
+
+
+def _EXE():
+    return ".exe" if IS_WINDOWS else ""
+
+
+def _join(*parts):
+    """Join for the platform being *described*, not the one running.
+
+    ntpath and posixpath by name rather than os.path, which is the same
+    reasoning locations() uses and it was a test that insisted on it: os.path
+    is ntpath on the Windows CI leg, so a Linux answer built with it comes back
+    as /opt/b\\ffmpeg and every Linux assertion here fails on one runner only.
+    """
+    return (ntpath.join(*parts) if IS_WINDOWS else posixpath.join(*parts))
+
+
+def ffmpeg_roots(env=None):
+    """Directories worth looking in when ffmpeg is not on PATH."""
+    if not IS_WINDOWS:
+        return ["/usr/bin", "/usr/local/bin"]
+    env = os.environ if env is None else env
+    roots = []
+    for var in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = env.get(var)
+        if base:
+            roots.append(ntpath.join(base, "ffmpeg", "bin"))
+    local = env.get("LOCALAPPDATA")
+    if local:
+        # winget puts shims here, and its ffmpeg package is the one most likely
+        # to be present without the operator remembering installing it.
+        roots.append(ntpath.join(local, "Microsoft", "WinGet", "Links"))
+    roots.append("C:\\ffmpeg\\bin")
+    return roots
+
+
+def find_tool(name, roots=None, which=None, exists=None):
+    """An absolute path to `name`, or "" when it is nowhere obvious.
+
+    PATH first, because an operator who put ffmpeg on PATH has already answered
+    this question. `shutil.which` honours PATHEXT, so "ffmpeg" finds ffmpeg.exe
+    without the extension being spelled anywhere.
+    """
+    which = shutil.which if which is None else which
+    exists = os.path.exists if exists is None else exists
+    found = which(name)
+    if found:
+        return found
+    for root in (ffmpeg_roots() if roots is None else roots):
+        candidate = _join(root, name + _EXE())
+        if exists(candidate):
+            return candidate
+    return ""
+
+
+def resolve_tool(answer, name, isdir=None, exists=None):
+    """Turn what the operator typed into a path to one binary.
+
+    A directory is accepted, and that is the Windows-shaped part: the zip
+    unpacks a `bin` folder holding ffmpeg.exe, ffprobe.exe and ffplay.exe
+    together, and "the ffmpeg binaries path" is how operators there describe
+    it. Given a directory, both binaries come from that one answer rather than
+    from two questions with a chance to disagree.
+    """
+    isdir = os.path.isdir if isdir is None else isdir
+    exists = os.path.exists if exists is None else exists
+    text = str(answer).strip().strip('"')
+    if not text:
+        return text
+    if not isdir(text):
+        return text
+    binary = name + _EXE()
+    for candidate in (_join(text, binary), _join(text, "bin", binary)):
+        if exists(candidate):
+            return candidate
+    return _join(text, binary)
 
 
 if __name__ == "__main__":
