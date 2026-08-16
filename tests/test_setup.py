@@ -3937,50 +3937,57 @@ class TestUnitRegistrationCommands(unittest.TestCase):
         # the installer, so it has to use the name their machine uses.
         self.assertIn(plat.native_name(plat.CAPTURE_UNIT), text)
 
-    def test_a_running_service_is_restarted_onto_the_new_build(self):
-        """Re-running the installer is how an upgrade happens, and registering
+    def test_registering_does_not_restart_anything(self):
+        """The restart is a separate step run AFTER the wizard, and this pins
 
-        does not touch the process already running: it is executing the scripts
-        it read at startup. Without this the installer reports success while
-        the old build keeps running, which is precisely what
-        restart_upgraded_services() exists for on the other platform.
+        the ordering rather than trusting install.ps1 to keep it. Registering
+        replaces the files on disk and leaves the running process alone; the
+        wizard then rewrites the config underneath it. Restarting during
+        registration picks up the new build with the *old* settings, which is
+        the worst of the three orderings because nothing about it looks wrong.
         """
-        out = io.StringIO()
         with mock.patch.object(setup, "install_service",
                                return_value=(True, "")), \
              mock.patch.object(setup, "install_task", return_value=(True, "")), \
              mock.patch.object(setup, "service_is_active", return_value=True), \
-             mock.patch.object(setup, "restart_service",
-                               return_value=(True, "")) as restart, \
-             contextlib.redirect_stdout(out):
-            setup.install_units("scripts", "cfg.json")
-        restart.assert_called_once_with(plat.CAPTURE_UNIT)
-        self.assertIn("restarted onto the new build", out.getvalue())
-
-    def test_a_service_that_was_not_running_is_left_stopped(self):
-        # A first install, or one where the operator had stopped it. Starting
-        # it here would be deciding something they did not ask for.
-        with mock.patch.object(setup, "install_service",
-                               return_value=(True, "")), \
-             mock.patch.object(setup, "install_task", return_value=(True, "")), \
-             mock.patch.object(setup, "service_is_active", return_value=False), \
              mock.patch.object(setup, "restart_service") as restart, \
              contextlib.redirect_stdout(io.StringIO()):
             setup.install_units("scripts", "cfg.json")
         restart.assert_not_called()
 
-    def test_a_restart_that_fails_is_reported_not_swallowed(self):
+    def test_a_running_service_is_restarted_onto_the_new_build(self):
         out = io.StringIO()
-        with mock.patch.object(setup, "install_service",
-                               return_value=(True, "")), \
-             mock.patch.object(setup, "install_task", return_value=(True, "")), \
-             mock.patch.object(setup, "service_is_active", return_value=True), \
+        with mock.patch.object(setup, "service_is_active", return_value=True), \
+             mock.patch.object(setup, "restart_service",
+                               return_value=(True, "")) as restart, \
+             contextlib.redirect_stdout(out):
+            self.assertTrue(setup.restart_units())
+        restart.assert_called_once_with(plat.CAPTURE_UNIT)
+        self.assertIn("onto the new build", out.getvalue())
+
+    def test_a_service_that_was_not_running_is_left_stopped(self):
+        # A first install, or one where the operator had stopped it. Starting
+        # it here would be deciding something they did not ask for.
+        with mock.patch.object(setup, "service_is_active", return_value=False), \
+             mock.patch.object(setup, "restart_service") as restart, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(setup.restart_units())
+        restart.assert_not_called()
+
+    def test_a_restart_that_fails_says_what_is_still_running(self):
+        """Not just that it failed: an operator who does nothing is left with
+
+        the previous build serving while every version number says otherwise,
+        so the message has to say so and give the command.
+        """
+        out = io.StringIO()
+        with mock.patch.object(setup, "service_is_active", return_value=True), \
              mock.patch.object(setup, "restart_service",
                                return_value=(False, "access denied")), \
              contextlib.redirect_stdout(out):
-            setup.install_units("scripts", "cfg.json")
-        self.assertIn("could not restart", out.getvalue())
+            self.assertFalse(setup.restart_units())
         self.assertIn("access denied", out.getvalue())
+        self.assertIn("previous build", out.getvalue())
 
     def test_a_partial_success_is_reported_without_being_called_a_failure(self):
         ok, text, _svc, _tsk = self.run_units(

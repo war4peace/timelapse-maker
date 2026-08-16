@@ -1647,26 +1647,43 @@ def install_units(scripts_dir, config_path, user_id=None):
             xml = task_xml(description, argv, user_id=user_id, **extras)
             ok, detail = install_task(unit, xml)
         else:
-            # Asked before, because registering is what changes the answer.
-            # A service already running is executing the scripts it read at
-            # startup, and re-registering does not touch the running process:
-            # the installer would report success while the old build kept
-            # running, which is the exact trap restart_upgraded_services()
-            # exists for on the other platform.
-            was_running = service_is_active(unit)
             ok, detail = install_service(unit, description, argv)
-            if ok and was_running:
-                restarted, why = restart_service(unit)
-                detail = detail or ("registered, but could not restart it "
-                                    "onto the new build: " + why
-                                    if not restarted else
-                                    "restarted onto the new build")
         if ok:
             good(f"Registered {native}.")
             if detail:
                 note(detail)
         else:
             fail(f"Could not register {native}: {detail}")
+            ok_all = False
+    return ok_all
+
+
+def restart_units():
+    """Restart whatever is running, so it executes what was just installed.
+
+    Separate from install_units(), and called **after** the wizard rather than
+    during registration, which is the ordering install.sh has: registering
+    replaces the files on disk and does not touch the process already running,
+    and the wizard then rewrites the config underneath it. Restarting at
+    registration time therefore restarted onto the new build and the *old*
+    config, and the operator was told to start a service that was already
+    running the wrong settings.
+
+    Not offered as a choice, for the reason install.sh gives: the operator
+    asked for this version, and declining leaves the previous one running while
+    every version number says otherwise. It costs the frames due during the
+    restart, a second or two.
+    """
+    ok_all = True
+    for unit in (CAPTURE_UNIT,):
+        if not service_is_active(unit):
+            continue
+        ok, detail = restart_service(unit)
+        if ok:
+            good(f"Restarted {native_name(unit)} onto the new build.")
+        else:
+            fail(f"Could not restart {native_name(unit)}: {detail}")
+            note(f"It is still running the previous build: {restart_hint(unit)}")
             ok_all = False
     return ok_all
 
@@ -3834,6 +3851,8 @@ def main():
                        help="register the capture service and the two tasks")
     units.add_argument("--remove-units", action="store_true",
                        help="deregister them again")
+    units.add_argument("--restart-units", action="store_true",
+                       help="restart what is running onto the new build")
     units.add_argument("--unit-status", action="store_true",
                        help="print one line per component, for scripts")
     units.add_argument("--scripts-dir", default=None,
@@ -3906,7 +3925,7 @@ def main():
     if args.unit_status:
         return print_unit_status()
 
-    if args.install_units or args.remove_units:
+    if args.install_units or args.remove_units or args.restart_units:
         if not is_elevated():
             fail("This changes how the machine starts, so it needs privilege.")
             note(elevation_hint())
@@ -3914,6 +3933,8 @@ def main():
         scripts = args.scripts_dir or Path(__file__).resolve().parent
         if args.remove_units:
             return 0 if remove_units() else 1
+        if args.restart_units:
+            return 0 if restart_units() else 1
         return 0 if install_units(scripts, args.output) else 1
 
     init_tty(force_defaults=args.defaults, use_stdin=args.stdin)

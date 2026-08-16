@@ -358,8 +358,21 @@ if ($LASTEXITCODE -ne 0) {
     Warn 'Registration did not fully succeed; see above.'
 }
 
-if (-not $NoWizard) {
-    Step 'Configuration'
+Step 'Configuration'
+if (Test-Path $CONFIG) {
+    # An upgrade never reconfigures, which is the rule install.sh states and
+    # the behaviour it has: reconfiguring is a separate job with its own
+    # commands, and being walked through the whole wizard is a strange thing to
+    # be offered by something you ran to get a bug fix. Worse here than there,
+    # because these questions include every camera password.
+    #
+    # New keys arrive with defaults, so an untouched config keeps working, and
+    # config.example.json above was refreshed so the new ones can be read.
+    Note "Keeping the existing configuration at $CONFIG"
+    Note 'To change it:  timelapse setup   (or: timelapse cameras)'
+} elseif ($NoWizard) {
+    Note 'Skipped. Configure it with:  timelapse setup'
+} else {
     # Not $args: that is an automatic variable in PowerShell, and assigning to
     # it works at script scope and quietly does not inside a function, which is
     # the kind of difference that shows up only after this file grows one.
@@ -368,6 +381,13 @@ if (-not $NoWizard) {
     if ($Unattended) { $wizard += '--defaults' }
     & $python (Join-Path $Prefix 'timelapse_setup.py') @wizard
 }
+
+# After the wizard, never during registration. Registering replaces the files
+# on disk and leaves the running process alone; the wizard then rewrites the
+# config underneath it. Restarting any earlier picks up the new build with the
+# old settings, which is the worst of the three possible orderings because
+# nothing about it looks wrong.
+& $python (Join-Path $Prefix 'timelapse_setup.py') --restart-units
 
 Step 'Next steps'
 # Both halves of this were wrong to leave implicit. NEW, because a PATH change

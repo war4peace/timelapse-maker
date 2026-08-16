@@ -341,6 +341,32 @@ class TestInstallerText(unittest.TestCase):
             self.assertIn(command, set(cli.COMMANDS) | set(cli.SPECIAL),
                           "install.ps1 recommends a command that does not exist")
 
+    def test_an_upgrade_does_not_walk_the_wizard_again(self):
+        """install.sh states the rule and has always behaved this way:
+
+        reconfiguring is a separate job with its own commands, and being walked
+        through the whole wizard is a strange thing to be offered by something
+        you ran to get a bug fix. Worse here, because these questions include
+        every camera password.
+        """
+        text = self.SOURCE.decode("ascii")
+        block = text.split("Step 'Configuration'", 1)[1].split("Step 'Next", 1)[0]
+        self.assertIn("Test-Path $CONFIG", block)
+        self.assertIn("Keeping the existing configuration", block)
+
+    def test_the_restart_happens_after_the_wizard(self):
+        """Ordering, pinned in the file that owns it. Registering leaves the
+
+        running process alone and the wizard then rewrites the config
+        underneath it, so restarting any earlier picks up the new build with
+        the old settings.
+        """
+        text = self.SOURCE.decode("ascii")
+        self.assertLess(text.index("Step 'Configuration'"),
+                        text.index("--restart-units"))
+        self.assertLess(text.index("--install-units"),
+                        text.index("Step 'Configuration'"))
+
     def test_uninstalling_leaves_the_recordings_alone(self):
         text = self.SOURCE.decode("ascii")
         uninstall = text.split("function Invoke-Uninstall", 1)[1] \
