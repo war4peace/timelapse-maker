@@ -3424,7 +3424,7 @@ class TestWindowsTransfer(unittest.TestCase):
     that cannot work.
     """
 
-    def drive(self, keystrokes, mapping=None):
+    def drive(self, keystrokes, mapping=None, local=True):
         prev_tty, prev_auto = setup._TTY, setup.AUTO
         setup.AUTO = False
         setup._TTY = FakeTTY(keystrokes, tty=False)
@@ -3434,6 +3434,8 @@ class TestWindowsTransfer(unittest.TestCase):
         try:
             with contextlib.redirect_stdout(buf), \
                  mock.patch.object(setup, "IS_WINDOWS", True), \
+                 mock.patch.object(setup, "drive_is_local",
+                                   return_value=local), \
                  mock.patch.object(setup, "network_path",
                                    side_effect=lambda p: mapping.get(str(p))):
                 setup.choose_transfer(cfg)
@@ -3470,6 +3472,30 @@ class TestWindowsTransfer(unittest.TestCase):
         _transfer, out = self.drive("y\nU:\\TL\n",
                                     mapping={"U:\\TL": "\\\\t\\c\\TL"})
         self.assertIn("logon session", out)
+
+    def test_a_drive_it_cannot_resolve_is_refused_not_stored(self):
+        """The backstop for a mapping made without /persistent, and for a typo.
+
+        From an elevated session both report DRIVE_NO_ROOT_DIR and both mean
+        the same thing to the operator: the nightly encode runs without their
+        sign-in session and will not find it. Storing it would reproduce the
+        exact failure this whole question exists to prevent.
+        """
+        transfer, out = self.drive("y\nQ:\\videos\n", local=False)
+        self.assertFalse(transfer["enabled"])
+        self.assertIn("unattended", out)
+        self.assertIn("net use", out)
+
+    def test_a_real_local_drive_is_not_refused(self):
+        transfer, _out = self.drive("y\nD:\\timelapse\\out\n", local=True)
+        self.assertTrue(transfer["enabled"])
+        self.assertEqual(transfer["destination"], "D:\\timelapse\\out")
+
+    def test_a_unc_path_is_never_asked_about_as_a_drive(self):
+        # It has no drive letter, so drive_is_local() answers None and the
+        # refusal must not fire on it.
+        transfer, _out = self.drive("y\n\\\\tower\\cctv\\TL\n", local=None)
+        self.assertTrue(transfer["enabled"])
 
     def test_an_rsync_spec_is_refused_with_its_reason(self):
         """A config written on Linux and carried over. Treated as a relative

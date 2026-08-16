@@ -56,6 +56,7 @@ import os
 import posixpath
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime, timedelta
@@ -373,6 +374,12 @@ class _WinApi(object):
             _LPWSTR, _LPWSTR, _DWORD, ctypes.POINTER(_DWORD),
             ctypes.POINTER(_DWORD), ctypes.POINTER(_DWORD), _LPWSTR, _DWORD]
         k.GetVolumeInformationW.restype = _BOOL
+        k.GetStdHandle.argtypes = [ctypes.c_int32]
+        k.GetStdHandle.restype = _HANDLE
+        k.GetConsoleMode.argtypes = [_HANDLE, ctypes.POINTER(_DWORD)]
+        k.GetConsoleMode.restype = _BOOL
+        k.SetConsoleMode.argtypes = [_HANDLE, _DWORD]
+        k.SetConsoleMode.restype = _BOOL
 
         self.mpr.WNetGetConnectionW.argtypes = [_LPWSTR, _LPWSTR,
                                                 ctypes.POINTER(_DWORD)]
@@ -1122,6 +1129,71 @@ def log_hint(unit, lines=40, log_dir=None):
 
 
 # ----------------------------------------------------------------------------
+# Whether this terminal can show colour
+#
+# A Windows console understands ANSI escapes only when a mode bit is set, and
+# that bit is **off by default** in conhost, which is what a plain PowerShell
+# window from the Start menu is. Without it every escape is printed literally:
+# the operator sees `<-[32mOK<-[0m    Registered TimelapseCapture.` where the
+# word OK should be green. Reported from the first real Windows install.
+#
+# What makes it nasty is where it is invisible. Windows Terminal sets the bit
+# itself, so a developer using it sees perfect colour; and `_COLOR` is false
+# under every test and on every CI runner, because none of them is a terminal.
+# So this is the second defect in this project that exists *only* in front of
+# the operator, after the padded-then-coloured column at 0.1.9.
+# ----------------------------------------------------------------------------
+
+STD_OUTPUT_HANDLE = -11
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+
+
+def enable_ansi():
+    """Turn on escape-sequence processing. True if escapes will be understood.
+
+    Not a query: on Windows it sets the bit, because asking is not enough and
+    nothing else in the process is going to do it. Idempotent, and false rather
+    than raising when the console refuses, which is what an old conhost on
+    Server 2016 does.
+    """
+    if not IS_WINDOWS:
+        return True
+    try:
+        api = _win()
+        handle = api.kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+        if handle is None or handle == -1:
+            return False
+        mode = _DWORD(0)
+        if not api.kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        if mode.value & ENABLE_VIRTUAL_TERMINAL_PROCESSING:
+            return True
+        wanted = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        return bool(api.kernel32.SetConsoleMode(handle, wanted))
+    except (OSError, AttributeError):
+        return False
+
+
+def use_colour(stream=None):
+    """Should this program emit colour at all?
+
+    Three questions in the order they can be answered cheaply: has the operator
+    said no, is this a terminal at all, and will that terminal understand it.
+    The middle one is why `timelapse test > report.txt` stops writing escape
+    codes into the file, which it did on every platform until now.
+    """
+    if os.environ.get("NO_COLOR") is not None:
+        return False
+    stream = sys.stdout if stream is None else stream
+    try:
+        if not stream.isatty():
+            return False
+    except (AttributeError, ValueError):
+        return False
+    return enable_ansi()
+
+
+# ----------------------------------------------------------------------------
 # Files that hold secrets
 # ----------------------------------------------------------------------------
 
@@ -1575,11 +1647,21 @@ ERROR_NOT_CONNECTED = 2250
 
 
 def unc_for_drive(letter):
-    """Where a mapped drive letter really points, or None if it is local.
+    """Where a mapped drive letter really points, or None if it is not mapped.
 
-    None means "not a mapping", which covers a local disk, a letter that does
-    not exist, and a machine where the question cannot be asked. All three want
-    the same thing from the caller: leave the path alone.
+    Two sources, and the second is not a belt-and-braces addition: it is the
+    one that works when it matters. `WNetGetConnectionW` answers about the
+    **calling logon session**, and UAC gives an elevated process a different
+    session from the desktop that launched it. The wizard always runs elevated.
+    So the API sees none of the operator's drive mappings, and the check that
+    exists to warn about exactly this failure could not detect it: measured on
+    the first real Windows install, where U:\\TL was stored verbatim.
+
+    The registry entry survives, because the split token is still the same
+    *user* and so still the same HKCU hive. It covers persistent (reconnect at
+    logon) mappings, which is what a drive somebody uses daily is; a mapping
+    made with `net use` and no /persistent is not there, and is why the caller
+    must still handle None for a letter this machine cannot otherwise see.
     """
     if not IS_WINDOWS:
         return None
@@ -1588,10 +1670,45 @@ def unc_for_drive(letter):
         return None
     size = _DWORD(1024)
     buf = ctypes.create_unicode_buffer(size.value)
-    rc = _win().mpr.WNetGetConnectionW(local, buf, ctypes.byref(size))
-    if rc != 0:
+    if _win().mpr.WNetGetConnectionW(local, buf, ctypes.byref(size)) == 0:
+        if buf.value:
+            return buf.value
+    return _mapped_in_registry(local[0])
+
+
+def _mapped_in_registry(letter):
+    """HKCU\\Network\\<letter>\\RemotePath, or None.
+
+    winreg is stdlib and Windows-only, so it is imported here rather than at
+    module scope: this file is imported by every script on both platforms.
+    """
+    try:
+        import winreg
+    except ImportError:
         return None
-    return buf.value or None
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            "Network\\" + letter.upper()) as key:
+            value, _kind = winreg.QueryValueEx(key, "RemotePath")
+    except OSError:
+        return None
+    return str(value) or None
+
+
+def drive_is_local(letter):
+    """True for a fixed disk this session can see. None if unanswerable.
+
+    The backstop for a drive letter that is neither resolvable nor local: from
+    an elevated session an unresolvable mapping reports DRIVE_NO_ROOT_DIR,
+    which is the same answer as a letter that was simply typed wrong, and both
+    mean the same thing to the caller. The destination cannot be used as given.
+    """
+    if not IS_WINDOWS:
+        return None
+    root = str(letter).rstrip("\\/")
+    if len(root) != 2 or root[1] != ":":
+        return None
+    return drive_kind(root + "\\") == DRIVE_FIXED
 
 
 def network_path(path, lookup=None):

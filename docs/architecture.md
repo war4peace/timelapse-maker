@@ -1727,6 +1727,32 @@ new file and the config loses its group. On Windows a new file inherits the
 file created there afterwards, including an editor's temporary copies, is
 covered by where it is rather than by what the editor did.
 
+**A drive letter cannot be resolved from the process that needs to resolve it.**
+Drive mappings belong to a logon session, and UAC's split token gives an
+elevated process a different session from the desktop that launched it. The
+wizard always runs elevated, so `WNetGetConnectionW` sees none of the
+operator's mappings: the check written to warn that a *service* cannot see
+drive mappings turned out to be running somewhere that could not see them
+either, and stored `U:\TL` verbatim on the first real run.
+`HKCU\Network\<letter>\RemotePath` is the source that survives, because the
+split token is still the same user and so the same hive. It covers persistent
+mappings; for a letter neither source resolves, the wizard refuses and asks for
+the UNC, since from there a non-persistent mapping and a typo are
+indistinguishable and want the same answer.
+
+**Colour is a platform question, not just an `isatty()` one.** A Windows
+console understands ANSI escapes only once `ENABLE_VIRTUAL_TERMINAL_PROCESSING`
+is set, and conhost leaves it off, so the wizard printed its escapes literally
+on the first real install. `use_colour()` in the platform module owns the
+decision for both `timelapse_setup.py` and `timelapse_test.py`, and setting the
+bit is part of answering rather than a separate step, because nothing else in
+the process will do it. It fixed an older bug in passing: the pre-flight emitted
+escapes unconditionally, so `timelapse test > report.txt` wrote them into the
+file on every platform. Note where this was invisible, because it is the same
+shape as the padded-then-coloured column in §4.4: Windows Terminal sets the bit
+itself, and no test or CI runner is a terminal, so every environment that could
+have caught it had colour switched off.
+
 **No Python one-liner in `install.ps1` may contain a quote.** PowerShell strips
 embedded double quotes when it hands arguments to a native executable, so
 `-c 'print("%d.%d" % sys.version_info[:2])'` arrives at Python as

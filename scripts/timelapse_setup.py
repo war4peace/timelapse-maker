@@ -37,13 +37,13 @@ from timelapse_platform import (
     CAPTURE_UNIT, CONFIG_DIR, CONFIG_PATH, DATA_ROOT_DEFAULT, ENCODE_UNIT,
     FFMPEG_URL, IS_WINDOWS, LINUX_STATE_DIR, LINUX_WEB_STATE_DIR,
     SERVICE_STATES, STATE_DIR_DEFAULT, WATCH_UNIT, WEB_STATE_DIR_DEFAULT,
-    daily_trigger, elevation_hint, find_tool, install_service, install_task,
-    is_elevated, is_reserved_name, is_scheduled, log_hint, native_name,
-    network_path, os_disk_mount, remove_service, remove_task,
+    daily_trigger, drive_is_local, elevation_hint, find_tool, install_service,
+    install_task, is_elevated, is_reserved_name, is_scheduled, log_hint,
+    native_name, network_path, os_disk_mount, remove_service, remove_task,
     repeating_trigger, resolve_tool, restart_hint, restart_service,
     same_file_name, scan_filesystems, secure_secret_file, service_is_active,
     service_state, start_hint, stop_hint, stop_service, task_exists, task_info,
-    task_result, task_xml,
+    task_result, task_xml, use_colour,
 )
 
 __version__ = "0.1.9"
@@ -106,7 +106,10 @@ def _survive_narrow_stdout():
 
 _survive_narrow_stdout()
 
-_COLOR = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+# Asked of the platform, because "is this a terminal" is not the whole question
+# on Windows: a console there understands escapes only once a mode bit is set,
+# and conhost leaves it off. See use_colour().
+_COLOR = use_colour()
 
 
 def c(code, text):
@@ -2077,6 +2080,11 @@ def choose_windows_destination(cfg):
     # way that reads as this tool being broken: drive mappings are per logon
     # session, so U:\TL is something the operator can open in Explorer and a
     # service cannot see at all.
+    #
+    # This wizard is itself an instance of that, which is how the first version
+    # came to store U:\TL verbatim: it runs elevated, UAC gives an elevated
+    # process its own logon session, and so the check written to warn about
+    # missing drive mappings was running somewhere that had none.
     unc = network_path(dest)
     if unc:
         print()
@@ -2086,6 +2094,20 @@ def choose_windows_destination(cfg):
         note("path you can open perfectly well. Storing where it really points:")
         note(f"  {unc}")
         dest = unc
+    elif drive_is_local(dest) is False:
+        # A letter that is neither resolvable nor a fixed disk. From here that
+        # is a mapping made without /persistent, or a typo, and the two are
+        # indistinguishable *and want the same answer*: this cannot be stored.
+        print()
+        fail(f"{dest[:2]} is not a drive this machine can use unattended.")
+        note("It is either a drive mapping that will not survive a reboot, or")
+        note("a letter that does not exist. Either way the nightly encode runs")
+        note("without your sign-in session and would not find it.")
+        note("")
+        note("Give the network path itself instead, the \\\\server\\share form.")
+        note("'net use' in a normal window prints it for each mapped drive.")
+        cfg["transfer"]["enabled"] = False
+        return
 
     cfg["transfer"]["destination"] = dest
     # Nothing to mount, so nothing to check for having been unmounted. The

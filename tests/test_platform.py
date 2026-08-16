@@ -1066,6 +1066,88 @@ class TestDailyFileHandler(unittest.TestCase):
         self.assertIn("during", body)
 
 
+class TestColour(unittest.TestCase):
+    """Whether to emit escapes at all, which is not just "is this a tty".
+
+    Reported from the first real Windows install: the wizard printed
+    `<-[32mOK<-[0m    Registered TimelapseCapture.` A Windows console
+    understands escapes only once a mode bit is set, and conhost leaves it off,
+    so `isatty()` being true is necessary and not sufficient.
+
+    Invisible in two places at once, which is why it reached an operator:
+    Windows Terminal sets the bit itself, and no test or CI runner is a
+    terminal, so `_COLOR` is false everywhere it could have been caught.
+    """
+
+    class FakeStream:
+        def __init__(self, tty):
+            self._tty = tty
+
+        def isatty(self):
+            return self._tty
+
+    def test_not_a_terminal_means_no_colour(self):
+        """The half that was wrong on every platform: timelapse test wrote
+
+        escape codes into a redirected file, because it never asked.
+        """
+        with mock.patch.dict(plat.os.environ, {}, clear=False):
+            plat.os.environ.pop("NO_COLOR", None)
+            self.assertFalse(plat.use_colour(self.FakeStream(tty=False)))
+
+    def test_no_color_is_honoured_before_anything_else_is_asked(self):
+        with mock.patch.dict(plat.os.environ, {"NO_COLOR": "1"}):
+            self.assertFalse(plat.use_colour(self.FakeStream(tty=True)))
+
+    def test_a_terminal_that_understands_escapes_gets_them(self):
+        with mock.patch.dict(plat.os.environ, {}, clear=False), \
+             mock.patch.object(plat, "enable_ansi", return_value=True):
+            plat.os.environ.pop("NO_COLOR", None)
+            self.assertTrue(plat.use_colour(self.FakeStream(tty=True)))
+
+    def test_a_terminal_that_does_not_gets_none(self):
+        with mock.patch.dict(plat.os.environ, {}, clear=False), \
+             mock.patch.object(plat, "enable_ansi", return_value=False):
+            plat.os.environ.pop("NO_COLOR", None)
+            self.assertFalse(plat.use_colour(self.FakeStream(tty=True)))
+
+    def test_a_stream_with_no_isatty_is_not_a_terminal(self):
+        self.assertFalse(plat.use_colour(object()))
+
+    def test_enabling_is_a_no_op_off_windows(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.assertTrue(plat.enable_ansi())
+
+    def test_it_sets_the_bit_rather_than_only_asking(self):
+        """A query would answer "no" for ever: nothing else in the process is
+
+        going to turn it on.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win") as api:
+            kernel = api.return_value.kernel32
+            kernel.GetStdHandle.return_value = 7
+
+            def get_mode(_handle, mode):
+                mode._obj.value = 0x0001
+                return 1
+
+            kernel.GetConsoleMode.side_effect = get_mode
+            kernel.SetConsoleMode.return_value = 1
+            self.assertTrue(plat.enable_ansi())
+        wanted = kernel.SetConsoleMode.call_args[0][1]
+        self.assertTrue(wanted & plat.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        self.assertTrue(wanted & 0x0001, "it clobbered the existing mode")
+
+    def test_a_console_that_refuses_is_false_rather_than_fatal(self):
+        # An old conhost on Server 2016 does exactly this.
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win") as api:
+            api.return_value.kernel32.GetStdHandle.return_value = 7
+            api.return_value.kernel32.GetConsoleMode.return_value = 0
+            self.assertFalse(plat.enable_ansi())
+
+
 class TestScanDrives(unittest.TestCase):
     """The Windows half of the storage scan, asserted from either leg.
 
@@ -1224,9 +1306,60 @@ class TestNetworkPath(unittest.TestCase):
         """
         self.assertIsNone(self.rewrite(r"C:\x", {}))
 
+    def test_the_registry_answers_when_the_api_cannot(self):
+        """The fix for the defect this whole feature failed to catch.
+
+        WNetGetConnectionW answers about the *calling logon session*, and UAC
+        gives an elevated process a different one from the desktop that
+        launched it. The wizard always runs elevated, so the API sees none of
+        the operator's drive mappings, and the check written to warn about a
+        service having no mappings was itself running somewhere with none.
+        Measured on the first real Windows install: U:\\TL was stored verbatim.
+
+        HKCU survives the split, because the elevated token is still the same
+        user and so still the same hive.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win") as api, \
+             mock.patch.object(plat, "_mapped_in_registry",
+                               return_value=r"\\tower\cctv") as registry:
+            api.return_value.mpr.WNetGetConnectionW.return_value = 1
+            self.assertEqual(plat.unc_for_drive("U:"), r"\\tower\cctv")
+        registry.assert_called_once_with("U")
+
+    def test_the_api_is_preferred_when_it_does_answer(self):
+        # It is authoritative for the session actually asking, and it covers a
+        # mapping made without /persistent, which the registry does not.
+        def wnet(_local, buf, _size):
+            buf.value = r"\\live\share"
+            return 0
+
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win") as api, \
+             mock.patch.object(plat, "_mapped_in_registry") as registry:
+            api.return_value.mpr.WNetGetConnectionW.side_effect = wnet
+            self.assertEqual(plat.unc_for_drive("U:"), r"\\live\share")
+        registry.assert_not_called()
+
+    def test_a_letter_neither_source_knows_is_still_none(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "_win") as api, \
+             mock.patch.object(plat, "_mapped_in_registry", return_value=None):
+            api.return_value.mpr.WNetGetConnectionW.return_value = 1
+            self.assertIsNone(plat.unc_for_drive("Q:"))
+
+    def test_a_fixed_disk_is_local_and_a_mapping_is_not(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat, "drive_kind",
+                               side_effect=lambda r: plat.DRIVE_FIXED
+                               if r.startswith("C") else 1):
+            self.assertIs(plat.drive_is_local("C:"), True)
+            self.assertIs(plat.drive_is_local("U:"), False)
+
     def test_the_lookup_declines_off_windows(self):
         with mock.patch.object(plat, "IS_WINDOWS", False):
             self.assertIsNone(plat.unc_for_drive("U:"))
+            self.assertIsNone(plat.drive_is_local("U:"))
 
     def test_the_lookup_refuses_anything_that_is_not_a_drive(self):
         with mock.patch.object(plat, "IS_WINDOWS", True):

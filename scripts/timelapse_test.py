@@ -35,13 +35,22 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-from timelapse_platform import CONFIG_PATH, is_reserved_name   # noqa: E402
+from timelapse_platform import (CONFIG_PATH, is_reserved_name,  # noqa: E402
+                                use_colour)
 
 __version__ = "0.1.9"
 
 OUT = Path(os.environ.get("TIMELAPSE_TEST_DIR") or
            Path(tempfile.gettempdir()) / "timelapse-test")
-GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+# Conditional, which it was not until 0.2.0. Two things were wrong with the
+# unconditional version and only one of them was about Windows: a plain
+# `timelapse test > report.txt` wrote escape codes into the file on every
+# platform, and on a Windows console they were printed literally because the
+# escape-processing bit is off by default there.
+_COLOR = use_colour()
+GREEN, RED, YELLOW, DIM, RESET = (
+    ("\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m") if _COLOR
+    else ("", "", "", "", ""))
 
 
 def ok(msg):    print(f"  {GREEN}PASS{RESET}  {msg}")
