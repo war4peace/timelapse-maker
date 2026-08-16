@@ -36,7 +36,8 @@ from urllib import request as urlrequest
 
 # Names, not the module: `platform` above is the stdlib one, and two things
 # called platform in one file is a trap waiting for a reader in a hurry.
-from timelapse_platform import CONFIG_PATH, STATE_DIR_DEFAULT, log_handler
+from timelapse_platform import (CONFIG_PATH, IS_WINDOWS, STATE_DIR_DEFAULT,
+                                log_handler)
 
 __version__ = "0.1.9"
 
@@ -1172,6 +1173,14 @@ def transfer(cfg, dry_run):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
+        # Two different facts wearing one error. On Linux rsync is missing and
+        # installing it fixes this; on Windows it is not a package that exists,
+        # the transfer is simply not built yet, and telling an operator there
+        # to run apt is advice that names a thing they do not have.
+        if IS_WINDOWS:
+            log.error("Moving videos is not implemented on Windows yet; "
+                      "they stay in %s", src)
+            return {"ok": False, "moved": 0, "detail": "not implemented yet"}
         log.error("rsync is not installed (sudo apt install rsync)")
         return {"ok": False, "moved": 0, "detail": "rsync not installed"}
     except Exception as exc:

@@ -2152,9 +2152,15 @@ def choose_windows_destination(cfg):
         note("is a network path, check the name now: this is the point where")
         note("a typo is cheap.")
     print()
-    note("Whether the account that runs the nightly encode can actually write")
-    note("there is tested when transfer itself is built. Until then, 'timelapse")
-    note("test' reports what it can see from your own account.")
+    # Said plainly rather than left to be discovered at 00:05. The nightly job
+    # moves videos with rsync, which Windows does not have, so tonight it would
+    # encode correctly and then log a failure naming a package manager that
+    # does not exist here. Recording the destination is still worth doing: it
+    # is the answer the step that builds this will use.
+    warn("Moving the videos is not implemented on Windows yet.")
+    note("The destination is saved and the nightly encode will use it once it")
+    note("is. Until then the videos stay in the videos folder above, and the")
+    note("nightly summary will report the transfer as not done.")
 
 
 def choose_transfer(cfg, svcuser=None):

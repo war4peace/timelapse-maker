@@ -697,6 +697,57 @@ class TestWebhookRequest(unittest.TestCase):
                          "café ✅")
 
 
+class TestTransferWithoutRsync(unittest.TestCase):
+    """What the nightly job says when it cannot move the videos.
+
+    The same missing binary means two different things. On Linux rsync is a
+    package and installing it fixes this. On Windows it is not the mechanism at
+    all: transfer is not built yet (item 11f step 4), so telling an operator
+    there to run apt names a thing they do not have, and the videos are not
+    lost, they are simply still in the videos folder.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        (self.tmp / "Roof.20260816.mkv").write_bytes(b"video")
+        self.cfg = {"paths": {"video_output": str(self.tmp)},
+                    "transfer": {"enabled": True, "destination": "/dest",
+                                 "require_mountpoint": False}}
+
+    def run_transfer(self, windows):
+        with mock.patch.object(enc, "IS_WINDOWS", windows), \
+             mock.patch.object(enc, "mount_problem", return_value=None), \
+             mock.patch.object(enc.subprocess, "run",
+                               side_effect=FileNotFoundError(2, "no rsync")):
+            return enc.transfer(self.cfg, dry_run=False)
+
+    def test_linux_says_install_rsync(self):
+        result = self.run_transfer(windows=False)
+        self.assertFalse(result["ok"])
+        self.assertIn("rsync", result["detail"])
+
+    def test_windows_says_it_is_not_built_yet(self):
+        result = self.run_transfer(windows=True)
+        self.assertFalse(result["ok"])
+        self.assertNotIn("rsync", result["detail"])
+        self.assertIn("not implemented", result["detail"])
+
+    def test_neither_raises(self):
+        """Failure isolation, which is the older rule: a failed transfer must
+
+        not turn a successful encode into a failure. The videos are safe where
+        they are and the next run ships them.
+        """
+        for windows in (True, False):
+            self.assertIsInstance(self.run_transfer(windows), dict)
+
+    def test_nothing_is_deleted_either_way(self):
+        for windows in (True, False):
+            self.run_transfer(windows)
+            self.assertTrue((self.tmp / "Roof.20260816.mkv").exists())
+
+
 class TestMountGuard(unittest.TestCase):
     """transfer.require_mountpoint - the CIFS/NFS dropped-mount protection.
 
