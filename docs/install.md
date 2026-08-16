@@ -137,6 +137,7 @@ timelapse version
   test     0.1.9
   setup    0.1.9
   update   0.1.9
+  platform 0.1.9
   web      0.1.9
 ```
 

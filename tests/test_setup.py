@@ -1,8 +1,9 @@
-"""Unit tests for timelapse_setup.py: storage discovery and config shaping.
+"""Unit tests for timelapse_setup.py: the wizard's questions and config shaping.
 
-The storage scan is the part with real bug surface: it has to reject a dozen
-kinds of thing that look like disks but aren't. These drive it with a synthetic
-/proc/mounts so the awkward cases are always present, regardless of the machine.
+The storage *scan* moved to timelapse_platform at 0.2.0, and its tests went
+with it: /proc/mounts is the Linux answer to "which disks could hold frames"
+and the platform module is where a platform answer belongs. What stays here is
+what the wizard does with the answer, which is the same on either platform.
 """
 
 import contextlib
@@ -25,198 +26,8 @@ import _support
 from _support import FakeStatVFS, write_mounts
 
 import timelapse_encode as enc
+import timelapse_platform as plat
 import timelapse_setup as setup
-
-
-def fake_statvfs(_target):
-    return FakeStatVFS(free_gb=100, total_gb=200)
-
-
-def no_rotational(_source):
-    return None
-
-
-class TestScanFilesystems(unittest.TestCase):
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def scan(self, lines, statvfs=fake_statvfs):
-        return setup.scan_filesystems(write_mounts(self.tmp, lines),
-                                      statvfs=statvfs,
-                                      rotational=no_rotational)
-
-    def test_accepts_a_plain_disk(self):
-        disks = self.scan(["/dev/sda1 /mnt/data ext4 rw,relatime 0 0"])
-        self.assertEqual([d["mount"] for d in disks], ["/mnt/data"])
-
-    def test_rejects_pseudo_filesystems(self):
-        lines = [
-            "proc /proc proc rw 0 0",
-            "sysfs /sys sysfs rw 0 0",
-            "none /run tmpfs rw 0 0",
-            "cgroup2 /sys/fs/cgroup cgroup2 rw 0 0",
-            "none /snap/core squashfs ro 0 0",
-            "overlay /var/lib/docker/overlay2/x overlay rw 0 0",
-            "devtmpfs /dev devtmpfs rw 0 0",
-            "/dev/sda1 /mnt/data ext4 rw 0 0",
-        ]
-        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
-
-    def test_rejects_network_fstypes(self):
-        # Fine as a transfer target, wrong for frames: os.replace() gives no
-        # atomicity guarantee across the wire.
-        #
-        # The source is deliberately /dev/-prefixed and the mountpoint outside
-        # SKIP_PREFIXES, so the ONLY thing that can reject these is the fstype
-        # rule. Realistic network sources ("nas:/vol") are also caught by the
-        # source filter, which would make this pass for the wrong reason.
-        for fstype in ("nfs", "nfs4", "cifs", "smb3", "9p", "fuse.sshfs",
-                       "ceph", "glusterfs", "lustre"):
-            with self.subTest(fstype=fstype):
-                self.assertEqual(
-                    self.scan([f"/dev/sda1 /mnt/data {fstype} rw 0 0"]), [],
-                    f"{fstype} must not be offered as frame storage")
-
-    def test_rejects_realistic_network_mount_lines(self):
-        lines = [
-            "nas:/vol /mnt/nfs nfs4 rw 0 0",
-            "//nas/share /mnt/cifs cifs rw 0 0",
-            "D:\\134 /mnt/d 9p rw 0 0",
-            "/dev/sda1 /mnt/data ext4 rw 0 0",
-        ]
-        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
-
-    def test_rejects_read_only_mounts(self):
-        lines = ["/dev/sr0 /media/cdrom ext4 ro,relatime 0 0",
-                 "/dev/sda1 /mnt/data ext4 rw 0 0"]
-        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
-
-    def test_ro_substring_in_another_option_is_not_read_only(self):
-        # "errors=remount-ro" contains "ro" but the mount is writable.
-        lines = ["/dev/sda1 / ext4 rw,relatime,errors=remount-ro 0 0"]
-        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/"])
-
-    def test_rejects_skipped_prefixes(self):
-        lines = ["/dev/sda1 /boot/efi vfat rw 0 0",
-                 "/dev/sdb1 /var/lib/docker/x ext4 rw 0 0",
-                 "/dev/sdc1 /mnt/data ext4 rw 0 0"]
-        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
-
-    def test_root_survives_the_prefix_filter(self):
-        # "/" is a prefix of everything; it must be special-cased.
-        self.assertEqual([d["mount"] for d in
-                          self.scan(["/dev/sda1 / ext4 rw 0 0"])], ["/"])
-
-    def test_rejects_sources_that_are_not_devices(self):
-        self.assertEqual(self.scan(["tmpfs /mnt/ram ext4 rw 0 0"]), [])
-
-    def test_deduplicates_a_device_mounted_twice(self):
-        # Keeps the primary (shortest) mountpoint. Both mountpoints must be
-        # ones nothing else would reject, or this passes for the wrong reason.
-        lines = ["/dev/sdd /mnt/data ext4 rw 0 0",
-                 "/dev/sdd /mnt/data/bind-mount ext4 rw 0 0"]
-        disks = self.scan(lines)
-        self.assertEqual([d["mount"] for d in disks], ["/mnt/data"])
-
-    def test_deduplicates_regardless_of_line_order(self):
-        lines = ["/dev/sdd /mnt/data/bind-mount ext4 rw 0 0",
-                 "/dev/sdd /mnt/data ext4 rw 0 0"]
-        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
-
-    def test_different_devices_are_both_kept(self):
-        lines = ["/dev/sda1 /mnt/one ext4 rw 0 0",
-                 "/dev/sdb1 /mnt/two ext4 rw 0 0"]
-        self.assertEqual(len(self.scan(lines)), 2)
-
-    def test_sorted_by_free_space_descending(self):
-        sizes = {"/mnt/small": 10, "/mnt/big": 900, "/mnt/mid": 400}
-
-        def sizing(target):
-            return FakeStatVFS(free_gb=sizes[target], total_gb=1000)
-
-        lines = [f"/dev/sd{c}1 {m} ext4 rw 0 0"
-                 for c, m in zip("abc", sizes)]
-        disks = self.scan(lines, statvfs=sizing)
-        self.assertEqual([d["mount"] for d in disks],
-                         ["/mnt/big", "/mnt/mid", "/mnt/small"])
-
-    def test_skips_filesystems_that_cannot_be_stat_ed(self):
-        def boom(_target):
-            raise OSError("gone")
-        self.assertEqual(self.scan(["/dev/sda1 /mnt/data ext4 rw 0 0"],
-                                   statvfs=boom), [])
-
-    def test_skips_zero_block_filesystems(self):
-        def empty(_target):
-            return FakeStatVFS(free_gb=0, total_gb=0)
-        self.assertEqual(self.scan(["/dev/sda1 /mnt/data ext4 rw 0 0"],
-                                   statvfs=empty), [])
-
-    def test_decodes_escaped_mountpoints(self):
-        disks = self.scan([r"/dev/sda1 /mnt/my\040disk ext4 rw 0 0"])
-        self.assertEqual(disks[0]["mount"], "/mnt/my disk")
-
-    def test_tolerates_short_and_blank_lines(self):
-        disks = self.scan(["", "garbage", "/dev/sda1 /mnt/data ext4 rw 0 0"])
-        self.assertEqual([d["mount"] for d in disks], ["/mnt/data"])
-
-    def test_missing_mounts_file_returns_empty(self):
-        self.assertEqual(setup.scan_filesystems("/nonexistent/mounts"), [])
-
-    def test_reports_free_and_total_in_bytes(self):
-        disks = self.scan(["/dev/sda1 /mnt/data ext4 rw 0 0"])
-        self.assertAlmostEqual(disks[0]["free"] / 1024 ** 3, 100, delta=0.1)
-        self.assertAlmostEqual(disks[0]["total"] / 1024 ** 3, 200, delta=0.1)
-
-
-class TestBaseDevice(unittest.TestCase):
-    """Partition-name stripping, against a fake /sys/block."""
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        for dev in ("sda", "nvme0n1", "mmcblk0"):
-            (self.tmp / dev / "queue").mkdir(parents=True)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def base(self, source):
-        return setup._base_device(source, sys_block=str(self.tmp))
-
-    def test_whole_disk(self):
-        self.assertEqual(self.base("/dev/sda"), "sda")
-
-    def test_sata_partition(self):
-        self.assertEqual(self.base("/dev/sda1"), "sda")
-
-    def test_nvme_partition(self):
-        self.assertEqual(self.base("/dev/nvme0n1p2"), "nvme0n1")
-
-    def test_nvme_whole_disk(self):
-        self.assertEqual(self.base("/dev/nvme0n1"), "nvme0n1")
-
-    def test_mmc_partition(self):
-        self.assertEqual(self.base("/dev/mmcblk0p1"), "mmcblk0")
-
-    def test_unknown_device(self):
-        self.assertIsNone(self.base("/dev/sdz9"))
-
-    def test_non_device_source(self):
-        self.assertIsNone(self.base("tmpfs"))
-
-    def test_rotational_reads_the_flag(self):
-        (self.tmp / "sda" / "queue" / "rotational").write_text("1\n")
-        (self.tmp / "nvme0n1" / "queue" / "rotational").write_text("0\n")
-        self.assertIs(setup._is_rotational("/dev/sda1", str(self.tmp)), True)
-        self.assertIs(setup._is_rotational("/dev/nvme0n1p2", str(self.tmp)),
-                      False)
-
-    def test_rotational_is_unknown_when_absent(self):
-        self.assertIsNone(setup._is_rotational("/dev/sda1", str(self.tmp)))
 
 
 class TestRecommend(unittest.TestCase):
@@ -1272,7 +1083,9 @@ class TestChooseWeb(unittest.TestCase):
         self.assertTrue(web["enabled"])
         self.assertEqual(web["bind"], self.LAN)
         self.assertEqual(web["port"], 8787)
-        self.assertEqual(web["state_dir"], "/var/lib/timelapse/web")
+        # The platform's default, not the literal: this one goes into a
+        # config.json, which is a per-machine file rather than a systemd unit.
+        self.assertEqual(web["state_dir"], plat.WEB_STATE_DIR_DEFAULT)
 
     def test_wildcard_is_the_fallback_when_there_is_no_lan_address(self):
         web, _ = self.drive("y\n\n\n\n\n", lan="")
@@ -2139,20 +1952,25 @@ class TestRuntimeStateDir(unittest.TestCase):
                                 str(path)]), \
                 contextlib.redirect_stdout(buf):
             setup.main()
-        self.assertEqual(buf.getvalue().strip(), "/var/lib/timelapse/state")
+        # Not the platform's default: this flag exists for install.sh, which
+        # is the Linux installer, and what it prints becomes a directory named
+        # in a systemd unit. See writable_paths().
+        self.assertEqual(buf.getvalue().strip(), plat.LINUX_STATE_DIR)
 
     def test_the_default_is_named_in_exactly_one_place(self):
         """Two copies of this string is how the unit and the directory drift.
 
         The wizard's template, the config example and install.sh's fallback all
         say /var/lib/timelapse/state, but only one of them is consulted at run
-        time.
+        time - and since 0.2.0 that one is timelapse_platform, because
+        /var/lib means nothing on Windows.
         """
         import timelapse_encode as enc
 
         cfg = setup.default_config()
         del cfg["paths"]["state_dir"]
-        self.assertEqual(enc.state_dir(cfg).as_posix(), enc.STATE_DIR_DEFAULT)
+        self.assertEqual(str(enc.state_dir(cfg)), enc.STATE_DIR_DEFAULT)
+        self.assertEqual(enc.STATE_DIR_DEFAULT, plat.STATE_DIR_DEFAULT)
 
 
 class TestWebStateDir(unittest.TestCase):

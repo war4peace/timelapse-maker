@@ -22,6 +22,7 @@ import json
 import logging
 import logging.handlers
 import math
+import ntpath
 import os
 import re
 import shutil
@@ -41,6 +42,66 @@ except ImportError:
              "(or: sudo apt install python3-requests)")
 
 __version__ = "0.1.9"
+
+
+# ----------------------------------------------------------------------------
+# Where things live
+#
+# Duplicated from timelapse_platform.py, deliberately and for the same reason
+# load_config(), replace_atomic() and the redaction rule are: this daemon
+# imports nothing from its siblings, so that a syntax error in a script it does
+# not need cannot stop the capture. Tests pin the copies together, character by
+# character, because the copy that drifts is always the one nobody is watching.
+#
+# It cannot simply be four string literals: /var/lib has no meaning on Windows,
+# where Path("/var/lib/timelapse/state") is not an error but a directory on
+# whichever drive happens to be current, so the daemon would publish a
+# heartbeat nobody reads.
+# ----------------------------------------------------------------------------
+
+LINUX_CONFIG_DIR = "/etc/timelapse"
+LINUX_DATA_ROOT = "/var/lib/timelapse"
+LINUX_STATE_DIR = "/var/lib/timelapse/state"
+LINUX_WEB_STATE_DIR = "/var/lib/timelapse/web"
+
+
+def program_data(env=None):
+    """%ProgramData%, with the two fallbacks that make it not matter.
+
+    ALLUSERSPROFILE has named the same directory since Vista and is what a
+    stripped environment (a service, a scheduled task) tends to keep. The
+    literal is the last resort: a machine where neither is set is not a machine
+    where guessing a different path would help.
+    """
+    env = os.environ if env is None else env
+    return (env.get("ProgramData") or env.get("ALLUSERSPROFILE")
+            or "C:\\ProgramData")
+
+
+def locations(windows, env=None):
+    """Every fixed location, as a dict, for the platform named by `windows`.
+
+    Pure, and takes the platform rather than reading it, so both branches are
+    reachable from both CI legs. ntpath.join rather than os.path.join for the
+    same reason: it produces a correct Windows path when this runs on Linux,
+    which is what makes the Windows branch assertable there.
+    """
+    if not windows:
+        return {"config_dir": LINUX_CONFIG_DIR,
+                "config": LINUX_CONFIG_DIR + "/config.json",
+                "data_root": LINUX_DATA_ROOT,
+                "state": LINUX_STATE_DIR,
+                "web_state": LINUX_WEB_STATE_DIR}
+    base = ntpath.join(program_data(env), "timelapse")
+    return {"config_dir": base,
+            "config": ntpath.join(base, "config.json"),
+            "data_root": base,
+            "state": ntpath.join(base, "state"),
+            "web_state": ntpath.join(base, "web")}
+
+
+_LOC = locations(os.name == "nt")
+CONFIG_PATH = _LOC["config"]
 
 
 # ----------------------------------------------------------------------------
@@ -1010,7 +1071,7 @@ def record_cadences(cams):
 # who is asking; a reader can work that out and a writer cannot take it back.
 # ----------------------------------------------------------------------------
 
-STATE_DIR_DEFAULT = "/var/lib/timelapse/state"
+STATE_DIR_DEFAULT = _LOC["state"]
 CAPTURE_STATE = "capture.json"
 STATE_VERSION = 1
 _state_warned = False
@@ -1130,7 +1191,7 @@ def main():
         print(f"usage: timelapse_capture.py [config.json]\n{__doc__}")
         return
 
-    cfg_path = sys.argv[1] if len(sys.argv) > 1 else "/etc/timelapse/config.json"
+    cfg_path = sys.argv[1] if len(sys.argv) > 1 else CONFIG_PATH
     cfg = load_config(cfg_path)
     setup_logging(cfg["paths"].get("log_dir"))
 

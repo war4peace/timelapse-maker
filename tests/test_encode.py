@@ -1764,23 +1764,26 @@ class TestStateDir(unittest.TestCase):
     def test_absent_falls_back_to_the_default(self):
         # Every config written before 0.1.6 lacks the key, and upgrades keep
         # the existing config, so this is the normal case for a while.
-        self.assertEqual(enc.state_dir({"paths": {}}).as_posix(),
+        # str(), not as_posix(): STATE_DIR_DEFAULT is the platform's own
+        # spelling, and on Windows as_posix() would turn it into a path no
+        # caller ever sees.
+        self.assertEqual(str(enc.state_dir({"paths": {}})),
                          enc.STATE_DIR_DEFAULT)
 
     def test_an_empty_or_blank_value_falls_back_too(self):
         for value in ("", "   ", None):
             self.assertEqual(
-                enc.state_dir({"paths": {"state_dir": value}}).as_posix(),
+                str(enc.state_dir({"paths": {"state_dir": value}})),
                 enc.STATE_DIR_DEFAULT)
 
     def test_a_config_with_no_paths_block_at_all(self):
-        self.assertEqual(enc.state_dir({}).as_posix(), enc.STATE_DIR_DEFAULT)
+        self.assertEqual(str(enc.state_dir({})), enc.STATE_DIR_DEFAULT)
 
     def test_it_is_not_the_web_index_directory(self):
         # The web UI's state_dir lives under web, not paths, and means
         # something else entirely: the one directory that service may write.
         cfg = {"paths": {}, "web": {"state_dir": "/var/lib/timelapse/web"}}
-        self.assertEqual(enc.state_dir(cfg).as_posix(), enc.STATE_DIR_DEFAULT)
+        self.assertEqual(str(enc.state_dir(cfg)), enc.STATE_DIR_DEFAULT)
 
     def test_the_state_files_are_named_once(self):
         self.assertEqual((enc.CAPTURE_STATE, enc.ENCODE_STATE),

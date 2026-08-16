@@ -89,6 +89,62 @@ jobs:
       - name: End-to-end encode smoke test
         run: python tests/smoke_test.py
 
+  # Added at the first commit of the Windows port rather than the last, per
+  # docs/future-features.md item 11e. The suite already passed on Windows
+  # before any of this existed, so this leg starts green and its entire value
+  # is catching timelapse_platform regressing: half of what that module
+  # answers is unreachable from the Linux legs by construction, and this
+  # project has twice been bitten by "a local branch is a branch CI has never
+  # seen". Developing a Windows port on a Windows box with no Windows CI is
+  # that mistake with the platforms swapped.
+  #
+  # Unit suite only, deliberately. No ffmpeg, so no smoke test: the encode
+  # pipeline is shared code that the Linux legs exercise on every push, and
+  # installing a build here would add a download to the one job that is
+  # otherwise fast and has no network dependency at all.
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Byte-compile all scripts
+        run: python -m compileall -q scripts tests
+
+      - name: Unit tests
+        run: python -m unittest discover -s tests -t tests -p 'test_*.py' -v
+
+      - name: Check --version on every entry point
+        run: |
+          python scripts/timelapse_encode.py --version
+          python scripts/timelapse_test.py --version
+          python scripts/timelapse_capture.py --version
+          python scripts/timelapse_setup.py --version
+          python scripts/timelapse_update.py --version
+          python scripts/timelapse_platform.py --version
+
+      # The one place the Windows locations get written into a real file
+      # rather than asserted about. No --template here, unlike the Linux leg:
+      # config.example.json is a Linux template and its values would simply be
+      # copied through, which would test the copying rather than the defaults.
+      #
+      # --print-paths is deliberately not run. It emits ReadWritePaths= for a
+      # systemd unit, so there is nothing for it to be right about here.
+      - name: Wizard runs headless and writes Windows locations
+        run: |
+          python scripts/timelapse_setup.py --defaults --output "${env:RUNNER_TEMP}\wizard.json"
+          python -m json.tool "${env:RUNNER_TEMP}\wizard.json"
+          python .github/check_windows_config.py "${env:RUNNER_TEMP}\wizard.json"
+
   shell:
     runs-on: ubuntu-latest
     timeout-minutes: 15

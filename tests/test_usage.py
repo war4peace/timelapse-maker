@@ -16,8 +16,9 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-import _support
+import _support                                            # noqa: F401
 
+import timelapse_platform as plat
 import timelapse_test as tt
 
 
@@ -258,8 +259,11 @@ class TestStateDirCheck(unittest.TestCase):
         self.assertIn("not writable by", out)
 
     def test_a_config_without_the_key_checks_the_default(self):
+        # The platform's default rather than the literal: what the pre-flight
+        # must not do is check some other directory than the one the daemons
+        # will actually write to on this machine.
         out = self.run_check({"paths": {}})
-        self.assertIn("/var/lib/timelapse/state", out)
+        self.assertIn(plat.STATE_DIR_DEFAULT, out)
 
 
 if __name__ == "__main__":

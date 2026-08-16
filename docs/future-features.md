@@ -196,16 +196,24 @@ grep across `scripts/`: 10 `systemctl` call sites, 1 `journalctl`, 7 `mount`,
 4 `rsync`, 2 `runuser`, 2 `mount.cifs`, and 29 user-facing strings containing
 `sudo `.
 
-**1. A platform module, not sprinkled branches.** The single most important
-structural decision here. `if os.name == "nt"` scattered through six scripts
-is how the two-forks outcome arrives by increments. Propose one new file,
+**1. A platform module, not sprinkled branches. BUILT 2026-08-16.** The single
+most important structural decision here. `if os.name == "nt"` scattered through
+six scripts is how the two-forks outcome arrives by increments. One new file,
 `timelapse_platform.py`, answering a small closed set of questions: where the
 config lives, where state lives, how to ask whether a service is running, how
-to restart one, how to read its recent log, how to copy files to a
-destination, how to secure a file holding passwords. Every existing call site
-becomes a call into it. This is a prerequisite for everything else in this
-item, which under the ordering rule is why it is first despite being the least
-visible.
+to restart one, what to tell an operator to type, how to secure a file holding
+passwords, which disks could hold frames. Every existing call site is a call
+into it. This is a prerequisite for everything else in this item, which under
+the ordering rule is why it is first despite being the least visible.
+
+It shipped as an **extraction**: the Linux answers moved in unchanged and the
+existing suite held the line, which is why the diff carries no new Linux
+behaviour at all. Two questions in the list above are deliberately *not*
+answered yet, because each is the substance of a later step rather than a
+mechanical move: **reading a service's recent log** and **copying files to a
+destination**. The first is the web UI's Log tab (step 5), the second is
+transfer (step 4). See architecture.md §4.6a for what was settled; the entry
+below is the design that produced it and is left as written.
 
 **2. Service supervision. Real Windows services, not scheduled tasks.**
 Requirement from the operator 2026-08-15, and it is right for reasons beyond
@@ -895,12 +903,35 @@ stops being worth it:
    works** (see 11c.2). This was the one load-bearing unknown, and it landing
    green is why the rest of this list is written as it is: no dependency, no
    vendored binary, real services.
-1. `timelapse_platform.py` and the `os.replace` retry. The retry is worth
-   doing **whatever is decided about Windows**, because it is a latent bug for
-   any Windows developer running the tools directly, and it is a few lines.
-2. The four measured correctness fixes that are cheap and platform-guarded:
-   case-insensitive camera-name collision, reserved names,
-   `SO_EXCLUSIVEADDRUSE`, and the log-rollover sidestep.
+1. ~~`timelapse_platform.py` and the `os.replace` retry.~~ **Done 2026-08-16**,
+   with the `windows-latest` CI leg, and it went in as an extraction rather
+   than as new code: today's Linux answers moved behind the module and the
+   existing suite proved Linux behaviour unchanged, which is what the count
+   going 1,340 to 1,369 with nothing edited on the Linux side means. Scope was
+   locations, service control, the config's permissions and the storage scan.
+   The web UI's status and log sources were left where they are on purpose:
+   they are step 5's work and their Windows shape is a design question
+   (`QueryServiceStatusEx` returns integers where `systemctl show` returns
+   text), not a mechanical move. Transfer likewise, because step 4 replaces
+   rsync wholesale and splitting it now would design the API against a guess.
+   Four things settled while building it, all recorded in architecture.md
+   §4.6a: the module never prints; "cannot be asked" is a value and is not
+   "no"; the Windows half of a question is written only when a caller exists,
+   so nothing stubs a lie; and `locations()` takes the platform as an argument
+   so both branches are asserted on both CI legs. Two things deliberately did
+   not move: `writable_paths()` and `--print-state-path` name the *Linux*
+   constant, because a `ReadWritePaths=` line is a POSIX artefact whoever
+   generated it, and the capture daemon keeps its independence and carries a
+   pinned copy. Windows config and state live under `%ProgramData%\timelapse`,
+   decided 2026-08-16: it is machine-wide, survives upgrades and can be ACL
+   restricted, none of which `%ProgramFiles%` gives for a file that is edited.
+   The module is the seventh versioned script, installed and listed by
+   `timelapse version`, because a stale copy of it breaks a daemon exactly as
+   a stale script does.
+2. The three remaining measured correctness fixes, all cheap and
+   platform-guarded: case-insensitive camera-name collision, reserved device
+   names, and the log-rollover sidestep. (`SO_EXCLUSIVEADDRUSE` was the fourth
+   and shipped early, with the `os.replace` retry, at `1ffec92`.)
 3. Capture as a real service and encode as a scheduled task, with file
    logging. That is a *useful product on its own*: it captures, it encodes, it
    notifies. Ship or evaluate at this point before going further.
@@ -911,8 +942,13 @@ stops being worth it:
 6. The GUI installer (11c.6b), which is deliberately last and is the only item
    here whose trigger is an audience rather than a dependency.
 
-**Add a `windows-latest` leg to CI at step 1, not at the end**, for the
-reasons in 11e.
+~~**Add a `windows-latest` leg to CI at step 1, not at the end**~~, for the
+reasons in 11e. **Done 2026-08-16**, with step 1. Python 3.12, unit suite only:
+no ffmpeg, because the encode pipeline is shared code the three Linux legs
+exercise on every push and a download would land in the one job that otherwise
+has no network dependency. It also runs the wizard headless and checks the
+config it writes names Windows locations, which is the only place those get
+written to a real file rather than asserted about.
 
 **Decisions taken 2026-08-15, so that the build order above is a plan rather
 than a menu:**

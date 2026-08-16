@@ -714,6 +714,34 @@ class TestCredentialsNeverReachTheLog(unittest.TestCase):
                          enc.state_dir({"paths": {"state_dir": "/srv/s"}}))
         self.assertEqual(cap.state_dir({}), enc.state_dir({}))
 
+    def test_the_daemons_copy_of_the_path_derivation_has_not_drifted(self):
+        """Fourth duplicated thing, and the first one that is platform code.
+
+        The daemon may not import timelapse_platform for the same reason it
+        imports nothing else: a syntax error in a script it does not need must
+        not be able to stop the capture. So it carries the derivation, and this
+        holds the two copies character-identical, which is the only assertion
+        that would notice the *Windows* branch drifting while both platforms'
+        tests still pass on the Linux one.
+
+        This is also the exception named in test_platform's rule that no file
+        outside timelapse_platform tests os.name.
+        """
+        import inspect
+        import timelapse_platform as plat
+        self.assertEqual(inspect.getsource(cap.program_data),
+                         inspect.getsource(plat.program_data))
+        self.assertEqual(inspect.getsource(cap.locations),
+                         inspect.getsource(plat.locations))
+        for name in ("LINUX_CONFIG_DIR", "LINUX_DATA_ROOT", "LINUX_STATE_DIR",
+                     "LINUX_WEB_STATE_DIR"):
+            self.assertEqual(getattr(cap, name), getattr(plat, name), name)
+        # And the values it actually derives, which is what the rest of the
+        # project reads. STATE_DIR_DEFAULT is pinned to the encoder above; this
+        # pins the pair of them to the module that owns the answer.
+        self.assertEqual(cap.STATE_DIR_DEFAULT, plat.STATE_DIR_DEFAULT)
+        self.assertEqual(cap.CONFIG_PATH, plat.CONFIG_PATH)
+
     def test_the_daemons_copy_of_the_atomic_write_has_not_drifted(self):
         """Third duplicated thing, pinned for the same reason as the other two.
 

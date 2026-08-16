@@ -35,6 +35,8 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
+from timelapse_platform import CONFIG_PATH                 # noqa: E402
+
 __version__ = "0.1.9"
 
 OUT = Path(os.environ.get("TIMELAPSE_TEST_DIR") or
@@ -473,10 +475,12 @@ def test_state_dir(cfg):
     from timelapse_encode import state_dir, whoami
 
     d = state_dir(cfg)
-    # as_posix() for display: every path this project deals with is a POSIX
-    # path, but a Path stringifies to whatever the running platform separates
-    # with, and the development box is not the deployment box.
-    shown = d.as_posix()
+    # str(), not as_posix(). The old rule here was that everything this project
+    # emits is POSIX, which is true of the paths it emits *for systemd* and
+    # false of this one: these lines are read by whoever ran the check, on the
+    # machine they ran it on, and an operator asked to create a directory needs
+    # it spelled the way their shell spells it.
+    shown = str(d)
     if not d.is_dir():
         bad(f"{shown} does not exist")
         info("The capture and encode units name it in ReadWritePaths, so they")
@@ -773,7 +777,7 @@ def test_discord(cfg, config_path=None, force=False):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    ap.add_argument("config", nargs="?", default="/etc/timelapse/config.json")
+    ap.add_argument("config", nargs="?", default=CONFIG_PATH)
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("--camera", help="test only this camera")
     # The --*-discord spellings are kept as aliases: they are in the docs, in

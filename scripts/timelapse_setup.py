@@ -30,6 +30,16 @@ from datetime import date
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlparse
 
+# The wizard is the script that touches the machine most, so it is the one that
+# imports the most of this. Names rather than the module: several of them read
+# as ordinary constants at their call sites, which is the point.
+from timelapse_platform import (
+    CONFIG_DIR, CONFIG_PATH, DATA_ROOT_DEFAULT, LINUX_STATE_DIR,
+    LINUX_WEB_STATE_DIR, STATE_DIR_DEFAULT, WEB_STATE_DIR_DEFAULT,
+    log_hint, restart_hint, restart_service, scan_filesystems,
+    secure_secret_file, service_is_active, start_hint, stop_hint,
+)
+
 __version__ = "0.1.9"
 
 # ----------------------------------------------------------------------------
@@ -202,130 +212,12 @@ def human(n):
 
 # ----------------------------------------------------------------------------
 # Storage discovery
+#
+# scan_filesystems() itself lives in timelapse_platform: /proc/mounts is the
+# Linux answer to "which disks could hold frames" and Windows needs a different
+# one. What stays here is what to do with the answer, which is the same
+# question on either platform.
 # ----------------------------------------------------------------------------
-
-PSEUDO_FS = {
-    "tmpfs", "devtmpfs", "sysfs", "proc", "procfs", "cgroup", "cgroup2",
-    "overlay", "overlayfs", "squashfs", "devpts", "mqueue", "hugetlbfs",
-    "debugfs", "tracefs", "binfmt_misc", "configfs", "securityfs", "pstore",
-    "efivarfs", "fusectl", "autofs", "rpc_pipefs", "nsfs", "ramfs", "bpf",
-    "rootfs", "selinuxfs", "fuse.snapfuse", "fuse.gvfsd-fuse", "fuse.portal",
-    "iso9660", "udf",
-}
-
-# Usable, but a bad idea for frames: no atomic rename guarantees across the
-# wire, and 17k small writes per camera per day over a network is painful.
-NETWORK_FS = {
-    "nfs", "nfs4", "cifs", "smbfs", "smb3", "9p", "fuse.sshfs", "ceph",
-    "glusterfs", "fuse.rclone", "afs", "lustre",
-}
-
-SKIP_PREFIXES = (
-    "/proc", "/sys", "/dev", "/run", "/snap", "/var/snap", "/boot",
-    "/var/lib/docker", "/var/lib/containers", "/mnt/wsl", "/usr/lib/wsl",
-    "/mnt/wslg", "/tmp/.",
-)
-
-
-def _base_device(source, sys_block="/sys/block"):
-    """/dev/sda1 -> sda, /dev/nvme0n1p2 -> nvme0n1, /dev/mapper/vg-lv -> dm-N.
-
-    sys_block is injectable so the partition-stripping rules can be tested
-    against a fake tree rather than whatever disks this machine happens to have.
-    """
-    if not source.startswith("/dev/"):
-        return None
-    name = source[5:]
-    if name.startswith("mapper/"):
-        try:
-            return os.path.basename(os.readlink(source))
-        except OSError:
-            return None
-    if Path(f"{sys_block}/{name}").exists():
-        return name
-    # Strip a partition suffix: sda1 -> sda, nvme0n1p2 -> nvme0n1, mmcblk0p1.
-    for cut in (lambda s: s.rstrip("0123456789"),
-                lambda s: s.rsplit("p", 1)[0] if "p" in s else s):
-        cand = cut(name)
-        if cand and Path(f"{sys_block}/{cand}").exists():
-            return cand
-    return None
-
-
-def _is_rotational(source, sys_block="/sys/block"):
-    dev = _base_device(source, sys_block)
-    if not dev:
-        return None
-    try:
-        p = Path(f"{sys_block}/{dev}/queue/rotational")
-        return p.read_text().strip() == "1"
-    except OSError:
-        return None
-
-
-def scan_filesystems(mounts_path="/proc/mounts", statvfs=None, rotational=None):
-    """Real, writable, local filesystems that could hold frames.
-
-    The three inputs are injectable so the filtering can be tested against a
-    synthetic /proc/mounts without needing the machine to have the interesting
-    cases (network mounts, read-only duplicates, a device mounted twice) on it.
-
-    Resolved here rather than as default arguments: os.statvfs does not exist on
-    Windows, and evaluating it at def time would make the module unimportable
-    there - which matters only for running the tests off-target, but there is no
-    reason to forbid that.
-    """
-    if statvfs is None:
-        statvfs = getattr(os, "statvfs", None)
-        if statvfs is None:
-            return []
-    if rotational is None:
-        rotational = _is_rotational
-    try:
-        raw = Path(mounts_path).read_text().splitlines()
-    except OSError:
-        return []
-
-    found = {}
-    for line in raw:
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        source, target, fstype, opts = parts[0], parts[1], parts[2], parts[3]
-        target = target.replace("\\040", " ").replace("\\011", "\t")
-
-        if fstype in PSEUDO_FS or fstype in NETWORK_FS:
-            continue
-        if target != "/" and target.startswith(SKIP_PREFIXES):
-            continue
-        if "ro" in opts.split(","):
-            continue
-        if not source.startswith("/dev/"):
-            continue
-        try:
-            st = statvfs(target)
-        except OSError:
-            continue
-        if st.f_blocks == 0:
-            continue
-
-        entry = {
-            "mount": target,
-            "source": source,
-            "fstype": fstype,
-            "free": st.f_bavail * st.f_frsize,
-            "total": st.f_blocks * st.f_frsize,
-            "rotational": rotational(source),
-        }
-        # One device can be mounted repeatedly (bind mounts, WSL). Keep the
-        # shortest mountpoint, which is the primary one.
-        prev = found.get(source)
-        if prev is None or len(target) < len(prev["mount"]):
-            found[source] = entry
-
-    disks = sorted(found.values(), key=lambda d: -d["free"])
-    return disks
-
 
 def recommend(disks):
     """Prefer the roomiest non-root filesystem; don't fill the OS disk."""
@@ -367,7 +259,7 @@ def choose_storage(cfg):
 
     if not disks:
         warn("Could not detect any local filesystems automatically.")
-        base = ask("Base directory for timelapse data", "/var/lib/timelapse")
+        base = ask("Base directory for timelapse data", DATA_ROOT_DEFAULT)
         chosen = None
     else:
         best = recommend(disks)
@@ -378,7 +270,7 @@ def choose_storage(cfg):
         idx = ask_int("Which filesystem should hold the frames?",
                       default_idx, 1, len(disks))
         chosen = disks[idx - 1]
-        suggested = ("/var/lib/timelapse" if chosen["mount"] == "/"
+        suggested = (DATA_ROOT_DEFAULT if chosen["mount"] == "/"
                      else str(Path(chosen["mount"]) / "timelapse"))
         base = ask("Base directory", suggested)
 
@@ -1497,29 +1389,30 @@ def load_existing_config(path):
 
 
 def unit_is_active(unit):
-    """True, False, or None when systemd cannot be asked at all."""
-    if not shutil.which("systemctl"):
-        return None
-    try:
-        r = subprocess.run(["systemctl", "is-active", "--quiet", unit],
-                           timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        return None
-    return r.returncode == 0
+    """True, False, or None when the service manager cannot be asked at all.
+
+    A thin name over the platform module's answer, kept because every caller
+    here reads better for it and because the tests patch it.
+    """
+    return service_is_active(unit)
 
 
 def restart_unit(unit, success):
-    """Restart a unit and say what happened. True if it came back."""
-    try:
-        r = subprocess.run(["systemctl", "restart", unit], timeout=90)
-    except (OSError, subprocess.SubprocessError) as exc:
-        fail(f"Restart failed: {exc}")
-        return False
-    if r.returncode == 0:
+    """Restart a unit and say what happened. True if it came back.
+
+    The wording lives here rather than in the platform module: that module must
+    never print, because a Windows service has no console to print to and a
+    stray write there kills the service entry point (item 11c.2).
+    """
+    ok, detail = restart_service(unit)
+    if ok:
         good(success)
         return True
+    if detail:
+        fail(f"Restart failed: {detail}")
+        return False
     fail("Restart failed (are you root?).")
-    note(f"See: journalctl -u {unit.split('.')[0]} -n 40")
+    note(f"See: {log_hint(unit)}")
     return False
 
 
@@ -1539,7 +1432,7 @@ def restart_web_if_running(cfg):
         return
     if not active:
         if enabled:
-            note(f"Start it with: systemctl enable --now {unit}")
+            note(f"Start it with: {start_hint(unit)}")
         return
     print()
     if not enabled:
@@ -1549,12 +1442,12 @@ def restart_web_if_running(cfg):
         if ask_yes("Stop it now?", True):
             restart_unit(unit, "Web UI stopped.")
         else:
-            note(f"Stop it with: systemctl stop {unit}")
+            note(f"Stop it with: {stop_hint(unit)}")
         return
     note("The web UI is running on the settings it read at startup.")
     if not ask_yes("Restart it so the new settings take effect now?", True):
         warn("The running server still has the previous settings.")
-        note(f"Apply them with: systemctl restart {unit}")
+        note(f"Apply them with: {restart_hint(unit)}")
         return
     restart_unit(unit, "Web UI restarted on the new settings.")
 
@@ -1565,33 +1458,19 @@ def restart_capture_if_running():
     Same trap the installer had when it replaced scripts under a live service:
     editing the file changes nothing until the daemon restarts.
     """
-    if not shutil.which("systemctl"):
+    unit = "timelapse-capture.service"
+    active = unit_is_active(unit)
+    if active is None:
         return
-    try:
-        active = subprocess.run(
-            ["systemctl", "is-active", "--quiet", "timelapse-capture.service"],
-            timeout=15)
-    except (OSError, subprocess.SubprocessError):
-        return
-    if active.returncode != 0:
+    if not active:
         note("Capture is not running; the new list applies when it next starts.")
         return
     print()
     if not ask_yes("Restart capture so the change takes effect now?", True):
         warn("Capture is still using the previous camera list.")
-        note("Apply it with: systemctl restart timelapse-capture.service")
+        note(f"Apply it with: {restart_hint(unit)}")
         return
-    try:
-        r = subprocess.run(["systemctl", "restart", "timelapse-capture.service"],
-                           timeout=90)
-    except (OSError, subprocess.SubprocessError) as exc:
-        fail(f"Restart failed: {exc}")
-        return
-    if r.returncode == 0:
-        good("Capture restarted on the new camera list.")
-    else:
-        fail("Restart failed (are you root?).")
-        note("See: journalctl -u timelapse-capture -n 40")
+    restart_unit(unit, "Capture restarted on the new camera list.")
 
 
 def manage_cameras(cfg):
@@ -2042,7 +1921,7 @@ def setup_cifs_share(cfg, svcuser=None):
             warn(f"Unknown user '{svcuser}'; mounting as root.")
 
     # 0600 and root-owned: it holds the share password in plain text.
-    cred = Path("/etc/timelapse") / f"cifs-{share}.cred"
+    cred = Path(CONFIG_DIR) / f"cifs-{share}.cred"
     cred.parent.mkdir(parents=True, exist_ok=True)
     old_umask = os.umask(0o077)
     try:
@@ -2682,7 +2561,7 @@ def choose_web(cfg):
     note("The web UI writes one thing: an index of your library. The service")
     note("is allowed to write this directory and nothing else on the system.")
     web["state_dir"] = ask("Index directory",
-                           web.get("state_dir", "/var/lib/timelapse/web"))
+                           web.get("state_dir", WEB_STATE_DIR_DEFAULT))
 
     print()
     note("The Overview page can tell you when a new version is tagged, and")
@@ -2951,7 +2830,7 @@ def default_config(template_path=None):
         return cfg
     return {
         "paths": {"frames_root": "", "video_output": "", "log_dir": "",
-                  "state_dir": "/var/lib/timelapse/state",
+                  "state_dir": STATE_DIR_DEFAULT,
                   "ffmpeg": "/usr/bin/ffmpeg", "ffprobe": "/usr/bin/ffprobe"},
         "capture": {"interval_seconds": 5, "timeout_seconds": 4,
                     "min_bytes": 4096, "min_free_gb": 60,
@@ -2974,20 +2853,27 @@ def writable_paths(cfg):
     """Minimal set of directories systemd's ReadWritePaths must allow.
 
     PurePosixPath, not Path: the output goes into a systemd unit, so it is a
-    POSIX path whatever platform normalises it.
+    POSIX path whatever platform normalises it. Same reason LINUX_STATE_DIR is
+    named below rather than the platform's own default: a ReadWritePaths= line
+    is a Linux artefact even when a Windows box generated it, and this is the
+    function whose output install.sh consumes.
     """
-    from timelapse_encode import state_dir
-
     paths = [cfg["paths"][k] for k in ("frames_root", "video_output", "log_dir")
              if cfg["paths"].get(k)]
     # Both daemons publish runtime state here. It is usually /var/lib/timelapse
     # /state, a sibling of the others rather than a child, so the collapse
     # below does not absorb it and it genuinely needs naming.
     #
-    # as_posix(), not str(): state_dir() hands back a Path, and on Windows that
-    # stringifies with backslashes, which PurePosixPath below then treats as
-    # one long filename rather than a path. Same reason as the docstring above.
-    paths.append(state_dir(cfg).as_posix())
+    # as_posix(), not str(): a configured path may arrive with backslashes,
+    # which PurePosixPath below would treat as one long filename rather than a
+    # path. Same reason as the docstring above.
+    #
+    # Deliberately not timelapse_encode.state_dir(): that function answers
+    # "where does this daemon write its state on this machine", and the only
+    # part of it that differs here is the fallback, which is the part that has
+    # to be Linux's.
+    configured = (cfg.get("paths", {}).get("state_dir") or "").strip()
+    paths.append(Path(configured).as_posix() if configured else LINUX_STATE_DIR)
     t = cfg.get("transfer", {})
     dest = t.get("destination", "")
     if t.get("enabled") and dest.startswith("/"):
@@ -3011,7 +2897,7 @@ def web_writable_paths(cfg):
     access to every captured frame in exchange for nothing.
     """
     state = (cfg.get("web", {}).get("state_dir") or "").strip()
-    return [str(PurePosixPath(state or "/var/lib/timelapse/web"))]
+    return [str(PurePosixPath(state or LINUX_WEB_STATE_DIR))]
 
 
 def summarise(cfg, out_path):
@@ -3130,15 +3016,7 @@ def write_config(cfg, out_path, owner=None):
         json.dump(cfg, fh, indent=2)
         fh.write("\n")
     replace_atomic(tmp, out)
-    try:
-        os.chmod(out, 0o640)          # it holds camera credentials
-    except OSError:
-        pass
-    if owner:
-        try:
-            shutil.chown(out, group=owner)
-        except (OSError, LookupError):
-            pass
+    secure_secret_file(out, owner)    # it holds camera credentials
 
 
 def print_redacted_config(path):
@@ -3358,7 +3236,7 @@ def create_web_state_dir(cfg, owner=None):
     wants it. One empty directory is a cheap price for never seeing that.
     """
     web = cfg.get("web", {})
-    p = Path(web.get("state_dir") or "/var/lib/timelapse/web")
+    p = Path(web.get("state_dir") or WEB_STATE_DIR_DEFAULT)
     try:
         p.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
@@ -3456,7 +3334,7 @@ def run_camera_action(cfg, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    ap.add_argument("--output", default="/etc/timelapse/config.json")
+    ap.add_argument("--output", default=CONFIG_PATH)
     ap.add_argument("--template", default=None,
                     help="config.example.json to start from")
     ap.add_argument("--owner", default=None,
@@ -3565,13 +3443,15 @@ def main():
         return 0
 
     if args.print_state_path:
-        from timelapse_encode import state_dir
-
         with open(args.print_state_path, encoding="utf-8") as fh:
-            # as_posix() for the same reason writable_paths() uses it: this is
-            # read by install.sh to make a directory on the target, and a Path
-            # stringifies to whatever the *running* platform separates with.
-            print(state_dir(json.load(fh)).as_posix())
+            cfg = json.load(fh)
+        # POSIX, and the Linux fallback, for the same reasons writable_paths()
+        # uses both: this is read by install.sh to make a directory that a
+        # systemd unit then names, so it is a Linux answer even when a Windows
+        # box computed it. A Path stringifies to whatever the *running*
+        # platform separates with, which is the wrong thing here twice over.
+        configured = (cfg.get("paths", {}).get("state_dir") or "").strip()
+        print(Path(configured).as_posix() if configured else LINUX_STATE_DIR)
         return 0
 
     init_tty(force_defaults=args.defaults, use_stdin=args.stdin)

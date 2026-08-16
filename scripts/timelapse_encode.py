@@ -34,6 +34,10 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
+# Names, not the module: `platform` above is the stdlib one, and two things
+# called platform in one file is a trap waiting for a reader in a hurry.
+from timelapse_platform import CONFIG_PATH, STATE_DIR_DEFAULT
+
 __version__ = "0.1.9"
 
 log = logging.getLogger("encode")
@@ -642,19 +646,20 @@ def mark_encoded(day_dir, out_file, result, encoder_name):
 # This is a second on-disk contract and it will outlive whatever reads it
 # first, so it carries a version and every reader uses .get(key, default).
 #
-# `/var/lib/timelapse/state` rather than anywhere derived from the config's
-# other paths. The base directory the wizard asks about exists because frames
-# are enormous and may want their own disk; a few KB of JSON does not, and
-# /var/lib is where FHS puts exactly this. Deriving it from log_dir's parent
-# was considered and is a trap: log_dir may be /var/log/timelapse, whose
-# parent is /var/log.
+# A fixed location rather than anywhere derived from the config's other paths.
+# The base directory the wizard asks about exists because frames are enormous
+# and may want their own disk; a few KB of JSON does not, and /var/lib is where
+# FHS puts exactly this. Deriving it from log_dir's parent was considered and
+# is a trap: log_dir may be /var/log/timelapse, whose parent is /var/log.
+# STATE_DIR_DEFAULT comes from timelapse_platform because /var/lib has no
+# meaning on Windows, where Path("/var/lib/...") is not an error but a path on
+# whichever drive happens to be current.
 #
 # NOT `web.state_dir`. That belongs to the web UI's index, which is disposable
 # and is the one directory that service may write; this is written by the
 # daemons and only read by the UI.
 # ----------------------------------------------------------------------------
 
-STATE_DIR_DEFAULT = "/var/lib/timelapse/state"
 CAPTURE_STATE = "capture.json"
 ENCODE_STATE = "encode.json"
 STATE_VERSION = 1
@@ -1667,7 +1672,7 @@ def find_pending(frames_root, cameras, only_date, max_backlog, force=False):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    ap.add_argument("config", nargs="?", default="/etc/timelapse/config.json")
+    ap.add_argument("config", nargs="?", default=CONFIG_PATH)
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     ap.add_argument("--date", help="process only this YYYY-MM-DD")
     ap.add_argument("--dry-run", action="store_true")

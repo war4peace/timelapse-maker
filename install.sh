@@ -228,11 +228,17 @@ install_files() {
     create_user
 
     install -d -m 0755 "$PREFIX"
+    # timelapse_platform.py is a library rather than an entry point, but it is
+    # installed and versioned like the rest: every other script imports it, so
+    # a stale copy left behind by a partial upgrade breaks a daemon exactly as
+    # a stale script does, and that is the failure `timelapse version` exists
+    # to catch.
     install -m 0755 "$SRC/scripts/timelapse_capture.py" \
                     "$SRC/scripts/timelapse_encode.py" \
                     "$SRC/scripts/timelapse_test.py" \
                     "$SRC/scripts/timelapse_setup.py" \
                     "$SRC/scripts/timelapse_update.py" \
+                    "$SRC/scripts/timelapse_platform.py" \
                     "$SRC/scripts/timelapse_web.py" "$PREFIX/"
     ok "Scripts -> $PREFIX"
 
@@ -431,7 +437,7 @@ case "\${1:-}" in
                     timelapse-encode.timer timelapse-encode.service \\
                     timelapse-web.service ;;
     version)
-        for f in capture encode test setup update web; do
+        for f in capture encode test setup update platform web; do
             printf '  %-8s %s\n' "\$f" \\
                 "\$(sed -n 's/^__version__ = "\(.*\)"/\1/p' $PREFIX/timelapse_\$f.py)"
         done

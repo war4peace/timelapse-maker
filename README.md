@@ -53,6 +53,7 @@ see [CONTRIBUTING.md](CONTRIBUTING.md).
 | `timelapse_setup.py` | Storage-aware configuration wizard | installer, or `timelapse setup` |
 | `timelapse_web.py` | Optional read-only web UI: status, video index, hands playback to VLC | systemd service, off by default |
 | `timelapse_update.py` | Asks GitHub what the latest release is, and installs it | `timelapse update`, and the web UI's version panel |
+| `timelapse_platform.py` | Where the config and state live, and how services are asked about | imported by all of the above |
 
 Day to day you drive it through one wrapper; no reinstall, no hand-edited JSON:
 

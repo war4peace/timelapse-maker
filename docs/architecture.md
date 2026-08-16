@@ -1468,10 +1468,13 @@ setting it there looks like a timeout and is not one.
 Two things in one file, because they are the same knowledge: the GitHub
 release query, and the `timelapse update` command.
 
-**The only module-level import between this project's scripts**, and
-deliberately one-way:
-`timelapse_web.py` imports the query half for its version panel. Everything
-else here is standalone, and this exception earns itself. Two callers need to
+Imported at module level by `timelapse_web.py`, one-way, for its version
+panel. That used to be described here as the only module-level import between
+these scripts, and it has not been true for a while: `timelapse_web.py` also
+imports `timelapse_encode` at module level (so that a redaction failure is a
+startup failure rather than an unredacted page), and since 0.2.0 every script
+imports `timelapse_platform` (§4.6a). The exception still earns itself. Two
+callers need to
 know which tag is newest, and two copies of that means two places to get the
 tuple comparison wrong (`0.0.10` sorts below `0.0.9` as a string), two places
 to forget GitHub's mandatory User-Agent, and two places that have to know this
@@ -1498,6 +1501,75 @@ The privilege check sits between steps 3 and 4, not at the top of `main()`:
 `--check` answers the question without root, and only acting on the answer
 needs it. `--check` exits **10** when an update is available, so a cron job
 can notify without a human reading the output.
+
+### 4.6a `timelapse_platform.py` (0.2.0)
+
+The one file allowed to know which platform it is running on. Everything else
+is platform-neutral and must stay that way; the rule is
+**no `if os.name == "nt"` outside this module**, and `test_platform.py` scans
+for it rather than leaving it as a convention.
+
+It exists because of the Windows port (future-features.md item 11), but it is
+not conditional on that port being finished. What it does today is hold the
+Linux answers that were previously spelled as literals in six files, which is
+worth having on its own: `/var/lib/timelapse/state` appeared in three scripts
+and `/etc/timelapse/config.json` in five.
+
+It answers a **closed** set of questions, and closed is the point. A module
+that grows a question per call site is a second copy of the scripts under a
+different name:
+
+| Question | Answer |
+|---|---|
+| where the config lives | `CONFIG_DIR`, `CONFIG_PATH` |
+| where runtime state lives | `STATE_DIR_DEFAULT`, `WEB_STATE_DIR_DEFAULT` |
+| where data lives by default | `DATA_ROOT_DEFAULT` |
+| is a service running | `service_is_active()` |
+| restart one | `restart_service()` |
+| how an operator drives one | `start_hint()`, `stop_hint()`, `restart_hint()`, `log_hint()` |
+| secure a file holding passwords | `secure_secret_file()` |
+| which disks could hold frames | `scan_filesystems()` |
+
+Four properties are load-bearing.
+
+**It never prints.** Everything returns a value and the caller words it. A
+platform module that writes to stdout is one a Windows service cannot call:
+under the SCM there is no console, `sys.stdout` may be a dead handle, and a
+stray print kills the service entry point in a way that presents as "this
+approach does not work" rather than as a bug.
+
+**"Cannot be asked" is a value, and it is not "no".** `service_is_active()`
+returns `None` where there is no systemd, and `None` on Windows until the SCM
+binding arrives. Reporting a healthy system as stopped is the same error the
+daemon/timer/oneshot split in §4.5 exists to avoid, met in a smaller place.
+
+**The Windows halves exist only where a caller does.** Locations are
+implemented for both platforms because everything imports them today. Service
+control, file permissions and the storage scan are Linux only, and on Windows
+they degrade to exactly what they already do on a Linux box without systemd or
+without `os.statvfs`: they decline. There is no stub that lies. In particular
+`secure_secret_file()` does **nothing** on Windows rather than calling `chmod`,
+because `chmod` there sets one bit (read-only), so `0640` would report success
+for a file every account on the machine can still read.
+
+**Both branches are testable from either CI leg.** `locations()` takes the
+platform as an argument rather than reading it, and builds the Windows answers
+with `ntpath.join`, so the Windows paths are asserted on Linux and the Linux
+paths on Windows. This matters more than it looks: a platform branch is
+otherwise code that one runner cannot reach, which is the standing cost of
+sharing a codebase across platforms. The service and permission functions read
+`IS_WINDOWS` at call time for the same reason, so the tests patch it.
+
+**Two things deliberately did not move.**
+`writable_paths()` and `--print-state-path` emit `ReadWritePaths=` lines for a
+systemd unit, so they name `LINUX_STATE_DIR` explicitly rather than the running
+platform's default: a systemd unit is a POSIX artefact even when a Windows box
+generated it. And `timelapse-capture.py` does not import this module at all. It
+imports nothing from its siblings, so that a syntax error in a script it does
+not need cannot stop the recording, and it therefore carries a
+character-identical copy of the derivation, pinned by a test in
+`test_capture.py` exactly as `replace_atomic()` and the redaction rule are. It
+is the sole exception to the `os.name` rule and the scan names it as such.
 
 ### 4.7 `install.sh`
 
@@ -2021,13 +2093,26 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,118 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,369 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
 `writable_paths`, credential quoting, `_dest_path` including the DST
 collision suffixes, and the web UI's library resolution and routing. Anything
 needing a camera, a GPU or systemd is out of scope here by design.
+
+**The suite runs on Windows as well as Linux, and CI runs it on both.** The
+`windows-latest` leg was added with `timelapse_platform.py` rather than at the
+end of the Windows port, because half of what that module answers is
+unreachable from the Linux legs by construction, and this project has twice
+been bitten by "a local branch is a branch CI has never seen". `test_platform.py`
+is written so that neither leg trusts the other to have looked: `locations()`
+takes the platform as an argument, so both branches are asserted on both
+runners, and the service and permission functions read `IS_WINDOWS` at call
+time so the tests can patch it. The Windows leg runs the unit suite only: the
+encode pipeline is shared code the Linux legs exercise on every push, and
+fetching an ffmpeg build would put a download into the one job that otherwise
+has no network dependency at all.
 
 `test_web.py` drives the real handler through a fake socket rather than binding
 a port: a listening socket in a unit test is a flake waiting for a busy CI
@@ -2299,17 +2384,19 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 958 lines
-scripts/timelapse_capture.py     daemon, 1150 lines
-scripts/timelapse_encode.py      batch job, 1799 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 848 lines
-scripts/timelapse_setup.py       configuration wizard, 3735 lines
+install.sh                       bootstrap installer, 964 lines
+scripts/timelapse_capture.py     daemon, 1252 lines
+scripts/timelapse_encode.py      batch job, 1848 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 852 lines
+scripts/timelapse_setup.py       configuration wizard, 3634 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_web.py         read-only web UI, 3516 lines
+scripts/timelapse_platform.py    the only platform branch, 387 lines
+scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_encode.py             unit tests
 tests/test_grammar.py            the 3.9 floor, incl. the PEP 701 gap
+tests/test_platform.py           unit tests
 tests/test_setup.py              unit tests
 tests/test_update.py             unit tests
 tests/test_usage.py              unit tests
@@ -2324,7 +2411,8 @@ service/timelapse-watch.timer     every 5 minutes
 service/timelapse-web.service
 docs/architecture.md             this file
 docs/install.md                  operator guide
-docs/future-features.md          planned work, in build order (empty at 0.1.9)
+docs/future-features.md          planned work, in build order
+.github/check_windows_config.py  CI: the wizard's Windows locations
 docs/decided-against.md          considered and refused, and why
 ```
 

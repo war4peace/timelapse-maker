@@ -1,0 +1,495 @@
+"""Unit tests for timelapse_platform.py: the one file allowed a platform branch.
+
+Two things are being pinned here, and they are different in kind.
+
+The first is the storage scan, which simply moved from timelapse_setup at
+0.2.0 and is tested exactly as it was: against a synthetic /proc/mounts, so
+the dozen kinds of thing that look like a disk and are not are always present
+regardless of the machine this runs on.
+
+The second is new and is the reason this module exists. Every platform branch
+is code that one CI leg cannot reach, which is the standing cost item 11e
+admits to. The path derivation is therefore a pure function taking the
+platform as an argument, so the Windows answers are asserted on Linux and the
+Linux answers on Windows, and neither leg is trusting the other to have looked.
+"""
+
+import contextlib
+import io
+import re
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+import _support                                            # noqa: F401
+from _support import FakeStatVFS, write_mounts
+
+import timelapse_platform as plat
+
+
+def fake_statvfs(_target):
+    return FakeStatVFS(free_gb=100, total_gb=200)
+
+
+def no_rotational(_source):
+    return None
+
+
+class TestScanFilesystems(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def scan(self, lines, statvfs=fake_statvfs):
+        return plat.scan_filesystems(write_mounts(self.tmp, lines),
+                                      statvfs=statvfs,
+                                      rotational=no_rotational)
+
+    def test_accepts_a_plain_disk(self):
+        disks = self.scan(["/dev/sda1 /mnt/data ext4 rw,relatime 0 0"])
+        self.assertEqual([d["mount"] for d in disks], ["/mnt/data"])
+
+    def test_rejects_pseudo_filesystems(self):
+        lines = [
+            "proc /proc proc rw 0 0",
+            "sysfs /sys sysfs rw 0 0",
+            "none /run tmpfs rw 0 0",
+            "cgroup2 /sys/fs/cgroup cgroup2 rw 0 0",
+            "none /snap/core squashfs ro 0 0",
+            "overlay /var/lib/docker/overlay2/x overlay rw 0 0",
+            "devtmpfs /dev devtmpfs rw 0 0",
+            "/dev/sda1 /mnt/data ext4 rw 0 0",
+        ]
+        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
+
+    def test_rejects_network_fstypes(self):
+        # Fine as a transfer target, wrong for frames: os.replace() gives no
+        # atomicity guarantee across the wire.
+        #
+        # The source is deliberately /dev/-prefixed and the mountpoint outside
+        # SKIP_PREFIXES, so the ONLY thing that can reject these is the fstype
+        # rule. Realistic network sources ("nas:/vol") are also caught by the
+        # source filter, which would make this pass for the wrong reason.
+        for fstype in ("nfs", "nfs4", "cifs", "smb3", "9p", "fuse.sshfs",
+                       "ceph", "glusterfs", "lustre"):
+            with self.subTest(fstype=fstype):
+                self.assertEqual(
+                    self.scan([f"/dev/sda1 /mnt/data {fstype} rw 0 0"]), [],
+                    f"{fstype} must not be offered as frame storage")
+
+    def test_rejects_realistic_network_mount_lines(self):
+        lines = [
+            "nas:/vol /mnt/nfs nfs4 rw 0 0",
+            "//nas/share /mnt/cifs cifs rw 0 0",
+            "D:\\134 /mnt/d 9p rw 0 0",
+            "/dev/sda1 /mnt/data ext4 rw 0 0",
+        ]
+        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
+
+    def test_rejects_read_only_mounts(self):
+        lines = ["/dev/sr0 /media/cdrom ext4 ro,relatime 0 0",
+                 "/dev/sda1 /mnt/data ext4 rw 0 0"]
+        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
+
+    def test_ro_substring_in_another_option_is_not_read_only(self):
+        # "errors=remount-ro" contains "ro" but the mount is writable.
+        lines = ["/dev/sda1 / ext4 rw,relatime,errors=remount-ro 0 0"]
+        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/"])
+
+    def test_rejects_skipped_prefixes(self):
+        lines = ["/dev/sda1 /boot/efi vfat rw 0 0",
+                 "/dev/sdb1 /var/lib/docker/x ext4 rw 0 0",
+                 "/dev/sdc1 /mnt/data ext4 rw 0 0"]
+        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
+
+    def test_root_survives_the_prefix_filter(self):
+        # "/" is a prefix of everything; it must be special-cased.
+        self.assertEqual([d["mount"] for d in
+                          self.scan(["/dev/sda1 / ext4 rw 0 0"])], ["/"])
+
+    def test_rejects_sources_that_are_not_devices(self):
+        self.assertEqual(self.scan(["tmpfs /mnt/ram ext4 rw 0 0"]), [])
+
+    def test_deduplicates_a_device_mounted_twice(self):
+        # Keeps the primary (shortest) mountpoint. Both mountpoints must be
+        # ones nothing else would reject, or this passes for the wrong reason.
+        lines = ["/dev/sdd /mnt/data ext4 rw 0 0",
+                 "/dev/sdd /mnt/data/bind-mount ext4 rw 0 0"]
+        disks = self.scan(lines)
+        self.assertEqual([d["mount"] for d in disks], ["/mnt/data"])
+
+    def test_deduplicates_regardless_of_line_order(self):
+        lines = ["/dev/sdd /mnt/data/bind-mount ext4 rw 0 0",
+                 "/dev/sdd /mnt/data ext4 rw 0 0"]
+        self.assertEqual([d["mount"] for d in self.scan(lines)], ["/mnt/data"])
+
+    def test_different_devices_are_both_kept(self):
+        lines = ["/dev/sda1 /mnt/one ext4 rw 0 0",
+                 "/dev/sdb1 /mnt/two ext4 rw 0 0"]
+        self.assertEqual(len(self.scan(lines)), 2)
+
+    def test_sorted_by_free_space_descending(self):
+        sizes = {"/mnt/small": 10, "/mnt/big": 900, "/mnt/mid": 400}
+
+        def sizing(target):
+            return FakeStatVFS(free_gb=sizes[target], total_gb=1000)
+
+        lines = [f"/dev/sd{c}1 {m} ext4 rw 0 0"
+                 for c, m in zip("abc", sizes)]
+        disks = self.scan(lines, statvfs=sizing)
+        self.assertEqual([d["mount"] for d in disks],
+                         ["/mnt/big", "/mnt/mid", "/mnt/small"])
+
+    def test_skips_filesystems_that_cannot_be_stat_ed(self):
+        def boom(_target):
+            raise OSError("gone")
+        self.assertEqual(self.scan(["/dev/sda1 /mnt/data ext4 rw 0 0"],
+                                   statvfs=boom), [])
+
+    def test_skips_zero_block_filesystems(self):
+        def empty(_target):
+            return FakeStatVFS(free_gb=0, total_gb=0)
+        self.assertEqual(self.scan(["/dev/sda1 /mnt/data ext4 rw 0 0"],
+                                   statvfs=empty), [])
+
+    def test_decodes_escaped_mountpoints(self):
+        disks = self.scan([r"/dev/sda1 /mnt/my\040disk ext4 rw 0 0"])
+        self.assertEqual(disks[0]["mount"], "/mnt/my disk")
+
+    def test_tolerates_short_and_blank_lines(self):
+        disks = self.scan(["", "garbage", "/dev/sda1 /mnt/data ext4 rw 0 0"])
+        self.assertEqual([d["mount"] for d in disks], ["/mnt/data"])
+
+    def test_missing_mounts_file_returns_empty(self):
+        self.assertEqual(plat.scan_filesystems("/nonexistent/mounts"), [])
+
+    def test_reports_free_and_total_in_bytes(self):
+        disks = self.scan(["/dev/sda1 /mnt/data ext4 rw 0 0"])
+        self.assertAlmostEqual(disks[0]["free"] / 1024 ** 3, 100, delta=0.1)
+        self.assertAlmostEqual(disks[0]["total"] / 1024 ** 3, 200, delta=0.1)
+
+
+class TestBaseDevice(unittest.TestCase):
+    """Partition-name stripping, against a fake /sys/block."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        for dev in ("sda", "nvme0n1", "mmcblk0"):
+            (self.tmp / dev / "queue").mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def base(self, source):
+        return plat._base_device(source, sys_block=str(self.tmp))
+
+    def test_whole_disk(self):
+        self.assertEqual(self.base("/dev/sda"), "sda")
+
+    def test_sata_partition(self):
+        self.assertEqual(self.base("/dev/sda1"), "sda")
+
+    def test_nvme_partition(self):
+        self.assertEqual(self.base("/dev/nvme0n1p2"), "nvme0n1")
+
+    def test_nvme_whole_disk(self):
+        self.assertEqual(self.base("/dev/nvme0n1"), "nvme0n1")
+
+    def test_mmc_partition(self):
+        self.assertEqual(self.base("/dev/mmcblk0p1"), "mmcblk0")
+
+    def test_unknown_device(self):
+        self.assertIsNone(self.base("/dev/sdz9"))
+
+    def test_non_device_source(self):
+        self.assertIsNone(self.base("tmpfs"))
+
+    def test_rotational_reads_the_flag(self):
+        (self.tmp / "sda" / "queue" / "rotational").write_text("1\n")
+        (self.tmp / "nvme0n1" / "queue" / "rotational").write_text("0\n")
+        self.assertIs(plat._is_rotational("/dev/sda1", str(self.tmp)), True)
+        self.assertIs(plat._is_rotational("/dev/nvme0n1p2", str(self.tmp)),
+                      False)
+
+    def test_rotational_is_unknown_when_absent(self):
+        self.assertIsNone(plat._is_rotational("/dev/sda1", str(self.tmp)))
+
+
+class TestLocations(unittest.TestCase):
+    """The path derivation, both branches, on whichever platform is running.
+
+    locations() takes the platform rather than reading it precisely so that
+    this class is not half-skipped on each CI leg. A branch only one runner
+    can reach is a branch that regresses on the other one quietly.
+    """
+
+    WIN_ENV = {"ProgramData": "C:\\ProgramData"}
+
+    def test_linux_puts_config_and_state_where_the_fhs_does(self):
+        loc = plat.locations(False)
+        self.assertEqual(loc["config_dir"], "/etc/timelapse")
+        self.assertEqual(loc["config"], "/etc/timelapse/config.json")
+        self.assertEqual(loc["data_root"], "/var/lib/timelapse")
+        self.assertEqual(loc["state"], "/var/lib/timelapse/state")
+        self.assertEqual(loc["web_state"], "/var/lib/timelapse/web")
+
+    def test_windows_puts_all_of_it_under_program_data(self):
+        loc = plat.locations(True, self.WIN_ENV)
+        self.assertEqual(loc["config"],
+                         "C:\\ProgramData\\timelapse\\config.json")
+        self.assertEqual(loc["state"], "C:\\ProgramData\\timelapse\\state")
+        self.assertEqual(loc["web_state"], "C:\\ProgramData\\timelapse\\web")
+
+    def test_the_windows_branch_produces_windows_separators_anywhere(self):
+        """ntpath.join, not os.path.join, and this is what that buys.
+
+        Derived on Linux it must still be a Windows path, or the Linux legs
+        would be asserting against something no Windows box will ever see.
+        """
+        for value in plat.locations(True, self.WIN_ENV).values():
+            self.assertNotIn("/", value)
+            self.assertTrue(value.startswith("C:\\ProgramData\\timelapse"))
+
+    def test_program_data_prefers_the_environment(self):
+        self.assertEqual(plat.program_data({"ProgramData": "D:\\PD"}), "D:\\PD")
+
+    def test_all_users_profile_is_the_second_answer(self):
+        # A service or a scheduled task runs with a stripped environment, and
+        # this is the variable that tends to survive it.
+        self.assertEqual(plat.program_data({"ALLUSERSPROFILE": "D:\\PD"}),
+                         "D:\\PD")
+
+    def test_an_empty_environment_still_answers(self):
+        # A machine with neither set is not one where guessing differently
+        # would help, so the documented default is the right last resort.
+        self.assertEqual(plat.program_data({}), "C:\\ProgramData")
+
+    def test_state_and_web_state_are_never_the_same_directory(self):
+        """The web UI's index is the one directory that service may write.
+
+        Collapsing it into the daemons' state directory would hand a
+        network-facing service write access to the heartbeat it is meant only
+        to be reading, on either platform.
+        """
+        for windows in (False, True):
+            loc = plat.locations(windows, self.WIN_ENV)
+            self.assertNotEqual(loc["state"], loc["web_state"])
+
+    def test_the_module_constants_come_from_the_derivation(self):
+        # The constants are what every caller imports; the function is what
+        # the tests above pin. This is the join between the two.
+        loc = plat.locations(plat.IS_WINDOWS)
+        self.assertEqual(plat.CONFIG_DIR, loc["config_dir"])
+        self.assertEqual(plat.CONFIG_PATH, loc["config"])
+        self.assertEqual(plat.DATA_ROOT_DEFAULT, loc["data_root"])
+        self.assertEqual(plat.STATE_DIR_DEFAULT, loc["state"])
+        self.assertEqual(plat.WEB_STATE_DIR_DEFAULT, loc["web_state"])
+
+    def test_the_linux_constants_stay_linux_whatever_this_platform_is(self):
+        """Named separately because a systemd unit is a POSIX artefact.
+
+        writable_paths() emits ReadWritePaths= lines, and a ProgramData path
+        in one of those would be nonsense; so would refusing to generate the
+        unit on the platform the tests happen to run on.
+        """
+        self.assertEqual(plat.LINUX_STATE_DIR, "/var/lib/timelapse/state")
+        self.assertEqual(plat.LINUX_WEB_STATE_DIR, "/var/lib/timelapse/web")
+        self.assertEqual(plat.LINUX_CONFIG_DIR, "/etc/timelapse")
+
+
+class TestServiceIsActive(unittest.TestCase):
+    """True, False, or None, and None is not "stopped"."""
+
+    def _ask(self, rc=0, exc=None):
+        result = mock.Mock(returncode=rc)
+        which = mock.patch.object(plat.shutil, "which",
+                                  return_value="/bin/systemctl")
+        run = mock.patch.object(plat.subprocess, "run", side_effect=exc,
+                                return_value=result)
+        with mock.patch.object(plat, "IS_WINDOWS", False), which, run:
+            return plat.service_is_active("timelapse-capture.service")
+
+    def test_no_systemctl_means_the_question_could_not_be_put(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+             mock.patch.object(plat.shutil, "which", return_value=None):
+            self.assertIsNone(
+                plat.service_is_active("timelapse-capture.service"))
+
+    def test_windows_cannot_be_asked_yet_and_says_so(self):
+        """Not False. A service manager that cannot be queried yet must not
+
+        report a healthy system as stopped: that is the error the three-way
+        daemon/timer/oneshot split in the status page exists to avoid, met
+        here in a smaller place.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertIsNone(
+                plat.service_is_active("timelapse-capture.service"))
+
+    def test_exit_zero_is_running(self):
+        self.assertIs(self._ask(rc=0), True)
+
+    def test_a_non_zero_exit_is_not_running(self):
+        self.assertIs(self._ask(rc=3), False)
+
+    def test_an_unrunnable_systemctl_is_unanswerable_not_stopped(self):
+        self.assertIsNone(self._ask(exc=OSError("boom")))
+
+    def test_a_timeout_is_unanswerable_too(self):
+        self.assertIsNone(
+            self._ask(exc=subprocess.TimeoutExpired("systemctl", 15)))
+
+
+class TestRestartService(unittest.TestCase):
+
+    def _restart(self, rc=0, exc=None):
+        result = mock.Mock(returncode=rc)
+        run = mock.patch.object(plat.subprocess, "run", side_effect=exc,
+                                return_value=result)
+        with mock.patch.object(plat, "IS_WINDOWS", False), run:
+            return plat.restart_service("timelapse-capture.service")
+
+    def test_success_carries_no_detail(self):
+        self.assertEqual(self._restart(rc=0), (True, ""))
+
+    def test_a_non_zero_exit_carries_no_detail_either(self):
+        # Deliberate: the reason is nearly always "not root", and the caller
+        # words that better than an exit code does.
+        self.assertEqual(self._restart(rc=1), (False, ""))
+
+    def test_a_restart_that_could_not_be_attempted_says_why(self):
+        ok, detail = self._restart(exc=OSError("no such file"))
+        self.assertFalse(ok)
+        self.assertIn("no such file", detail)
+
+    def test_windows_declines_rather_than_pretending(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            ok, detail = plat.restart_service("timelapse-capture.service")
+        self.assertFalse(ok)
+        self.assertIn("Windows", detail)
+
+    def test_it_prints_nothing_on_any_path(self):
+        """A platform module a Windows service cannot call is not one.
+
+        Under the SCM there is no console and sys.stdout may be a dead handle,
+        so a stray print in the service path kills service_main and presents
+        as "the approach does not work" (item 11c.2).
+        """
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self._restart(rc=0)
+            self._restart(rc=1)
+            self._restart(exc=OSError("boom"))
+        self.assertEqual(buf.getvalue(), "")
+
+
+class TestHints(unittest.TestCase):
+    """What to tell an operator to type, for the cases where nothing ran."""
+
+    UNIT = "timelapse-web.service"
+
+    def test_the_three_service_hints_name_the_unit(self):
+        for hint in (plat.start_hint, plat.stop_hint, plat.restart_hint):
+            self.assertIn(self.UNIT, hint(self.UNIT))
+
+    def test_the_log_hint_drops_the_unit_suffix(self):
+        # journalctl -u takes the unit name without .service. Pasting the
+        # suffix in works, but reads as though it were required.
+        self.assertEqual(plat.log_hint(self.UNIT),
+                         "journalctl -u timelapse-web -n 40")
+
+    def test_the_log_hint_takes_a_line_count(self):
+        self.assertIn("-n 5", plat.log_hint(self.UNIT, 5))
+
+
+class TestSecureSecretFile(unittest.TestCase):
+    """The file holds camera passwords, so what this does is a claim."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.path = self.tmp / "config.json"
+        self.path.write_text("{}", encoding="utf-8")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_linux_sets_the_mode_and_the_group(self):
+        # create=True: shutil.chown does not exist on Windows, and this branch
+        # is asserted there too.
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+             mock.patch.object(plat.os, "chmod") as chmod, \
+             mock.patch.object(plat.shutil, "chown", create=True) as chown:
+            plat.secure_secret_file(self.path, "timelapse")
+        chmod.assert_called_once_with(self.path, 0o640)
+        chown.assert_called_once_with(self.path, group="timelapse")
+
+    def test_no_group_means_no_chown(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+             mock.patch.object(plat.os, "chmod"), \
+             mock.patch.object(plat.shutil, "chown", create=True) as chown:
+            plat.secure_secret_file(self.path)
+        chown.assert_not_called()
+
+    def test_it_never_raises_over_a_file_already_written(self):
+        # Refusing to have written a config because its group could not be set
+        # would be a worse outcome than one the pre-flight complains about.
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+             mock.patch.object(plat.os, "chmod", side_effect=OSError(1, "no")), \
+             mock.patch.object(plat.shutil, "chown", create=True,
+                               side_effect=LookupError("no such group")):
+            plat.secure_secret_file(self.path, "timelapse")
+
+    def test_windows_does_not_chmod_and_that_is_the_point(self):
+        """chmod on Windows sets one bit, read-only, and 0640 clears it.
+
+        Calling it there would report success for a file every account on the
+        box can still read, which is a security claim that is false. Doing
+        nothing until the installer can set a real ACL is the honest answer.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+             mock.patch.object(plat.os, "chmod") as chmod, \
+             mock.patch.object(plat.shutil, "chown", create=True) as chown:
+            plat.secure_secret_file(self.path, "timelapse")
+        chmod.assert_not_called()
+        chown.assert_not_called()
+
+
+class TestNoPlatformBranchesElsewhere(unittest.TestCase):
+    """Item 11e rule 1: no `if os.name == "nt"` outside this module.
+
+    The two-forks outcome arrives by increments, and this is the increment.
+    Written as a scan rather than left as a convention for the same reason the
+    RedactingFormatter duplication is a pinned duplication: a rule nobody
+    measures is a rule already broken somewhere nobody has looked.
+    """
+
+    # timelapse_capture.py is the one exception, and a deliberate one: the
+    # daemon imports nothing from its siblings, so it carries a pinned copy of
+    # the derivation instead. The pin itself is in test_capture.py.
+    ALLOWED = {"timelapse_platform.py", "timelapse_capture.py"}
+
+    PATTERN = re.compile(r"os\.name\s*[=!]=\s*['\"]nt['\"]"
+                         r"|sys\.platform\s*[=!]=\s*['\"]win32['\"]"
+                         r"|platform\.system\(\)\s*[=!]=")
+
+    def test_no_script_tests_the_platform_by_hand(self):
+        offenders = []
+        for path in sorted(_support.SCRIPTS.glob("timelapse_*.py")):
+            if path.name in self.ALLOWED:
+                continue
+            if self.PATTERN.search(path.read_text(encoding="utf-8")):
+                offenders.append(path.name)
+        self.assertEqual(offenders, [],
+                         "platform branch outside timelapse_platform.py")
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+

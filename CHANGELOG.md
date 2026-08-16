@@ -9,6 +9,35 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Added
+- **`scripts/timelapse_platform.py`, the one file allowed to know which
+  operating system it is running on.** **Nothing changes on a Linux install**:
+  every path, every message and every command is byte-for-byte what it was, and
+  the whole point of doing it this way was that the existing suite could prove
+  that. What it changes is where the answers live. `/var/lib/timelapse/state`
+  was spelled out in three scripts and `/etc/timelapse/config.json` in five, so
+  "where does this project keep its things" had six copies and no owner; it now
+  has one. The module answers a deliberately closed list, the same list twice:
+  where the config and state live, whether a service is running, how to restart
+  one, what to tell an operator to type, how to protect a file holding camera
+  passwords, and which disks could hold frames. The storage scan moved into it
+  from the wizard, and its tests moved with it.
+
+  It is the first step of the Windows variant researched at 0.1.9, and it is
+  the step that is worth having whether or not the rest is ever built. The
+  standing rule that comes with it is that no other file may test the platform,
+  and a test scans for that rather than trusting anyone to remember. The one
+  exception is the capture daemon, which imports nothing from its siblings so
+  that a syntax error elsewhere cannot stop a recording, and which therefore
+  carries a pinned copy, held character-identical by a test, exactly as its two
+  existing duplications already are.
+- **CI now runs the test suite on Windows as well as Linux**, from this commit
+  rather than at the end of the port. Half of what the new module answers
+  cannot be reached from a Linux runner, and a branch no runner reaches is a
+  branch that breaks quietly. The path derivation is written as a function
+  taking the platform as an argument, so both platforms' answers are checked on
+  both runners and neither leg is trusting the other to have looked.
+
 ### Fixed
 - **Two defects that only appear when the scripts are run on Windows.**
   **Nothing changes on a Linux install**, which is every supported deployment

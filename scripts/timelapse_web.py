@@ -80,6 +80,10 @@ from timelapse_encode import (                            # noqa: E402
     state_dir as runtime_state_dir,
 )
 
+from timelapse_platform import (                           # noqa: E402
+    CONFIG_PATH, WEB_STATE_DIR_DEFAULT,
+)
+
 __version__ = "0.1.9"
 
 log = logging.getLogger("web")
@@ -89,7 +93,7 @@ DEFAULT_PORT = 8787
 
 # The only path this service writes to. The unit's ReadWritePaths is scoped to
 # exactly this, so everything else - library, frames, config - stays read-only.
-DEFAULT_STATE_DIR = "/var/lib/timelapse/web"
+DEFAULT_STATE_DIR = WEB_STATE_DIR_DEFAULT
 
 # A request handler must never outlive the client that abandoned it. This
 # belongs on the handler, not the server: ThreadingHTTPServer.timeout is only
@@ -3425,7 +3429,7 @@ def main():
     ap = argparse.ArgumentParser(
         prog="timelapse_web.py",
         description="Read-only web UI for timelapse-maker.")
-    ap.add_argument("config", nargs="?", default="/etc/timelapse/config.json")
+    ap.add_argument("config", nargs="?", default=CONFIG_PATH)
     ap.add_argument("--bind", help=f"address to listen on (default {DEFAULT_BIND})")
     ap.add_argument("--port", type=int, help=f"port (default {DEFAULT_PORT})")
     ap.add_argument("--force", action="store_true",
