@@ -2227,6 +2227,14 @@ two failure modes: if the daemon captures in the foreground and the dispatcher
 is refused with the documented 1063, then anything still broken is in the
 hosting and nowhere else.
 
+All 17 of its checks passed on the first elevated run, 2026-08-16. Two of the
+numbers matter beyond a tick: RUNNING was reported **0.7 seconds** after
+`StartService`, against roughly thirty seconds of SCM patience, so the 1053
+failure is not being narrowly avoided; and the service captured **six frames in
+twelve seconds at a two second cadence**, which is exactly right rather than
+approximately right, so the tick grid survived being hosted on a thread the SCM
+owns.
+
 `test_web.py` drives the real handler through a fake socket rather than binding
 a port: a listening socket in a unit test is a flake waiting for a busy CI
 runner. The fake implements `sendall`, not a writable `makefile`, because

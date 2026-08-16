@@ -1007,7 +1007,13 @@ stops being worth it:
    platform module, the SCM query/control/registration bindings, the scheduled
    task definitions, and `timelapse_setup.py --install-units / --remove-units /
    --unit-status`, which is what `install.ps1` will front-end. File logging was
-   already done at step 2. 1,469 tests, zero skips on both platforms.
+   already done at step 2. 1,469 tests, zero skips on both platforms, and the
+   **elevated lifecycle passed first time**: registered as LocalSystem, RUNNING
+   in 0.7s, six frames in twelve seconds at a two second cadence, a
+   date-stamped log and a heartbeat written by the service rather than by the
+   console session, a stop that the SCM was satisfied with in 0.5s, and a clean
+   deregistration. `temp/step3_check.py` is the harness and it uses the
+   shipping code path throughout.
    **What remains of step 3 is 3b: `install.ps1`, `timelapse.cmd`, and the
    wizard's Windows adaptations** (ffmpeg path per 6a, the storage scan per 8,
    drive-letter resolution per 9). Nothing is shippable until those exist.
