@@ -293,6 +293,17 @@ if ([int]$parts[0] -lt 3 -or ([int]$parts[0] -eq 3 -and [int]$parts[1] -lt 9)) {
     Die "Python 3.9 or newer is needed; this is $pyver. Get one from $PYTHONURL"
 }
 
+# Before the two steps below, both of which are about *installing*. Uninstalling
+# needs an interpreter to run --remove-units with and nothing else: the first
+# version reached here after Install-Requests, so `-Uninstall` on a machine
+# without requests would have pip-installed it on its way to removing the
+# program. An uninstall must not add anything to the machine.
+if ($Uninstall) {
+    Invoke-Uninstall $python
+    Write-Host ''
+    exit 0
+}
+
 # Warned rather than refused. It demonstrably works, so refusing it would be
 # calling a working install broken, which this project has done once and does
 # not intend to repeat. But it is worth saying out loud: the service runs as
@@ -309,12 +320,6 @@ if ($python -like "$env:LOCALAPPDATA*" -or $python -like '*\Users\*') {
 }
 
 Install-Requests $python
-
-if ($Uninstall) {
-    Invoke-Uninstall $python
-    Write-Host ''
-    exit 0
-}
 
 Step 'Installing'
 foreach ($name in $SCRIPTS) {

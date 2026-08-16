@@ -2318,6 +2318,16 @@ the kind that make a check worthless rather than wrong: a helper whose return
 value leaked into the output, and a check that asserted the *absence* of a
 string and therefore passed against no output at all.
 
+**Reading the passing log then found three more defects**, which is the argument
+for reading it rather than trusting the verdict. A scheduled task that has never
+run reports `LastTaskResult` 267011 (`SCHED_S_TASK_HAS_NOT_RUN`) and
+`--unit-status` printed the number, so a healthy system announced what looks
+like a five-figure error code; `-Uninstall` ran the dependency install on its
+way past, so removing the program could install a package; and the restricted
+ACL the installer now sets made `Path.is_dir()` **raise** for an unelevated
+pre-flight, where on Linux it returns False. A pass is not the same as a good
+log.
+
 All 17 of `step3_check.py`'s checks passed on the first elevated run,
 2026-08-16. Two of the
 numbers matter beyond a tick: RUNNING was reported **0.7 seconds** after

@@ -531,7 +531,20 @@ def test_state_dir(cfg):
     # machine they ran it on, and an operator asked to create a directory needs
     # it spelled the way their shell spells it.
     shown = str(d)
-    if not d.is_dir():
+    # Guarded, because "does not exist" and "you are not allowed to look" are
+    # different findings and Path.is_dir() raises for the second on Windows.
+    # The Windows installer restricts %ProgramData%\timelapse to SYSTEM and
+    # Administrators, so an unelevated run of this check stat()s a directory it
+    # cannot read: unguarded that is a traceback, and a traceback from a
+    # pre-flight check reads as the tool being broken rather than as the answer.
+    try:
+        present = d.is_dir()
+    except OSError as exc:
+        bad(f"Cannot tell whether {shown} exists: {exc}")
+        info("That is a permission problem, not a missing directory. Re-run")
+        info("this with the privileges the daemons have.")
+        return
+    if not present:
         bad(f"{shown} does not exist")
         info("The capture and encode units name it in ReadWritePaths, so they")
         info("will not start until it is there. Fix with: sudo timelapse setup")

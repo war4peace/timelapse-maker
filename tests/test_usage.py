@@ -320,8 +320,33 @@ class TestStateDirCheck(unittest.TestCase):
         # The platform's default rather than the literal: what the pre-flight
         # must not do is check some other directory than the one the daemons
         # will actually write to on this machine.
-        out = self.run_check({"paths": {}})
+        #
+        # is_dir() is stubbed rather than left to hit the real path, and that
+        # is not tidiness: on Windows the default IS %ProgramData%\timelapse\
+        # state, which install.ps1 restricts to SYSTEM and Administrators, so
+        # this test began raising PermissionError on the developer's box the
+        # moment a real install had been run there. A test whose result depends
+        # on whether the product happens to be installed is a test that will
+        # eventually be wrong on somebody's machine.
+        with mock.patch.object(Path, "is_dir", return_value=False):
+            out = self.run_check({"paths": {}})
         self.assertIn(plat.STATE_DIR_DEFAULT, out)
+
+    def test_a_directory_it_may_not_even_look_at_is_a_separate_finding(self):
+        """"Missing" and "not allowed to look" want different remedies, and
+
+        Path.is_dir() raises for the second on Windows rather than returning
+        False. Found for real: after an install, an unelevated pre-flight
+        stat()ed the restricted %ProgramData%\\timelapse\\state and tracebacked,
+        which reads as the tool being broken rather than as the answer.
+        """
+        with mock.patch.object(Path, "is_dir",
+                               side_effect=PermissionError(5, "Access denied")):
+            out = self.run_check({"paths": {"state_dir": str(self.tmp)}})
+        self.assertIn("FAIL", out)
+        self.assertIn("Cannot tell whether", out)
+        self.assertIn("permission problem", out)
+        self.assertNotIn("does not exist", out)
 
 
 if __name__ == "__main__":

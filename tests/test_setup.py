@@ -3782,6 +3782,35 @@ class TestUnitRegistrationCommands(unittest.TestCase):
         self.assertIn("running", lines[0])
         self.assertIn("Ready", lines[1])
 
+    def test_a_task_that_has_never_run_does_not_look_like_an_error(self):
+        """Straight from the log of the first passing Windows install: two
+
+        freshly registered tasks reported "last result 267011", which is the
+        healthy "has not run yet" and reads as a five-figure error code.
+        """
+        out = io.StringIO()
+        with mock.patch.object(setup, "service_state",
+                               return_value=plat.SERVICE_STOPPED), \
+             mock.patch.object(setup, "task_info",
+                               return_value={"State": "Ready",
+                                             "LastResult": 267011}), \
+             contextlib.redirect_stdout(out):
+            setup.print_unit_status()
+        text = out.getvalue()
+        self.assertIn("has not run yet", text)
+        self.assertNotIn("267011", text)
+
+    def test_a_task_that_really_failed_still_says_so(self):
+        out = io.StringIO()
+        with mock.patch.object(setup, "service_state",
+                               return_value=plat.SERVICE_STOPPED), \
+             mock.patch.object(setup, "task_info",
+                               return_value={"State": "Ready",
+                                             "LastResult": 1}), \
+             contextlib.redirect_stdout(out):
+            setup.print_unit_status()
+        self.assertIn("failed", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

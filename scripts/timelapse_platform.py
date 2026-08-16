@@ -930,6 +930,47 @@ def task_exists(unit):
     return ok
 
 
+# What Task Scheduler's LastTaskResult means. It is either the last run's exit
+# code or one of these HRESULTs, and the distinction matters because they
+# overlap in the worst way: 267011 is "has not run yet", which is the state
+# every freshly registered task is in, and printed as a bare number it reads as
+# a five-figure error code. That is the same defect as calling the nightly
+# oneshot "Stopped" for the 23 hours a day it is not running, met on the other
+# platform, and the fix is the same: translate, never print the raw state.
+SCHED_RESULTS = {
+    0x00000000: "last run succeeded",
+    0x00041300: "ready",
+    0x00041301: "currently running",
+    0x00041302: "disabled",
+    0x00041303: "has not run yet",
+    0x00041304: "no more runs scheduled",
+    0x00041305: "not scheduled",
+    0x00041306: "last run was terminated",
+    0x00041307: "no valid triggers",
+}
+
+
+def task_result(code):
+    """LastTaskResult in words. Never returns a bare number for a good state.
+
+    An unrecognised value is reported as an exit code, because that is what it
+    is: anything outside the SCHED_S_ range is whatever the program returned,
+    and a non-zero one is a real failure that must not be softened.
+    """
+    if code is None:
+        return "unknown"
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        return "unknown"
+    if code in SCHED_RESULTS:
+        return SCHED_RESULTS[code]
+    # Signed on the way in from PowerShell for anything above 0x7FFFFFFF.
+    if code < 0 and (code + (1 << 32)) in SCHED_RESULTS:
+        return SCHED_RESULTS[code + (1 << 32)]
+    return "last run failed (0x%08X)" % (code & 0xFFFFFFFF)
+
+
 def task_info(unit):
     """State, last result and next run as a dict, or None if unanswerable.
 

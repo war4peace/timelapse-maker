@@ -716,6 +716,50 @@ class TestTaskDefinitions(unittest.TestCase):
                       plat.task_xml("x", ["a"], plat.daily_trigger(0, 5)))
 
 
+class TestTaskResult(unittest.TestCase):
+    """LastTaskResult in words, because the number invents a fault.
+
+    Found in the log of the first passing Windows install: two freshly
+    registered tasks reported "last result 267011", which is 0x00041303,
+    SCHED_S_TASK_HAS_NOT_RUN, and is the correct and healthy state for a task
+    that has never fired. Printed as a five-figure number it reads as an error
+    code, on a system with nothing wrong with it. Same defect as calling the
+    nightly oneshot "Stopped" for the 23 hours a day it is not running.
+    """
+
+    def test_a_task_that_has_never_run_says_so(self):
+        self.assertEqual(plat.task_result(267011), "has not run yet")
+
+    def test_a_successful_run_says_so(self):
+        self.assertEqual(plat.task_result(0), "last run succeeded")
+
+    def test_the_healthy_states_never_render_as_a_number(self):
+        for code in plat.SCHED_RESULTS:
+            self.assertNotIn("0x", plat.task_result(code), hex(code))
+
+    def test_a_real_failure_is_not_softened(self):
+        """The other half of the same rule. A task whose program exited 1 has
+
+        failed, and dressing that up would be the opposite error: reporting a
+        fault as health.
+        """
+        self.assertIn("failed", plat.task_result(1))
+        self.assertIn("0x00000001", plat.task_result(1))
+
+    def test_a_signed_hresult_is_recognised_anyway(self):
+        # PowerShell hands back anything above 0x7FFFFFFF as a negative int,
+        # so the same state arrives with two different spellings.
+        self.assertEqual(plat.task_result(267011 - (1 << 32)),
+                         "has not run yet")
+
+    def test_an_unknown_failure_keeps_its_code(self):
+        self.assertIn("0x80070005", plat.task_result(0x80070005))
+
+    def test_nothing_to_report_is_unknown_rather_than_a_guess(self):
+        for given in (None, "", "not a number"):
+            self.assertEqual(plat.task_result(given), "unknown", repr(given))
+
+
 class TestWindowsCallsDeclineElsewhere(unittest.TestCase):
     """Every Windows-only call answers on Linux rather than raising.
 

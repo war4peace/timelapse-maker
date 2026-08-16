@@ -43,7 +43,7 @@ from timelapse_platform import (
     repeating_trigger, resolve_tool, restart_hint, restart_service,
     same_file_name, scan_filesystems, secure_secret_file, service_is_active,
     service_state, start_hint, stop_hint, stop_service, task_exists, task_info,
-    task_xml,
+    task_result, task_xml,
 )
 
 __version__ = "0.1.9"
@@ -1687,8 +1687,11 @@ def print_unit_status():
                 state = "not installed" if task_exists(unit) is False \
                     else "unknown"
             else:
-                state = f"{info.get('State', '?')}, last result " \
-                        f"{info.get('LastResult', '?')}"
+                # Translated, never the raw number: a task that has never run
+                # reports 267011, and printed as a figure that is indis-
+                # tinguishable from a fault on a system that has none.
+                state = f"{info.get('State', '?')}, " \
+                        f"{task_result(info.get('LastResult'))}"
         else:
             code = service_state(unit)
             state = "unknown" if code is None else SERVICE_STATES.get(code,
