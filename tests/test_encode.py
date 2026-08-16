@@ -330,6 +330,73 @@ class TestFindPendingSkipsEncoded(unittest.TestCase):
         self.assertEqual(done, 0)
 
 
+class TestExplainIdle(unittest.TestCase):
+    """"Nothing to process" is the same sentence for four different states.
+
+    An operator ran the Windows scheduled task by hand at 21:58, got that
+    line and an empty videos folder, and had no way to tell the correct
+    answer (today is still being captured) from the one worth acting on
+    (the frames are stranded behind a renamed camera).
+    """
+
+    setUp = TestFindPending.setUp
+    tearDown = TestFindPending.tearDown
+    day = TestFindPending.day
+
+    def why(self, cameras):
+        return " ".join(enc.explain_idle(self.root, cameras))
+
+    def test_only_today_says_so_and_says_when_it_goes_out(self):
+        self.day("Cam", 0)
+        why = self.why(["Cam"])
+        self.assertIn(self.today.isoformat(), why)
+        self.assertIn("still", why)
+        self.assertIn("tonight", why)
+
+    def test_only_today_across_several_cameras_is_still_the_today_answer(self):
+        for cam in ("A", "B", "C"):
+            self.day(cam, 0)
+        self.assertIn("still", self.why(["A", "B", "C"]))
+
+    def test_a_missing_directory_is_named(self):
+        # Enabled in the config, nothing on disk: harmless before the first
+        # capture, and the entire fault after a rename.
+        self.day("Roof", 0)
+        why = self.why(["Roof", "Garage"])
+        self.assertIn("Garage", why)
+        self.assertNotIn("Roof,", why)
+        self.assertIn("renamed", why)
+
+    def test_no_camera_has_a_directory_at_all(self):
+        why = self.why(["Roof"])
+        self.assertIn("Roof", why)
+        self.assertIn(str(self.root), why)
+
+    def test_older_days_all_encoded_points_at_force(self):
+        self.day("Cam", -1)
+        self.assertIn("--force", self.why(["Cam"]))
+
+    def test_a_camera_directory_with_no_day_folders(self):
+        (self.root / "Cam").mkdir(parents=True)
+        why = self.why(["Cam"])
+        self.assertIn("No day folders", why)
+        self.assertNotIn("--force", why)
+
+    def test_no_enabled_cameras_is_its_own_answer(self):
+        self.assertIn("No cameras are enabled", self.why([]))
+
+    def test_a_stray_file_is_not_mistaken_for_a_day(self):
+        (self.root / "Cam").mkdir(parents=True)
+        (self.root / "Cam" / "2026-08-11").write_text("x", encoding="utf-8")
+        self.assertIn("No day folders", self.why(["Cam"]))
+
+    def test_every_branch_returns_at_least_one_line(self):
+        # A silent explanation is the defect this function exists to fix.
+        self.day("Has", -1)
+        for cameras in ([], ["Has"], ["Has", "Missing"], ["Missing"]):
+            self.assertTrue(enc.explain_idle(self.root, cameras), cameras)
+
+
 class TestEncodedMarker(unittest.TestCase):
 
     def setUp(self):

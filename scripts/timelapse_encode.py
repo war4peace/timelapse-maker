@@ -1677,6 +1677,53 @@ def find_pending(frames_root, cameras, only_date, max_backlog, force=False):
     return sorted(jobs, key=lambda j: (j[1].name, j[0])), done
 
 
+def explain_idle(frames_root, cameras, today=None):
+    """Lines saying WHY find_pending() came back empty.
+
+    "Nothing to process." is the correct answer when the run fires an hour
+    before midnight and today is still being captured, and it is equally the
+    correct answer when a camera was renamed and left its frames stranded
+    behind the old name. Those two want opposite reactions from whoever is
+    reading, and the line cannot be told apart into either. An operator who
+    ran the job by hand is asking a question, so answer the one they asked.
+
+    Reported from a manual run of the Windows scheduled task, 2026-08-16.
+    """
+    today = today or date.today().isoformat()
+    if not cameras:
+        return ["No cameras are enabled in the config."]
+
+    missing, days = [], set()
+    for cam in cameras:
+        cam_dir = frames_root / cam
+        if not cam_dir.is_dir():
+            missing.append(cam)
+            continue
+        for d in cam_dir.iterdir():
+            if d.is_dir() and DATE_DIR.match(d.name):
+                days.add(d.name)
+
+    lines = []
+    if missing:
+        # The stranding case: enabled in the config, no directory on disk.
+        # Harmless before the first capture, and the whole fault when a
+        # camera has been renamed, so it is stated rather than diagnosed.
+        lines.append("No frames directory under %s for: %s (nothing captured "
+                     "yet, or renamed after its frames were written)."
+                     % (frames_root, ", ".join(sorted(missing))))
+    if not days:
+        if not missing:
+            lines.append("No day folders under %s yet." % frames_root)
+    elif days == {today}:
+        lines.append("The only day with frames is today (%s), which is still "
+                     "being captured. A day is encoded after it ends, so this "
+                     "one goes out tonight." % today)
+    else:
+        lines.append("Every day before today (%s) is already encoded; "
+                     "--force re-does them." % today)
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("config", nargs="?", default=CONFIG_PATH)
@@ -1743,6 +1790,8 @@ def main():
                      done)
         if not jobs:
             log.info("Nothing to process.")
+            for line in explain_idle(frames_root, cameras):
+                log.info("  %s", line)
             # Still ship the backlog. A transfer that failed last night leaves
             # videos in video_output, and returning here without trying again
             # stranded them until some later night happened to produce a new
