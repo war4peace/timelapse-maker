@@ -1164,6 +1164,22 @@ stops being worth it:
    elevated harness, and the question it exists for is the one no test can
    answer: it registers a throwaway task **as LocalSystem**, runs it, and reads
    back whether that account could write to the real share.
+
+   **Verified on the author's NAS 2026-08-16, all 15 checks.** LocalSystem is
+   **refused outright** by `\\tower` (error 5), then reaches the destination
+   through `reach_destination()`, then moves a real video that arrives byte for
+   byte. That confirms the premise rather than assuming it: without this, every
+   Windows install with a permissioned share would encode correctly and fail to
+   deliver, nightly, on a folder the operator can write to by hand.
+
+   **The harness had the defect, not the product, and it cost the operator
+   real work** (new NAS users, several username forms) before that was clear.
+   Its LocalSystem probe called `try_destination()` alone, which is the bare
+   token and not what the encoder does, so it reported a working configuration
+   as broken while the credential check beside it was already green. Third
+   instance of **a probe must produce what the pipeline produces**, after
+   `PIX_FMT` and the two RTSP probes. The general form is worth keeping: **when
+   a check disagrees with a passing neighbour, suspect the check.**
 5. The web UI last, because it carries the status source, the log source and
    the hardening question, which are three of the four hardest problems in
    this entry.
