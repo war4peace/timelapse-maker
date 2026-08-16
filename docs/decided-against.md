@@ -493,6 +493,61 @@ a storage decision for the operator rather than a code change.
 
 ---
 
+## A monitoring client for other Windows PCs
+
+**Refused on scope, 2026-08-16, and the web UI on Windows is deferred with
+it. Windows already browses the destination and plays the videos, so the
+problem the web UI solves does not exist on that platform.**
+
+The proposal was a small utility installable on any Windows PC, reporting the
+status of a timelapse-maker install elsewhere on the network. It was weighed
+against porting the web UI (11f step 5) and both lost to the same sentence
+from the operator: a Windows user points their file explorer at the
+destination and double-clicks a video.
+
+That is worth stating precisely, because the obvious version of the argument
+is the weak one. "Windows has a GUI" is not why. Three real reasons:
+
+- **The web UI exists on Linux because the recorder is a CLI box.** Windows
+  has had a universal remote GUI for twenty years, so a local window over RDP
+  answers what headlessness forces a browser to answer over there.
+- **The library half is redundant here, and it is the expensive half.** On
+  Windows the videos land on an SMB share, so Explorer already browses them
+  and VLC already plays them, better than a web page does. That half carries
+  the sqlite index, the six-pattern filename parser, the `.m3u` handoff and
+  the `/video/` authentication carve-out.
+- **The hardening story does not port, and this project does not fake those.**
+  The web UI's read-only nature is a *structural* property, `ProtectSystem=
+  strict` plus exactly one `ReadWritePaths` entry, verified under systemd
+  rather than asserted (architecture.md §4.5). Windows has no equivalent, so
+  the same claim would degrade to "the source does not write anything". That
+  is the trade already refused when `secure_secret_file()` was made a
+  deliberate no-op on Windows, because a false security claim is worse than an
+  absent one.
+
+**The monitoring client has a cost of its own that is easy to miss.** A client
+that runs on *another* PC needs something on the recorder to talk to, which is
+a server: the web UI's hard half rebuilt with a bespoke protocol, plus a client
+that must be installed, updated and kept version-matched with the daemon.
+Version skew between two shipped components is a failure mode this project does
+not currently have, and the thing it would replace, a browser, is free and
+already installed everywhere.
+
+**What survives, if the need ever proves real**, is the *local* form: a small
+tkinter window on the recorder itself, reading `capture.json` and
+`encode.json`, viewed over RDP when nobody is sitting at it. Item 2 built those
+as machine-readable state for exactly this, so it is a pure reader against a
+contract that already exists: no server, no port, no login, no privilege. It
+would share technology and distribution with the GUI installer, and the seam
+stays at the JSON, so the Linux web UI and a Windows window cannot drift into
+different opinions about the same state.
+
+**Which constraint would reopen this:** wanting to check the cameras from a
+phone. A local window cannot do that and a web page can, and no amount of
+Explorer covers it. Notifications are the current answer, and they are the
+reason this is deferrable at all: a failed run already reaches you without
+anything being looked at.
+
 ## Where the rest of the "no" decisions live
 
 Several refusals are recorded next to the code they constrain, because that is

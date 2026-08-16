@@ -1180,11 +1180,21 @@ stops being worth it:
    instance of **a probe must produce what the pipeline produces**, after
    `PIX_FMT` and the two RTSP probes. The general form is worth keeping: **when
    a check disagrees with a passing neighbour, suspect the check.**
-5. The web UI last, because it carries the status source, the log source and
-   the hardening question, which are three of the four hardest problems in
-   this entry.
-6. The GUI installer (11c.6b), which is deliberately last and is the only item
-   here whose trigger is an audience rather than a dependency.
+5. **The GUI installer and wizard (11c.6b). Promoted from last to next,
+   2026-08-16**, swapping places with the web UI on the operator's decision.
+   Its trigger was filed as "an audience rather than a dependency", and with
+   steps 1 to 4 done the audience is the thing that arrives next: someone who
+   chose Windows, downloaded a release and has not got an Administrator prompt
+   open. The console wizard serves the author; it does not serve them.
+6. ~~The web UI.~~ **Deferred indefinitely on the operator's scope decision,
+   2026-08-16**, together with the monitoring client that was weighed against
+   it. Both are written up in decided-against.md; the short form is that
+   Windows already browses the destination and plays the videos, so the
+   problem the web UI solves on a CLI box does not exist there, and its
+   read-only *structural* guarantee cannot be carried across anyway.
+   **Notifications are what make this deferrable**: a failed run already
+   reaches the operator without anything being looked at. It is not refused,
+   and the constraint that would reopen it is naming the cameras from a phone.
 
 ~~**Add a `windows-latest` leg to CI at step 1, not at the end**~~, for the
 reasons in 11e. **Done 2026-08-16**, with step 1. Python 3.12, unit suite only:
