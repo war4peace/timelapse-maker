@@ -557,6 +557,39 @@ class TestComponentNames(unittest.TestCase):
             self.assertEqual(plat.native_name(plat.CAPTURE_UNIT),
                              "TimelapseCapture")
 
+    def test_the_display_name_is_not_the_description(self):
+        """services.msc is sorted by display name, so it is the only string an
+
+        administrator can find the service by. The first version passed the
+        description as the display name, which filed the capture service under
+        "Camera snapshot capture for timelapse": reported from a real install,
+        where `sc query` said RUNNING and the Services window appeared not to
+        list it at all. That is half of 11c.2's argument for using real
+        services rather than scheduled tasks, lost to one misplaced argument.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertEqual(plat.display_name(plat.CAPTURE_UNIT),
+                             "Timelapse Capture")
+            self.assertEqual(plat.display_name(plat.WEB_UNIT),
+                             "Timelapse Web UI")
+
+    def test_every_display_name_sorts_with_the_scheduled_tasks(self):
+        """One block under T wherever any of this is listed, rather than the
+
+        services under one letter and the tasks under another.
+        """
+        names = [plat.DISPLAY_NAMES[plat.CAPTURE_UNIT],
+                 plat.DISPLAY_NAMES[plat.WEB_UNIT],
+                 plat.WINDOWS_NAMES[plat.ENCODE_UNIT],
+                 plat.WINDOWS_NAMES[plat.WATCH_UNIT]]
+        for name in names:
+            self.assertTrue(name.startswith("Timelapse"), name)
+
+    def test_a_component_with_no_display_name_falls_back_to_its_own(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertEqual(plat.display_name(plat.ENCODE_UNIT),
+                             "Timelapse Encode")
+
     def test_an_unknown_identifier_passes_through_unchanged(self):
         with mock.patch.object(plat, "IS_WINDOWS", True):
             self.assertEqual(plat.native_name("something.service"),

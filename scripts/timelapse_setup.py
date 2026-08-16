@@ -1647,11 +1647,24 @@ def install_units(scripts_dir, config_path, user_id=None):
             xml = task_xml(description, argv, user_id=user_id, **extras)
             ok, detail = install_task(unit, xml)
         else:
+            # Asked before, because registering is what changes the answer.
+            # A service already running is executing the scripts it read at
+            # startup, and re-registering does not touch the running process:
+            # the installer would report success while the old build kept
+            # running, which is the exact trap restart_upgraded_services()
+            # exists for on the other platform.
+            was_running = service_is_active(unit)
             ok, detail = install_service(unit, description, argv)
+            if ok and was_running:
+                restarted, why = restart_service(unit)
+                detail = detail or ("registered, but could not restart it "
+                                    "onto the new build: " + why
+                                    if not restarted else
+                                    "restarted onto the new build")
         if ok:
             good(f"Registered {native}.")
             if detail:
-                warn(detail)
+                note(detail)
         else:
             fail(f"Could not register {native}: {detail}")
             ok_all = False

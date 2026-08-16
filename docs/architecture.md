@@ -1727,6 +1727,24 @@ new file and the config loses its group. On Windows a new file inherits the
 file created there afterwards, including an editor's temporary copies, is
 covered by where it is rather than by what the editor did.
 
+**The name an administrator finds a service by is its display name.**
+`services.msc` sorts by it, and `CreateServiceW`'s third argument is
+`lpDisplayName` rather than the description. Passing the description there
+filed the capture service under "Camera snapshot capture for timelapse", so
+`sc query` reported RUNNING while the Services window appeared not to list it,
+which costs half of §11c.2's argument for using real services at all.
+`DISPLAY_NAMES` spells them so that the two services and the two scheduled
+tasks sort together in one block. The description is set separately by
+`ChangeServiceConfig2W`.
+
+**Re-running the installer reconfigures rather than failing.**
+`CreateServiceW` refuses a service that already exists, so `install_service()`
+falls back to `ChangeServiceConfigW`, and `install_units()` restarts a service
+that was running before it was re-registered. Both halves matter: without the
+first, the second install of any version fails on every component; without the
+second, the installer reports success while the old build keeps running, which
+is the trap `restart_upgraded_services()` exists for in `install.sh`.
+
 **A drive letter cannot be resolved from the process that needs to resolve it.**
 Drive mappings belong to a logon session, and UAC's split token gives an
 elevated process a different session from the desktop that launched it. The

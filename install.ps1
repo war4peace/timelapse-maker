@@ -19,9 +19,12 @@
       and if there is none it says where to get one and stops. Without an
       interpreter there is nothing to install.
 
-    * It does not carry service state across an upgrade, the way install.sh
-      does. Re-running is idempotent because registration overwrites, and
-      there is no field of Windows installs whose states need preserving yet.
+    * It does not snapshot and restore every unit's enabled/disabled state
+      across an upgrade, the way install.sh does; there is no field of Windows
+      installs whose states need preserving yet. Re-running IS safe: an
+      existing service is reconfigured rather than refused, and one that was
+      running is restarted onto the new build, because a service already
+      running is executing the scripts it read at startup.
 
   Everything that decides anything lives in the Python scripts, and this file
   calls them: registration is `timelapse_setup.py --install-units`, which is

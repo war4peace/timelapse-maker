@@ -172,6 +172,22 @@ WINDOWS_NAMES = {
     WATCH_UNIT: "Timelapse Watch",
 }
 
+# What services.msc actually shows, which is not the service name: that list is
+# sorted by display name, so this is the only string an administrator can find
+# the service by. The first version passed the *description* as the display
+# name, which filed the capture service under "Camera snapshot capture for
+# timelapse" and left an operator looking under T unable to find it at all.
+# That is half of item 11c.2's argument for using real services rather than
+# scheduled tasks, lost to one misplaced argument.
+#
+# Spelled to sort together with the two scheduled tasks above, so that
+# everything this project installs sits in one block under T wherever it is
+# listed.
+DISPLAY_NAMES = {
+    CAPTURE_UNIT: "Timelapse Capture",
+    WEB_UNIT: "Timelapse Web UI",
+}
+
 # Which log file a component writes. Two units share one: the credential watch
 # is timelapse_encode.py --watch, so it logs where the encoder does.
 LOG_STEMS = {
@@ -185,6 +201,11 @@ LOG_STEMS = {
 def native_name(unit):
     """What this platform's service manager calls that component."""
     return WINDOWS_NAMES.get(unit, unit) if IS_WINDOWS else unit
+
+
+def display_name(unit):
+    """What an administrator will see this listed as."""
+    return DISPLAY_NAMES.get(unit, native_name(unit))
 
 
 def is_scheduled(unit):
@@ -264,6 +285,7 @@ SERVICE_CONFIG_FAILURE_ACTIONS = 2
 SERVICE_CONFIG_DELAYED_AUTO_START_INFO = 3
 SC_ACTION_RESTART = 1
 
+ERROR_SERVICE_EXISTS = 1073
 ERROR_SERVICE_DOES_NOT_EXIST = 1060
 ERROR_FAILED_SERVICE_CONTROLLER_CONNECT = 1063
 
@@ -354,6 +376,12 @@ class _WinApi(object):
         a.QueryServiceStatusEx.restype = _BOOL
         a.ChangeServiceConfig2W.argtypes = [_HANDLE, _DWORD, ctypes.c_void_p]
         a.ChangeServiceConfig2W.restype = _BOOL
+        a.ChangeServiceConfigW.argtypes = [_HANDLE, _DWORD, _DWORD, _DWORD,
+                                           _LPWSTR, _LPWSTR,
+                                           ctypes.POINTER(_DWORD),
+                                           ctypes.c_void_p, _LPWSTR, _LPWSTR,
+                                           _LPWSTR]
+        a.ChangeServiceConfigW.restype = _BOOL
         a.SetServiceStatus.argtypes = [_HANDLE, ctypes.POINTER(SERVICE_STATUS)]
         a.SetServiceStatus.restype = _BOOL
         a.RegisterServiceCtrlHandlerExW.argtypes = [_LPWSTR, self.HANDLER,
@@ -518,11 +546,31 @@ def install_service(unit, description, argv, account=None, password=None,
                 ctypes.create_unicode_buffer("\0".join(depends) + "\0"),
                 ctypes.c_void_p)
         svc = api.advapi32.CreateServiceW(
-            scm, native_name(unit), description, SERVICE_ALL_ACCESS,
+            scm, native_name(unit), display_name(unit), SERVICE_ALL_ACCESS,
             SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
             service_binpath(argv), None, None, dependencies, account, password)
         if not svc:
-            return False, _last_error("CreateServiceW")
+            if ctypes.get_last_error() != ERROR_SERVICE_EXISTS:
+                return False, _last_error("CreateServiceW")
+            # Re-running the installer is supposed to be how an upgrade
+            # happens, and CreateServiceW refuses outright for a service that
+            # already exists. Without this the second install of any version
+            # fails on all three components while reporting only a Win32 error
+            # number, which is a thing the docs promised did not happen.
+            svc = _open_service(scm, unit, SERVICE_ALL_ACCESS)
+            if not svc:
+                return False, _last_error("OpenServiceW")
+            try:
+                if not api.advapi32.ChangeServiceConfigW(
+                        svc, SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START,
+                        SERVICE_ERROR_NORMAL, service_binpath(argv), None,
+                        None, dependencies, account, password,
+                        display_name(unit)):
+                    api.advapi32.CloseServiceHandle(svc)
+                    return False, _last_error("ChangeServiceConfigW")
+            except OSError as exc:
+                api.advapi32.CloseServiceHandle(svc)
+                return False, str(exc)
         try:
             problems = []
             info = SERVICE_DESCRIPTIONW(description)

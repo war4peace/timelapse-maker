@@ -3937,6 +3937,51 @@ class TestUnitRegistrationCommands(unittest.TestCase):
         # the installer, so it has to use the name their machine uses.
         self.assertIn(plat.native_name(plat.CAPTURE_UNIT), text)
 
+    def test_a_running_service_is_restarted_onto_the_new_build(self):
+        """Re-running the installer is how an upgrade happens, and registering
+
+        does not touch the process already running: it is executing the scripts
+        it read at startup. Without this the installer reports success while
+        the old build keeps running, which is precisely what
+        restart_upgraded_services() exists for on the other platform.
+        """
+        out = io.StringIO()
+        with mock.patch.object(setup, "install_service",
+                               return_value=(True, "")), \
+             mock.patch.object(setup, "install_task", return_value=(True, "")), \
+             mock.patch.object(setup, "service_is_active", return_value=True), \
+             mock.patch.object(setup, "restart_service",
+                               return_value=(True, "")) as restart, \
+             contextlib.redirect_stdout(out):
+            setup.install_units("scripts", "cfg.json")
+        restart.assert_called_once_with(plat.CAPTURE_UNIT)
+        self.assertIn("restarted onto the new build", out.getvalue())
+
+    def test_a_service_that_was_not_running_is_left_stopped(self):
+        # A first install, or one where the operator had stopped it. Starting
+        # it here would be deciding something they did not ask for.
+        with mock.patch.object(setup, "install_service",
+                               return_value=(True, "")), \
+             mock.patch.object(setup, "install_task", return_value=(True, "")), \
+             mock.patch.object(setup, "service_is_active", return_value=False), \
+             mock.patch.object(setup, "restart_service") as restart, \
+             contextlib.redirect_stdout(io.StringIO()):
+            setup.install_units("scripts", "cfg.json")
+        restart.assert_not_called()
+
+    def test_a_restart_that_fails_is_reported_not_swallowed(self):
+        out = io.StringIO()
+        with mock.patch.object(setup, "install_service",
+                               return_value=(True, "")), \
+             mock.patch.object(setup, "install_task", return_value=(True, "")), \
+             mock.patch.object(setup, "service_is_active", return_value=True), \
+             mock.patch.object(setup, "restart_service",
+                               return_value=(False, "access denied")), \
+             contextlib.redirect_stdout(out):
+            setup.install_units("scripts", "cfg.json")
+        self.assertIn("could not restart", out.getvalue())
+        self.assertIn("access denied", out.getvalue())
+
     def test_a_partial_success_is_reported_without_being_called_a_failure(self):
         ok, text, _svc, _tsk = self.run_units(
             install=(True, "registered, but could not set: description"))
