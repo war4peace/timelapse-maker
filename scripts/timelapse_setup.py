@@ -3152,6 +3152,56 @@ def record_webhook_verified(config_path, url):
 # Output
 # ----------------------------------------------------------------------------
 
+def foreign_path(value):
+    """True if this path was written for the other platform.
+
+    A crude test on purpose, because only two shapes need telling apart: an
+    absolute POSIX path (`/var/lib/...`) and a drive-lettered Windows one
+    (`C:\\...`). Anything relative, empty or UNC is left alone, since none of
+    those is evidence of the platform that wrote it.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    windows_shaped = len(text) > 1 and text[1] == ":"
+    posix_shaped = text.startswith("/")
+    return windows_shaped if not IS_WINDOWS else posix_shaped
+
+
+def localise_locations(cfg):
+    """Replace locations a template carried over from the other platform.
+
+    A template is a source of **settings**, not of locations, and the two live
+    in the same file. `config.example.json` is a Linux document, so on Windows
+    it hands over `/var/lib/timelapse/state`, and the wizard never asks about
+    state_dir: it is not a choice, it is where this platform keeps things.
+
+    So a real Windows install wrote a config whose daemons publish their
+    heartbeat to `\\var\\lib\\timelapse\\state`, which resolves against
+    whatever drive happens to be current. Nothing failed, and `timelapse test`
+    reported the directory missing with advice to run `sudo timelapse setup`,
+    which would have written the same thing again. This project had recorded
+    the trap for CI, where the wizard is run *without* a template for exactly
+    this reason, and then the Windows installer was given one.
+
+    Only the two state directories, deliberately. Frames, videos, logs, ffmpeg
+    and the transfer destination are all asked about, so a wrong value from a
+    template never survives the wizard; these two are the only locations
+    nobody is offered.
+    """
+    # get(), never setdefault(). This runs on the single write path, so it sees
+    # every config anything writes, and a normaliser there must correct what is
+    # present and never invent what is not: the first version added empty
+    # "paths" and "web" sections to configs that had neither, which its own
+    # test caught by comparing the file byte for byte.
+    for section, key, default in (("paths", "state_dir", STATE_DIR_DEFAULT),
+                                  ("web", "state_dir", WEB_STATE_DIR_DEFAULT)):
+        block = cfg.get(section)
+        if isinstance(block, dict) and foreign_path(block.get(key)):
+            block[key] = default
+    return cfg
+
+
 def default_config(template_path=None):
     if template_path and Path(template_path).exists():
         with open(template_path, encoding="utf-8") as fh:
@@ -3171,6 +3221,7 @@ def default_config(template_path=None):
                 for key in [k for k in block if k.startswith("_")]:
                     block.pop(key)
         cfg["cameras"] = []
+        localise_locations(cfg)
         return cfg
     return {
         "paths": {"frames_root": "", "video_output": "", "log_dir": "",
@@ -3371,6 +3422,12 @@ def write_config(cfg, out_path, owner=None):
     produced a config the service could not read.
     """
     from timelapse_encode import replace_atomic
+    # Here as well as in default_config(), because this is the single write
+    # path and that is what makes it the place a correction reaches every
+    # route in: a config carried between platforms, or one written by an
+    # earlier version from a Linux template, is fixed the next time anything
+    # touches it rather than only when the whole wizard is re-run.
+    localise_locations(cfg)
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     backup_config(out)

@@ -205,7 +205,9 @@ class TestRsyncFlagCheckOutput(unittest.TestCase):
         self.assertIn("FAIL", out)
         self.assertIn("exit 23", out)
         self.assertIn("-rt --partial", out)
-        self.assertIn("sudo timelapse transfer", out)
+        # The command, spelled for whichever platform is reading it:
+        # there is no sudo to prefix on Windows.
+        self.assertIn(plat.admin_cmd("timelapse transfer"), out)
 
     def test_success_names_the_account_it_proved_it_for(self):
         out = self.run_check(True, "")

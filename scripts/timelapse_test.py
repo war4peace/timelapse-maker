@@ -35,8 +35,8 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-from timelapse_platform import (CONFIG_PATH, is_reserved_name,  # noqa: E402
-                                use_colour)
+from timelapse_platform import (CONFIG_PATH, admin_cmd,  # noqa: E402
+                                is_reserved_name, use_colour)
 
 __version__ = "0.1.9"
 
@@ -556,7 +556,7 @@ def test_state_dir(cfg):
     if not present:
         bad(f"{shown} does not exist")
         info("The capture and encode units name it in ReadWritePaths, so they")
-        info("will not start until it is there. Fix with: sudo timelapse setup")
+        info(f"will not start until it is there. Fix with: {admin_cmd('timelapse setup')}")
         return
     probe = d / ".preflight.tmp"
     try:
@@ -753,7 +753,7 @@ def check_rsync_args(cfg, dest):
     working = probe_rsync_flags(dest, svcuser)
     if working:
         info(f"these work: {' '.join(working)}")
-        info("Fix it with:  sudo timelapse transfer")
+        info(f"Fix it with:  {admin_cmd('timelapse transfer')}")
     elif working == []:
         info("no flag combination worked; check the share permissions for")
         info(f"{svcuser or 'this account'}.")

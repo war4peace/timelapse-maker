@@ -1090,6 +1090,19 @@ def stop_hint(unit):
     return f"systemctl stop {unit}"
 
 
+def admin_cmd(command):
+    """A command the operator must run with privilege, spelled for this box.
+
+    `sudo x` on Linux. On Windows there is no prefix to add, because privilege
+    is a property of how the window was opened, so the requirement moves into
+    the words beside the command. Printing "sudo timelapse setup" there is
+    advice that cannot be followed, and this project ships 29 such strings.
+    """
+    if IS_WINDOWS:
+        return "%s  (from an Administrator prompt)" % command
+    return "sudo " + command
+
+
 def elevation_hint():
     """How to become able to change the machine, as a sentence.
 

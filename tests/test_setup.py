@@ -3387,6 +3387,93 @@ class TestIPv6CameraAddresses(unittest.TestCase):
         self.assertEqual(parsed.port, 554)
 
 
+class TestLocaliseLocations(unittest.TestCase):
+    """A template is a source of settings, not of locations.
+
+    `config/config.example.json` is a Linux document and the Windows installer
+    passes it to the wizard, so a real install wrote a config whose daemons
+    publish their heartbeat to `/var/lib/timelapse/state`. Nothing failed
+    loudly: it resolved against whatever drive was current, and `timelapse
+    test` reported the directory missing with advice to re-run the wizard,
+    which would have written the same thing again.
+
+    The trap was already recorded for CI, where the Windows job runs the wizard
+    *without* a template for exactly this reason. Then the installer was given
+    one.
+    """
+
+    def linux_template(self):
+        return {"paths": {"state_dir": "/var/lib/timelapse/state"},
+                "web": {"state_dir": "/var/lib/timelapse/web"}}
+
+    def windows_template(self):
+        return {"paths": {"state_dir": r"C:\ProgramData\timelapse\state"},
+                "web": {"state_dir": r"C:\ProgramData\timelapse\web"}}
+
+    def test_a_foreign_state_dir_is_replaced_with_this_platforms(self):
+        foreign = (self.linux_template() if plat.IS_WINDOWS
+                   else self.windows_template())
+        cfg = setup.localise_locations(foreign)
+        self.assertEqual(cfg["paths"]["state_dir"], plat.STATE_DIR_DEFAULT)
+        self.assertEqual(cfg["web"]["state_dir"], plat.WEB_STATE_DIR_DEFAULT)
+
+    def test_this_platforms_own_paths_are_left_exactly_alone(self):
+        native = (self.windows_template() if plat.IS_WINDOWS
+                  else self.linux_template())
+        before = json.dumps(native)
+        self.assertEqual(json.dumps(setup.localise_locations(native)), before)
+
+    def test_a_deliberate_choice_elsewhere_on_this_platform_survives(self):
+        """Only the *other* platform's shapes are corrected. An operator who
+
+        put the state directory on another disk chose that, and a wizard that
+        moved it back would be overriding them.
+        """
+        chosen = r"E:\timelapse\state" if plat.IS_WINDOWS else "/srv/tl/state"
+        cfg = setup.localise_locations({"paths": {"state_dir": chosen}})
+        self.assertEqual(cfg["paths"]["state_dir"], chosen)
+
+    def test_it_corrects_what_is_there_and_invents_nothing(self):
+        """It runs on the single write path, so it sees every config anything
+
+        writes. The first version used setdefault() and added empty "paths"
+        and "web" sections to configs that had neither; its own test caught
+        that by comparing the written file byte for byte.
+        """
+        cfg = {"marker": "x"}
+        self.assertEqual(setup.localise_locations(cfg), {"marker": "x"})
+
+    def test_an_empty_or_relative_value_is_not_evidence_of_a_platform(self):
+        for given in ("", "   ", "state", "./state", None):
+            self.assertFalse(setup.foreign_path(given), repr(given))
+
+    def test_a_unc_path_belongs_to_neither(self):
+        self.assertFalse(setup.foreign_path(r"\\tower\cctv\state"))
+
+    def test_the_template_load_localises(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        template = tmp / "config.example.json"
+        template.write_text(json.dumps(self.linux_template()),
+                            encoding="utf-8")
+        cfg = setup.default_config(str(template))
+        self.assertEqual(cfg["paths"]["state_dir"], plat.STATE_DIR_DEFAULT)
+
+    def test_writing_localises_too(self):
+        """So a config that arrived by any other route is corrected the next
+
+        time anything touches it, rather than only when the whole wizard runs.
+        """
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        out = tmp / "config.json"
+        setup.write_config(self.linux_template()
+                           if plat.IS_WINDOWS else self.windows_template(),
+                           str(out))
+        written = json.loads(out.read_text(encoding="utf-8"))
+        self.assertEqual(written["paths"]["state_dir"], plat.STATE_DIR_DEFAULT)
+
+
 class TestSummarySinks(unittest.TestCase):
     """The summary must describe what the questions just configured.
 
