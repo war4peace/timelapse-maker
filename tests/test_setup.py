@@ -465,6 +465,33 @@ class TestCameraManagement(unittest.TestCase):
         self.assertEqual(setup.sanitise_name("../etc", "x"), "etc")
         self.assertEqual(setup.sanitise_name("!!!", "fallback"), "fallback")
 
+    def test_sanitise_name_leaves_a_reserved_name_alone(self):
+        """Deliberate, and the opposite of what it looks like.
+
+        Quietly handing back 'Camera3' to somebody who typed 'NUL' teaches
+        them nothing, and this function has no way to say why. The prompts
+        refuse it with an explanation instead; this only strips characters.
+        """
+        self.assertEqual(setup.sanitise_name("NUL", "x"), "NUL")
+
+    def test_a_reserved_name_is_refused_with_a_reason(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            refused = setup.reject_reserved("NUL")
+        self.assertTrue(refused)
+        out = buf.getvalue()
+        self.assertIn("reserved device name", out)
+        # It must say why a Linux operator is being refused as well, or the
+        # refusal reads as arbitrary on the platform where it costs them
+        # something and buys them nothing locally.
+        self.assertIn("portable", out)
+
+    def test_an_ordinary_name_is_not_refused_and_says_nothing(self):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertFalse(setup.reject_reserved("Driveway"))
+        self.assertEqual(buf.getvalue(), "")
+
     # -- credentials --------------------------------------------------------
 
     def test_the_camera_list_does_not_print_passwords(self):

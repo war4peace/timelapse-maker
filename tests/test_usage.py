@@ -213,6 +213,64 @@ class TestRsyncFlagCheckOutput(unittest.TestCase):
         self.assertIn("as timelapse", out)
 
 
+class TestCameraNameCheck(unittest.TestCase):
+    """The config that already holds a bad name, which the wizard cannot see.
+
+    Two ways in: hand-edited through `timelapse config`, or written on Linux
+    and carried to a Windows box, where two directories become one.
+    """
+
+    def run_check(self, names):
+        cfg = {"cameras": [{"name": n} for n in names]}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            tt.check_camera_names(cfg)
+        return buf.getvalue()
+
+    def test_ordinary_names_pass(self):
+        out = self.run_check(["Driveway", "Court180", "Roof"])
+        self.assertIn("PASS", out)
+        self.assertNotIn("FAIL", out)
+
+    def test_an_exact_duplicate_is_caught_on_every_platform(self):
+        # A hand-edited config can hold this on Linux, where it is just as
+        # destructive: one directory, two cameras, one video.
+        out = self.run_check(["Workshop", "Workshop"])
+        self.assertIn("FAIL", out)
+        self.assertIn("one folder here", out)
+
+    def test_case_variants_are_judged_by_this_filesystem(self):
+        """Workshop and workshop are a real pair from this project's library.
+
+        On NTFS they are one directory and the check must fail; on Linux they
+        are two and it must not, because reporting a working install as broken
+        is the error `try_rsync_args` exists to avoid.
+        """
+        out = self.run_check(["Workshop", "workshop"])
+        collides = os.path.normcase("Workshop") == os.path.normcase("workshop")
+        self.assertEqual("FAIL" in out, collides)
+
+    def test_a_reserved_name_is_reported_with_the_command_to_fix_it(self):
+        out = self.run_check(["Driveway", "NUL"])
+        self.assertIn("FAIL", out)
+        self.assertIn("reserved device name", out)
+        self.assertIn("timelapse cameras -e NUL", out)
+
+    def test_a_disabled_camera_is_checked_too(self):
+        """Its frames are still in that directory, and re-enabling it is the
+        moment the collision starts."""
+        cfg = {"cameras": [{"name": "Shed"},
+                           {"name": "Shed", "enabled": False}]}
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            tt.check_camera_names(cfg)
+        self.assertIn("FAIL", buf.getvalue())
+
+    def test_no_cameras_is_not_a_failure(self):
+        out = self.run_check([])
+        self.assertNotIn("FAIL", out)
+
+
 class TestStateDirCheck(unittest.TestCase):
     """A missing state directory stops both daemons from starting at all.
 

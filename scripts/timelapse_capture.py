@@ -100,7 +100,8 @@ def locations(windows, env=None):
             "web_state": ntpath.join(base, "web")}
 
 
-_LOC = locations(os.name == "nt")
+IS_WINDOWS = os.name == "nt"
+_LOC = locations(IS_WINDOWS)
 CONFIG_PATH = _LOC["config"]
 
 
@@ -300,6 +301,110 @@ class RedactingFormatter(logging.Formatter):
         return redact(super().format(record))
 
 
+# ----------------------------------------------------------------------------
+# Log files
+#
+# Duplicated from timelapse_platform.py, for the reason given above the
+# location block and pinned by the same test. This is the largest of the five
+# duplications the independence rule now costs, and it is worth saying so: the
+# rule keeps paying while the pins hold, and the day a pin cannot be written is
+# the day to revisit it.
+#
+# `RotatingFileHandler` renames, and Windows refuses to rename a file another
+# process holds open. Measured: `PermissionError: [WinError 32]` the moment
+# anything reads `capture.log` while the daemon rolls it over.
+#
+# The nastier half is what logging does with that. It does **not** propagate:
+# `Handler.handleError` prints the whole traceback to stderr and carries on, so
+# the daemon does not crash, it emits a traceback per log record and the file
+# silently never rotates until the reader lets go. That is the same shape as
+# the socketserver traceback the web UI had to catch, in a new place.
+#
+# So Windows sidesteps rotation entirely rather than defending it: one file per
+# day, named rather than renamed, pruned by age. Nothing renames anything, so
+# there is no failure mode left to handle. Linux keeps RotatingFileHandler
+# exactly as it was, because nothing is wrong with it there.
+# ----------------------------------------------------------------------------
+
+class DailyFileHandler(logging.FileHandler):
+    """One log file per day, chosen by name. Never renames anything.
+
+    Deliberately has no size cap, unlike the handler it replaces. The trade is
+    stated rather than hidden: this is less clever and has no failure mode,
+    where a cap costs either a rename or a second file-in-progress convention.
+    Volume is bounded in practice because the capture daemon logs the first
+    failure of a burst rather than every failure.
+    """
+
+    def __init__(self, log_dir, stem, keep_days):
+        self.log_dir = Path(log_dir)
+        self.stem = stem
+        self.keep_days = max(1, int(keep_days))
+        self.day = datetime.now().strftime("%Y%m%d")
+        logging.FileHandler.__init__(self, self._path(self.day),
+                                     encoding="utf-8")
+        self._prune()
+
+    def _path(self, day):
+        return str(self.log_dir / f"{self.stem}-{day}.log")
+
+    def emit(self, record):
+        # A daemon runs for weeks, so the day has to be re-checked here rather
+        # than only at startup, or everything lands in the file it opened with.
+        today = datetime.now().strftime("%Y%m%d")
+        if today != self.day:
+            self._switch_to(today)
+        logging.FileHandler.emit(self, record)
+
+    def _switch_to(self, today):
+        """Open the new file before letting go of the old one.
+
+        The other order was written first and a test found it: it loses the
+        record that triggered the switch, and leaves the handler holding a
+        closed stream for ever after, so the daemon stops logging to disk
+        entirely over one transient failure.
+        """
+        was_named, was_open = self.baseFilename, self.stream
+        self.baseFilename = self._path(today)
+        try:
+            self.stream = self._open()
+        except OSError:
+            # Keep the file already open rather than lose the record. A log
+            # call must never be the thing that stops the recording, and
+            # leaving self.day alone means the next record tries again.
+            self.baseFilename, self.stream = was_named, was_open
+            return
+        self.day = today
+        if was_open:
+            was_open.close()
+        self._prune()
+
+    def _prune(self):
+        cutoff = datetime.now() - timedelta(days=self.keep_days)
+        for path in self.log_dir.glob(f"{self.stem}-*.log"):
+            stamp = path.name[len(self.stem) + 1:-len(".log")]
+            try:
+                if datetime.strptime(stamp, "%Y%m%d") < cutoff:
+                    path.unlink()
+            except (ValueError, OSError):
+                # Not one of ours, or in use. Either way, leave it alone.
+                pass
+
+
+def log_handler(log_dir, stem, max_bytes=8 * 1024 * 1024, backups=3):
+    """The file handler this platform can actually rotate.
+
+    `backups` carries both meanings, because they are the same intent measured
+    differently: how much history to keep. On Linux it is that many rotated
+    files beside the current one; on Windows that many days beside today.
+    """
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    if IS_WINDOWS:
+        return DailyFileHandler(log_dir, stem, keep_days=backups + 1)
+    return logging.handlers.RotatingFileHandler(
+        Path(log_dir) / f"{stem}.log", maxBytes=max_bytes, backupCount=backups)
+
+
 def setup_logging(log_dir):
     fmt = RedactingFormatter(
         "%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
@@ -312,9 +417,7 @@ def setup_logging(log_dir):
     root.addHandler(stream)
 
     if log_dir:
-        Path(log_dir).mkdir(parents=True, exist_ok=True)
-        fileh = logging.handlers.RotatingFileHandler(
-            Path(log_dir) / "capture.log", maxBytes=8 * 1024 * 1024, backupCount=3)
+        fileh = log_handler(log_dir, "capture", backups=3)
         fileh.setFormatter(fmt)
         root.addHandler(fileh)
 

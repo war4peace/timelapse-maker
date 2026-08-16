@@ -36,8 +36,9 @@ from urllib.parse import unquote, urlparse
 from timelapse_platform import (
     CONFIG_DIR, CONFIG_PATH, DATA_ROOT_DEFAULT, LINUX_STATE_DIR,
     LINUX_WEB_STATE_DIR, STATE_DIR_DEFAULT, WEB_STATE_DIR_DEFAULT,
-    log_hint, restart_hint, restart_service, scan_filesystems,
-    secure_secret_file, service_is_active, start_hint, stop_hint,
+    is_reserved_name, log_hint, restart_hint, restart_service,
+    scan_filesystems, secure_secret_file, service_is_active, start_hint,
+    stop_hint,
 )
 
 __version__ = "0.1.9"
@@ -959,8 +960,14 @@ def add_one_camera(cfg, n, found=None):
     choice = ask_int("Camera type", default_type, 1, len(CAMERA_PRESETS))
     label, method, auth, template = CAMERA_PRESETS[choice - 1]
 
-    name = ask("Name (used as the folder name)", f"Camera{n}")
-    name = "".join(ch for ch in name if ch.isalnum() or ch in "-_") or f"Camera{n}"
+    # sanitise_name(), not a second copy of its body: this line had drifted
+    # into an inline duplicate of it, which is how the two would have come to
+    # disagree about what a camera may be called.
+    while True:
+        name = sanitise_name(ask("Name (used as the folder name)", f"Camera{n}"),
+                             f"Camera{n}")
+        if not reject_reserved(name):
+            break
 
     if template is None:                       # custom
         method = "rtsp" if ask_yes("Is this an RTSP stream?", False) else "http"
@@ -1030,7 +1037,14 @@ DAY_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def sanitise_name(raw, fallback):
-    """Camera names become directory names, so keep them boring."""
+    """Camera names become directory names, so keep them boring.
+
+    Character stripping only. Reserved device names survive this on purpose:
+    they are refused by the prompts with an explanation, because silently
+    handing back `Camera3` to somebody who typed `NUL` teaches them nothing,
+    and this function has no way to say why. `check_camera_names()` in the
+    pre-flight is the backstop for a config that got one by another route.
+    """
     return "".join(ch for ch in raw if ch.isalnum() or ch in "-_") or fallback
 
 
@@ -1079,6 +1093,22 @@ def warn_stranded(cfg, name, verb):
     note(f"this would leave those frames on disk with nothing to encode them.")
     note(f"Encode them first with:  timelapse encode --date {pend[0].name}")
     return ask_yes(f"{verb.capitalize()} it anyway?", False)
+
+
+def reject_reserved(name):
+    """True, having said so, if this name cannot be a directory on Windows.
+
+    Refused on Linux too. A `config.json` is portable between platforms by
+    design, so a name only one of them accepts is a trap set for whoever moves
+    the file; and no one has ever wanted a camera called `AUX`.
+    """
+    if not is_reserved_name(name):
+        return False
+    fail(f"'{name}' is a reserved device name and cannot be a folder.")
+    note("Windows treats it as hardware rather than as a file. A camera named")
+    note("NUL there records nothing at all, and the rest are refused outright,")
+    note("so the name is rejected on every platform to keep configs portable.")
+    return True
 
 
 def name_taken(cams, name, skip=None):
@@ -1237,6 +1267,8 @@ def edit_one_camera(cfg, cams, cam):
 
     while True:
         new_name = sanitise_name(ask("Name", old_name), old_name)
+        if reject_reserved(new_name):
+            continue
         if new_name != old_name and name_taken(cams, new_name, skip=cam):
             fail(f"Another camera is already called '{new_name}'.")
             continue

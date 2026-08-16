@@ -19,6 +19,8 @@ different name:
     restart one                         restart_service()
     how does an operator drive one      start_hint() and its neighbours
     secure a file that holds passwords  secure_secret_file()
+    is this name usable as a filename   is_reserved_name(), same_file_name()
+    how is a log file kept              log_handler()
     which disks could hold frames       scan_filesystems()
 
 Not answered here yet, deliberately, because each is the substance of a later
@@ -40,10 +42,13 @@ a platform branch is otherwise code that one CI leg cannot reach, which is the
 cost item 11e admits to.
 """
 
+import logging
+import logging.handlers
 import ntpath
 import os
 import shutil
 import subprocess
+from datetime import datetime, timedelta
 from pathlib import Path
 
 __version__ = "0.1.9"
@@ -239,6 +244,162 @@ def secure_secret_file(path, group=None):
             shutil.chown(path, group=group)
         except (OSError, LookupError):
             pass
+
+
+# ----------------------------------------------------------------------------
+# Names that are not filenames
+#
+# Enforced on **both** platforms, which is the unusual choice and the
+# deliberate one. A camera name is a directory name, `config.json` is portable
+# between platforms by design, and refusing a Linux operator a camera called
+# `CON` costs nothing anybody will ever notice. A rule that holds on one
+# platform only is a seam in the one project trying not to have any.
+#
+# Measured 2026-08-16 (temp/step2_probe.py), and the folklore is much broader
+# than the hazard. Of the six probed, only **NUL** touches this project, and it
+# is loud rather than silent: `frames/NUL/` "succeeds" as a mkdir, and then
+# `frames/NUL/2026-08-16` fails WinError 3 on every single frame, which is the
+# `-strftime_mkdir` failure shape again. CON, AUX, PRN, COM1 and LPT1 all work
+# perfectly well as camera directories with frames inside them, and all six
+# work as `<Camera>.YYYYMMDD.mkv`. So the research note's "the encoder would
+# report OK and delete the frames" does not happen: nothing is ever written and
+# the encoder skips the day.
+#
+# The whole set is still refused, because the cost is a frozenset and the
+# alternative is knowing which of six names is safe in which of three path
+# shapes, for ever.
+# ----------------------------------------------------------------------------
+
+RESERVED_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+)
+
+
+def is_reserved_name(name):
+    """True for a name Windows treats as a device rather than as a file.
+
+    Case-insensitive, because the filesystem is. The extension is not
+    considered: `NUL.txt` is reserved too, and nothing here produces one.
+    """
+    return str(name).strip().upper() in RESERVED_NAMES
+
+
+def same_file_name(a, b):
+    """Would these two names reach the same file on this filesystem?
+
+    `os.path.normcase` rather than a platform test, and this is the point:
+    identity on POSIX, lowercasing on Windows. So the exact-duplicate case is
+    exercised by the Linux CI legs and the case-variant case by the Windows
+    one, from a single code path, with no branch to get wrong.
+
+    It answers for *this* filesystem, which is a first-order answer rather than
+    a perfect one: a case-insensitive volume mounted on Linux, or a
+    case-sensitive directory on Windows, would each be judged by their host's
+    default. The wizard is stricter on purpose (see name_taken), because the
+    destination the videos are copied to may be case-insensitive whatever the
+    recorder runs on.
+    """
+    return os.path.normcase(str(a)) == os.path.normcase(str(b))
+
+
+# ----------------------------------------------------------------------------
+# Log files
+#
+# `RotatingFileHandler` renames, and Windows refuses to rename a file another
+# process holds open. Measured: `PermissionError: [WinError 32]` the moment
+# anything reads `capture.log` while the daemon rolls it over.
+#
+# The nastier half is what logging does with that. It does **not** propagate:
+# `Handler.handleError` prints the whole traceback to stderr and carries on, so
+# the daemon does not crash, it emits a traceback per log record and the file
+# silently never rotates until the reader lets go. That is the same shape as
+# the socketserver traceback the web UI had to catch, in a new place.
+#
+# So Windows sidesteps rotation entirely rather than defending it: one file per
+# day, named rather than renamed, pruned by age. Nothing renames anything, so
+# there is no failure mode left to handle. Linux keeps RotatingFileHandler
+# exactly as it was, because nothing is wrong with it there.
+# ----------------------------------------------------------------------------
+
+class DailyFileHandler(logging.FileHandler):
+    """One log file per day, chosen by name. Never renames anything.
+
+    Deliberately has no size cap, unlike the handler it replaces. The trade is
+    stated rather than hidden: this is less clever and has no failure mode,
+    where a cap costs either a rename or a second file-in-progress convention.
+    Volume is bounded in practice because the capture daemon logs the first
+    failure of a burst rather than every failure.
+    """
+
+    def __init__(self, log_dir, stem, keep_days):
+        self.log_dir = Path(log_dir)
+        self.stem = stem
+        self.keep_days = max(1, int(keep_days))
+        self.day = datetime.now().strftime("%Y%m%d")
+        logging.FileHandler.__init__(self, self._path(self.day),
+                                     encoding="utf-8")
+        self._prune()
+
+    def _path(self, day):
+        return str(self.log_dir / f"{self.stem}-{day}.log")
+
+    def emit(self, record):
+        # A daemon runs for weeks, so the day has to be re-checked here rather
+        # than only at startup, or everything lands in the file it opened with.
+        today = datetime.now().strftime("%Y%m%d")
+        if today != self.day:
+            self._switch_to(today)
+        logging.FileHandler.emit(self, record)
+
+    def _switch_to(self, today):
+        """Open the new file before letting go of the old one.
+
+        The other order was written first and a test found it: it loses the
+        record that triggered the switch, and leaves the handler holding a
+        closed stream for ever after, so the daemon stops logging to disk
+        entirely over one transient failure.
+        """
+        was_named, was_open = self.baseFilename, self.stream
+        self.baseFilename = self._path(today)
+        try:
+            self.stream = self._open()
+        except OSError:
+            # Keep the file already open rather than lose the record. A log
+            # call must never be the thing that stops the recording, and
+            # leaving self.day alone means the next record tries again.
+            self.baseFilename, self.stream = was_named, was_open
+            return
+        self.day = today
+        if was_open:
+            was_open.close()
+        self._prune()
+
+    def _prune(self):
+        cutoff = datetime.now() - timedelta(days=self.keep_days)
+        for path in self.log_dir.glob(f"{self.stem}-*.log"):
+            stamp = path.name[len(self.stem) + 1:-len(".log")]
+            try:
+                if datetime.strptime(stamp, "%Y%m%d") < cutoff:
+                    path.unlink()
+            except (ValueError, OSError):
+                # Not one of ours, or in use. Either way, leave it alone.
+                pass
+
+
+def log_handler(log_dir, stem, max_bytes=8 * 1024 * 1024, backups=3):
+    """The file handler this platform can actually rotate.
+
+    `backups` carries both meanings, because they are the same intent measured
+    differently: how much history to keep. On Linux it is that many rotated
+    files beside the current one; on Windows that many days beside today.
+    """
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    if IS_WINDOWS:
+        return DailyFileHandler(log_dir, stem, keep_days=backups + 1)
+    return logging.handlers.RotatingFileHandler(
+        Path(log_dir) / f"{stem}.log", maxBytes=max_bytes, backupCount=backups)
 
 
 # ----------------------------------------------------------------------------

@@ -16,11 +16,15 @@ Linux answers on Windows, and neither leg is trusting the other to have looked.
 
 import contextlib
 import io
+import logging
+import logging.handlers
+import os
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -458,6 +462,207 @@ class TestSecureSecretFile(unittest.TestCase):
             plat.secure_secret_file(self.path, "timelapse")
         chmod.assert_not_called()
         chown.assert_not_called()
+
+
+class TestReservedNames(unittest.TestCase):
+    """Refused on both platforms, which is the deliberate part."""
+
+    def test_the_documented_four_plus_the_numbered_ports(self):
+        for name in ("CON", "PRN", "AUX", "NUL", "COM1", "COM9", "LPT1",
+                     "LPT9"):
+            self.assertTrue(plat.is_reserved_name(name), name)
+
+    def test_it_is_case_insensitive_because_the_filesystem_is(self):
+        for name in ("nul", "Nul", "nUl"):
+            self.assertTrue(plat.is_reserved_name(name), name)
+
+    def test_surrounding_space_does_not_smuggle_one_through(self):
+        self.assertTrue(plat.is_reserved_name("  NUL "))
+
+    def test_ordinary_names_are_left_alone(self):
+        for name in ("Driveway", "Court180", "Workshop", "CONSERVATORY",
+                     "COM", "LPT", "COM10", "NULL", "Camera1"):
+            self.assertFalse(plat.is_reserved_name(name), name)
+
+    def test_the_rule_does_not_depend_on_the_platform(self):
+        """A config.json is portable, so a name only one platform accepts is a
+        trap set for whoever moves the file."""
+        for windows in (False, True):
+            with mock.patch.object(plat, "IS_WINDOWS", windows):
+                self.assertTrue(plat.is_reserved_name("NUL"))
+                self.assertFalse(plat.is_reserved_name("Driveway"))
+
+
+class TestSameFileName(unittest.TestCase):
+    """os.path.normcase, so the filesystem answers rather than a branch."""
+
+    def test_identical_names_always_collide(self):
+        # The case both CI legs exercise, and the one a hand-edited config on
+        # Linux can actually produce.
+        self.assertTrue(plat.same_file_name("Workshop", "Workshop"))
+
+    def test_different_names_never_collide(self):
+        self.assertFalse(plat.same_file_name("Workshop", "Garage"))
+
+    def test_case_variants_follow_the_platform(self):
+        # True on Windows, False on Linux, and both are correct: on Linux they
+        # genuinely are two directories. Asserting the platform's own answer
+        # rather than a fixed one is the point of using normcase at all.
+        expected = os.path.normcase("Workshop") == os.path.normcase("workshop")
+        self.assertIs(plat.same_file_name("Workshop", "workshop"), expected)
+
+
+class TestLogHandler(unittest.TestCase):
+    """RotatingFileHandler renames; Windows will not rename an open file."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def tearDown(self):
+        logging.shutdown()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def close(self, handler):
+        handler.close()
+        return handler
+
+    def test_linux_keeps_the_handler_it_always_had(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            handler = self.close(plat.log_handler(self.tmp, "capture",
+                                                  backups=3))
+        self.assertIsInstance(handler, logging.handlers.RotatingFileHandler)
+        self.assertEqual(Path(handler.baseFilename).name, "capture.log")
+        self.assertEqual(handler.backupCount, 3)
+
+    def test_windows_gets_a_handler_that_never_renames(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            handler = self.close(plat.log_handler(self.tmp, "capture",
+                                                  backups=3))
+        self.assertIsInstance(handler, plat.DailyFileHandler)
+        self.assertRegex(Path(handler.baseFilename).name,
+                         r"^capture-\d{8}\.log$")
+
+    def test_the_history_setting_means_the_same_thing_on_both(self):
+        # backups=3 is "three lots of history beside the current one" either
+        # way: three rotated files, or three days beside today.
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            handler = self.close(plat.log_handler(self.tmp, "capture",
+                                                  backups=3))
+        self.assertEqual(handler.keep_days, 4)
+
+    def test_it_creates_the_log_directory(self):
+        target = self.tmp / "a" / "b"
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.close(plat.log_handler(target, "capture"))
+        self.assertTrue(target.is_dir())
+
+
+class TestDailyFileHandler(unittest.TestCase):
+    """The Windows handler, driven on whichever platform is running."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.log = logging.getLogger("daily-probe")
+        self.log.setLevel(logging.INFO)
+        self.log.propagate = False
+
+    def tearDown(self):
+        for handler in list(self.log.handlers):
+            handler.close()
+            self.log.removeHandler(handler)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def attach(self, keep_days=3):
+        handler = plat.DailyFileHandler(self.tmp, "capture", keep_days)
+        self.log.addHandler(handler)
+        return handler
+
+    def files(self):
+        return sorted(p.name for p in self.tmp.glob("capture-*.log"))
+
+    def test_it_writes_todays_file(self):
+        self.attach()
+        self.log.info("hello")
+        today = datetime.now().strftime("%Y%m%d")
+        self.assertEqual(self.files(), [f"capture-{today}.log"])
+        self.assertIn("hello", (self.tmp / f"capture-{today}.log")
+                      .read_text(encoding="utf-8"))
+
+    def test_crossing_midnight_opens_a_new_file_without_renaming(self):
+        """The whole point. Nothing is renamed, so nothing can fail to rename.
+
+        The day is forced rather than waited for; what is being asserted is
+        that yesterday's file is still there, under its own name, with its own
+        content, which is what a rename would have destroyed.
+        """
+        handler = self.attach()
+        self.log.info("yesterday")
+        first = Path(handler.baseFilename)
+
+        handler.day = "20000101"          # pretend the process started then
+        self.log.info("today")
+
+        today = datetime.now().strftime("%Y%m%d")
+        self.assertEqual(Path(handler.baseFilename).name,
+                         f"capture-{today}.log")
+        self.assertEqual(first.name, f"capture-{today}.log")
+        body = first.read_text(encoding="utf-8")
+        self.assertIn("yesterday", body)
+        self.assertIn("today", body)
+
+    def test_a_reader_holding_the_file_open_does_not_break_it(self):
+        """The measured failure, reproduced against the replacement.
+
+        RotatingFileHandler raises PermissionError WinError 32 here and logging
+        swallows it, so the daemon prints a traceback per record and the file
+        never rotates. This handler renames nothing, so there is nothing to
+        refuse.
+        """
+        handler = self.attach()
+        self.log.info("first")
+        reader = open(handler.baseFilename, "r", encoding="utf-8")
+        try:
+            handler.day = "20000101"      # force the day change while it is open
+            self.log.info("second")
+        finally:
+            reader.close()
+        body = Path(handler.baseFilename).read_text(encoding="utf-8")
+        self.assertIn("second", body)
+
+    def test_old_files_are_pruned_by_age(self):
+        old = datetime.now() - timedelta(days=10)
+        stale = self.tmp / f"capture-{old.strftime('%Y%m%d')}.log"
+        stale.write_text("ancient", encoding="utf-8")
+        self.attach(keep_days=3)
+        self.assertFalse(stale.exists())
+
+    def test_recent_files_are_kept(self):
+        recent = datetime.now() - timedelta(days=1)
+        keep = self.tmp / f"capture-{recent.strftime('%Y%m%d')}.log"
+        keep.write_text("recent", encoding="utf-8")
+        self.attach(keep_days=3)
+        self.assertTrue(keep.exists())
+
+    def test_a_stranger_in_the_directory_is_left_alone(self):
+        """Pruning parses a date out of a filename, and anything that is not
+
+        one of ours will not parse. Deleting it because it sat in the log
+        directory would be this program throwing away somebody else's file.
+        """
+        stranger = self.tmp / "capture-notadate.log"
+        stranger.write_text("theirs", encoding="utf-8")
+        self.attach(keep_days=1)
+        self.assertTrue(stranger.exists())
+
+    def test_a_failed_roll_keeps_logging_rather_than_losing_the_record(self):
+        # A log call must never be the thing that stops the recording.
+        handler = self.attach()
+        self.log.info("before")
+        handler.day = "20000101"
+        with mock.patch.object(handler, "_open", side_effect=OSError("denied")):
+            self.log.info("during")
+        body = Path(handler.baseFilename).read_text(encoding="utf-8")
+        self.assertIn("during", body)
 
 
 class TestNoPlatformBranchesElsewhere(unittest.TestCase):

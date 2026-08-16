@@ -39,6 +39,27 @@ While the version is `0.x`, the configuration format may change in any release.
   both runners and neither leg is trusting the other to have looked.
 
 ### Fixed
+- **Three more Windows-only defects, and one that is not.** **Nothing changes
+  on a Linux install** except the last of them. First, the log file: the
+  rotating handler works by renaming, and Windows refuses to rename a file
+  another process has open, which is exactly what happens when anything reads
+  `capture.log` while the daemon rolls it over. That failure is quieter than a
+  crash, because Python's logging catches it, prints the whole traceback and
+  carries on, so the daemon would emit a traceback per log line and never
+  rotate at all. On Windows the log is now one file per day, named rather than
+  renamed and pruned by age, so there is nothing left to refuse; on Linux it is
+  the same `capture.log` it has always been. Second, camera names that Windows
+  treats as hardware rather than as files, of which only `NUL` actually
+  affects this tool: a camera called that records nothing whatsoever. Those
+  names are now refused when you type them, on every platform, because a
+  config file is meant to be portable between them.
+- **The pre-flight now checks camera names**, which is the part that is not
+  Windows-only. `timelapse test` reports two cameras whose folders the
+  filesystem cannot tell apart. On Linux that means an exact duplicate, which
+  a hand-edited config can hold and which quietly makes one video out of two
+  cameras' pictures; on Windows it also means two names differing only in case,
+  which is the more likely one, and the wizard has always refused it but a
+  config carried over from a Linux machine has not been through the wizard.
 - **Two defects that only appear when the scripts are run on Windows.**
   **Nothing changes on a Linux install**, which is every supported deployment
   today; these were found while researching a possible Windows variant and are

@@ -35,7 +35,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-from timelapse_platform import CONFIG_PATH                 # noqa: E402
+from timelapse_platform import CONFIG_PATH, is_reserved_name   # noqa: E402
 
 __version__ = "0.1.9"
 
@@ -463,6 +463,56 @@ def scan_camera_frames(cam_dir):
     return {"days": days, "frames": frames, "size": size, "stray": stray}
 
 
+def check_camera_names(cfg):
+    """Names a filesystem cannot keep apart, and names it will not accept.
+
+    The wizard already refuses both at the prompt, so this is about the config
+    that got one another way: hand-edited through `timelapse config`, or
+    written on Linux and carried to a Windows box, where two names that were
+    two directories become one.
+
+    That second case is the destructive one, and it is silent. `Workshop` and
+    `workshop` are documented in architecture.md §9a as two real cameras in
+    this project's own library. On NTFS they write into a single directory,
+    interleaved, and the encoder makes one video out of two cameras' pictures
+    with nothing failing anywhere.
+
+    Disabled cameras are checked too. A disabled camera's frames still sit in
+    that directory, and re-enabling it is the moment the collision starts.
+    """
+    cams = cfg.get("cameras", [])
+    names = [str(c.get("name", "")) for c in cams]
+    if not names:
+        info("no cameras configured")
+        return
+
+    for name in names:
+        if is_reserved_name(name):
+            bad(f"'{name}' is a reserved device name and cannot be a folder")
+            info("Windows treats it as hardware rather than as a file: a camera")
+            info("named NUL records nothing at all. Rename it with:")
+            info(f"  timelapse cameras -e {name}")
+
+    # normcase, not lower(): it answers for the filesystem this is running on,
+    # so the Linux legs exercise the exact-duplicate case and the Windows one
+    # the case-variant case, from a single code path.
+    seen = {}
+    for name in names:
+        seen.setdefault(os.path.normcase(name), []).append(name)
+
+    collisions = [group for group in seen.values() if len(group) > 1]
+    for group in collisions:
+        joined = " and ".join(f"'{n}'" for n in group)
+        bad(f"{joined} are one folder here")
+        info("Both cameras write into it, so their frames interleave and the")
+        info("nightly encode would make one video out of two cameras'")
+        info("pictures, without anything failing. Rename one and move its")
+        info("frames; 'timelapse cameras -e NAME' does both.")
+
+    if not collisions and not any(is_reserved_name(n) for n in names):
+        ok(f"{len(names)} camera name(s), all usable as folder names")
+
+
 def test_state_dir(cfg):
     """The runtime-state directory, checked here because of how it fails.
 
@@ -818,6 +868,9 @@ def main():
             probe_profiles(cam, cfg)
         print(f"\nSample images: {OUT}\n")
         return
+
+    print("\n=== Camera names ===")
+    check_camera_names(cfg)
 
     print(f"\n=== Cameras ({len(cams)} enabled) ===")
     sizes = []

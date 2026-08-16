@@ -737,6 +737,23 @@ Several of them cannot fail on Linux, which is the point.
   `capture-YYYYMMDD.log`, never rename anything, and prune by age. That is
   less clever than `RotatingFileHandler` and has no failure mode.
 
+  **BUILT 2026-08-16 exactly as recommended**, and one thing the entry above
+  got wrong is worth keeping: it says the rollover "can throw", and it cannot,
+  which is worse. `logging` catches handler failures, prints the traceback to
+  stderr through `Handler.handleError` and carries on, so the daemon does not
+  crash. It emits a full traceback **per log record** and the file simply never
+  rotates until the reader lets go. Measured both ways against the daemon's own
+  `setup_logging` path (`temp/step2_verify.py`): 58 stderr tracebacks and no
+  rotated files from `RotatingFileHandler`, versus zero tracebacks and a
+  correct daily file from the replacement. This is the same shape as the
+  `socketserver` traceback the web UI had to catch: **anything that writes to
+  stderr in a service gets mislabelled, and a swallowed error is harder to find
+  than a raised one.**
+
+  Linux is untouched and still writes `capture.log`, with a test asserting so,
+  because `docs/install.md` tells operators to grep it and an upgrade that
+  quietly renamed it would break that with no message.
+
 - **NTFS is case-insensitive, and this project has a documented invariant that
   says two camera names are two places.** Measured: creating `Workshop` and
   then `workshop` raises `FileExistsError`, and the second name resolves to
@@ -749,17 +766,52 @@ Several of them cannot fail on Linux, which is the point.
   Windows port must reject a camera name that differs from an existing one
   only by case, at the point of adding it, in the wizard.
 
-- **A camera named `NUL` silently destroys its own output.** Measured: writing
-  to a bare `NUL` path "succeeds", reports size 0, and the file is absent from
-  the directory listing; the bytes went to the null device. `sanitise_name()`
-  keeps alphanumerics, so `NUL`, `CON`, `AUX`, `COM1` and `LPT1` all survive
-  it. The good news, also measured and contrary to what the folklore says: as
-  *directories* all five were created without complaint, and as video files
-  (`CON.20260815.mkv`) all five wrote and read back correctly, so the blast
-  radius is far smaller than expected. It is the bare, extensionless form that
-  bites. Low probability, trivial to close: reject the reserved set in
-  `sanitise_name()` when running on Windows. Worth doing because the failure
-  is silent and the encoder would then report OK and delete the frames.
+  **HANDLED 2026-08-16, and most of it already was.** `name_taken()` has been
+  case-insensitive since well before this research, and both the wizard's add
+  and edit paths use it, so the wizard has never been able to create this
+  pair. Saying what already exists before saying what is missing would have
+  caught that; the entry above is what happens when it is not done. What was
+  genuinely missing is the config that already holds the collision, which the
+  wizard never sees: hand-edited through `timelapse config`, or written on
+  Linux and carried across. `check_camera_names()` in the pre-flight covers it
+  now, keyed on `os.path.normcase` rather than on a platform test, so it
+  reports the exact-duplicate case on Linux and the case-variant case on
+  Windows from one code path that both CI legs exercise. Deliberately not
+  case-folded on Linux: two directories there genuinely are two directories,
+  and reporting a working install as broken is the error `try_rsync_args()`
+  exists to avoid.
+
+- **A camera named `NUL` produces nothing. FIXED 2026-08-16, and this entry
+  was wrong about how.** It used to say the name "silently destroys its own
+  output" and that "the encoder would then report OK and delete the frames".
+  Re-measured against this project's actual path shapes before the fix was
+  written (`temp/step2_probe.py`), and it does not: `frames/NUL/` "succeeds" as
+  a mkdir, and then `frames/NUL/2026-08-16` fails **WinError 3** on every
+  single frame, which is the `-strftime_mkdir` failure shape again. Nothing is
+  ever written, so there is nothing for the encoder to report OK about or to
+  delete; it skips the day for having too few frames. Loud and useless rather
+  than silent and destructive.
+
+  The blast radius is narrower than the first pass suggested, too. `CON`,
+  `AUX`, `PRN`, `COM1` and `LPT1` all work **perfectly well** as camera
+  directories with frames inside them, and all six work as
+  `<Camera>.YYYYMMDD.mkv`. In the bare extensionless form only `NUL` vanishes;
+  the other five raise `Permission denied`, which the earlier note had not
+  said. So exactly one name of nineteen touches this project at all.
+
+  The whole set is refused anyway, and **on both platforms**, which was a
+  decision rather than an oversight: a `config.json` is portable by design, so
+  a name only one platform accepts is a trap for whoever moves the file, and
+  the cost to a Linux operator is a frozenset. `sanitise_name()` deliberately
+  does *not* do the refusing, because it strips characters and has no way to
+  say why; the prompts refuse it with an explanation, and
+  `check_camera_names()` in the pre-flight is the backstop for a config that
+  arrived by another route.
+
+  **The general lesson is the one this file already teaches about item 10, met
+  again**: researching a fix changed what the fix was for. Measure the hazard
+  against your own code's path shapes, not against the folklore, before
+  writing the words that will outlive the fix.
 
 - **`SO_REUSEADDR` makes `check_bind()` blind to a port already in use.**
   Measured three ways on the same listener: with `SO_REUSEADDR` (what
@@ -928,10 +980,22 @@ stops being worth it:
    The module is the seventh versioned script, installed and listed by
    `timelapse version`, because a stale copy of it breaks a daemon exactly as
    a stale script does.
-2. The three remaining measured correctness fixes, all cheap and
-   platform-guarded: case-insensitive camera-name collision, reserved device
-   names, and the log-rollover sidestep. (`SO_EXCLUSIVEADDRUSE` was the fourth
-   and shipped early, with the `os.replace` retry, at `1ffec92`.)
+2. ~~The three remaining measured correctness fixes.~~ **Done 2026-08-16.**
+   (`SO_EXCLUSIVEADDRUSE` was the fourth and shipped early, with the
+   `os.replace` retry, at `1ffec92`.) Two of the three turned out differently
+   from how they were filed, and both corrections are written into 11d above
+   rather than left here: the camera-name collision was **already prevented by
+   the wizard** and what was actually missing was a check on a config that
+   arrived by another route, and the reserved-name hazard is **one name, not
+   five, and it fails loudly rather than silently**. Only the log-rollover
+   sidestep was built as specified, and even there the entry understated it:
+   the rollover cannot throw, because logging swallows it.
+
+   Two of the three are *not* platform-guarded in the end, which was a
+   decision. Reserved names are refused on both platforms because a
+   `config.json` is portable, and the collision check uses `os.path.normcase`
+   so the filesystem answers rather than a branch. Only the log handler
+   actually forks, and it forks inside `timelapse_platform`.
 3. Capture as a real service and encode as a scheduled task, with file
    logging. That is a *useful product on its own*: it captures, it encodes, it
    notifies. Ship or evaluate at this point before going further.

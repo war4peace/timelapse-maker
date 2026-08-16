@@ -511,6 +511,7 @@ logic cannot drift between the two).
 
 | Check | What it catches |
 |---|---|
+| `check_camera_names` | two cameras the filesystem cannot keep apart, and names Windows will not accept at all. The wizard refuses both at the prompt, so this is for the config that got one another way: hand-edited, or written on Linux and carried to a Windows box |
 | `test_http` / `test_rtsp` | wrong credentials, wrong auth scheme, non-JPEG responses, slow cameras relative to the interval |
 | `probe_profiles` | ONVIF `Profile_N` pointing at a substream. Profile numbering is not consistent across vendors, so it is easy to configure a low-resolution stream without noticing |
 | `test_encoders` | ffmpeg built without NVENC |
@@ -1528,6 +1529,8 @@ different name:
 | restart one | `restart_service()` |
 | how an operator drives one | `start_hint()`, `stop_hint()`, `restart_hint()`, `log_hint()` |
 | secure a file holding passwords | `secure_secret_file()` |
+| is this name usable as a filename | `is_reserved_name()`, `same_file_name()` |
+| how a log file is kept | `log_handler()`, `DailyFileHandler` |
 | which disks could hold frames | `scan_filesystems()` |
 
 Four properties are load-bearing.
@@ -1559,6 +1562,31 @@ paths on Windows. This matters more than it looks: a platform branch is
 otherwise code that one runner cannot reach, which is the standing cost of
 sharing a codebase across platforms. The service and permission functions read
 `IS_WINDOWS` at call time for the same reason, so the tests patch it.
+
+**Two of its answers are enforced on both platforms, which looks wrong and is
+not.** `is_reserved_name()` refuses `NUL`, `CON`, `AUX`, `PRN`, `COM1-9` and
+`LPT1-9` as camera names on Linux too. A `config.json` is portable between
+platforms by design, so a name only one of them accepts is a trap set for
+whoever moves the file, and refusing a Linux operator a camera called `AUX`
+costs nothing anyone will ever notice. The measured hazard is much narrower
+than the folklore, and the note in the module says so: only `NUL` touches this
+project's path shapes, and it fails loudly rather than silently.
+`same_file_name()` is the other way round: it uses `os.path.normcase`, so it
+answers for whichever filesystem is running, which is what makes it correct to
+report `Workshop` and `workshop` as one directory on NTFS and as two on ext4.
+
+**Logging is the one place Linux and Windows genuinely diverge in behaviour.**
+Linux keeps `RotatingFileHandler` and `capture.log`, unchanged, because nothing
+is wrong with it there. Windows gets `DailyFileHandler`: one file per day,
+named rather than renamed, pruned by age, with no size cap. Renaming is the
+whole problem, since Windows refuses to rename a file another process holds
+open, which is what the Log tab reading `capture.log` does to the daemon. The
+failure is worse than an exception: `logging` catches it, prints the traceback
+to stderr and carries on, so the daemon does not crash, it emits a traceback
+per record and simply never rotates. Measured both ways: 58 stderr tracebacks
+and no rotated files from `RotatingFileHandler`, zero and a correct daily file
+from the replacement. The trade is stated rather than hidden: the replacement
+is less clever, and in exchange it has no failure mode.
 
 **Two things deliberately did not move.**
 `writable_paths()` and `--print-state-path` emit `ReadWritePaths=` lines for a
@@ -2093,7 +2121,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,369 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,399 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -2385,12 +2413,12 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 
 ```
 install.sh                       bootstrap installer, 964 lines
-scripts/timelapse_capture.py     daemon, 1252 lines
-scripts/timelapse_encode.py      batch job, 1848 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 852 lines
-scripts/timelapse_setup.py       configuration wizard, 3634 lines
+scripts/timelapse_capture.py     daemon, 1355 lines
+scripts/timelapse_encode.py      batch job, 1846 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 905 lines
+scripts/timelapse_setup.py       configuration wizard, 3666 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_platform.py    the only platform branch, 387 lines
+scripts/timelapse_platform.py    the only platform branch, 548 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests

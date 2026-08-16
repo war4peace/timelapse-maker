@@ -742,6 +742,42 @@ class TestCredentialsNeverReachTheLog(unittest.TestCase):
         self.assertEqual(cap.STATE_DIR_DEFAULT, plat.STATE_DIR_DEFAULT)
         self.assertEqual(cap.CONFIG_PATH, plat.CONFIG_PATH)
 
+    def test_the_daemons_copy_of_the_log_handler_has_not_drifted(self):
+        """Fifth duplicated thing, and the largest.
+
+        Worth stating plainly: the independence rule now costs this daemon
+        five copies (load_config, the redaction rule, replace_atomic, the path
+        derivation and this). It keeps paying while every one of them is
+        pinned; the day a pin cannot be written is the day to revisit it.
+
+        Character-identical rather than behavioural, because what matters is
+        the ordering inside _switch_to - open the new file before closing the
+        old one - and no assertion about the handler's output on Linux would
+        notice that being reversed, since Linux never takes this path.
+        """
+        import inspect
+        import timelapse_platform as plat
+        self.assertEqual(inspect.getsource(cap.DailyFileHandler),
+                         inspect.getsource(plat.DailyFileHandler))
+        self.assertEqual(inspect.getsource(cap.log_handler),
+                         inspect.getsource(plat.log_handler))
+
+    def test_the_daemon_still_writes_capture_log_on_linux(self):
+        """The Windows fix must not have moved the file anybody greps.
+
+        install.md tells operators to grep <log_dir>/capture.log, and an
+        upgrade that silently renamed it would break that with no message.
+        """
+        from unittest import mock
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.object(cap, "IS_WINDOWS", False):
+            handler = cap.log_handler(tmp, "capture", backups=3)
+        self.addCleanup(handler.close)
+        self.assertIsInstance(handler,
+                              logging.handlers.RotatingFileHandler)
+        self.assertEqual(Path(handler.baseFilename).name, "capture.log")
+
     def test_the_daemons_copy_of_the_atomic_write_has_not_drifted(self):
         """Third duplicated thing, pinned for the same reason as the other two.
 

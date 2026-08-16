@@ -36,7 +36,7 @@ from urllib import request as urlrequest
 
 # Names, not the module: `platform` above is the stdlib one, and two things
 # called platform in one file is a trap waiting for a reader in a hurry.
-from timelapse_platform import CONFIG_PATH, STATE_DIR_DEFAULT
+from timelapse_platform import CONFIG_PATH, STATE_DIR_DEFAULT, log_handler
 
 __version__ = "0.1.9"
 
@@ -266,9 +266,7 @@ def setup_logging(log_dir):
     sh.setFormatter(fmt)
     root.addHandler(sh)
     if log_dir:
-        Path(log_dir).mkdir(parents=True, exist_ok=True)
-        fh = logging.handlers.RotatingFileHandler(
-            Path(log_dir) / "encode.log", maxBytes=8 * 1024 * 1024, backupCount=5)
+        fh = log_handler(log_dir, "encode", backups=5)
         fh.setFormatter(fmt)
         root.addHandler(fh)
 
