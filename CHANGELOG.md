@@ -23,9 +23,13 @@ While the version is `0.x`, the configuration format may change in any release.
   It refuses the same things at the point you type them rather than at the
   first nightly run: a camera name Windows reserves for a device, a duplicate
   name, a snapshot interval so slow that no video would ever be produced, and a
-  mapped drive letter as a destination. Cameras and the transfer destination
-  both have a Test button that reaches the real hardware, and the transfer one
-  tells you which account it just proved it for.
+  mapped drive letter as a destination. Cameras are picked by make, as in the
+  console wizard, so a Reolink or a Dahua needs an address and a password
+  rather than a hand-typed URL. Cameras, the transfer destination and each
+  notification service all have a Test button that reaches the real thing, and
+  the transfer one tells you which account it just proved. When it finishes it
+  offers to run the full set of checks and shows you the result, so nothing
+  about setting this up needs a command prompt.
 - **Finished videos are moved to their destination on Windows.** **Nothing
   changes on a Linux install**, which still uses rsync. The destination can be
   a folder on this machine or a network path such as `\\tower\videos\timelapse`;

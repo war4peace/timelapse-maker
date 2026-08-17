@@ -268,27 +268,290 @@ class TestDestination(unittest.TestCase):
         self.assertIn("system account", text)
 
 
-class TestNotifyTargets(unittest.TestCase):
+class TestNotifySinks(unittest.TestCase):
+    """The field names are the schema's, and getting them wrong is silent.
+
+    The first cut stored a single "url" for all three services, which the
+    encoder reads as an empty sink: it would have written a config that looked
+    configured and notified nobody.
+    """
+
+    def test_each_service_writes_the_keys_the_encoder_reads(self):
+        expected = {"discord": {"webhook_url"},
+                    "ntfy": {"server", "topic", "token"},
+                    "telegram": {"token", "chat_id"}}
+        for kind, keys in expected.items():
+            _level, _m, sink = gui.build_sink(
+                kind, {k: "x" for k in keys}, enabled=False)
+            self.assertTrue(keys <= set(sink), "%s: %s" % (kind, sorted(sink)))
+            self.assertEqual(sink["type"], kind)
 
     def test_a_discord_webhook(self):
         url = "https://discord.com/api/webhooks/1/abc"
-        self.assertEqual(gui.check_notify_target("discord", url)[0], gui.OK)
-        self.assertEqual(gui.check_notify_target("discord", "abc")[0], gui.FAIL)
+        level, _m, sink = gui.build_sink("discord", {"webhook_url": url})
+        self.assertEqual(level, gui.OK)
+        self.assertEqual(sink["webhook_url"], url)
+        # The encoder posts under a name; absent, Discord shows the app's.
+        self.assertTrue(sink.get("username"))
 
-    def test_something_https_that_is_not_a_webhook_only_warns(self):
-        # Refusing outright would block a self-hosted or proxied endpoint.
-        level, _m, _v = gui.check_notify_target("discord",
-                                                "https://example.invalid/hook")
-        self.assertEqual(level, gui.WARN)
-
-    def test_ntfy_wants_a_full_url(self):
-        self.assertEqual(gui.check_notify_target("ntfy", "mytopic")[0], gui.FAIL)
+    def test_discord_without_https(self):
         self.assertEqual(
-            gui.check_notify_target("ntfy", "https://ntfy.sh/t")[0], gui.OK)
+            gui.build_sink("discord", {"webhook_url": "abc"})[0], gui.FAIL)
 
-    def test_a_telegram_token_has_a_colon_in_it(self):
-        self.assertEqual(gui.check_notify_target("telegram", "abc")[0], gui.FAIL)
-        self.assertEqual(gui.check_notify_target("telegram", "1:ab")[0], gui.OK)
+    def test_ntfy_defaults_to_the_public_server_and_warns_about_it(self):
+        level, message, sink = gui.build_sink("ntfy", {"topic": "mytopic"})
+        self.assertEqual(sink["server"], "https://ntfy.sh")
+        self.assertEqual(level, gui.WARN)
+        self.assertIn("only secret", message)
+
+    def test_ntfy_needs_a_topic(self):
+        level, message, _s = gui.build_sink("ntfy", {"server": "https://n.sh"})
+        self.assertEqual(level, gui.FAIL)
+        self.assertIn("Topic", message)
+
+    def test_telegram_needs_both_halves(self):
+        """A token with no chat id is the one that used to send people to the
+
+        command line, from a window built so they would not need one.
+        """
+        level, message, _s = gui.build_sink("telegram", {"token": "1:ab"})
+        self.assertEqual(level, gui.FAIL)
+        self.assertIn("Chat id", message)
+        self.assertEqual(
+            gui.build_sink("telegram", {"token": "1:ab", "chat_id": "7"})[0],
+            gui.OK)
+
+    def test_a_bot_token_has_a_colon_in_it(self):
+        self.assertEqual(
+            gui.build_sink("telegram", {"token": "abc", "chat_id": "7"})[0],
+            gui.FAIL)
+
+    def test_turning_one_off_is_recorded_rather_than_refused(self):
+        # Written even when empty, so "off" is a state in the config rather
+        # than a sink that merely looks configured.
+        level, _m, sink = gui.build_sink("discord", {"webhook_url": ""},
+                                         enabled=False)
+        self.assertEqual(level, gui.OK)
+        self.assertFalse(sink["enabled"])
+
+    def test_the_starting_values_come_from_the_existing_config(self):
+        cfg = {"notify": [{"type": "ntfy", "enabled": True,
+                           "server": "https://n.example", "topic": "t"}]}
+        values, on = gui.sink_values(cfg, "ntfy")
+        self.assertTrue(on)
+        self.assertEqual(values["server"], "https://n.example")
+        self.assertEqual(values["topic"], "t")
+
+    def test_an_absent_sink_starts_from_its_default(self):
+        values, on = gui.sink_values({}, "ntfy")
+        self.assertFalse(on)
+        self.assertEqual(values["server"], "https://ntfy.sh")
+
+    def test_every_declared_field_has_a_label_and_a_secret_flag(self):
+        for kind, (title, blurb, fields) in gui.NOTIFY_FIELDS.items():
+            self.assertTrue(title and blurb, kind)
+            for key, label, secret, default in fields:
+                self.assertTrue(key and label, kind)
+                self.assertIn(secret, (True, False), kind)
+                self.assertIsInstance(default, str)
+
+    def test_secrets_are_marked_so_the_window_masks_them(self):
+        marked = {(kind, key)
+                  for kind, (_t, _b, fields) in gui.NOTIFY_FIELDS.items()
+                  for key, _l, secret, _d in fields if secret}
+        self.assertIn(("telegram", "token"), marked)
+        self.assertIn(("ntfy", "token"), marked)
+
+
+class TestBrowseStart(unittest.TestCase):
+    """Where Browse opens, which the first version got wrong.
+
+    It ignored what was already in the box, so the operator had to navigate
+    back to the folder the field was showing them.
+    """
+
+    def test_an_existing_folder_is_used_as_is(self):
+        self.assertEqual(gui.browse_start("D:\\data", isdir=lambda p: True),
+                         "D:\\data")
+
+    def test_a_file_opens_its_folder(self):
+        """Built with os.path.join rather than written as a Windows literal.
+
+        browse_start asks a question about the *running* machine's filesystem,
+        so os.path is the right module for it to use, which means os.path is
+        also what the test has to build with: a "C:\\ff\\bin" literal has no
+        directory separator at all under posixpath, and this failed on the
+        three Linux legs while passing here.
+        """
+        import os
+        folder = os.path.join("ff", "bin")
+        target = os.path.join(folder, "ffmpeg" + (".exe" if os.name == "nt"
+                                                  else ""))
+
+        def isdir(path):
+            return path == folder
+
+        self.assertEqual(gui.browse_start(target, isdir), folder)
+
+    def test_nothing_usable_falls_back_to_the_dialog_default(self):
+        self.assertEqual(gui.browse_start("", isdir=lambda p: False), "")
+        self.assertEqual(gui.browse_start(None, isdir=lambda p: False), "")
+        self.assertEqual(gui.browse_start("Q:\\gone", isdir=lambda p: False),
+                         "")
+
+    def test_quotes_pasted_from_explorer_are_stripped(self):
+        self.assertEqual(gui.browse_start('"D:\\data"', isdir=lambda p: True),
+                         "D:\\data")
+
+    def test_a_directory_it_may_not_read_does_not_raise(self):
+        # is_dir() raises on Windows for an unreadable directory, where on
+        # Linux it answers False. A Browse button must not throw.
+        def boom(_path):
+            raise PermissionError(5, "Access is denied")
+        self.assertEqual(gui.browse_start("D:\\locked", isdir=boom), "")
+
+
+class TestCameraBuilding(unittest.TestCase):
+    """The dialog's real output, credentials included.
+
+    The first cut offered a name, a radio button and a URL, so a camera
+    needing a password could not be configured in the window at all.
+    """
+
+    def preset(self, label):
+        for entry in gui.camera_types():
+            if entry[0] == label:
+                return entry
+        raise AssertionError("no preset called %s" % label)
+
+    def test_the_preset_list_is_the_wizards_own(self):
+        # Read, not restated: it is the answer to "what is a Reolink URL", and
+        # a second copy would become a second answer.
+        self.assertEqual(gui.camera_types(), list(setup.CAMERA_PRESETS))
+
+    def test_a_preset_builds_its_url_from_an_address(self):
+        level, _m, cam = gui.build_camera(
+            {"name": "Yard", "preset": self.preset("Dahua / Amcrest"),
+             "address": "192.168.1.9", "username": "admin",
+             "password": "secret"}, [])
+        self.assertEqual(level, gui.OK)
+        self.assertIn("192.168.1.9", cam["url"])
+        self.assertEqual(cam["method"], "http")
+        # Digest, so the credentials are their own fields rather than the URL.
+        self.assertEqual(cam["auth"], "digest")
+        self.assertEqual(cam["username"], "admin")
+        self.assertEqual(cam["password"], "secret")
+        self.assertNotIn("secret", cam["url"])
+
+    def test_a_reolink_carries_the_password_in_the_url(self):
+        """Which is a property of that make, not a choice made here.
+
+        Worth a test because it is the case where an empty password field does
+        not mean no password is stored.
+        """
+        preset = self.preset("Reolink")
+        self.assertTrue(gui.credentials_go_in_the_url(preset))
+        _level, _m, cam = gui.build_camera(
+            {"name": "Drive", "preset": preset, "address": "10.0.0.4",
+             "username": "admin", "password": "hunter2"}, [])
+        self.assertIn("hunter2", cam["url"])
+        self.assertNotIn("password", set(cam) - {"url"})
+
+    def test_an_ipv6_address_is_bracketed(self):
+        _level, _m, cam = gui.build_camera(
+            {"name": "V6", "preset": self.preset("Axis"),
+             "address": "2001:db8::1"}, [])
+        self.assertIn("[2001:db8::1]", cam["url"])
+
+    def test_rtsp_credentials_go_into_the_stream_url(self):
+        preset = self.preset("RTSP only (no snapshot URL)")
+        _level, _m, cam = gui.build_camera(
+            {"name": "Tapo", "preset": preset, "address": "10.0.0.7",
+             "username": "u", "password": "p"}, [])
+        self.assertEqual(cam["method"], "rtsp")
+        self.assertTrue(cam["url"].startswith("rtsp://"))
+        self.assertNotIn("auth", cam)
+        self.assertEqual(cam.get("quality"), 2)
+
+    def test_a_custom_camera_carries_the_url_it_was_given(self):
+        level, _m, cam = gui.build_camera(
+            {"name": "Odd", "preset": self.preset("Custom URL"),
+             "url": "http://host/snap.jpg", "auth": "basic",
+             "username": "u", "password": "p", "method": "http"}, [])
+        self.assertEqual(level, gui.OK)
+        self.assertEqual(cam["url"], "http://host/snap.jpg")
+        self.assertEqual(cam["auth"], "basic")
+
+    def test_auth_none_does_not_leave_a_stale_username_behind(self):
+        """A username stored under auth "none" reads as a credential in use.
+
+        It is not, and leaving it is how a config comes to describe something
+        that is not happening.
+        """
+        existing = {"name": "Old", "auth": "digest", "username": "admin",
+                    "password": "p", "url": "http://x/y", "method": "http"}
+        _level, _m, cam = gui.build_camera(
+            {"name": "Old", "preset": self.preset("Custom URL"),
+             "url": "http://x/y", "auth": "none", "method": "http"},
+            [existing], cam=existing)
+        self.assertNotIn("username", cam)
+        self.assertNotIn("password", cam)
+
+    def test_a_preset_with_no_address_is_refused(self):
+        level, message, cam = gui.build_camera(
+            {"name": "Nope", "preset": self.preset("Axis"), "address": ""}, [])
+        self.assertEqual(level, gui.FAIL)
+        self.assertIsNone(cam)
+        self.assertIn("IP address", message)
+
+    def test_a_bad_name_is_refused_before_anything_else(self):
+        level, message, cam = gui.build_camera(
+            {"name": "NUL", "preset": self.preset("Axis"),
+             "address": "10.0.0.1"}, [])
+        self.assertEqual(level, gui.FAIL)
+        self.assertIsNone(cam)
+        self.assertIn("reserves", message)
+
+    def test_editing_keeps_the_keys_it_was_not_asked_about(self):
+        existing = {"name": "Roof", "url": "http://x", "method": "http",
+                    "interval_seconds": 10, "enabled": True}
+        _level, _m, cam = gui.build_camera(
+            {"name": "Roof", "preset": self.preset("Custom URL"),
+             "url": "http://y", "auth": "none", "method": "http",
+             "enabled": True}, [existing], cam=existing)
+        self.assertEqual(cam["interval_seconds"], 10,
+                         "a per-camera cadence must survive an edit here")
+
+    def test_disabling_is_carried_through(self):
+        _level, _m, cam = gui.build_camera(
+            {"name": "Off", "preset": self.preset("Axis"),
+             "address": "10.0.0.1", "enabled": False}, [])
+        self.assertFalse(cam["enabled"])
+
+    def test_which_types_ask_for_credentials(self):
+        wants = {p[0] for p in gui.camera_types()
+                 if gui.preset_wants_credentials(p)}
+        self.assertIn("Reolink", wants)
+        self.assertIn("Dahua / Amcrest", wants)
+        self.assertIn("RTSP only (no snapshot URL)", wants)
+
+    def test_smoothing_is_optional_and_bounded(self):
+        from timelapse_encode import SMOOTH_MAX, SMOOTH_MIN
+        self.assertEqual(gui.check_smoothing("")[2], None)
+        self.assertEqual(gui.check_smoothing(str(SMOOTH_MIN))[2], SMOOTH_MIN)
+        self.assertEqual(gui.check_smoothing(str(SMOOTH_MAX - 1))[0], gui.OK)
+        self.assertEqual(gui.check_smoothing("2")[0], gui.FAIL)
+        self.assertEqual(gui.check_smoothing("999")[0], gui.FAIL)
+        self.assertEqual(gui.check_smoothing("lots")[0], gui.FAIL)
+
+    def test_smoothing_is_removed_when_cleared(self):
+        existing = {"name": "R", "url": "http://x", "method": "http",
+                    "smooth_frames": 15}
+        _level, _m, cam = gui.build_camera(
+            {"name": "R", "preset": self.preset("Custom URL"),
+             "url": "http://x", "auth": "none", "method": "http",
+             "smoothing": None}, [existing], cam=existing)
+        self.assertNotIn("smooth_frames", cam)
 
 
 class TestReview(unittest.TestCase):

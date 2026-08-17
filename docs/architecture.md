@@ -2547,30 +2547,45 @@ checklist run by hand, below.
 
 **The click-through checklist**, in the order that finds problems soonest:
 
-1. Start it with no config present. Every page opens, Back is disabled on the
-   first page, and Finish is the last button rather than Next.
-2. Storage: type a relative path and a nonexistent drive. Both are refused
-   before Next, and the three derived directories update as you type.
-3. ffmpeg: point it at a folder rather than an executable. It finds both
-   binaries and names the encoder it will use. Point it at nothing and the
-   download page is offered.
-4. Cadence: enter 900. It refuses and says a day of that produces no video,
-   which is the failure that is otherwise silent for ever.
-5. Cameras: add one named `NUL`, one named `Roof Top!`, and a duplicate of an
-   existing name. Refused, corrected with a warning, refused. Test reaches a
-   real camera.
-6. Transfer: type a local folder, then a UNC path. The username and password
-   rows appear only for the UNC one and appear *above* the Test button, not
-   below it. Test reports which account it just proved.
-7. Notifications: leave all three off and continue.
-8. Review: it lists no password and no webhook URL. Finish writes the config,
-   the previous one is backed up, and the services restart.
-9. Run it again with that config present. Every page opens on the saved
-   answers rather than on defaults.
+1. **Launch it from the Start menu, not from a prompt.** No console window
+   should appear at any point, and the UAC prompt should come before the
+   wizard. This is the step that found the shortcut targeting a `.cmd`.
+2. Every page opens, Back is disabled on the first page, and the last button
+   reads Finish rather than Next.
+3. Storage: type a relative path and a nonexistent drive. Both refused before
+   Next, and the three derived directories update as you type. **Then press
+   Browse: it must open at the folder already in the box.**
+4. ffmpeg: point it at a folder rather than an executable. Both binaries are
+   found and the encoder is named. Browse opens where the box points. Point it
+   at nothing and the download page is offered.
+5. Cadence: enter 900. Refused, saying a day of that produces no video, which
+   is the failure that is otherwise silent for ever.
+6. Cameras: add one named `NUL`, one named `Roof Top!`, and a duplicate of an
+   existing name. Refused, corrected with a warning, refused. **Pick each
+   camera type in turn:** an address field for the presets and a URL field for
+   Custom, with username and password appearing for the makes that need them
+   and staying *above* the buttons. Reolink says the password goes in the URL.
+   Test reaches a real camera and says "Test successful".
+7. **Edit an existing camera.** It opens on Custom showing the stored URL, with
+   its username, password and smoothing filled in, and saving keeps any
+   per-camera cadence it had.
+8. Transfer: type a local folder, then a UNC path. Username and password appear
+   only for the UNC one, and *above* the Test button. Test says which account
+   it proved, and warns when that account is not the one that runs nightly.
+9. Notifications: fill in one service and press its Send a test message. The
+   message arrives. Leaving all three empty is allowed and says so.
+10. Review: no password and no webhook URL anywhere on it. Finish writes the
+    config, backs up the previous one, and restarts the services.
+11. **Run the checks from the completion dialog.** The pre-flight output
+    appears in a window. Nothing in the wizard should ever tell the operator to
+    open a prompt and type a command.
+12. Run it again with that config present. Every page opens on the saved
+    answers rather than on defaults.
 
-Steps 5 and 6 are the ones worth repeating after any change: they are where the
-GUI has to agree with the console wizard, and where disagreeing would be
-invisible until an install fails.
+Steps 6, 7 and 8 are the ones worth repeating after any change: they are where
+the GUI has to agree with the console wizard, and where disagreeing stays
+invisible until an install fails. Ten of the defects in the first operator run
+were in this list's territory, and none of them was reachable by a unit test.
 
 `test_web.py` drives the real handler through a fake socket rather than binding
 a port: a listening socket in a unit test is a flake waiting for a busy CI
@@ -2850,7 +2865,7 @@ scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
 scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 946 lines
+scripts/timelapse_gui.py         the same wizard in a window, 1376 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2078 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
