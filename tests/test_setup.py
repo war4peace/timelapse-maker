@@ -3486,13 +3486,15 @@ class TestSummarySinks(unittest.TestCase):
     def test_the_new_sinks_are_named(self):
         cfg = {"notify": [{"type": "ntfy", "enabled": True, "topic": "x"},
                           {"type": "telegram", "enabled": True, "token": "t"}]}
-        self.assertEqual(setup.summarise_sinks(cfg), "ntfy, telegram")
+        # As each service spells itself. "ntfy" keeps its lower case, which is
+        # the product's name rather than a missing capital.
+        self.assertEqual(setup.summarise_sinks(cfg), "ntfy, Telegram")
 
     def test_a_disabled_sink_is_not_named(self):
         cfg = {"notify": [{"type": "ntfy", "enabled": False},
                           {"type": "discord", "enabled": True,
                            "webhook_url": "u"}]}
-        self.assertEqual(setup.summarise_sinks(cfg), "discord")
+        self.assertEqual(setup.summarise_sinks(cfg), "Discord")
 
     def test_nothing_configured_says_disabled(self):
         self.assertEqual(setup.summarise_sinks({"notify": []}), "disabled")
@@ -3501,7 +3503,7 @@ class TestSummarySinks(unittest.TestCase):
     def test_the_legacy_block_still_shows(self):
         # Every config written before 0.1.6 has one, and upgrades keep it.
         cfg = {"discord": {"enabled": True, "webhook_url": "https://x/y"}}
-        self.assertEqual(setup.summarise_sinks(cfg), "discord")
+        self.assertEqual(setup.summarise_sinks(cfg), "Discord")
 
     def test_it_prints_no_credential(self):
         """A webhook URL is the authority to post, exactly as a bot token is,

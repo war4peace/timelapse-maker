@@ -1904,6 +1904,11 @@ enable switch, smoothing, Test and Save. Four things about it are deliberate:
 - **`exportselection=False` on the Listbox.** Without it, clicking into any
   Entry on the right hands over the X selection and the list silently
   unhighlights the camera being edited.
+- **Each verdict sits beside the button that produced it**, Test on the left
+  and Save on the right, and switching camera clears both. One shared line at
+  the bottom made "Saved." and "Test successful." interchangeable, and a
+  verdict left over from the previous row would be read as being about this
+  one. The transfer page's Test does the same.
 - **Leaving an edited camera asks first.** `form_is_dirty()` compares the pane
   against what was loaded into it, because a typed password is the one thing
   here that cannot be recovered by looking at the config. Discarding an entry
@@ -2675,8 +2680,9 @@ into it.
     message arrives. Leaving all three empty is allowed and says so. **All
     three services must be visible without resizing the window**, along with
     the Next button.
-11. Review: no password and no webhook URL anywhere on it. Finish writes the
-    config, backs up the previous one, and restarts the services.
+11. Summary: no password and no webhook URL anywhere on it. The Video row
+    names the encoder this machine chose and the quality it will use. Finish
+    writes the config, backs up the previous one, and restarts the services.
 12. **Run the checks from the completion dialog.** The pre-flight output
     appears in a window. Nothing in the wizard should ever tell the operator to
     open a prompt and type a command.
@@ -2966,7 +2972,7 @@ scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
 scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 1729 lines
+scripts/timelapse_gui.py         the same wizard in a window, 1784 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines

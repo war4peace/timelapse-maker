@@ -599,7 +599,32 @@ def preflight(cfg):
     return problems
 
 
-def summary_lines(cfg):
+def encoder_details(cfg, codec):
+    """How the video will be encoded: "hevc_nvenc, cq 24, preset p6".
+
+    Read out of the argument list the encoder is actually built with rather
+    than restated here, so a change to a preset or a quality setting cannot
+    leave this panel describing an older one. The codec comes from the ffmpeg
+    check on the first page, which is the same probe the nightly run makes.
+    """
+    from timelapse_encode import build_candidates
+
+    if not codec:
+        return ""
+    for candidate in build_candidates(cfg.get("encode", {})):
+        if candidate["codec"] != codec:
+            continue
+        args = candidate["args"]
+        bits = [codec]
+        for flag, label in (("-cq", "cq"), ("-crf", "crf"),
+                            ("-preset", "preset")):
+            if flag in args:
+                bits.append("%s %s" % (label, args[args.index(flag) + 1]))
+        return ", ".join(bits)
+    return codec
+
+
+def summary_lines(cfg, codec=None):
     """(label, value) pairs for the review page. Names, never secrets.
 
     The same rule summarise() had to learn: a webhook URL is the authority to
@@ -620,8 +645,10 @@ def summary_lines(cfg):
         ("ffmpeg", paths.get("ffmpeg", "")),
         ("Cadence", f"one frame every {interval}s"
                     f" ({int(86400 / interval)} a day)" if interval else ""),
-        ("Video", f"{enc.get('framerate', 0)} fps, "
-                  f"{enc.get('container', 'mkv')}"),
+        ("Video", ", ".join(x for x in
+                            (f"{enc.get('framerate', 0)} fps",
+                             enc.get("container", "mkv"),
+                             encoder_details(cfg, codec)) if x)),
         ("Cameras", ", ".join(c.get("name", "?") for c in cams) or "none"),
     ]
     if t.get("enabled"):
@@ -684,6 +711,11 @@ def run(config_path=None, existing=None):
             self.cfg = existing or setup.default_config()
             setup.localise_locations(self.cfg)
             self.written = False
+            # Which encoder this machine will actually use. Found by the
+            # ffmpeg check on the first page, and carried rather than stored:
+            # it is a property of the box, not a setting, and the nightly run
+            # probes for it again anyway.
+            self.codec = None
 
             self.header = ttk.Label(self, text="", font=("Segoe UI", 14, "bold"))
             self.header.pack(anchor="w", padx=16, pady=(14, 0))
@@ -839,7 +871,7 @@ def run(config_path=None, existing=None):
             bar.pack(fill="x", pady=(10, 0))
             ttk.Button(bar, text="Cancel",
                        command=box.destroy).pack(side="right")
-            ttk.Button(bar, text="Use this one",
+            ttk.Button(bar, text="Select network share",
                        command=choose).pack(side="right", padx=(0, 8))
 
         # -- pages -------------------------------------------------------
@@ -867,7 +899,7 @@ def run(config_path=None, existing=None):
             store = ttk.LabelFrame(self.body, text="Storage", padding=8)
             store.pack(fill="x")
             current = self.cfg["paths"].get("frames_root", "")
-            folder, row = self.field(store, "Folder",
+            folder, row = self.field(store, "Data folder",
                                      str(Path(current).parent)
                                      if current else "", width=46,
                                      label_width=LABELS)
@@ -994,6 +1026,7 @@ def run(config_path=None, existing=None):
                 self.cfg["paths"]["ffmpeg"] = ffmpeg
                 if ffprobe:
                     self.cfg["paths"]["ffprobe"] = ffprobe
+                self.codec = _codec
                 cap["interval_seconds"] = interval
                 # The fetch timeout must stay under the interval, or a slow
                 # camera's request outlives the tick that asked for it.
@@ -1100,6 +1133,10 @@ def run(config_path=None, existing=None):
             count.pack(side="left", padx=6)
             ttk.Label(smooth_bar, text="frames").pack(side="left")
 
+            # Three message labels, not one, and which one is used says where
+            # the answer came from. A verdict beside the button that produced
+            # it needs no reading to be attributed; one shared line at the
+            # bottom made "Saved." and "Test successful." look interchangeable.
             note = ttk.Label(right, text="", wraplength=380, justify="left")
             note.grid(row=place[0], column=0, columnspan=2, sticky="w",
                       pady=(10, 0))
@@ -1110,6 +1147,9 @@ def run(config_path=None, existing=None):
             bar = ttk.Frame(right)
             bar.grid(row=place[0], column=0, columnspan=2, sticky="we",
                      pady=(10, 0))
+            tested = ttk.Label(bar, text="", wraplength=250, justify="left")
+            saved = ttk.Label(bar, text="", wraplength=250, justify="right",
+                              anchor="e")
 
             def index_of(cam):
                 for n, other in enumerate(cams):
@@ -1160,6 +1200,11 @@ def run(config_path=None, existing=None):
                 for widget in bar.winfo_children():
                     widget.state(["!disabled"] if cam else ["disabled"])
                 remover.state(["!disabled"] if cam else ["disabled"])
+                # Both verdicts belong to the camera that was showing, so they
+                # go with it. A "Test successful." left over from the previous
+                # row would be read as being about this one.
+                self.say(tested, OK, "")
+                self.say(saved, OK, "")
                 # After fill(), never before: filling runs refresh(), which
                 # owns the note and would wipe anything written first.
                 fill(camera_form_values(cam))
@@ -1186,10 +1231,11 @@ def run(config_path=None, existing=None):
                 if cam is None:
                     return True
                 values = form_values()
+                self.say(tested, OK, "")
                 level, message, frames = check_smoothing(
                     values["smoothing"] if values["smoothing_on"] else "")
                 if level == FAIL:
-                    self.say(note, FAIL, message)
+                    self.say(saved, FAIL, message)
                     return False
                 fields = {"name": values["name"],
                           "preset": preset_named(values["type"]),
@@ -1202,7 +1248,7 @@ def run(config_path=None, existing=None):
                           .startswith("rtsp://") else "http"}
                 level, message, built = build_camera(fields, cams, cam)
                 if level == FAIL:
-                    self.say(note, FAIL, message)
+                    self.say(saved, FAIL, message)
                     return False
                 cam.clear()
                 cam.update(built)
@@ -1212,7 +1258,7 @@ def run(config_path=None, existing=None):
                 name.set(built["name"])
                 state["loaded"] = form_values()
                 redraw()
-                self.say(note, level if message else OK,
+                self.say(saved, level if message else OK,
                          message or "Saved.")
                 return True
 
@@ -1233,8 +1279,9 @@ def run(config_path=None, existing=None):
                           "method": "rtsp" if values["url"].lower()
                           .startswith("rtsp://") else "http"}
                 level, message, built = build_camera(fields, cams, cam)
+                self.say(saved, OK, "")
                 if level == FAIL:
-                    return self.say(note, FAIL, message)
+                    return self.say(tested, FAIL, message)
                 self.config(cursor="watch")
                 self.update_idletasks()
                 try:
@@ -1243,7 +1290,7 @@ def run(config_path=None, existing=None):
                             else setup.test_camera(built, self.cfg))
                 finally:
                     self.config(cursor="")
-                self.say(note, OK if good else FAIL,
+                self.say(tested, OK if good else FAIL,
                          "Test successful." if good else
                          "No usable image came back. Check the address, and "
                          "the username and password.")
@@ -1319,7 +1366,9 @@ def run(config_path=None, existing=None):
                                  width=11)
             remover.pack(side="right")
             ttk.Button(bar, text="Test", command=test).pack(side="left")
+            tested.pack(side="left", padx=(8, 0))
             ttk.Button(bar, text="Save", command=save).pack(side="right")
+            saved.pack(side="right", padx=(0, 8))
 
             kind.trace_add("write", refresh)
             smooth_on.trace_add("write", refresh)
@@ -1350,7 +1399,7 @@ def run(config_path=None, existing=None):
 
         def page_transfer(self):
             self.heading(
-                "Send finished videos somewhere?",
+                "Timelapses destination",
                 "A folder on this machine, or a network path such as "
                 "\\\\tower\\videos. Leave this off to keep them locally.")
             t = self.cfg.setdefault("transfer", {})
@@ -1384,9 +1433,14 @@ def run(config_path=None, existing=None):
             user, _ = self.field(creds, "Share username", t.get("username", ""))
             password, _ = self.field(creds, "Share password",
                                      t.get("password", ""), secret=True)
-            tester = ttk.Button(self.body, text="Test the destination")
-            tester.pack(anchor="w", pady=(8, 0))
-            result = self.status(self.body)
+            # The button and its verdict on one row, so the answer sits
+            # against the thing that produced it rather than under it.
+            bar = ttk.Frame(self.body)
+            bar.pack(fill="x", pady=(8, 0))
+            tester = ttk.Button(bar, text="Test the destination")
+            tester.pack(side="left")
+            result = ttk.Label(bar, text="", wraplength=520, justify="left")
+            result.pack(side="left", padx=(8, 0))
 
             def refresh(*_a):
                 level, message, stored = check_destination(dest.get())
@@ -1395,7 +1449,7 @@ def run(config_path=None, existing=None):
                 advice.config(text=credentials_advice(stored or dest.get())
                               if needs else "")
                 if needs:
-                    creds.pack(fill="x", pady=(6, 0), before=tester)
+                    creds.pack(fill="x", pady=(6, 0), before=bar)
                 else:
                     creds.pack_forget()
 
@@ -1548,7 +1602,7 @@ def run(config_path=None, existing=None):
             self.commit = commit
 
         def page_review(self):
-            self.heading("Ready to save",
+            self.heading("Summary",
                          f"This writes {config_path} and creates the folders. "
                          f"The previous configuration is backed up first.")
             problems = preflight(self.cfg)
@@ -1560,7 +1614,8 @@ def run(config_path=None, existing=None):
 
             grid = ttk.Frame(self.body)
             grid.pack(fill="both", expand=True)
-            for rown, (label, value) in enumerate(summary_lines(self.cfg)):
+            for rown, (label, value) in enumerate(
+                    summary_lines(self.cfg, self.codec)):
                 ttk.Label(grid, text=label, width=14,
                           font=("Segoe UI", 9, "bold")).grid(row=rown, column=0,
                                                              sticky="nw", pady=2)

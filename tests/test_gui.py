@@ -758,6 +758,54 @@ class TestReview(unittest.TestCase):
         self.assertIn("war", text, "the account name is the useful half")
         self.assertIn("discord", text.lower())
 
+    def test_the_video_row_names_the_encoder_and_its_quality(self):
+        """Which is the difference between a 300 MB day and a 900 MB one.
+
+        The encoder is a property of the machine rather than of the config,
+        found by the ffmpeg check on the first page, so it is passed in.
+        """
+        rows = dict(gui.summary_lines(self.config(), codec="hevc_nvenc"))
+        self.assertIn("60 fps", rows["Video"])
+        self.assertIn("hevc_nvenc", rows["Video"])
+        self.assertIn("cq 24", rows["Video"])
+
+    def test_the_video_row_still_reads_without_one(self):
+        # Nothing has probed yet, and a row saying "None" would be worse than
+        # a row that simply does not mention it.
+        rows = dict(gui.summary_lines(self.config()))
+        self.assertIn("60 fps", rows["Video"])
+        self.assertNotIn("nvenc", rows["Video"])
+
+    def test_the_quality_comes_from_the_arguments_that_will_run(self):
+        """Not restated here, or this panel would describe an older setting.
+
+        Same rule as try_rsync_args(): the description lives beside the code
+        it describes, so the two cannot disagree.
+        """
+        cfg = self.config()
+        cfg["encode"].update({"av1_cq": 31, "av1_preset": "p4"})
+        detail = gui.encoder_details(cfg, "av1_nvenc")
+        self.assertIn("cq 31", detail)
+        self.assertIn("preset p4", detail)
+
+    def test_the_cpu_fallback_reports_a_crf(self):
+        detail = gui.encoder_details(self.config(), "libx264")
+        self.assertIn("libx264", detail)
+        self.assertIn("crf 20", detail)
+
+    def test_an_unrecognised_encoder_is_still_named(self):
+        # Whatever it is, saying its name beats saying nothing.
+        self.assertEqual(gui.encoder_details(self.config(), "vp9_qsv"),
+                         "vp9_qsv")
+        self.assertEqual(gui.encoder_details(self.config(), None), "")
+
+    def test_the_notification_row_spells_each_service_properly(self):
+        cfg = self.config()
+        cfg["notify"] = [{"type": "discord", "enabled": True,
+                          "webhook_url": "https://x/y"}]
+        rows = dict(gui.summary_lines(cfg))
+        self.assertEqual(rows["Notifications"], "Discord")
+
     def test_the_summary_says_what_off_means_rather_than_just_off(self):
         text = dict(gui.summary_lines(self.config()))["Transfer"]
         self.assertIn("videos folder", text)

@@ -3418,6 +3418,11 @@ def web_writable_paths(cfg):
     return [str(PurePosixPath(state or LINUX_WEB_STATE_DIR))]
 
 
+# How each service spells its own name. "ntfy" is lower case deliberately;
+# it is the product's name, not a missing capital.
+SINK_NAMES = {"discord": "Discord", "ntfy": "ntfy", "telegram": "Telegram"}
+
+
 def summarise_sinks(cfg):
     """Which notification sinks are on, by name. "disabled" when none is.
 
@@ -3428,7 +3433,8 @@ def summarise_sinks(cfg):
     from timelapse_encode import notify_sinks
 
     kinds = [(s.get("type") or "discord").lower() for s in notify_sinks(cfg)]
-    return ", ".join(kinds) if kinds else "disabled"
+    return ", ".join(SINK_NAMES.get(k, k) for k in kinds) if kinds \
+        else "disabled"
 
 
 def summarise(cfg, out_path):

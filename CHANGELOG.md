@@ -39,6 +39,12 @@ While the version is `0.x`, the configuration format may change in any release.
   one page for the same reason, since each was a single question with a window
   to itself.
 
+  **The summary names the encoder your machine will actually use**, and the
+  quality setting that goes with it, which is the difference between a 300 MB
+  day and a 900 MB one. It is read from the arguments the nightly run will be
+  given rather than described separately, so it cannot end up describing an
+  older setting.
+
   **No command prompt windows flash up while it works.** Testing ffmpeg used to
   blink a run of them across the screen, which looks like something left in by
   mistake. They came from Windows, not from ffmpeg: a program with no console
