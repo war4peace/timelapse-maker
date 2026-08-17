@@ -901,6 +901,28 @@ def run(config_path=None, existing=None):
     return 0 if app.written else 1
 
 
+def warn_not_elevated(config_path):
+    """Say so in a box, or on the terminal if there is no display.
+
+    Its own function so that main() stays callable from a test. Inlined, the
+    non-elevated path would open a real modal dialog during the suite and wait
+    for somebody to click it, which is a hang rather than a failure.
+    """
+    try:
+        import tkinter
+        from tkinter import messagebox
+        root = tkinter.Tk()
+        root.withdraw()
+        messagebox.showerror(
+            "Administrator needed",
+            "Setup writes to %s, which needs an Administrator prompt.\n\n"
+            "Close this, right-click the shortcut and choose Run as "
+            "administrator." % config_path)
+        root.destroy()
+    except Exception:                                       # noqa: BLE001
+        print(elevation_hint())
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if "--version" in argv:
@@ -917,6 +939,7 @@ def main(argv=None):
     # Positional, matching every script here except the wizard, which is what
     # the dispatcher already passes for anything that is not timelapse_setup.
     positional = [a for a in argv if not a.startswith("-")]
+    config_path = positional[0] if positional else CONFIG_PATH
     existing = setup.load_existing_config(config_path) \
         if os.path.exists(config_path) else None
 
@@ -924,19 +947,7 @@ def main(argv=None):
         # Said before any questions rather than at the save, because thirty
         # answers and then "you cannot write that" is the worst possible
         # moment to find out.
-        try:
-            import tkinter
-            from tkinter import messagebox
-            root = tkinter.Tk()
-            root.withdraw()
-            messagebox.showerror(
-                "Administrator needed",
-                "Setup writes to %s, which needs an Administrator prompt.\n\n"
-                "Close this, right-click the shortcut and choose Run as "
-                "administrator." % config_path)
-            root.destroy()
-        except Exception:                                   # noqa: BLE001
-            print(elevation_hint())
+        warn_not_elevated(config_path)
         return 1
 
     return run(config_path, existing)

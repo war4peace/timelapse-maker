@@ -227,9 +227,18 @@ function New-StartMenuShortcut {
         New-Item -ItemType Directory -Force -Path $menu | Out-Null
         $shell = New-Object -ComObject WScript.Shell
         $link = $shell.CreateShortcut((Join-Path $menu 'Timelapse Setup.lnk'))
-        $link.TargetPath = Join-Path $Prefix 'timelapse-setup.cmd'
+        # PowerShell directly, NOT timelapse-setup.cmd. A shortcut to a .cmd
+        # opens a console window and leaves it there, so the graphical wizard
+        # announces itself with a terminal, which is the one thing it exists to
+        # spare the operator. Reported from a real install: "running Timelapse
+        # Setup displays a CLI". The .cmd stays for double-clicking in
+        # Explorer, where a console is expected anyway.
+        $link.TargetPath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+        $link.Arguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden ' +
+                          "-File `"$(Join-Path $Prefix 'setup-gui.ps1')`""
         $link.WorkingDirectory = $Prefix
         $link.Description = 'Configure timelapse-maker'
+        $link.WindowStyle = 7
         $link.Save()
         Ok 'Start menu -> timelapse-maker \ Timelapse Setup'
     } catch {
@@ -417,9 +426,12 @@ if (Test-Path $CONFIG) {
     # New keys arrive with defaults, so an untouched config keeps working, and
     # config.example.json above was refreshed so the new ones can be read.
     Note "Keeping the existing configuration at $CONFIG"
-    Note 'To change it:  timelapse setup   (or: timelapse cameras)'
+    Note 'To change it, either:'
+    Note '  Start menu -> timelapse-maker -> Timelapse Setup   (a window)'
+    Note '  timelapse setup   (or: timelapse cameras)          (a prompt)'
 } elseif ($NoWizard) {
     Note 'Skipped. Configure it with:  timelapse setup'
+    Note 'or from the Start menu: timelapse-maker -> Timelapse Setup'
 } else {
     # Not $args: that is an automatic variable in PowerShell, and assigning to
     # it works at script scope and quietly does not inside a function, which is
@@ -443,6 +455,10 @@ Step 'Next steps'
 # commands named here read the configuration file that holds the camera
 # passwords and refuse without it. Telling somebody to open a terminal and then
 # watching them be refused is a worse first five minutes than saying so.
+Say 'To change the settings without a prompt at all:'
+Say '  Start menu -> timelapse-maker -> Timelapse Setup'
+Note 'The same questions in a window. It asks for Administrator itself.'
+Write-Host ''
 Say 'Open a NEW Command Prompt or PowerShell, AS ADMINISTRATOR, then:'
 Say '  timelapse test        check the cameras, ffmpeg and the disk'
 Say '  timelapse cameras     add or edit a camera'

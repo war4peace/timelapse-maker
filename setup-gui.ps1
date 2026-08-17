@@ -88,10 +88,14 @@ $admin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 
 if (-not $admin -and -not $NoElevate) {
     $self = $MyInvocation.MyCommand.Path
-    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$self`"",
-                   '-Prefix', "`"$Prefix`"")
+    $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+                   '-File', "`"$self`"", '-Prefix', "`"$Prefix`"")
     try {
-        Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -Verb RunAs
+        # Hidden, or the elevated relaunch puts a console window on screen in
+        # front of the wizard, which is the thing this whole entry point exists
+        # to avoid: an operator who wanted to click sees a terminal instead.
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments `
+                      -Verb RunAs -WindowStyle Hidden
     } catch {
         Show-Problem ("Setup needs Administrator rights and the prompt was refused." +
                       [Environment]::NewLine + [Environment]::NewLine +
@@ -107,5 +111,32 @@ if (-not $admin -and -not $NoElevate) {
 $quiet = Join-Path (Split-Path $python -Parent) 'pythonw.exe'
 if (-not (Test-Path $quiet)) { $quiet = $python }
 
-& $quiet $gui
-exit $LASTEXITCODE
+# stderr goes to a file, and that is not tidiness. pythonw.exe has no console
+# at all, so anything that fails before the window opens is discarded and the
+# operator sees precisely nothing happen: the same class of trap as a service
+# writing to a stderr that goes nowhere. A NameError in the wizard's entry
+# point shipped exactly this way and was invisible until it was run with
+# python.exe instead.
+$errlog = Join-Path $env:TEMP 'timelapse-setup-error.log'
+if (Test-Path $errlog) { Remove-Item $errlog -Force -ErrorAction SilentlyContinue }
+
+$proc = Start-Process -FilePath $quiet -ArgumentList "`"$gui`"" `
+                      -Wait -PassThru -WindowStyle Hidden `
+                      -RedirectStandardError $errlog
+
+$detail = ''
+if (Test-Path $errlog) { $detail = (Get-Content $errlog -Raw) }
+
+# Keyed on there being output rather than on the exit code: exit 1 is also what
+# closing the wizard without saving reports, and a message box every time
+# somebody clicks Cancel would be worse than none.
+if ($detail -and $detail.Trim()) {
+    $lines = $detail.Trim() -split "`r?`n"
+    $tail = ($lines | Select-Object -Last 6) -join [Environment]::NewLine
+    Show-Problem ("The setup wizard stopped before it could finish." +
+                  [Environment]::NewLine + [Environment]::NewLine + $tail +
+                  [Environment]::NewLine + [Environment]::NewLine +
+                  "The full text is in:" + [Environment]::NewLine + $errlog)
+}
+
+exit $proc.ExitCode

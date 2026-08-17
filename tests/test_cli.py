@@ -367,6 +367,52 @@ class TestSetupLauncher(unittest.TestCase):
         # the developer's machine and nowhere else.
         self.assertIn("%~dp0", self.CMD)
 
+    def test_it_reports_a_failure_that_pythonw_would_swallow(self):
+        """pythonw.exe has no console, so anything failing before the window
+
+        opens is discarded and the operator sees nothing happen at all. A
+        NameError in the wizard's entry point shipped exactly that way.
+        Redirecting stderr and showing it is what makes the next one visible.
+        """
+        code = self.code_only(self.SOURCE)
+        self.assertIn("RedirectStandardError", code)
+        self.assertIn("Show-Problem", code.split("RedirectStandardError")[1])
+
+    def test_it_does_not_nag_on_a_plain_cancel(self):
+        # Closing the wizard without saving also exits non-zero, so the error
+        # box has to key on there being output rather than on the exit code.
+        code = self.code_only(self.SOURCE)
+        self.assertIn("$detail.Trim()", code)
+
+
+class TestSetupShortcut(unittest.TestCase):
+    """The Start menu entry must not open a console.
+
+    Reported from a real install: "running Timelapse Setup displays a CLI".
+    A shortcut whose target is a .cmd opens a console window and keeps it
+    there, so the graphical wizard announced itself with a terminal, which is
+    the single thing it exists to spare the operator.
+    """
+
+    SOURCE = (ROOT / "install.ps1").read_text(encoding="ascii")
+
+    def block(self):
+        body = self.SOURCE.split("function New-StartMenuShortcut", 1)[1]
+        return body.split("\nfunction ", 1)[0]
+
+    def test_the_shortcut_does_not_target_the_batch_file(self):
+        block = self.block()
+        self.assertIn("TargetPath", block, "the scan found no shortcut code")
+        target = [line for line in block.splitlines()
+                  if ".TargetPath" in line][0]
+        self.assertNotIn(".cmd", target)
+
+    def test_it_launches_powershell_with_the_window_hidden(self):
+        block = self.block()
+        self.assertIn("powershell.exe", block)
+        self.assertIn("WindowStyle Hidden", block)
+        self.assertIn("setup-gui.ps1", block)
+
 
 class TestInstallerText(unittest.TestCase):
     """install.ps1's encoding and its file list, which no unit test can run.

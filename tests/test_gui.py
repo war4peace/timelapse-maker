@@ -43,9 +43,23 @@ class TestNoDisplayNeeded(unittest.TestCase):
             self.assertFalse(any(n.split(".")[0] == "tkinter" for n in names),
                              "tkinter must be imported inside a function")
 
-    def test_importing_it_did_not_pull_tkinter_in(self):
+    def test_importing_it_does_not_pull_tkinter_in(self):
+        """Measured in a fresh interpreter, not by inspecting sys.modules here.
+
+        The first version asserted against this process's sys.modules and so
+        depended on test *order*: any earlier test that reached the message-box
+        path imported tkinter, and this then failed for a reason that had
+        nothing to do with the property being claimed.
+        """
+        import subprocess
         import sys
-        self.assertNotIn("tkinter", sys.modules)
+
+        code = ("import sys; sys.path.insert(0, %r); import timelapse_gui; "
+                "print('tkinter' in sys.modules)" % str(_support.SCRIPTS))
+        out = subprocess.run([sys.executable, "-c", code],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "False", out.stdout)
 
 
 class TestDecideLayerIsSeparate(unittest.TestCase):
@@ -382,6 +396,93 @@ class TestFfmpegCheck(unittest.TestCase):
         self.assertEqual(len(lines), 1)
         self.assertIn("av1_nvenc", lines[0])
         self.assertIn("too old", lines[0])
+
+
+class TestEntryPoint(unittest.TestCase):
+    """main() itself, which is the part that had no coverage and broke.
+
+    The decide/show split made every *rule* testable and left the glue between
+    them untested, so an editing slip removed the line that sets config_path
+    and every test still passed: the off-Windows test returns before reaching
+    it, and nothing else called main() on the Windows path. It failed with a
+    NameError at the entry point, and under pythonw.exe, where stderr goes
+    nowhere, it failed **silently**.
+
+    The lesson is not "add a test for this line". It is that a wiring function
+    with no branches worth testing still has to be *executed* by something.
+    """
+
+    def drive(self, argv, elevated=True, exists=False):
+        seen = {}
+
+        def fake_run(config_path=None, existing=None):
+            seen["config"] = config_path
+            seen["existing"] = existing
+            return 0
+
+        with mock.patch.object(gui, "IS_WINDOWS", True), \
+             mock.patch.object(gui, "is_elevated", return_value=elevated), \
+             mock.patch.object(gui.os.path, "exists", return_value=exists), \
+             mock.patch.object(setup, "load_existing_config",
+                               return_value={"cameras": []}), \
+             mock.patch.object(gui, "run", side_effect=fake_run):
+            code = gui.main(argv)
+        return code, seen
+
+    def test_it_reaches_the_window_with_the_default_config_path(self):
+        code, seen = self.drive([])
+        self.assertEqual(code, 0)
+        self.assertEqual(seen["config"], gui.CONFIG_PATH)
+
+    def test_a_config_path_can_be_passed_positionally(self):
+        # What the dispatcher hands every script that is not timelapse_setup.
+        _code, seen = self.drive(["C:\\somewhere\\config.json"])
+        self.assertEqual(seen["config"], "C:\\somewhere\\config.json")
+
+    def test_flags_are_not_mistaken_for_the_config_path(self):
+        _code, seen = self.drive(["--whatever"])
+        self.assertEqual(seen["config"], gui.CONFIG_PATH)
+
+    def test_an_existing_config_is_loaded_rather_than_defaulted(self):
+        """Reconfiguring must open on the saved answers.
+
+        Opening on defaults would look like it worked and quietly propose
+        replacing every setting the operator already has.
+        """
+        _code, seen = self.drive([], exists=True)
+        self.assertEqual(seen["existing"], {"cameras": []})
+
+    def test_a_fresh_install_starts_from_defaults(self):
+        _code, seen = self.drive([], exists=False)
+        self.assertIsNone(seen["existing"])
+
+    def test_it_refuses_before_asking_anything_when_not_elevated(self):
+        """Thirty answers and then "you cannot write that" is the worst moment
+
+        to find out, so the check comes before the window. warn_not_elevated is
+        patched rather than allowed to run: unpatched it opens a real modal
+        dialog and waits for a click, which hangs the suite rather than
+        failing it.
+        """
+        told = []
+        with mock.patch.object(gui, "IS_WINDOWS", True), \
+             mock.patch.object(gui, "is_elevated", return_value=False), \
+             mock.patch.object(gui.os.path, "exists", return_value=False), \
+             mock.patch.object(gui, "warn_not_elevated", told.append), \
+             mock.patch.object(gui, "run",
+                               side_effect=AssertionError("opened anyway")):
+            code = gui.main([])
+        self.assertEqual(code, 1)
+        self.assertEqual(told, [gui.CONFIG_PATH],
+                         "the message must name the file it cannot write")
+
+    def test_the_version_flag_answers_without_a_display(self):
+        import contextlib
+        import io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(gui.main(["--version"]), 0)
+        self.assertIn(gui.__version__, buf.getvalue())
 
 
 class TestItRefusesOffWindows(unittest.TestCase):
