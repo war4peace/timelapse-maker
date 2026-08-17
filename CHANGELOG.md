@@ -38,6 +38,14 @@ While the version is `0.x`, the configuration format may change in any release.
   round trip through a dialog. Storage, ffmpeg and the capture cadence share
   one page for the same reason, since each was a single question with a window
   to itself.
+
+  **The destination page lists your mapped network drives.** Setup runs as
+  Administrator, and drive mappings belong to the account that made them, so
+  Windows' own folder browser shows this program only the local disks: it would
+  have been asking you to browse for a share that was not in the list. Press
+  Network instead and every drive you have mapped is there with the address it
+  really points at, which is the address that gets saved, because a drive
+  letter means nothing to the nightly encode.
 - **Finished videos are moved to their destination on Windows.** **Nothing
   changes on a Linux install**, which still uses rsync. The destination can be
   a folder on this machine or a network path such as `\\tower\videos\timelapse`;

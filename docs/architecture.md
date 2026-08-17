@@ -1536,7 +1536,7 @@ different name:
 | is this name usable as a filename | `is_reserved_name()`, `same_file_name()` |
 | how a log file is kept | `log_handler()`, `DailyFileHandler` |
 | which disks could hold frames | `scan_filesystems()`, `os_disk_mount()` |
-| is this path really on the network | `network_path()`, `unc_for_drive()` |
+| is this path really on the network | `network_path()`, `unc_for_drive()`, `mapped_drives()` |
 | where ffmpeg might be | `find_tool()`, `resolve_tool()` |
 
 Four properties are load-bearing.
@@ -1916,6 +1916,26 @@ what does not fit, silently and only on screen, so this has been reported twice
 from real runs: "Discord webhook UR..." and "Seconds between fram". A test now
 reads the label literals out of the source and measures them, since nothing
 else here can see the difference.
+
+**The destination page offers the mapped drives itself**, next to Browse,
+because Windows' own folder browser is shown by *this* process and this process
+is elevated. It therefore lists the local disks and no network drives at all,
+and the operator is invited to browse for the share they use every day while it
+is not in the list: the drive-letter trap in its third disguise, after the
+config that stored `U:\TL` verbatim and the check that could not see the
+mapping either. `mapped_drives()` reads `HKCU\Network`, which survives
+elevation because the split token is still the same user, and the picker puts
+the **UNC** in the box before continuing into the ordinary folder dialog
+rooted there. A letter is never stored: it belongs to one logon session and the
+nightly encode has its own.
+
+**The notification page fits, and had to be made to.** Three services, each
+with a switch, an explanation, up to three fields, a Test button and a verdict,
+ran off the bottom of the window with no way to scroll, which reads as there
+being no way forward. The switch and the explanation share a line, and the
+verdict sits beside the button rather than above it: that row was blank until
+the button was pressed, so it read as three unexplained gaps. Anything added
+here has to be measured against the window rather than assumed to fit.
 
 **Getting one change right needed `detect_encoders()` to stop printing.** It
 used to write "could not run ffmpeg" to stdout itself and return `(None, [])`,
@@ -2576,8 +2596,9 @@ rule.
 
 That leaves the widget layer, which no automated test here reaches.
 `temp/gui_smoke.py` builds every page, walks the camera pane through every
-camera type, and then **presses Add, Save and Remove and checks the config
-list afterwards**, which catches the class of mistake unit tests structurally
+camera type, drives the network-share picker, and **presses Add, Save and
+Remove and checks the config list afterwards**, which catches the class of
+mistake unit tests structurally
 cannot: a widget method that does not exist, two geometry managers mixed in one
 container, a trace firing before the widget it writes to exists, a button wired
 to nothing. It asserts nothing about appearance. The rest is a click-through
@@ -2622,8 +2643,13 @@ into it.
 9. Transfer: type a local folder, then a UNC path. Username and password appear
    only for the UNC one, and *above* the Test button. Test says which account
    it proved, and warns when that account is not the one that runs nightly.
+   **Then press Network:** every drive the operator has mapped is listed with
+   where it really points, and picking one puts the UNC in the box and carries
+   on into the folder dialog there.
 10. Notifications: fill in one service and press its Send a test message. The
-    message arrives. Leaving all three empty is allowed and says so.
+    message arrives. Leaving all three empty is allowed and says so. **All
+    three services must be visible without resizing the window**, along with
+    the Next button.
 11. Review: no password and no webhook URL anywhere on it. Finish writes the
     config, backs up the previous one, and restarts the services.
 12. **Run the checks from the completion dialog.** The pre-flight output
@@ -2915,9 +2941,9 @@ scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
 scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 1614 lines
+scripts/timelapse_gui.py         the same wizard in a window, 1733 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_platform.py    the only platform branch, 2078 lines
+scripts/timelapse_platform.py    the only platform branch, 2120 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes

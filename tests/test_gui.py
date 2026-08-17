@@ -303,6 +303,26 @@ class TestDestination(unittest.TestCase):
             level, _m, stored = gui.check_destination("D:\\videos")
         self.assertEqual((level, stored), (gui.OK, "D:\\videos"))
 
+    def test_the_network_picker_offers_the_letter_and_the_target(self):
+        """The letter is what the operator recognises; the UNC is what is kept.
+
+        The picker exists because the folder browser is shown by an elevated
+        process, which has its own logon session and therefore none of the
+        operator's drive mappings in it: they browse for the share they use
+        daily and it is not in the list.
+        """
+        rows = gui.network_choices([("U:", "\\\\tower\\cctv"),
+                                    ("Z:", "\\\\tower\\media")])
+        self.assertEqual([unc for _label, unc in rows],
+                         ["\\\\tower\\cctv", "\\\\tower\\media"])
+        self.assertIn("U:", rows[0][0])
+        self.assertIn("\\\\tower\\cctv", rows[0][0])
+
+    def test_nothing_mapped_offers_nothing(self):
+        self.assertEqual(gui.network_choices([]), [])
+        # And says what to do instead, rather than an empty box with no reason.
+        self.assertIn("\\\\server\\share", gui.no_network_advice())
+
     def test_only_a_share_raises_the_account_question(self):
         self.assertTrue(gui.destination_needs_credentials("\\\\tower\\cctv"))
         self.assertFalse(gui.destination_needs_credentials("D:\\videos"))

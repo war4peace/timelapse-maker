@@ -1817,6 +1817,44 @@ def _mapped_in_registry(letter):
     return str(value) or None
 
 
+def mapped_drives():
+    """Every persistent drive mapping this user has, as sorted (letter, unc).
+
+    Enumerated from the registry rather than probed with `WNetGetConnectionW`,
+    for the reason unc_for_drive() sets out: an elevated process has its own
+    logon session and no mappings in it.
+
+    The consequence reaches further than the config check that rule was written
+    for, which is why this exists. **Windows' own folder browser is shown by
+    this process**, so it lists the local disks and no network drives at all,
+    and an operator whose destination is `U:\\TL` is being invited to browse
+    for something that is not there. Offering the list from here is the only
+    way that dialog can be pointed at a share the operator actually has.
+    """
+    if not IS_WINDOWS:
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    found = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Network") as key:
+            index = 0
+            while True:
+                try:
+                    letter = winreg.EnumKey(key, index)
+                except OSError:
+                    break
+                index += 1
+                target = _mapped_in_registry(letter)
+                if target:
+                    found.append((letter.upper() + ":", target))
+    except OSError:
+        return []
+    return sorted(found)
+
+
 def drive_is_local(path):
     """True for a fixed disk this session can see. None if there is no drive.
 
@@ -1987,7 +2025,11 @@ def disconnect_share(path):
 # asks, defaulting to whatever is already here, and verifies by running it.
 # ----------------------------------------------------------------------------
 
-FFMPEG_URL = "https://ffmpeg.org/download.html"
+# The Windows-builds anchor, not the page top: every caller of this says
+# "builds for Windows", and the top of that page is a source tarball and a set
+# of links to other platforms. The operator wants gyan.dev or BtbN, which is
+# what this section lists.
+FFMPEG_URL = "https://ffmpeg.org/download.html#build-windows"
 
 
 def _EXE():

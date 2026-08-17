@@ -1629,6 +1629,35 @@ class TestNetworkPath(unittest.TestCase):
                 self.assertEqual(called[0], "U:", given)
 
 
+class TestMappedDrives(unittest.TestCase):
+    """Enumerating what the operator has mapped, for the wizard's picker.
+
+    From the registry, not from WNetGetConnectionW, for the reason
+    unc_for_drive() sets out: the wizard runs elevated and an elevated process
+    has its own logon session with no mappings in it.
+    """
+
+    def test_it_declines_off_windows(self):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.assertEqual(plat.mapped_drives(), [])
+
+    def test_every_row_is_a_letter_and_a_target(self):
+        """Whatever this machine happens to have, including nothing.
+
+        Asserting the shape rather than the contents is the point: the
+        developer's box has seven mappings and a CI runner has none, and a
+        test whose result depends on that is a test that reports the machine
+        rather than the code.
+        """
+        for letter, unc in plat.mapped_drives():
+            self.assertRegex(letter, r"^[A-Z]:$")
+            self.assertTrue(unc, "a mapping with no target is not a mapping")
+
+    def test_it_is_sorted_by_letter(self):
+        rows = plat.mapped_drives()
+        self.assertEqual(rows, sorted(rows))
+
+
 class TestFindingTools(unittest.TestCase):
     """Where ffmpeg is, and what an operator is allowed to type."""
 

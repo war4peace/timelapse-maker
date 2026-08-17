@@ -536,6 +536,32 @@ def check_destination(dest):
     return OK, "", text
 
 
+def network_choices(drives=None):
+    """(label, unc) for every mapped drive, for the destination picker.
+
+    Windows' own folder browser is shown by *this* process, and this process is
+    elevated, so it lists the local disks and no network drives at all: the
+    operator is invited to browse for the share they use daily and it is not
+    there. Reported from a real run, and it is the drive-letter trap arriving
+    in a third disguise, after the config storing `U:\\TL` verbatim and the
+    check that could not see the mapping either.
+
+    The label carries the letter as well as the target, because the letter is
+    what the operator recognises and the UNC is what gets stored.
+    """
+    from timelapse_platform import mapped_drives
+
+    drives = mapped_drives() if drives is None else drives
+    return [("%s   %s" % (letter, unc), unc) for letter, unc in drives]
+
+
+def no_network_advice():
+    """What to say when the picker has nothing to offer."""
+    return ("No mapped network drives were found for your account. Type the "
+            "share as \\\\server\\share instead, which is what gets stored in "
+            "any case.")
+
+
 def destination_needs_credentials(dest):
     """True when the account question applies, which is UNC and only UNC."""
     return bool(is_unc(dest))
@@ -744,6 +770,21 @@ def run(config_path=None, existing=None):
             entry.pack(side="left", fill="x" if grow else None, expand=grow)
             return var, row
 
+        def link(self, parent, text, url):
+            """A label that opens a page, since a URL printed is a URL typed.
+
+            webbrowser is stdlib and imported here rather than at module
+            scope, on the same footing as every other import in this file that
+            only the window needs.
+            """
+            import webbrowser
+
+            label = ttk.Label(parent, text=text, foreground="#0b5cad",
+                              cursor="hand2", font=("Segoe UI", 9,
+                                                    "underline"))
+            label.bind("<Button-1>", lambda _e: webbrowser.open(url))
+            return label
+
         def browse_into(self, var, directory=True):
             # Opening where the box already points, which the first version did
             # not: it started wherever the dialog felt like and the operator had
@@ -754,6 +795,52 @@ def run(config_path=None, existing=None):
                       else filedialog.askopenfilename(**options))
             if chosen:
                 var.set(os.path.normpath(chosen))
+
+        def pick_network(self, var):
+            """Choose one of the operator's mapped drives, then browse into it.
+
+            The share goes into the box as its UNC, which is what has to be
+            stored: a letter belongs to one logon session and the nightly
+            encode has its own. Browsing continues from there, so picking a
+            subfolder of the share is the same two clicks it would have been
+            if the folder dialog could see the drive at all.
+            """
+            choices = network_choices()
+            if not choices:
+                messagebox.showinfo("Network", no_network_advice())
+                return
+
+            box = tk.Toplevel(self)
+            box.title("Network shares")
+            box.transient(self)
+            box.grab_set()
+            frame = ttk.Frame(box, padding=12)
+            frame.pack(fill="both", expand=True)
+            ttk.Label(frame, text="Your mapped drives, and where they really "
+                                  "point. The address is what gets stored.",
+                      wraplength=380, justify="left").pack(anchor="w",
+                                                           pady=(0, 8))
+            listing = tk.Listbox(frame, height=min(10, len(choices)), width=46)
+            listing.pack(fill="both", expand=True)
+            for label, _unc in choices:
+                listing.insert("end", label)
+            listing.selection_set(0)
+
+            def choose(_event=None):
+                picked = listing.curselection()
+                if not picked:
+                    return
+                var.set(choices[picked[0]][1])
+                box.destroy()
+                self.browse_into(var)
+
+            listing.bind("<Double-Button-1>", choose)
+            bar = ttk.Frame(frame)
+            bar.pack(fill="x", pady=(10, 0))
+            ttk.Button(bar, text="Cancel",
+                       command=box.destroy).pack(side="right")
+            ttk.Button(bar, text="Use this one",
+                       command=choose).pack(side="right", padx=(0, 8))
 
         # -- pages -------------------------------------------------------
 
@@ -795,13 +882,19 @@ def run(config_path=None, existing=None):
             # -- ffmpeg ---------------------------------------------------
             tools = ttk.LabelFrame(self.body, text="ffmpeg", padding=8)
             tools.pack(fill="x", pady=(10, 0))
+            # The link ends the sentence rather than sitting inside it: three
+            # packed labels cannot be kerned into one line of prose, and a
+            # gap before a full stop reads as a rendering fault.
+            blurb = ttk.Frame(tools)
+            blurb.pack(anchor="w")
+            ttk.Label(blurb, text="Path to ffmpeg.exe. You can download and "
+                                  "install it from",
+                      foreground="#555").pack(side="left")
+            self.link(blurb, "here", FFMPEG_URL).pack(side="left", padx=(5, 0))
             ttk.Label(tools,
-                      text="Not supplied by this installer: a recorder usually "
-                           "has one its owner chose. Give the folder holding "
-                           "ffmpeg.exe and ffprobe.exe and both are taken "
-                           "from it.",
-                      foreground="#555", wraplength=740,
-                      justify="left").pack(anchor="w", pady=(0, 4))
+                      text="A folder holding ffmpeg.exe and ffprobe.exe is "
+                           "accepted too, and both are taken from it.",
+                      foreground="#555").pack(anchor="w", pady=(0, 4))
             ff, ff_row = self.field(tools, "Folder or ffmpeg.exe",
                                     self.cfg["paths"].get("ffmpeg", "")
                                     or setup.find_binary("ffmpeg", ""),
@@ -813,8 +906,6 @@ def run(config_path=None, existing=None):
             ff_detail = ttk.Label(tools, text="", foreground="#555",
                                   wraplength=740, justify="left")
             ff_detail.pack(anchor="w", pady=(4, 0))
-            link = ttk.Label(tools, text=f"Builds for Windows: {FFMPEG_URL}",
-                             foreground="#555")
 
             def test_ffmpeg():
                 self.config(cursor="watch")
@@ -827,8 +918,6 @@ def run(config_path=None, existing=None):
                     if ffprobe:
                         lines.insert(0, f"ffprobe -> {ffprobe}")
                     ff_detail.config(text="\n".join(lines))
-                    link.pack(anchor="w", pady=(6, 0)) if level == FAIL \
-                        else link.pack_forget()
                 finally:
                     self.config(cursor="")
 
@@ -836,7 +925,8 @@ def run(config_path=None, existing=None):
                        command=test_ffmpeg).pack(side="left")
 
             # -- cadence --------------------------------------------------
-            timing = ttk.LabelFrame(self.body, text="Capture", padding=8)
+            timing = ttk.LabelFrame(self.body, text="Default capture settings",
+                                    padding=8)
             timing.pack(fill="x", pady=(10, 0))
             iv, iv_row = self.field(timing, "Seconds between frames",
                                     str(cap.get("interval_seconds", 5)),
@@ -851,6 +941,14 @@ def run(config_path=None, existing=None):
             fps_note = ttk.Label(fps_row, text="", wraplength=470,
                                  justify="left")
             fps_note.pack(side="left", padx=(10, 0))
+            # Said here rather than only on the camera page, because "default"
+            # in the title is a promise this sentence has to keep: a camera
+            # carrying neither key follows these, which is what lets a change
+            # here still move it later.
+            ttk.Label(timing,
+                      text="You can override these settings for each camera, "
+                           "if needed.",
+                      foreground="#555").pack(anchor="w", pady=(6, 0))
 
             def refresh(*_a):
                 level, message = check_storage(folder.get())
@@ -987,7 +1085,10 @@ def run(config_path=None, existing=None):
             password, pw_row = entry_row("Password", secret=True)
 
             enabled = tk.BooleanVar(value=True)
-            ttk.Checkbutton(right, text="Enabled", variable=enabled).grid(
+            # "Enable timelapse", not "Enabled": sitting directly above the
+            # smoothing controls, one word could as easily have meant them.
+            ttk.Checkbutton(right, text="Enable timelapse",
+                            variable=enabled).grid(
                 row=place[0], column=0, columnspan=2, sticky="w", pady=(8, 0))
             place[0] += 1
 
@@ -1244,8 +1345,8 @@ def run(config_path=None, existing=None):
                 if not [c for c in cams if c.get("enabled", True)]:
                     messagebox.showerror(
                         "Cameras",
-                        "Add at least one camera and tick Enabled, or nothing "
-                        "will be captured.")
+                        "Add at least one camera and tick Enable timelapse, "
+                        "or nothing will be captured.")
                     return False
                 return True
 
@@ -1262,10 +1363,19 @@ def run(config_path=None, existing=None):
                             variable=on).pack(anchor="w", pady=(0, 8))
 
             dest, row = self.field(self.body, "Destination",
-                                   t.get("destination", ""))
+                                   t.get("destination", ""), width=44)
             ttk.Button(row, text="Browse",
                        command=lambda: self.browse_into(dest)).pack(side="left",
                                                                     padx=6)
+            ttk.Button(row, text="Network",
+                       command=lambda: self.pick_network(dest)).pack(
+                           side="left")
+            ttk.Label(self.body,
+                      text="Browse shows only local disks, because setup runs "
+                           "as Administrator and drive mappings belong to your "
+                           "own sign-in. Network lists them instead.",
+                      foreground="#555", wraplength=740,
+                      justify="left").pack(anchor="w", pady=(2, 0))
             note = self.status(self.body)
             advice = ttk.Label(self.body, text="", foreground="#555",
                                wraplength=680, justify="left")
@@ -1358,33 +1468,38 @@ def run(config_path=None, existing=None):
             id, from a window built so they would not need one.
             """
             self.heading("Tell you when a run finishes?",
-                         "One summary per night, to any of these. This is how "
-                         "you find out about a failure without looking.")
-            ttk.Label(self.body,
-                      text="If every entry is empty, no notifications will "
-                           "be sent.",
-                      foreground="#555").pack(anchor="w", pady=(0, 6))
+                         "One summary per night, to any of these; this is how "
+                         "you find out about a failure without looking. If "
+                         "every entry is empty, nothing is sent.")
 
             state = {}
             for kind in ("discord", "ntfy", "telegram"):
                 title, blurb, fields = NOTIFY_FIELDS[kind]
                 values, on_now = sink_values(self.cfg, kind)
 
-                group = ttk.LabelFrame(self.body, text=title, padding=8)
-                group.pack(fill="x", pady=4)
+                group = ttk.LabelFrame(self.body, text=title, padding=6)
+                group.pack(fill="x", pady=3)
                 on = tk.BooleanVar(value=on_now)
-                ttk.Checkbutton(group, text="Send the nightly summary here",
-                                variable=on).pack(anchor="w")
-                ttk.Label(group, text=blurb, foreground="#555",
-                          wraplength=620, justify="left").pack(anchor="w",
-                                                               pady=(0, 4))
+                head = ttk.Frame(group)
+                head.pack(fill="x")
+                # The switch and the instructions on one line: three services
+                # each needing a checkbox, a paragraph, its fields, a button
+                # and a verdict is more than a 620-pixel page holds, and the
+                # first version ran off the bottom with no way to scroll.
+                ttk.Checkbutton(head, text="Send here",
+                                variable=on).pack(side="left", padx=(0, 10))
+                ttk.Label(head, text=blurb, foreground="#555",
+                          wraplength=600, justify="left").pack(side="left")
                 boxes = {}
                 for key, label, secret, _default in fields:
                     var, _row = self.field(group, label, values.get(key, ""),
-                                           width=44, secret=secret)
+                                           width=40, secret=secret)
                     boxes[key] = var
 
-                result = self.status(group)
+                bar = ttk.Frame(group)
+                bar.pack(fill="x", pady=(4, 0))
+                result = ttk.Label(bar, text="", wraplength=520,
+                                   justify="left")
                 state[kind] = (on, boxes, result)
 
                 def tester(kind=kind, on=on, boxes=boxes, result=result):
@@ -1414,8 +1529,12 @@ def run(config_path=None, existing=None):
                                  "message. Check the values above.")
                     return go
 
-                ttk.Button(group, text="Send a test message",
-                           command=tester()).pack(anchor="w", pady=(4, 0))
+                # Button and verdict on one line. The verdict used to have a
+                # row of its own, which was blank until the button was pressed
+                # and so read as three unexplained gaps.
+                ttk.Button(bar, text="Send a test message",
+                           command=tester()).pack(side="left")
+                result.pack(side="left", padx=(10, 0))
 
             def commit():
                 for kind, (on, boxes, _result) in state.items():
