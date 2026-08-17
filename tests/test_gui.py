@@ -97,6 +97,51 @@ class TestDecideLayerIsSeparate(unittest.TestCase):
             self.assertNotIn(word, names,
                              "%s belongs below the banner" % word)
 
+    def test_no_field_label_is_wider_than_the_column_it_sits_in(self):
+        """Truncation is invisible to every other test in this file.
+
+        A ttk.Label with a fixed width in characters simply cuts what does not
+        fit, silently, so "Discord webhook URL" arrived as "Discord webhook
+        UR..." and "Seconds between frames" as "Seconds between fram". Both
+        were reported by the operator from a real run, which is an expensive
+        way to measure a string length. The labels are literals in the source,
+        so read them from the source.
+        """
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+        checked = 0
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "field"
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"):
+                continue
+            if len(node.args) < 2 or not isinstance(node.args[1], ast.Constant):
+                continue
+            label = node.args[1].value
+            width = gui.LABELS
+            for word in node.keywords:
+                if word.arg == "label_width" and \
+                        isinstance(word.value, ast.Constant):
+                    width = word.value.value
+                elif word.arg == "label_width" and \
+                        isinstance(word.value, ast.Name):
+                    width = getattr(gui, word.value.id, width)
+            self.assertLessEqual(
+                len(label), width,
+                "%r is %d characters in a %d character label, so it will be "
+                "cut off on screen" % (label, len(label), width))
+            checked += 1
+        self.assertGreater(checked, 5, "the labels were not found at all")
+
+        # The notification page passes its labels from a table rather than as
+        # literals, so the source scan above cannot see them, and the table is
+        # where the defect that started this actually was.
+        for kind, (_title, _blurb, fields) in gui.NOTIFY_FIELDS.items():
+            for _key, label, _secret, _default in fields:
+                self.assertLessEqual(len(label), gui.LABELS,
+                                     "%s: %r will be cut off" % (kind, label))
+
     def test_every_check_returns_a_level_the_window_can_colour(self):
         # A check that invents a fourth level would render with no colour and
         # look like a bug in the window rather than in the check.
@@ -552,6 +597,101 @@ class TestCameraBuilding(unittest.TestCase):
              "url": "http://x", "auth": "none", "method": "http",
              "smoothing": None}, [existing], cam=existing)
         self.assertNotIn("smooth_frames", cam)
+
+
+class TestCameraPane(unittest.TestCase):
+    """The list on the left and the detail pane on the right.
+
+    The pane replaced a modal dialog, which is a change of shape rather than
+    of rules: what these check is the three things the pane has to get right
+    on its own, which are what it shows in the list, what it fills the fields
+    with, and whether it has been edited since.
+    """
+
+    def test_the_list_shows_the_name(self):
+        self.assertEqual(gui.camera_label({"name": "Roof", "enabled": True}),
+                         "Roof")
+
+    def test_a_disabled_camera_says_so(self):
+        """Disabling is as destructive as removing, so it cannot look the same.
+
+        The encoder builds its work list from cameras enabled in the config,
+        so a disabled one's frames are stranded on disk exactly as a renamed
+        one's are.
+        """
+        self.assertIn("disabled",
+                      gui.camera_label({"name": "Yard", "enabled": False}))
+
+    def test_an_entry_add_made_and_nobody_filled_in(self):
+        self.assertEqual(gui.camera_label({}), "(new camera)")
+        self.assertEqual(gui.camera_label(None), "(new camera)")
+
+    def test_an_existing_camera_opens_on_custom_showing_its_url(self):
+        """Rather than guessing which template produced the URL.
+
+        Guessing wrong would silently rewrite a working camera, which is the
+        console wizard's reasoning for showing the URL on its edit path.
+        """
+        values = gui.camera_form_values({"name": "Roof", "method": "http",
+                                         "url": "http://10.0.0.1/snap"})
+        self.assertEqual(values["type"], gui.camera_types()[-1][0])
+        self.assertEqual(values["url"], "http://10.0.0.1/snap")
+
+    def test_a_new_camera_opens_on_a_make_where_an_address_is_enough(self):
+        values = gui.camera_form_values({})
+        self.assertEqual(values["type"], gui.camera_types()[0][0])
+        self.assertEqual(values["url"], "")
+        self.assertTrue(values["enabled"])
+
+    def test_the_credentials_are_there_to_be_changed(self):
+        # The whole reason the pane exists: the first cut showed a name, a
+        # type and an address, so a stored password could not be corrected.
+        values = gui.camera_form_values({"name": "R", "url": "http://x",
+                                         "auth": "basic", "username": "admin",
+                                         "password": "hunter2"})
+        self.assertEqual(values["username"], "admin")
+        self.assertEqual(values["password"], "hunter2")
+        self.assertEqual(values["auth"], "basic")
+
+    def test_smoothing_arrives_as_a_switch_and_a_count(self):
+        from timelapse_encode import SMOOTH_DEFAULT
+
+        on = gui.camera_form_values({"name": "R", "url": "http://x",
+                                     "smooth_frames": 9})
+        self.assertTrue(on["smoothing_on"])
+        self.assertEqual(on["smoothing"], "9")
+
+        off = gui.camera_form_values({"name": "R", "url": "http://x"})
+        self.assertFalse(off["smoothing_on"])
+        # The box still offers a number, so switching it on needs one click
+        # rather than a click and a guess at what a sensible value is.
+        self.assertEqual(off["smoothing"], str(SMOOTH_DEFAULT))
+
+    def test_an_untouched_pane_is_not_dirty(self):
+        values = gui.camera_form_values({"name": "R", "url": "http://x"})
+        self.assertFalse(gui.form_is_dirty(values, dict(values)))
+
+    def test_a_typed_password_makes_it_dirty(self):
+        values = gui.camera_form_values({"name": "R", "url": "http://x"})
+        current = dict(values, password="new")
+        self.assertTrue(gui.form_is_dirty(values, current))
+
+    def test_a_key_the_pane_does_not_carry_is_not_a_change(self):
+        values = gui.camera_form_values({"name": "R", "url": "http://x"})
+        self.assertFalse(gui.form_is_dirty(values, dict(values, extra="x")))
+
+    def test_the_enable_switch_counts_as_a_change(self):
+        values = gui.camera_form_values({"name": "R", "url": "http://x"})
+        self.assertTrue(gui.form_is_dirty(values, dict(values, enabled=False)))
+
+    def test_a_type_is_looked_up_by_its_label(self):
+        for preset in gui.camera_types():
+            self.assertIs(gui.preset_named(preset[0]), preset)
+
+    def test_an_unknown_type_falls_back_to_custom(self):
+        # Which is the safe direction: Custom carries the URL through
+        # untouched, where a wrong make would rebuild it from a template.
+        self.assertTrue(gui.preset_is_custom(gui.preset_named("Nonesuch")))
 
 
 class TestReview(unittest.TestCase):

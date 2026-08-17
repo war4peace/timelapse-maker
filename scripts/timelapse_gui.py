@@ -40,9 +40,16 @@ __version__ = "0.1.9"
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 
-# Wide enough for a UNC path and an explanation of what is wrong with it,
-# narrow enough to sit on a 1366x768 laptop, which a recorder often is.
-WINDOW = "760x560"
+# Wide enough for a UNC path and an explanation of what is wrong with it, and
+# for a camera list beside the camera being edited; short enough to sit on a
+# 1366x768 laptop, which a recorder often is, taskbar and title bar included.
+WINDOW = "820x620"
+
+# Field labels are a fixed width so the boxes line up down a page, which means
+# the widest label sets it: "Seconds between frames" is 22 characters, and at
+# 20 it arrived as "Seconds between fram". Same defect as the notification
+# page's "Discord webhook UR...", and it is invisible to every test here.
+LABELS = 22
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +264,19 @@ def camera_types():
     return list(setup.CAMERA_PRESETS)
 
 
+def preset_named(label):
+    """The preset carrying this label, falling back to Custom URL.
+
+    The detail pane holds a label rather than an index, so that reordering the
+    presets cannot silently repoint a camera at a different make, which is the
+    same reasoning VENDOR_HINTS is keyed on labels for.
+    """
+    for preset in camera_types():
+        if preset[0] == label:
+            return preset
+    return camera_types()[-1]
+
+
 def preset_is_custom(preset):
     return preset[3] is None
 
@@ -359,6 +379,59 @@ def check_smoothing(text):
         return FAIL, "Between %d and %d frames, or empty for none." % (
             SMOOTH_MIN, SMOOTH_MAX), None
     return OK, "Each frame is blended with the %d around it." % value, value
+
+
+def camera_label(cam):
+    """The one line the camera list shows for this entry.
+
+    The name, which is what identifies a camera here, plus whether it is
+    switched off. Disabling is as destructive as removing (the encoder builds
+    its work list from enabled cameras, so a disabled one's frames are
+    stranded), and a list that looked identical either way would hide that.
+    """
+    cam = cam or {}
+    name = str(cam.get("name", "") or "").strip()
+    if not name:
+        return "(new camera)"
+    return name if cam.get("enabled", True) else "%s  (disabled)" % name
+
+
+def camera_form_values(cam):
+    """What the detail pane starts out holding for this camera.
+
+    An existing camera opens on Custom URL showing the URL it actually has,
+    which is the console wizard's edit path: working out which template
+    produced a stored URL would be guesswork, and guessing wrong would
+    silently rewrite a working camera. A new one opens on the first make in
+    the list, where an address is all that is wanted.
+    """
+    from timelapse_encode import SMOOTH_DEFAULT
+
+    cam = cam or {}
+    types = camera_types()
+    smooth = cam.get("smooth_frames") or 0
+    return {"name": str(cam.get("name", "") or ""),
+            "type": types[-1][0] if cam.get("url") else types[0][0],
+            "address": "",
+            "url": str(cam.get("url", "") or ""),
+            "auth": str(cam.get("auth", "") or "digest"),
+            "username": str(cam.get("username", "") or ""),
+            "password": str(cam.get("password", "") or ""),
+            "smoothing_on": bool(smooth),
+            "smoothing": str(smooth or SMOOTH_DEFAULT),
+            "enabled": bool(cam.get("enabled", True))}
+
+
+def form_is_dirty(loaded, current):
+    """Has the detail pane been changed since it was filled in?
+
+    Keyed on what was loaded, so a key the pane does not carry cannot make an
+    untouched camera look edited. What it buys is the prompt before a click
+    somewhere else throws away a typed password, which is the one thing in
+    this pane that cannot be recovered by looking at the config.
+    """
+    return any(str(current.get(key, "")) != str(value)
+               for key, value in (loaded or {}).items())
 
 
 # ---------------------------------------------------------------------------
@@ -604,9 +677,12 @@ def run(config_path=None, existing=None):
             self.next = ttk.Button(bar, text="Next", command=self.go_next)
             self.next.pack(side="right", padx=(0, 8))
 
-            self.pages = [self.page_storage, self.page_tools, self.page_capture,
-                          self.page_cameras, self.page_transfer,
-                          self.page_notify, self.page_review]
+            # Five, not seven. Storage, ffmpeg and cadence were a page each and
+            # each held one question: three Next clicks to answer three things
+            # that are all "where does this run", and no page filled its window.
+            self.pages = [self.page_basics, self.page_cameras,
+                          self.page_transfer, self.page_notify,
+                          self.page_review]
             self.index = 0
             self.show()
 
@@ -653,7 +729,7 @@ def run(config_path=None, existing=None):
             label.config(text=message, foreground=COLOURS.get(level, "#333"))
 
         def field(self, parent, label, value="", width=58, secret=False,
-                  label_width=22):
+                  label_width=22, grow=True):
             # 22, not 18: "Discord webhook URL" is nineteen characters and was
             # arriving as "Discord webhook UR...". A label that truncates makes
             # the field beside it a guess.
@@ -663,7 +739,9 @@ def run(config_path=None, existing=None):
             var = tk.StringVar(value=value)
             entry = ttk.Entry(row, textvariable=var, width=width,
                               show="*" if secret else "")
-            entry.pack(side="left", fill="x", expand=True)
+            # grow=False leaves room to the right of a narrow box, which is
+            # where a one-line verdict goes on a page holding several of them.
+            entry.pack(side="left", fill="x" if grow else None, expand=grow)
             return var, row
 
         def browse_into(self, var, directory=True):
@@ -679,125 +757,136 @@ def run(config_path=None, existing=None):
 
         # -- pages -------------------------------------------------------
 
-        def page_storage(self):
+        def page_basics(self):
+            """Storage, ffmpeg and cadence, which were three pages.
+
+            They belong together: each was one question with a window to
+            itself, and all three answer "how does this machine run", where
+            cameras and destinations are about everything else. Three
+            LabelFrames rather than three pages means the operator can see the
+            cadence while choosing the disk, which is the one dependency
+            between them worth seeing.
+            """
             self.heading(
-                "Where should the frames go?",
-                "Frames are written continuously and deleted once the day has "
-                "been encoded, so this needs room for about one day at a time. "
-                "A spinning disk is fine; the access pattern is sequential.")
+                "The basics",
+                "Where the frames go, which ffmpeg turns them into video, and "
+                "how often a frame is taken. Frames are deleted once their day "
+                "has been encoded, so the folder needs room for about a day at "
+                "a time.")
+            cap = self.cfg["capture"]
+            enc = self.cfg["encode"]
+
+            # -- storage --------------------------------------------------
+            store = ttk.LabelFrame(self.body, text="Storage", padding=8)
+            store.pack(fill="x")
             current = self.cfg["paths"].get("frames_root", "")
-            base = str(Path(current).parent) if current else ""
-            var, row = self.field(self.body, "Folder", base)
+            folder, row = self.field(store, "Folder",
+                                     str(Path(current).parent)
+                                     if current else "", width=46,
+                                     label_width=LABELS)
             ttk.Button(row, text="Browse",
-                       command=lambda: self.browse_into(var)).pack(side="left",
-                                                                   padx=6)
-            note = self.status(self.body)
-            paths = ttk.Label(self.body, text="", foreground="#555",
-                              justify="left")
-            paths.pack(anchor="w", pady=(10, 0))
+                       command=lambda: self.browse_into(folder)).pack(
+                           side="left", padx=6)
+            store_note = self.status(store)
+            derived = ttk.Label(store, text="", foreground="#555",
+                                justify="left")
+            derived.pack(anchor="w", pady=(4, 0))
 
-            def refresh(*_a):
-                level, message = check_storage(var.get())
-                self.say(note, level, message)
-                if var.get().strip():
-                    p = storage_paths(var.get())
-                    paths.config(text="frames  -> %s\nvideos  -> %s\nlogs    "
-                                      "-> %s" % (p["frames_root"],
-                                                 p["video_output"],
-                                                 p["log_dir"]))
-                else:
-                    paths.config(text="")
-
-            var.trace_add("write", refresh)
-            refresh()
-
-            def commit():
-                level, message = check_storage(var.get())
-                if level == FAIL:
-                    messagebox.showerror("Storage", message)
-                    return False
-                self.cfg["paths"].update(storage_paths(var.get()))
-                return True
-
-            self.commit = commit
-
-        def page_tools(self):
-            self.heading(
-                "Where is ffmpeg?",
-                "This installer does not supply ffmpeg, because a recorder "
-                "usually already has one its owner chose deliberately. Give "
-                "the folder holding ffmpeg.exe and ffprobe.exe and both are "
-                "taken from it.")
-            var, row = self.field(self.body, "ffmpeg",
-                                  self.cfg["paths"].get("ffmpeg", "")
-                                  or setup.find_binary("ffmpeg", ""))
-            ttk.Button(row, text="Browse",
-                       command=lambda: self.browse_into(var)).pack(side="left",
-                                                                   padx=6)
-            note = self.status(self.body)
-            detail = ttk.Label(self.body, text="", foreground="#555",
-                               wraplength=680, justify="left")
-            detail.pack(anchor="w", pady=(10, 0))
-            link = ttk.Label(self.body, text=f"Builds for Windows: {FFMPEG_URL}",
+            # -- ffmpeg ---------------------------------------------------
+            tools = ttk.LabelFrame(self.body, text="ffmpeg", padding=8)
+            tools.pack(fill="x", pady=(10, 0))
+            ttk.Label(tools,
+                      text="Not supplied by this installer: a recorder usually "
+                           "has one its owner chose. Give the folder holding "
+                           "ffmpeg.exe and ffprobe.exe and both are taken "
+                           "from it.",
+                      foreground="#555", wraplength=740,
+                      justify="left").pack(anchor="w", pady=(0, 4))
+            ff, ff_row = self.field(tools, "Folder or ffmpeg.exe",
+                                    self.cfg["paths"].get("ffmpeg", "")
+                                    or setup.find_binary("ffmpeg", ""),
+                                    width=38, label_width=LABELS)
+            ttk.Button(ff_row, text="Browse",
+                       command=lambda: self.browse_into(ff)).pack(side="left",
+                                                                  padx=6)
+            ff_note = self.status(tools)
+            ff_detail = ttk.Label(tools, text="", foreground="#555",
+                                  wraplength=740, justify="left")
+            ff_detail.pack(anchor="w", pady=(4, 0))
+            link = ttk.Label(tools, text=f"Builds for Windows: {FFMPEG_URL}",
                              foreground="#555")
 
-            def test():
+            def test_ffmpeg():
                 self.config(cursor="watch")
                 self.update_idletasks()
                 try:
-                    level, message, ffmpeg, ffprobe, _codec = \
-                        check_ffmpeg(var.get())
-                    self.say(note, level, message)
-                    lines = encoder_notes(var.get())
+                    level, message, _ffmpeg, ffprobe, _codec = \
+                        check_ffmpeg(ff.get())
+                    self.say(ff_note, level, message)
+                    lines = encoder_notes(ff.get())
                     if ffprobe:
                         lines.insert(0, f"ffprobe -> {ffprobe}")
-                    detail.config(text="\n".join(lines))
-                    link.pack(anchor="w", pady=(8, 0)) if level == FAIL \
+                    ff_detail.config(text="\n".join(lines))
+                    link.pack(anchor="w", pady=(6, 0)) if level == FAIL \
                         else link.pack_forget()
                 finally:
                     self.config(cursor="")
 
-            ttk.Button(self.body, text="Test this ffmpeg",
-                       command=test).pack(anchor="w", pady=(8, 0))
+            ttk.Button(ff_row, text="Test",
+                       command=test_ffmpeg).pack(side="left")
 
-            def commit():
-                level, message, ffmpeg, ffprobe, _codec = check_ffmpeg(var.get())
-                if level == FAIL:
-                    messagebox.showerror("ffmpeg", message)
-                    return False
-                self.cfg["paths"]["ffmpeg"] = ffmpeg
-                if ffprobe:
-                    self.cfg["paths"]["ffprobe"] = ffprobe
-                return True
-
-            self.commit = commit
-
-        def page_capture(self):
-            self.heading(
-                "How often, and how fast?",
-                "One frame every few seconds, played back at the frame rate "
-                "below. A cadence slower than about fifteen minutes produces "
-                "no video at all, so the wizard refuses it.")
-            cap = self.cfg["capture"]
-            enc = self.cfg["encode"]
-            iv, _ = self.field(self.body, "Seconds between frames",
-                               str(cap.get("interval_seconds", 5)), width=10)
-            iv_note = self.status(self.body)
-            fps, _ = self.field(self.body, "Frames per second",
-                                str(enc.get("framerate", 60)), width=10)
-            fps_note = self.status(self.body)
+            # -- cadence --------------------------------------------------
+            timing = ttk.LabelFrame(self.body, text="Capture", padding=8)
+            timing.pack(fill="x", pady=(10, 0))
+            iv, iv_row = self.field(timing, "Seconds between frames",
+                                    str(cap.get("interval_seconds", 5)),
+                                    width=8, label_width=LABELS,
+                                    grow=False)
+            iv_note = ttk.Label(iv_row, text="", wraplength=470,
+                                justify="left")
+            iv_note.pack(side="left", padx=(10, 0))
+            fps, fps_row = self.field(timing, "Frames per second",
+                                      str(enc.get("framerate", 60)),
+                                      width=8, label_width=LABELS, grow=False)
+            fps_note = ttk.Label(fps_row, text="", wraplength=470,
+                                 justify="left")
+            fps_note.pack(side="left", padx=(10, 0))
 
             def refresh(*_a):
-                level, message, value = check_interval(iv.get())
+                level, message = check_storage(folder.get())
+                self.say(store_note, level, message)
+                if folder.get().strip():
+                    p = storage_paths(folder.get())
+                    derived.config(text="frames  -> %s\nvideos  -> %s\n"
+                                        "logs    -> %s" % (p["frames_root"],
+                                                           p["video_output"],
+                                                           p["log_dir"]))
+                else:
+                    derived.config(text="")
+                level, message, seconds = check_interval(iv.get())
                 self.say(iv_note, level, message)
-                level2, message2, _v = check_framerate(fps.get(), value)
-                self.say(fps_note, level2, message2)
+                level, message, _rate = check_framerate(fps.get(), seconds)
+                self.say(fps_note, level, message)
 
-            iv.trace_add("write", refresh)
-            fps.trace_add("write", refresh)
+            for var in (folder, iv, fps):
+                var.trace_add("write", refresh)
             refresh()
 
             def commit():
+                level, message = check_storage(folder.get())
+                if level == FAIL:
+                    messagebox.showerror("Storage", message)
+                    return False
+                self.config(cursor="watch")
+                self.update_idletasks()
+                try:
+                    level, message, ffmpeg, ffprobe, _codec = \
+                        check_ffmpeg(ff.get())
+                finally:
+                    self.config(cursor="")
+                if level == FAIL:
+                    messagebox.showerror("ffmpeg", message)
+                    return False
                 level, message, interval = check_interval(iv.get())
                 if level == FAIL:
                     messagebox.showerror("Cadence", message)
@@ -806,6 +895,11 @@ def run(config_path=None, existing=None):
                 if level == FAIL:
                     messagebox.showerror("Frame rate", message)
                     return False
+
+                self.cfg["paths"].update(storage_paths(folder.get()))
+                self.cfg["paths"]["ffmpeg"] = ffmpeg
+                if ffprobe:
+                    self.cfg["paths"]["ffprobe"] = ffprobe
                 cap["interval_seconds"] = interval
                 # The fetch timeout must stay under the interval, or a slow
                 # camera's request outlives the tick that asked for it.
@@ -818,200 +912,344 @@ def run(config_path=None, existing=None):
             self.commit = commit
 
         def page_cameras(self):
-            self.heading("Which cameras?",
-                         "A camera's name becomes the folder its frames live "
-                         "in, so renaming one later means moving that folder.")
-            cams = self.cfg.setdefault("cameras", [])
+            """The list on the left, the camera it names on the right.
 
-            listing = tk.Listbox(self.body, height=9)
-            listing.pack(fill="both", expand=True, side="left")
-            side = ttk.Frame(self.body)
-            side.pack(side="left", fill="y", padx=(10, 0))
+            The first cut put every camera behind a modal dialog, so the only
+            way to see what a camera was set to was to open it, and the only
+            way to compare two was to remember the first. Editing in place
+            beside the list is what an operator with eight cameras needs, and
+            it is where the credentials, the test and the enable switch belong
+            rather than three clicks away.
+            """
+            self.heading(
+                "Which cameras?",
+                "Pick one on the left to change it on the right. A camera's "
+                "name becomes the folder its frames live in, so renaming one "
+                "later means moving that folder.")
+            cams = self.cfg.setdefault("cameras", [])
+            presets = camera_types()
+            labels = [p[0] for p in presets]
+            # The camera being edited, by identity rather than by position: a
+            # save can rename it and a remove can shift everything after it.
+            state = {"cam": None, "loaded": {}}
+
+            panes = ttk.Frame(self.body)
+            panes.pack(fill="both", expand=True)
+
+            left = ttk.Frame(panes)
+            left.pack(side="left", fill="y")
+            # exportselection=False, or clicking into any Entry on the right
+            # hands the X selection over and the list silently unhighlights
+            # the camera being edited.
+            listing = tk.Listbox(left, height=14, width=26,
+                                 exportselection=False)
+            listing.pack(fill="both", expand=True)
+            list_buttons = ttk.Frame(left)
+            list_buttons.pack(fill="x", pady=(6, 0))
+
+            right = ttk.LabelFrame(panes, text="Details", padding=10)
+            right.pack(side="left", fill="both", expand=True, padx=(12, 0))
+            right.columnconfigure(1, weight=1)
+
+            # grid rather than pack for the detail rows, and grid_remove()
+            # rather than pack_forget(): a removed cell remembers where it was,
+            # so a row that comes back cannot land at the bottom of the pane.
+            # That defect has been shipped twice here already.
+            place = [0]
+
+            def add_row(label, widget):
+                text = ttk.Label(right, text=label)
+                text.grid(row=place[0], column=0, sticky="w", pady=3,
+                          padx=(0, 8))
+                widget.grid(row=place[0], column=1, sticky="we", pady=3)
+                place[0] += 1
+                return text, widget
+
+            def entry_row(label, secret=False):
+                var = tk.StringVar()
+                return var, add_row(label, ttk.Entry(
+                    right, textvariable=var, width=34,
+                    show="*" if secret else ""))
+
+            name, name_row = entry_row("Name")
+            kind = tk.StringVar()
+            add_row("Camera type",
+                    ttk.Combobox(right, textvariable=kind, values=labels,
+                                 state="readonly", width=32))
+            address, address_row = entry_row("IP address or host")
+            url, url_row = entry_row("Snapshot or stream URL")
+            auth = tk.StringVar()
+            auth_row = add_row("Authentication",
+                               ttk.Combobox(right, textvariable=auth,
+                                            values=["digest", "basic", "none"],
+                                            state="readonly", width=14))
+            user, user_row = entry_row("Username")
+            password, pw_row = entry_row("Password", secret=True)
+
+            enabled = tk.BooleanVar(value=True)
+            ttk.Checkbutton(right, text="Enabled", variable=enabled).grid(
+                row=place[0], column=0, columnspan=2, sticky="w", pady=(8, 0))
+            place[0] += 1
+
+            smooth_bar = ttk.Frame(right)
+            smooth_bar.grid(row=place[0], column=0, columnspan=2, sticky="w",
+                            pady=(4, 0))
+            place[0] += 1
+            smooth_on = tk.BooleanVar(value=False)
+            smoothing = tk.StringVar()
+            ttk.Checkbutton(smooth_bar, text="Smooth motion, averaging",
+                            variable=smooth_on).pack(side="left")
+            count = ttk.Entry(smooth_bar, textvariable=smoothing, width=5)
+            count.pack(side="left", padx=6)
+            ttk.Label(smooth_bar, text="frames").pack(side="left")
+
+            note = ttk.Label(right, text="", wraplength=380, justify="left")
+            note.grid(row=place[0], column=0, columnspan=2, sticky="w",
+                      pady=(10, 0))
+            place[0] += 1
+            right.rowconfigure(place[0], weight=1)
+            place[0] += 1
+
+            bar = ttk.Frame(right)
+            bar.grid(row=place[0], column=0, columnspan=2, sticky="we",
+                     pady=(10, 0))
+
+            def index_of(cam):
+                for n, other in enumerate(cams):
+                    if other is cam:
+                        return n
+                return None
+
+            def form_values():
+                return {"name": name.get(), "type": kind.get(),
+                        "address": address.get(), "url": url.get(),
+                        "auth": auth.get(), "username": user.get(),
+                        "password": password.get(),
+                        "smoothing_on": smooth_on.get(),
+                        "smoothing": smoothing.get(), "enabled": enabled.get()}
+
+            def refresh(*_a):
+                preset = preset_named(kind.get())
+                custom = preset_is_custom(preset)
+                wants = preset_wants_credentials(preset)
+                for widgets, wanted in ((address_row, not custom),
+                                        (url_row, custom),
+                                        (auth_row, custom),
+                                        (user_row, wants), (pw_row, wants)):
+                    for widget in widgets:
+                        widget.grid() if wanted else widget.grid_remove()
+                count.state(["!disabled"] if smooth_on.get() else ["disabled"])
+                self.say(note, WARN,
+                         "This make carries the password inside the URL, so "
+                         "it is stored there rather than on its own."
+                         if credentials_go_in_the_url(preset) else "")
+
+            def fill(values):
+                name.set(values["name"])
+                kind.set(values["type"])
+                address.set(values["address"])
+                url.set(values["url"])
+                auth.set(values["auth"])
+                user.set(values["username"])
+                password.set(values["password"])
+                smooth_on.set(values["smoothing_on"])
+                smoothing.set(values["smoothing"])
+                enabled.set(values["enabled"])
+                state["loaded"] = form_values()
+                refresh()
+
+            def show_camera(cam):
+                state["cam"] = cam
+                for widget in bar.winfo_children():
+                    widget.state(["!disabled"] if cam else ["disabled"])
+                remover.state(["!disabled"] if cam else ["disabled"])
+                # After fill(), never before: filling runs refresh(), which
+                # owns the note and would wipe anything written first.
+                fill(camera_form_values(cam))
+                if cam is None:
+                    self.say(note, OK, "No cameras yet. Add is on the left.")
+                    return
+                n = index_of(cam)
+                listing.selection_clear(0, "end")
+                if n is not None:
+                    listing.selection_set(n)
+                    listing.activate(n)
 
             def redraw():
                 listing.delete(0, "end")
                 for cam in cams:
-                    mark = "" if cam.get("enabled", True) else "  (disabled)"
-                    listing.insert("end", "%s   %s%s" % (
-                        cam.get("name", "?"), cam.get("method", "http"), mark))
+                    listing.insert("end", camera_label(cam))
+                n = index_of(state["cam"])
+                if n is not None:
+                    listing.selection_clear(0, "end")
+                    listing.selection_set(n)
 
-            def add():
-                self.camera_dialog(cams, None, redraw)
-
-            def edit():
-                picked = listing.curselection()
-                if picked:
-                    self.camera_dialog(cams, cams[picked[0]], redraw)
-
-            def remove():
-                picked = listing.curselection()
-                if not picked:
-                    return
-                cam = cams[picked[0]]
-                if messagebox.askokcancel(
-                        "Remove camera",
-                        "Remove %s?\n\nFrames already captured are left where "
-                        "they are; this only stops new ones." % cam["name"]):
-                    cams.remove(cam)
-                    redraw()
-
-            for text, command in (("Add", add), ("Edit", edit),
-                                  ("Remove", remove)):
-                ttk.Button(side, text=text, command=command,
-                           width=10).pack(pady=3)
-            redraw()
-
-            def commit():
-                if not [c for c in cams if c.get("enabled", True)]:
-                    messagebox.showerror(
-                        "Cameras",
-                        "Add at least one camera, or nothing will be captured.")
-                    return False
-                return True
-
-            self.commit = commit
-
-        def camera_dialog(self, cams, cam, redraw):
-            """Add or edit one camera, credentials included.
-
-            The first cut offered a name, a radio button and a URL, which meant
-            a camera needing a password could not be configured here at all and
-            an existing one could not have its password changed. It also asked
-            for a URL where the console wizard asks for an IP and builds the
-            URL from a per-make template, so a Reolink had to be typed out by
-            hand, query string and all.
-            """
-            box = tk.Toplevel(self)
-            box.title("Camera")
-            box.transient(self)
-            box.grab_set()
-            frame = ttk.Frame(box, padding=14)
-            frame.pack(fill="both", expand=True)
-
-            presets = camera_types()
-            labels = [p[0] for p in presets]
-            # An existing camera opens on Custom, showing the URL it actually
-            # has. Guessing which template produced a stored URL would be
-            # guesswork, and guessing wrong would silently rewrite a working
-            # camera. Same as the console wizard's edit path, which shows the
-            # URL rather than the make.
-            start = labels[-1] if cam else labels[0]
-
-            name, _ = self.field(frame, "Name", (cam or {}).get("name", ""))
-
-            row = ttk.Frame(frame)
-            row.pack(fill="x", pady=4)
-            ttk.Label(row, text="Camera type", width=22).pack(side="left")
-            kind = tk.StringVar(value=start)
-            picker = ttk.Combobox(row, textvariable=kind, values=labels,
-                                  state="readonly", width=34)
-            picker.pack(side="left")
-
-            address, address_row = self.field(frame, "IP address or host", "")
-            url, url_row = self.field(frame, "Snapshot or stream URL",
-                                      (cam or {}).get("url", ""))
-
-            auth_row = ttk.Frame(frame)
-            ttk.Label(auth_row, text="Authentication",
-                      width=22).pack(side="left")
-            auth = tk.StringVar(value=(cam or {}).get("auth", "digest"))
-            ttk.Combobox(auth_row, textvariable=auth,
-                         values=["digest", "basic", "none"], state="readonly",
-                         width=12).pack(side="left")
-
-            user, user_row = self.field(frame, "Username",
-                                        (cam or {}).get("username", ""))
-            password, pw_row = self.field(frame, "Password",
-                                          (cam or {}).get("password", ""),
-                                          secret=True)
-            smoothing, smooth_row = self.field(
-                frame, "Smoothing (blank = off)",
-                str((cam or {}).get("smooth_frames", "") or ""), width=10)
-
-            enabled = tk.BooleanVar(value=(cam or {}).get("enabled", True))
-            ttk.Checkbutton(frame, text="Enabled", variable=enabled).pack(
-                anchor="w", pady=(6, 0))
-            note = self.status(frame)
-
-            def current_preset():
-                return presets[labels.index(kind.get())]
-
-            def refresh(*_a):
-                preset = current_preset()
-                custom = preset_is_custom(preset)
-                # pack(before=) throughout: re-packing appends, so a row hidden
-                # and brought back would land at the bottom of the dialog.
-                for widget, wanted in ((address_row, not custom),
-                                       (url_row, custom),
-                                       (auth_row, custom),
-                                       (user_row,
-                                        preset_wants_credentials(preset)),
-                                       (pw_row,
-                                        preset_wants_credentials(preset))):
-                    if wanted:
-                        widget.pack(fill="x", pady=4, before=smooth_row)
-                    else:
-                        widget.pack_forget()
-                if credentials_go_in_the_url(preset):
-                    self.say(note, WARN,
-                             "This make carries the password inside the URL, "
-                             "so it is stored there rather than on its own.")
-                else:
-                    self.say(note, OK, "")
-
-            kind.trace_add("write", refresh)
-            refresh()
-
-            def gather():
-                level, message, frames = check_smoothing(smoothing.get())
+            def save():
+                cam = state["cam"]
+                if cam is None:
+                    return True
+                values = form_values()
+                level, message, frames = check_smoothing(
+                    values["smoothing"] if values["smoothing_on"] else "")
                 if level == FAIL:
-                    return None, message
-                fields = {"name": name.get(), "preset": current_preset(),
-                          "address": address.get(), "url": url.get(),
-                          "auth": auth.get(), "username": user.get(),
-                          "password": password.get(),
-                          "enabled": enabled.get(), "smoothing": frames,
-                          "method": "rtsp" if str(url.get()).lower()
+                    self.say(note, FAIL, message)
+                    return False
+                fields = {"name": values["name"],
+                          "preset": preset_named(values["type"]),
+                          "address": values["address"], "url": values["url"],
+                          "auth": values["auth"],
+                          "username": values["username"],
+                          "password": values["password"],
+                          "enabled": values["enabled"], "smoothing": frames,
+                          "method": "rtsp" if values["url"].lower()
                           .startswith("rtsp://") else "http"}
                 level, message, built = build_camera(fields, cams, cam)
-                return (built, message) if level != FAIL else (None, message)
+                if level == FAIL:
+                    self.say(note, FAIL, message)
+                    return False
+                cam.clear()
+                cam.update(built)
+                # The name as stored, not as typed: sanitise_name() may have
+                # dropped a space, and leaving the old spelling in the box
+                # would make a saved camera read as unsaved for ever.
+                name.set(built["name"])
+                state["loaded"] = form_values()
+                redraw()
+                self.say(note, level if message else OK,
+                         message or "Saved.")
+                return True
 
             def test():
-                built, message = gather()
-                if built is None:
+                cam = state["cam"]
+                if cam is None:
+                    return
+                values = form_values()
+                _level, _message, frames = check_smoothing(
+                    values["smoothing"] if values["smoothing_on"] else "")
+                fields = {"name": values["name"] or "test",
+                          "preset": preset_named(values["type"]),
+                          "address": values["address"], "url": values["url"],
+                          "auth": values["auth"],
+                          "username": values["username"],
+                          "password": values["password"],
+                          "enabled": True, "smoothing": frames,
+                          "method": "rtsp" if values["url"].lower()
+                          .startswith("rtsp://") else "http"}
+                level, message, built = build_camera(fields, cams, cam)
+                if level == FAIL:
                     return self.say(note, FAIL, message)
-                box.config(cursor="watch")
-                box.update_idletasks()
+                self.config(cursor="watch")
+                self.update_idletasks()
                 try:
                     good = (setup.test_camera_rtsp(built, self.cfg)
                             if built.get("method") == "rtsp"
                             else setup.test_camera(built, self.cfg))
                 finally:
-                    box.config(cursor="")
+                    self.config(cursor="")
                 self.say(note, OK if good else FAIL,
                          "Test successful." if good else
                          "No usable image came back. Check the address, and "
                          "the username and password.")
 
-            def save():
-                built, message = gather()
-                if built is None:
-                    return self.say(note, FAIL, message)
-                if cam is None:
-                    cams.append(built)
-                else:
-                    cam.clear()
-                    cam.update(built)
-                redraw()
-                box.destroy()
+            def leave_current():
+                """True when it is all right to stop editing this camera."""
+                cam = state["cam"]
+                if cam is None or not form_is_dirty(state["loaded"],
+                                                    form_values()):
+                    return True
+                answer = messagebox.askyesnocancel(
+                    "Unsaved changes",
+                    "Save the changes to %s first?"
+                    % (str(state["loaded"].get("name") or "").strip()
+                       or "this camera"))
+                if answer is None:
+                    return False
+                if answer:
+                    return save()
+                # Discarded and never named: an entry Add created and nobody
+                # filled in is not a camera, and leaving it would block the
+                # page with an error about a row the operator has already
+                # decided against.
+                if not str(cam.get("name", "") or "").strip():
+                    n = index_of(cam)
+                    if n is not None:
+                        cams.pop(n)
+                    state["cam"] = None
+                    redraw()
+                return True
 
-            bar = ttk.Frame(frame)
-            bar.pack(fill="x", pady=(12, 0))
+            def on_select(_event=None):
+                picked = listing.curselection()
+                if not picked or picked[0] >= len(cams):
+                    return
+                wanted = cams[picked[0]]
+                if wanted is state["cam"]:
+                    return
+                if not leave_current():
+                    return redraw()          # put the highlight back
+                show_camera(wanted)
+
+            def add():
+                if not leave_current():
+                    return
+                cams.append({"enabled": True, "method": "http", "url": ""})
+                redraw()
+                show_camera(cams[-1])
+                name_row[1].focus_set()
+
+            def remove():
+                cam = state["cam"]
+                if cam is None:
+                    return
+                n = index_of(cam)
+                if n is None:
+                    return
+                if not messagebox.askokcancel(
+                        "Remove camera",
+                        "Remove %s?\n\nFrames already captured are left where "
+                        "they are; this only stops new ones."
+                        % (str(cam.get("name", "") or "").strip()
+                           or "this camera")):
+                    return
+                cams.pop(n)
+                state["cam"] = None
+                redraw()
+                show_camera(cams[min(n, len(cams) - 1)] if cams else None)
+
+            ttk.Button(list_buttons, text="Add", command=add,
+                       width=11).pack(side="left")
+            remover = ttk.Button(list_buttons, text="Remove", command=remove,
+                                 width=11)
+            remover.pack(side="right")
             ttk.Button(bar, text="Test", command=test).pack(side="left")
-            ttk.Button(bar, text="Cancel",
-                       command=box.destroy).pack(side="right")
-            ttk.Button(bar, text="Save", command=save).pack(side="right",
-                                                            padx=(0, 8))
+            ttk.Button(bar, text="Save", command=save).pack(side="right")
+
+            kind.trace_add("write", refresh)
+            smooth_on.trace_add("write", refresh)
+            listing.bind("<<ListboxSelect>>", on_select)
+            redraw()
+            show_camera(cams[0] if cams else None)
+
+            def commit():
+                if not leave_current():
+                    return False
+                unnamed = [c for c in cams
+                           if not str(c.get("name", "") or "").strip()]
+                if unnamed:
+                    messagebox.showerror(
+                        "Cameras",
+                        "One camera has no name yet. Give it one and press "
+                        "Save, or select it and press Remove.")
+                    return False
+                if not [c for c in cams if c.get("enabled", True)]:
+                    messagebox.showerror(
+                        "Cameras",
+                        "Add at least one camera and tick Enabled, or nothing "
+                        "will be captured.")
+                    return False
+                return True
+
+            self.commit = commit
 
         def page_transfer(self):
             self.heading(

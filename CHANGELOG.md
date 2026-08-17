@@ -30,6 +30,14 @@ While the version is `0.x`, the configuration format may change in any release.
   the transfer one tells you which account it just proved. When it finishes it
   offers to run the full set of checks and shows you the result, so nothing
   about setting this up needs a command prompt.
+
+  **The cameras are a list beside the camera you are editing**, rather than one
+  dialog per camera: pick a name on the left and everything about it is on the
+  right, including its password, whether it is enabled and its own Test button,
+  so comparing two cameras or correcting one setting is a click rather than a
+  round trip through a dialog. Storage, ffmpeg and the capture cadence share
+  one page for the same reason, since each was a single question with a window
+  to itself.
 - **Finished videos are moved to their destination on Windows.** **Nothing
   changes on a Linux install**, which still uses rsync. The destination can be
   a folder on this machine or a network path such as `\\tower\videos\timelapse`;

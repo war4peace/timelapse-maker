@@ -1880,6 +1880,43 @@ Win32 bindings are lazy: the suite is collected on three Linux legs and in WSL,
 none of which has a window station, and an import at the top would take all of
 them down at collection time.
 
+**Five pages, not seven.** Storage, ffmpeg and cadence began as a page each,
+and each held one question: three Next clicks to answer three things that are
+all "how does this machine run", where cameras and destinations are about
+everything else. They are three `LabelFrame`s on one page now, which also puts
+the cadence in view while the disk is being chosen, the one dependency between
+them worth seeing. The remaining four are cameras, transfer, notifications and
+review.
+
+**The camera page is a list beside the camera it names**, not a modal dialog
+per camera. With the dialog, the only way to see what a camera was set to was
+to open it, and the only way to compare two was to remember the first; an
+operator with eight cameras is doing that constantly. The pane carries the
+name, the make, the address or URL, the authentication, the credentials, the
+enable switch, smoothing, Test and Save. Four things about it are deliberate:
+
+- **The pane holds a camera by identity, never by position.** Saving can rename
+  it and removing shifts everything after it, so an index captured when the row
+  was clicked is a stale answer by the time it is used.
+- **Rows are hidden with `grid_remove()`**, not `pack_forget()`. A removed cell
+  remembers where it was, so a row that comes back cannot land at the bottom of
+  the pane, which is a defect this project has shipped twice with `pack()`.
+- **`exportselection=False` on the Listbox.** Without it, clicking into any
+  Entry on the right hands over the X selection and the list silently
+  unhighlights the camera being edited.
+- **Leaving an edited camera asks first.** `form_is_dirty()` compares the pane
+  against what was loaded into it, because a typed password is the one thing
+  here that cannot be recovered by looking at the config. Discarding an entry
+  that Add created and nobody named removes it, rather than leaving the page
+  blocked by an error about a row the operator has already decided against.
+
+**Field labels are a fixed 22 characters wide** (`LABELS`), which is what
+"Seconds between frames" needs. A `ttk.Label` with a width in characters cuts
+what does not fit, silently and only on screen, so this has been reported twice
+from real runs: "Discord webhook UR..." and "Seconds between fram". A test now
+reads the label literals out of the source and measures them, since nothing
+else here can see the difference.
+
 **Getting one change right needed `detect_encoders()` to stop printing.** It
 used to write "could not run ffmpeg" to stdout itself and return `(None, [])`,
 which collided with two other outcomes: an import failure, and ffmpeg running
@@ -2538,12 +2575,19 @@ the GUI's name check answers, which it only can if the GUI has no copy of that
 rule.
 
 That leaves the widget layer, which no automated test here reaches.
-`temp/gui_smoke.py` builds every page and the camera dialog and then closes the
-window, which catches the class of mistake unit tests structurally cannot: a
-widget method that does not exist, two geometry managers mixed in one
-container, a trace firing before the widget it writes to exists. It clicks
-nothing and asserts nothing about appearance. The rest is a click-through
+`temp/gui_smoke.py` builds every page, walks the camera pane through every
+camera type, and then **presses Add, Save and Remove and checks the config
+list afterwards**, which catches the class of mistake unit tests structurally
+cannot: a widget method that does not exist, two geometry managers mixed in one
+container, a trace firing before the widget it writes to exists, a button wired
+to nothing. It asserts nothing about appearance. The rest is a click-through
 checklist run by hand, below.
+
+Driving it turned up a trap worth stating, because anything reaching into a
+built window will meet it: **`ttk.Combobox` is a subclass of `ttk.Entry`**, so
+collecting the text boxes with `isinstance(w, ttk.Entry)` picks up the type
+picker as well, and the first version of the driver typed a camera's address
+into it.
 
 **The click-through checklist**, in the order that finds problems soonest:
 
@@ -2552,37 +2596,43 @@ checklist run by hand, below.
    wizard. This is the step that found the shortcut targeting a `.cmd`.
 2. Every page opens, Back is disabled on the first page, and the last button
    reads Finish rather than Next.
-3. Storage: type a relative path and a nonexistent drive. Both refused before
-   Next, and the three derived directories update as you type. **Then press
-   Browse: it must open at the folder already in the box.**
-4. ffmpeg: point it at a folder rather than an executable. Both binaries are
-   found and the encoder is named. Browse opens where the box points. Point it
-   at nothing and the download page is offered.
-5. Cadence: enter 900. Refused, saying a day of that produces no video, which
-   is the failure that is otherwise silent for ever.
-6. Cameras: add one named `NUL`, one named `Roof Top!`, and a duplicate of an
-   existing name. Refused, corrected with a warning, refused. **Pick each
-   camera type in turn:** an address field for the presets and a URL field for
-   Custom, with username and password appearing for the makes that need them
-   and staying *above* the buttons. Reolink says the password goes in the URL.
-   Test reaches a real camera and says "Test successful".
-7. **Edit an existing camera.** It opens on Custom showing the stored URL, with
-   its username, password and smoothing filled in, and saving keeps any
-   per-camera cadence it had.
-8. Transfer: type a local folder, then a UNC path. Username and password appear
+3. Basics, storage: type a relative path and a nonexistent drive. Both refused
+   before Next, and the three derived directories update as you type. **Then
+   press Browse: it must open at the folder already in the box.**
+4. Basics, ffmpeg: point it at a folder rather than an executable. Both
+   binaries are found and the encoder is named. Browse opens where the box
+   points. Point it at nothing and the download page is offered.
+5. Basics, cadence: enter 900. Refused, saying a day of that produces no video,
+   which is the failure that is otherwise silent for ever. **Read every label
+   on this page to its last character:** a fixed-width label cuts what does not
+   fit and says nothing about it.
+6. Cameras: press Add, then name it `NUL`, then `Roof Top!`, then an existing
+   name. Refused, corrected with a warning, refused. **Pick each camera type in
+   turn:** an address field for the presets and a URL field for Custom, with
+   username and password appearing for the makes that need them, and every row
+   staying where it was. Reolink says the password goes in the URL. Test
+   reaches a real camera and says "Test successful".
+7. **Select an existing camera in the list.** Its make reads Custom URL and the
+   URL, username, password, smoothing and enable switch are all filled in from
+   the config. Change the password, click a different camera, and it must offer
+   to save first. Save keeps any per-camera cadence the entry had.
+8. Cameras: press Add and then Next without filling anything in. Refused,
+   naming what to do. Press Add, click away, answer no: the empty row goes.
+   Remove asks before it removes.
+9. Transfer: type a local folder, then a UNC path. Username and password appear
    only for the UNC one, and *above* the Test button. Test says which account
    it proved, and warns when that account is not the one that runs nightly.
-9. Notifications: fill in one service and press its Send a test message. The
-   message arrives. Leaving all three empty is allowed and says so.
-10. Review: no password and no webhook URL anywhere on it. Finish writes the
+10. Notifications: fill in one service and press its Send a test message. The
+    message arrives. Leaving all three empty is allowed and says so.
+11. Review: no password and no webhook URL anywhere on it. Finish writes the
     config, backs up the previous one, and restarts the services.
-11. **Run the checks from the completion dialog.** The pre-flight output
+12. **Run the checks from the completion dialog.** The pre-flight output
     appears in a window. Nothing in the wizard should ever tell the operator to
     open a prompt and type a command.
-12. Run it again with that config present. Every page opens on the saved
+13. Run it again with that config present. Every page opens on the saved
     answers rather than on defaults.
 
-Steps 6, 7 and 8 are the ones worth repeating after any change: they are where
+Steps 6, 7 and 9 are the ones worth repeating after any change: they are where
 the GUI has to agree with the console wizard, and where disagreeing stays
 invisible until an install fails. Ten of the defects in the first operator run
 were in this list's territory, and none of them was reachable by a unit test.
@@ -2865,7 +2915,7 @@ scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
 scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 1376 lines
+scripts/timelapse_gui.py         the same wizard in a window, 1614 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2078 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
