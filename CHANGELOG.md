@@ -48,6 +48,19 @@ While the version is `0.x`, the configuration format may change in any release.
   Custom URL showing the address it had been given, which was correct but read
   as the wizard having forgotten.
 
+  **Scan network finds the cameras for you**, which `timelapse discover` has
+  done from the command line since 0.1.7 and the window could not. It sends one
+  query and lists what answers, with a tick beside each: tick the ones you want
+  and they are added with their address already filled in and, where the camera
+  said enough about itself, the right make already chosen. Cameras you have
+  already configured are greyed out and marked, so a second scan later finds
+  only what is new. No username or password is sent, so it cannot lock a camera
+  account, and nothing is added until you press the button. A camera that did
+  not say what make it is asks you to choose one rather than guessing, because
+  a wrong guess is a wrong address that looks deliberate. If nothing answers,
+  that is not the same as there being no cameras: this kind of query does not
+  cross subnets or VLANs, and many cameras ship with ONVIF switched off.
+
   **The summary names the encoder your machine will actually use**, and the
   quality setting that goes with it, which is the difference between a 300 MB
   day and a 900 MB one. It is read from the arguments the nightly run will be

@@ -1938,6 +1938,54 @@ enable switch, smoothing, Test and Save. Four things about it are deliberate:
   that Add created and nobody named removes it, rather than leaving the page
   blocked by an error about a row the operator has already decided against.
 
+**Scan network** puts `timelapse discover`'s capability on the camera page: one
+multicast WS-Discovery probe (`setup.discover_cameras()`, unchanged and
+unwrapped), a modal list of what answered, and a tick beside each. Everything it
+has to decide is above the banner (`scan_rows`, `scan_summary`,
+`configured_addresses`, `next_camera_names`, `build_scanned`), which is what
+lets the rules be checked without a display. Six things are deliberate:
+
+- **Only devices claiming to be video transmitters are offered**, read from
+  `Types` rather than the `type` scope, which is the trap §4.4a exists around.
+  An NVR, a doorbell, a printer and every Windows machine on the LAN answer this
+  same probe; the others are counted in the heading rather than hidden, so
+  "4 cameras answered, 1 other device also answered and is not offered".
+- **Already configured is decided on the address**, `camera_address()` reading
+  the host back out of the stored URL, because there is nowhere else it could
+  come from: a config keeps a URL and an address is only ever what the wizard
+  asked for on the way to building one. `wsd_host()` is reused rather than
+  restated, including the `ValueError` a malformed literal raises on 3.12+.
+  Such a row is greyed, is not tickable, **says "already added" on the row**
+  and carries that as a tooltip too: greying alone says "not available" without
+  saying why, and a hover message has to be found before it can be read.
+- **A make that was not identified is asked for, never guessed.**
+  `wsd_preset()` names six of the eight cameras here; the other two report no
+  vendor at all (a Reolink calling itself IPC-BO, a Tapo calling itself TC40).
+  Every row carries a type picker, prefilled where the make is known and empty
+  where it is not, and **a row with no make cannot be ticked**. A preselection
+  that is wrong is a wrong URL that looks deliberate, which is worse than no
+  answer. **Custom URL is not among the choices**: it builds no URL from an
+  address, so picking it there could only produce a camera with no URL at all.
+- **Credentials are not asked for here.** The alternative considered was one
+  username and password in the scan window applied to every camera it adds,
+  which a fleet sharing one admin account would like; per-camera was chosen. So
+  a scan contributes an address and a make, and a password is typed in the
+  detail pane, where it belongs to one camera.
+- **`build_camera()` builds the camera**, not an assembly of its own, so one
+  that arrives by a scan is the same shape as one typed in, down to the keys it
+  leaves absent. A scanned camera therefore carries no `interval_seconds` and no
+  `framerate` and follows the global, and reads back as its own make next time
+  the page opens, which is `identify_camera()` closing the loop.
+- **Names are `CameraN`**, skipping what is taken via `setup.name_taken` rather
+  than a second opinion about what taken means. Not named after what the device
+  calls itself: a camera name here is a *place*, and what a camera reports is
+  its model, so three Dahuas would all arrive called Dahua.
+
+Nothing answering is reported as "nothing answered on this network segment",
+never as "there are no cameras": multicast does not cross subnets or VLANs, and
+a dedicated camera VLAN is common in exactly the deployments with the most
+cameras.
+
 **Field labels are a fixed 22 characters wide** (`LABELS`), which is what
 "Seconds between frames" needs. A `ttk.Label` with a width in characters cuts
 what does not fit, silently and only on screen, so this has been reported twice
@@ -2649,8 +2697,9 @@ rule.
 
 That leaves the widget layer, which no automated test here reaches.
 `temp/gui_smoke.py` builds every page, walks the camera pane through every
-camera type, drives the network-share picker, and **presses Add, Save and
-Remove and checks the config list afterwards**, which catches the class of
+camera type, drives the network-share picker, **presses Add, Save and
+Remove and checks the config list afterwards**, and **drives the Scan network
+window on stubbed replies**, which catches the class of
 mistake unit tests structurally
 cannot: a widget method that does not exist, two geometry managers mixed in one
 container, a trace firing before the widget it writes to exists, a button wired
@@ -2662,6 +2711,15 @@ built window will meet it: **`ttk.Combobox` is a subclass of `ttk.Entry`**, so
 collecting the text boxes with `isinstance(w, ttk.Entry)` picks up the type
 picker as well, and the first version of the driver typed a camera's address
 into it.
+
+The scan half of the driver stubs `setup.discover_cameras` rather than probing
+for real, for two reasons: a smoke run has to say the same thing on a machine
+with no cameras on its LAN as on the one with eight, and the four invented
+replies are shaped to cover the cases the window has to tell apart (a make it
+recognises, one it does not, one already in the config, and a device that is
+not a camera). Everything else is a real click on a real widget. `scan_dialog()`
+blocks in `wait_window()`, so the driving is scheduled with `after()` *before*
+the button is pressed.
 
 **The click-through checklist**, in the order that finds problems soonest:
 
@@ -2697,26 +2755,35 @@ into it.
 8. Cameras: press Add and then Next without filling anything in. Refused,
    naming what to do. Press Add, click away, answer no: the empty row goes.
    Remove asks before it removes.
-9. Transfer: type a local folder, then a UNC path. Username and password appear
-   only for the UNC one, and *above* the Test button. Test says which account
-   it proved, and warns when that account is not the one that runs nightly.
-   **Then press Network:** every drive the operator has mapped is listed with
-   where it really points, and picking one puts the UNC in the box and carries
-   on into the folder dialog there.
-10. Notifications: fill in one service and press its Send a test message. The
+9. **Press Scan network** with a camera already configured. The window says it
+   is listening before it freezes, not after. What comes back is only the
+   cameras, counted, with anything else answering mentioned and not listed. The
+   configured one is greyed, untickable, reads "already added" and says the same
+   on hover. A camera whose make was recognised shows it; one whose make was
+   not shows an empty picker and **cannot be ticked until a make is chosen**.
+   Tick two, and the button counts them. They arrive as `CameraN`, enabled,
+   with the address in the box, no cadence override, and no password: select
+   each, type its credentials, and Test.
+10. Transfer: type a local folder, then a UNC path. Username and password appear
+    only for the UNC one, and *above* the Test button. Test says which account
+    it proved, and warns when that account is not the one that runs nightly.
+    **Then press Network:** every drive the operator has mapped is listed with
+    where it really points, and picking one puts the UNC in the box and carries
+    on into the folder dialog there.
+11. Notifications: fill in one service and press its Send a test message. The
     message arrives. Leaving all three empty is allowed and says so. **All
     three services must be visible without resizing the window**, along with
     the Next button.
-11. Summary: no password and no webhook URL anywhere on it. The Video row
+12. Summary: no password and no webhook URL anywhere on it. The Video row
     names the encoder this machine chose and the quality it will use. Finish
     writes the config, backs up the previous one, and restarts the services.
-12. **Run the checks from the completion dialog.** The pre-flight output
+13. **Run the checks from the completion dialog.** The pre-flight output
     appears in a window. Nothing in the wizard should ever tell the operator to
     open a prompt and type a command.
-13. Run it again with that config present. Every page opens on the saved
+14. Run it again with that config present. Every page opens on the saved
     answers rather than on defaults.
 
-Steps 6, 7 and 9 are the ones worth repeating after any change: they are where
+Steps 6, 7 and 10 are the ones worth repeating after any change: they are where
 the GUI has to agree with the console wizard, and where disagreeing stays
 invisible until an install fails. Ten of the defects in the first operator run
 were in this list's territory, and none of them was reachable by a unit test.
@@ -2999,7 +3066,7 @@ scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
 scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 1934 lines
+scripts/timelapse_gui.py         the same wizard in a window, 2301 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines

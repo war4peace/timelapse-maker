@@ -873,6 +873,271 @@ class TestCameraPane(unittest.TestCase):
         self.assertTrue(gui.preset_is_custom(gui.preset_named("Nonesuch")))
 
 
+class TestCameraDiscovery(unittest.TestCase):
+    """The Scan network button: what is offered, and what a tick becomes.
+
+    The probe itself is timelapse_setup's and is tested there against real
+    response bodies. Everything here is the decision layer the window sits on:
+    which answers are offered at all, which are already configured, what a
+    ticked row is called, and what config entry it turns into.
+    """
+
+    def device(self, address, **over):
+        dev = {"address": address, "camera": True, "name": "", "hardware": "",
+               "xaddrs": [], "sources": [address], "scopes": [], "types": ""}
+        dev.update(over)
+        return dev
+
+    # -- what gets offered ---------------------------------------------
+
+    def test_only_video_transmitters_are_offered(self):
+        """An NVR, a printer and every Windows PC answer this same probe.
+
+        Offering one as a camera would be offering a snapshot URL that cannot
+        work, which is the console wizard's rule read from the same field.
+        """
+        rows = gui.scan_rows([self.device("192.0.2.5"),
+                              self.device("192.0.2.6", camera=False)], [])
+        self.assertEqual([r["address"] for r in rows], ["192.0.2.5"])
+
+    def test_the_others_are_counted_rather_than_hidden(self):
+        summary = gui.scan_summary([self.device("192.0.2.5"),
+                                    self.device("192.0.2.6", camera=False)],
+                                   [{"address": "192.0.2.5"}])
+        self.assertIn("1 camera answered", summary)
+        self.assertIn("1 other device", summary)
+
+    def test_one_camera_alone_is_not_pluralised(self):
+        rows = [{"address": "192.0.2.5"}]
+        self.assertNotIn("cameras", gui.scan_summary([], rows))
+
+    def test_a_device_with_no_address_is_not_a_row(self):
+        # wsd_address() answers "" when a device advertised nothing usable and
+        # replied from nowhere we recorded; a row with no address offers a URL
+        # with a hole in it.
+        self.assertEqual(gui.scan_rows([self.device("")], []), [])
+
+    def test_the_model_identifies_the_row_not_the_onvif_name(self):
+        """Three Dahuas here all call themselves Dahua; the models differ."""
+        row = gui.scan_rows([self.device("192.0.2.5", name="Dahua",
+                                         hardware="IPC-HDW2431T")], [])[0]
+        self.assertEqual(row["model"], "IPC-HDW2431T")
+
+    def test_a_device_naming_neither_still_shows_something(self):
+        self.assertEqual(gui.scan_rows([self.device("192.0.2.5")],
+                                       [])[0]["model"], "(unnamed)")
+
+    # -- already added --------------------------------------------------
+
+    def test_a_configured_camera_is_marked(self):
+        cams = [{"name": "Roof",
+                 "url": "http://192.0.2.5/cgi-bin/snapshot.cgi"}]
+        rows = gui.scan_rows([self.device("192.0.2.5"),
+                              self.device("192.0.2.9")], cams)
+        self.assertEqual([r["added"] for r in rows], [True, False])
+
+    def test_the_address_comes_out_of_the_url(self):
+        """Because there is nowhere else it could come from.
+
+        A config stores a URL; an address is only ever what the wizard asked
+        for on the way to building one.
+        """
+        self.assertEqual(
+            gui.camera_address({"url": "rtsp://u:p@192.0.2.7:554/stream1"}),
+            "192.0.2.7")
+
+    def test_a_custom_url_camera_is_matched_too(self):
+        # identify_camera() cannot name this one's make, and it does not have
+        # to: the address is what says it is already configured.
+        rows = gui.scan_rows(
+            [self.device("10.1.2.3")],
+            [{"name": "Odd", "url": "http://10.1.2.3/some/vendor/path?x=1"}])
+        self.assertTrue(rows[0]["added"])
+
+    def test_an_ipv6_camera_is_matched_without_its_brackets(self):
+        rows = gui.scan_rows(
+            [self.device("2001:db8::5")],
+            [{"name": "Six", "url": "http://[2001:db8::5]/axis-cgi/jpg/"
+                                    "image.cgi"}])
+        self.assertTrue(rows[0]["added"])
+
+    def test_a_url_that_does_not_parse_is_not_an_address(self):
+        """One real Dahua advertises http://[]/onvif/device_service.
+
+        urlparse raises ValueError on that from 3.12, and a traceback out of
+        the scan would read as the scan being broken.
+        """
+        self.assertEqual(gui.camera_address({"url": "http://[]/onvif"}), "")
+        self.assertEqual(gui.configured_addresses([{"url": ""}, {}]), set())
+
+    def test_case_does_not_decide_whether_it_is_already_added(self):
+        rows = gui.scan_rows([self.device("CAM-ROOF")],
+                             [{"url": "http://cam-roof/axis-cgi/jpg/"
+                                      "image.cgi"}])
+        self.assertTrue(rows[0]["added"])
+
+    # -- the make -------------------------------------------------------
+
+    def test_a_named_vendor_preselects_its_make(self):
+        row = gui.scan_rows([self.device("192.0.2.5",
+                                         hardware="Amcrest IP2M-841")], [])[0]
+        self.assertEqual(row["type"], "Dahua / Amcrest")
+
+    def test_a_device_naming_no_vendor_preselects_nothing(self):
+        """The Reolink here calls itself IPC-BO and the Tapo calls itself TC40.
+
+        Empty is what makes the window ask. A preselection that is wrong is a
+        wrong URL that looks deliberate, which is worse than no answer.
+        """
+        row = gui.scan_rows([self.device("192.0.2.5", hardware="TC40")],
+                            [])[0]
+        self.assertEqual(row["type"], "")
+
+    def test_custom_url_is_not_a_choice_for_a_scanned_camera(self):
+        """It builds no URL from an address, so it could only produce an empty
+        one. The detail pane is where a camera becomes a custom one."""
+        choices = gui.scan_type_choices()
+        self.assertNotIn("Custom URL", choices)
+        for label in choices:
+            self.assertIsNotNone(gui.preset_named(label)[3],
+                                 "%s builds no URL from an address" % label)
+
+    def test_every_vendor_hint_names_a_type_the_window_offers(self):
+        # VENDOR_HINTS is keyed on preset labels precisely so this can be
+        # asserted rather than assumed; a hint naming a label the picker does
+        # not list would preselect a value the Combobox cannot show.
+        for _needle, label in setup.VENDOR_HINTS:
+            self.assertIn(label, gui.scan_type_choices())
+
+    # -- naming ---------------------------------------------------------
+
+    def test_new_cameras_are_numbered(self):
+        self.assertEqual(gui.next_camera_names([], 3),
+                         ["Camera1", "Camera2", "Camera3"])
+
+    def test_a_number_already_in_the_config_is_skipped(self):
+        self.assertEqual(gui.next_camera_names([{"name": "Camera1"},
+                                                {"name": "Camera3"}], 2),
+                         ["Camera2", "Camera4"])
+
+    def test_a_batch_does_not_collide_with_itself(self):
+        names = gui.next_camera_names([], 5)
+        self.assertEqual(len(set(names)), 5)
+
+    def test_naming_uses_the_wizards_own_rule(self):
+        """Patching setup.name_taken has to move the answer.
+
+        Which it can only do if there is no second opinion about what a taken
+        name is here. Case-insensitivity is that rule, and it lives in one
+        place.
+        """
+        with mock.patch.object(setup, "name_taken",
+                               side_effect=lambda cams, name, skip=None:
+                               name == "Camera1"):
+            self.assertEqual(gui.next_camera_names([], 1), ["Camera2"])
+
+    def test_a_camera_differing_only_in_case_is_taken(self):
+        self.assertEqual(gui.next_camera_names([{"name": "camera1"}], 1),
+                         ["Camera2"])
+
+    def test_asking_for_none_gets_none(self):
+        self.assertEqual(gui.next_camera_names([{"name": "Camera1"}], 0), [])
+
+    # -- what a tick builds ---------------------------------------------
+
+    def test_a_ticked_row_becomes_the_same_shape_as_a_typed_one(self):
+        row = {"address": "192.0.2.5", "model": "IP2M-841",
+               "type": "Dahua / Amcrest", "added": False}
+        level, _message, cam = gui.build_scanned(row, "Camera1", [])
+        self.assertEqual(level, gui.OK)
+        self.assertEqual(cam["name"], "Camera1")
+        self.assertEqual(cam["method"], "http")
+        self.assertEqual(cam["auth"], "digest")
+        self.assertIn("192.0.2.5", cam["url"])
+        self.assertTrue(cam["enabled"])
+
+    def test_it_carries_no_credentials(self):
+        """The operator chose per-camera over one shared pair for the scan.
+
+        So a scanned camera arrives with an address and a make, and the
+        password is typed in the detail pane. Empty rather than absent for a
+        digest camera, which is what build_camera() writes either way.
+        """
+        _l, _m, cam = gui.build_scanned({"address": "192.0.2.5",
+                                         "type": "Dahua / Amcrest"},
+                                        "Camera1", [])
+        self.assertEqual(cam.get("username"), "")
+        self.assertEqual(cam.get("password"), "")
+
+    def test_it_follows_the_global_cadence(self):
+        # Keyed on absence, as everywhere else: a scan that wrote today's
+        # global into every camera it added would pin the whole fleet.
+        _l, _m, cam = gui.build_scanned({"address": "192.0.2.5",
+                                         "type": "Reolink"}, "Camera1", [])
+        self.assertNotIn("interval_seconds", cam)
+        self.assertNotIn("framerate", cam)
+
+    def test_a_scanned_camera_reads_back_as_the_make_it_was_added_as(self):
+        """The round trip, for every make the scan can offer.
+
+        Which is what stops the scan being a special case: a camera it added
+        opens on its own make the next time the page does, exactly as one
+        typed in by hand does.
+
+        Compared on the template rather than on the label, because two of the
+        makes offered carry the *same* template (Hikvision ONVIF and Generic
+        ONVIF snapshot), so no amount of looking at a URL can tell them apart.
+        That is exactly why it does not matter: either answer saves the same
+        config, and it is the config this is about.
+        """
+        for label in gui.scan_type_choices():
+            _l, _m, cam = gui.build_scanned({"address": "192.0.2.5",
+                                             "type": label}, "Camera1", [])
+            values = gui.camera_form_values(cam)
+            self.assertEqual(gui.preset_named(values["type"])[3],
+                             gui.preset_named(label)[3],
+                             "%s did not survive being added" % label)
+            self.assertEqual(values["address"], "192.0.2.5")
+            # And re-saving it untouched has to be a no-op, which is the whole
+            # claim identify_camera() makes.
+            _l2, _m2, again = gui.build_camera(
+                {"name": cam["name"],
+                 "preset": gui.preset_named(values["type"]),
+                 "address": values["address"], "username": values["username"],
+                 "password": values["password"], "enabled": True}, [], cam)
+            self.assertEqual(again["url"], cam["url"])
+
+    def test_a_scanned_camera_is_found_again_by_its_own_address(self):
+        """So ticking the same camera twice is not possible.
+
+        Ties the two halves together: build_scanned() writes a URL, and
+        scan_rows() has to be able to read the address back out of it.
+        """
+        cams = []
+        for label in gui.scan_type_choices():
+            _l, _m, cam = gui.build_scanned({"address": "192.0.2.5",
+                                             "type": label},
+                                            "Camera%d" % (len(cams) + 1), [])
+            self.assertTrue(
+                gui.scan_rows([self.device("192.0.2.5")], [cam])[0]["added"],
+                "%s was not recognised as already added" % label)
+
+    def test_an_unnamed_row_is_refused_rather_than_written(self):
+        level, message, cam = gui.build_scanned(
+            {"address": "", "type": "Axis"}, "Camera1", [])
+        self.assertEqual(level, gui.FAIL)
+        self.assertIsNone(cam)
+        self.assertTrue(message)
+
+    def test_nothing_answering_is_not_the_same_as_no_cameras(self):
+        # Multicast does not cross subnets or VLANs, and a camera VLAN is
+        # common in exactly the deployments with the most cameras.
+        advice = gui.nothing_found_advice()
+        self.assertIn("VLAN", advice)
+        self.assertIn("Add", advice)
+        self.assertEqual(gui.scan_summary([], []), "")
+
+
 class TestReview(unittest.TestCase):
 
     def config(self, **over):

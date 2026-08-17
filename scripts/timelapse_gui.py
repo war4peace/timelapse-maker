@@ -547,6 +547,138 @@ def form_is_dirty(loaded, current):
 
 
 # ---------------------------------------------------------------------------
+# Camera discovery
+#
+# The probe itself is setup.discover_cameras(), unchanged and unwrapped: one
+# multicast WS-Discovery query, stdlib sockets, no credentials sent. What lives
+# here is everything the window has to decide about what answered, and it is
+# above the banner for the usual reason. "Is this one already configured" and
+# "what does a ticked row become" are rules, and a rule the window owns is a
+# rule nothing checks.
+# ---------------------------------------------------------------------------
+
+def camera_address(cam):
+    """The host a configured camera points at, or "" if nothing parses.
+
+    Read out of the URL, because there is no other place it could come from:
+    an address is what the wizard asks for and a URL is what the config keeps.
+    `wsd_host()` is this project's one answer to "the host of a string that may
+    not be a URL", including the ValueError a malformed literal raises on 3.12+
+    (one real Dahua advertises `http://[]/onvif/device_service`), so it is
+    reused here rather than restated.
+    """
+    return setup.wsd_host(str((cam or {}).get("url") or ""))
+
+
+def configured_addresses(cameras):
+    """Every host already in the config, folded for comparison."""
+    return {a.lower() for a in (camera_address(c) for c in cameras or []) if a}
+
+
+def scan_type_choices():
+    """The makes a scanned camera may be added as.
+
+    Custom URL is deliberately not among them. It builds no URL from an
+    address, so choosing it here could only produce a camera with no URL at
+    all; turning one into a custom camera afterwards is what the detail pane is
+    for.
+    """
+    return [preset[0] for preset in camera_types() if preset[3] is not None]
+
+
+def scan_rows(found, cameras):
+    """One row per discovered camera, in the order they should be listed.
+
+    Only devices claiming to be video transmitters. An NVR, a doorbell, a
+    printer and every Windows machine on the LAN answer this same probe, and
+    offering one as a camera would be offering a URL that cannot work.
+
+    `type` is `wsd_preset()`'s answer or "", and the empty string is
+    load-bearing: it means the window has to ask, because a preselected make
+    that is wrong is a wrong URL that looks deliberate. `added` is decided on
+    the address alone, which is the one thing the operator can compare by eye.
+    """
+    taken = configured_addresses(cameras)
+    rows = []
+    for dev in found or []:
+        if not dev.get("camera"):
+            continue
+        address = str(dev.get("address") or "")
+        if not address:
+            continue
+        rows.append({"address": address,
+                     # The model, not the ONVIF name: three Dahuas here all
+                     # call themselves Dahua, and the model tells them apart.
+                     "model": str(dev.get("hardware") or dev.get("name")
+                                  or "(unnamed)"),
+                     "type": setup.wsd_preset(dev),
+                     "added": address.lower() in taken})
+    return rows
+
+
+def scan_summary(found, rows):
+    """The line above the list: what answered, and what is not being offered."""
+    if not rows:
+        return ""
+    others = len([d for d in found or [] if not d.get("camera")])
+    parts = ["%d camera%s answered." % (len(rows),
+                                        "" if len(rows) == 1 else "s")]
+    if others:
+        parts.append("%d other device%s also answered and %s not offered: an "
+                     "NVR, a doorbell or a PC answers this too."
+                     % (others, "" if others == 1 else "s",
+                        "is" if others == 1 else "are"))
+    return " ".join(parts)
+
+
+def nothing_found_advice():
+    """Why nothing answering is not the same as there being no cameras."""
+    return ("Nothing answered on this network segment.\n\n"
+            "That does not mean there are no cameras. Multicast does not "
+            "cross subnets or VLANs, a dedicated camera VLAN is common in "
+            "exactly the deployments with the most cameras, and many cameras "
+            "ship with ONVIF switched off.\n\n"
+            "Add them with Add, which always works.")
+
+
+def next_camera_names(cameras, count):
+    """`count` unused CameraN names, in order.
+
+    Numbered rather than named after what each device calls itself, and that
+    is a decision rather than laziness: a camera name here is a *place*, and
+    what a camera reports is its model, so three Dahuas would all arrive
+    called Dahua. Names already in the config are skipped, using the wizard's
+    own case-insensitive rule rather than a second opinion about it.
+    """
+    names, used = [], list(cameras or [])
+    number = 1
+    while len(names) < max(0, int(count)):
+        candidate = "Camera%d" % number
+        if not setup.name_taken(used, candidate):
+            names.append(candidate)
+            used = used + [{"name": candidate}]
+        number += 1
+    return names
+
+
+def build_scanned(row, name, cameras):
+    """(level, message, camera) for one ticked row.
+
+    `build_camera()` again rather than an assembly of its own, so a camera that
+    arrived by a scan is the same shape as one typed in by hand, down to the
+    URL its template produces and the keys that are left absent.
+
+    Credentials are empty on purpose. Nothing here has ever been told one, and
+    the alternative considered was one shared pair applied to every camera in
+    the scan; the operator chose per-camera, so a scan adds an address and a
+    make and the detail pane is where a password gets typed.
+    """
+    return build_camera({"name": name, "preset": preset_named(row["type"]),
+                         "address": row["address"], "enabled": True,
+                         "username": "", "password": ""}, cameras)
+
+
+# ---------------------------------------------------------------------------
 # Notification sinks
 #
 # The field names are the schema's, not this file's invention. The first cut
@@ -929,6 +1061,41 @@ def run(config_path=None, existing=None):
             label.bind("<Button-1>", lambda _e: webbrowser.open(url))
             return label
 
+        def tooltip(self, widget, text):
+            """A hover label, since a greyed row has to be able to say why.
+
+            tkinter ships none, and it is a dozen lines: a borderless Toplevel
+            placed beside the widget on the way in and destroyed on the way
+            out. Bound to the row rather than to the control inside it, because
+            a disabled ttk widget is exactly the case this exists for and its
+            event handling is the thing being worked around.
+            """
+            holder = {}
+
+            def enter(_event=None):
+                if holder.get("tip") or not text:
+                    return
+                tip = tk.Toplevel(widget)
+                tip.wm_overrideredirect(True)
+                tip.wm_geometry("+%d+%d" % (widget.winfo_rootx()
+                                            + widget.winfo_width() + 10,
+                                            widget.winfo_rooty()))
+                ttk.Label(tip, text=text, background="#ffffe0", relief="solid",
+                          borderwidth=1, padding=(6, 3)).pack()
+                holder["tip"] = tip
+
+            def leave(_event=None):
+                tip = holder.pop("tip", None)
+                if tip is not None:
+                    tip.destroy()
+
+            widget.bind("<Enter>", enter)
+            widget.bind("<Leave>", leave)
+            # Or a tip whose row goes away sits on top of everything for ever,
+            # with no window left to take it back down.
+            widget.bind("<Destroy>", leave)
+            return widget
+
         def browse_into(self, var, directory=True):
             # Opening where the box already points, which the first version did
             # not: it started wherever the dialog felt like and the operator had
@@ -985,6 +1152,187 @@ def run(config_path=None, existing=None):
                        command=box.destroy).pack(side="right")
             ttk.Button(bar, text="Select network share",
                        command=choose).pack(side="right", padx=(0, 8))
+
+        def scan_dialog(self, cams):
+            """Probe the network, add what is ticked, return what was added.
+
+            The probe blocks for a few seconds, so the window opens *first* and
+            says what it is doing. A wizard that freezes with no explanation is
+            indistinguishable from one that has crashed, and this one runs
+            under pythonw with no console to say otherwise.
+            """
+            box = tk.Toplevel(self)
+            box.title("Scan network")
+            box.transient(self)
+            box.grab_set()
+            box.minsize(600, 250)
+            frame = ttk.Frame(box, padding=12)
+            frame.pack(fill="both", expand=True)
+            ttk.Label(frame, text="One multicast query, then a few seconds of "
+                                  "listening. No username or password is sent, "
+                                  "so this cannot lock a camera account.",
+                      wraplength=560, justify="left").pack(anchor="w")
+            heading = ttk.Label(frame, wraplength=560, justify="left",
+                                text="Listening for %d seconds ..."
+                                     % round(setup.WSD_WINDOW))
+            heading.pack(anchor="w", pady=(8, 6))
+
+            # A scrolling list, not a growing window: eight cameras is an
+            # ordinary fleet, and a form running past the bottom edge with no
+            # way to scroll was reported from the notifications page.
+            area = ttk.Frame(frame)
+            area.pack(fill="both", expand=True)
+            canvas = tk.Canvas(area, height=210, highlightthickness=0,
+                               borderwidth=0, background=box.cget("background"))
+            scroll = ttk.Scrollbar(area, orient="vertical",
+                                   command=canvas.yview)
+            rows_frame = ttk.Frame(canvas)
+            rows_frame.bind("<Configure>", lambda _e: canvas.configure(
+                scrollregion=canvas.bbox("all")))
+            canvas.create_window((0, 0), window=rows_frame, anchor="nw")
+            canvas.configure(yscrollcommand=scroll.set)
+            canvas.pack(side="left", fill="both", expand=True)
+            scroll.pack(side="right", fill="y")
+
+            hint = ttk.Label(frame, text="", foreground="#555", wraplength=560,
+                             justify="left")
+            hint.pack(anchor="w", pady=(6, 0))
+
+            buttons = ttk.Frame(frame)
+            buttons.pack(fill="x", pady=(10, 0))
+            ttk.Button(buttons, text="Cancel",
+                       command=box.destroy).pack(side="right")
+            adder = ttk.Button(buttons, text="Add")
+            adder.pack(side="right", padx=(0, 8))
+            adder.state(["disabled"])
+
+            picks, added = [], []
+
+            def tally(*_a):
+                ticked = len([1 for on, _row, _var in picks if on.get()])
+                adder.config(text="Add %d camera%s"
+                                  % (ticked, "" if ticked == 1 else "s")
+                             if ticked else "Add")
+                adder.state(["!disabled"] if ticked else ["disabled"])
+
+            def build_rows(rows):
+                for row in rows:
+                    line = ttk.Frame(rows_frame)
+                    line.pack(fill="x", pady=2)
+                    on = tk.BooleanVar(value=False)
+                    tick = ttk.Checkbutton(line, variable=on)
+                    tick.pack(side="left")
+                    grey = {"foreground": "#8a8a8a"} if row["added"] else {}
+                    ttk.Label(line, text=row["address"], width=18,
+                              **grey).pack(side="left")
+                    ttk.Label(line, text=row["model"][:20], width=21,
+                              **grey).pack(side="left")
+
+                    if row["added"]:
+                        # Explicit greying rather than the disabled state: a
+                        # ttk.Label greys on disable only if the theme says so,
+                        # and this has to be visible on every theme.
+                        tick.state(["disabled"])
+                        ttk.Label(line, text="already added",
+                                  **grey).pack(side="left", padx=(2, 0))
+                        # On the row as well as in the tooltip: a hover message
+                        # has to be found before it can be read, and greying
+                        # alone says "not available" without saying why.
+                        self.tooltip(line, "Already added. Select it in the "
+                                           "camera list to change it.")
+                        continue
+
+                    chosen = tk.StringVar(value=row["type"])
+                    ttk.Combobox(line, textvariable=chosen,
+                                 values=scan_type_choices(), state="readonly",
+                                 width=26).pack(side="left", padx=(2, 0))
+
+                    def gate(*_a, chosen=chosen, tick=tick, on=on):
+                        # Nothing may be ticked without a make. wsd_preset()
+                        # names six of eight real cameras and returns "" for
+                        # the rest, and adding one of those on a guess would
+                        # write a URL that looks chosen rather than invented.
+                        if chosen.get():
+                            tick.state(["!disabled"])
+                        else:
+                            on.set(False)
+                            tick.state(["disabled"])
+                        tally()
+
+                    chosen.trace_add("write", gate)
+                    on.trace_add("write", tally)
+                    picks.append((on, row, chosen))
+                    gate()
+
+                unknown = len([1 for _on, row, var in picks if not var.get()])
+                if unknown:
+                    hint.config(text="%d of these did not say what make it "
+                                     "is. Choose one beside it before ticking "
+                                     "it: a camera reports its model, and "
+                                     "some models name no vendor at all."
+                                     % unknown)
+
+            def accept():
+                wanted = [(row, var.get()) for on, row, var in picks
+                          if on.get()]
+                if not wanted:
+                    return
+                names = next_camera_names(cams, len(wanted))
+                problems = []
+                for (row, label), name in zip(wanted, names):
+                    level, message, cam = build_scanned(dict(row, type=label),
+                                                        name, cams)
+                    if level == FAIL or cam is None:
+                        problems.append("%s: %s" % (row["address"], message))
+                        continue
+                    cams.append(cam)
+                    added.append(cam)
+                box.destroy()
+                if problems:
+                    messagebox.showerror("Scan network", "\n".join(problems))
+
+            adder.config(command=accept)
+
+            def scan_now():
+                self.config(cursor="watch")
+                box.config(cursor="watch")
+                self.update_idletasks()
+                try:
+                    found = setup.discover_cameras()
+                except Exception as exc:            # noqa: BLE001
+                    # Discovery is an offer. Anything at all going wrong here
+                    # must leave the operator adding cameras by hand, never
+                    # looking at a stack trace.
+                    found, failure = [], "%s: %s" % (type(exc).__name__, exc)
+                else:
+                    failure = ""
+                finally:
+                    self.config(cursor="")
+                    box.config(cursor="")
+
+                rows = scan_rows(found, cams)
+                if not rows:
+                    box.destroy()
+                    messagebox.showinfo(
+                        "Scan network",
+                        ("Discovery failed (%s).\n\n" % failure if failure
+                         else "") + nothing_found_advice())
+                    return
+                heading.config(text=scan_summary(found, rows))
+                build_rows(rows)
+                # Sized to what answered, up to the cap: four cameras in a box
+                # of empty space looks like something failed to load. The
+                # geometry has to be cleared as well as the height set, or the
+                # window keeps whatever size it was given while it was still
+                # saying "listening".
+                canvas.config(height=min(240, max(56, 30 * len(rows))))
+                box.geometry("")
+                tally()
+
+            box.update_idletasks()
+            box.after(50, scan_now)
+            self.wait_window(box)
+            return added
 
         # -- pages -------------------------------------------------------
 
@@ -1180,9 +1528,13 @@ def run(config_path=None, existing=None):
             # exportselection=False, or clicking into any Entry on the right
             # hands the X selection over and the list silently unhighlights
             # the camera being edited.
-            listing = tk.Listbox(left, height=14, width=26,
+            # 12 rather than 14: the scan button below it has to fit without
+            # pushing the pane past the bottom of a 1366x768 screen.
+            listing = tk.Listbox(left, height=12, width=26,
                                  exportselection=False)
             listing.pack(fill="both", expand=True)
+            scan_bar = ttk.Frame(left)
+            scan_bar.pack(fill="x", pady=(6, 0))
             list_buttons = ttk.Frame(left)
             list_buttons.pack(fill="x", pady=(6, 0))
 
@@ -1510,6 +1862,21 @@ def run(config_path=None, existing=None):
                 redraw()
                 show_camera(cams[min(n, len(cams) - 1)] if cams else None)
 
+            def scan():
+                # leave_current() first, for the same reason Add calls it: the
+                # scan can append several cameras and select one of them, and
+                # a half-typed password on the camera showing now would go
+                # with no warning at all.
+                if not leave_current():
+                    return
+                fresh = self.scan_dialog(cams)
+                if not fresh:
+                    return
+                redraw()
+                show_camera(fresh[0])
+
+            ttk.Button(scan_bar, text="Scan network",
+                       command=scan).pack(fill="x")
             ttk.Button(list_buttons, text="Add", command=add,
                        width=11).pack(side="left")
             remover = ttk.Button(list_buttons, text="Remove", command=remove,
