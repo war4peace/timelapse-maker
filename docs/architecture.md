@@ -1986,6 +1986,53 @@ never as "there are no cameras": multicast does not cross subnets or VLANs, and
 a dedicated camera VLAN is common in exactly the deployments with the most
 cameras.
 
+**Leaving the camera page proves every enabled camera works**, and switches off
+the ones that do not. This exists because of what the scan leaves behind: five
+ticked cameras arrive enabled with no password, and nothing stopped Finish being
+pressed right then, which is five cameras configured to fail. A blank credential
+is a failed sign-in attempt rather than a free one.
+
+The operator's own account of why the credentials fork went the way it did is
+what shaped this, and it is worth recording: **AgentDVR asked for one credential
+pair, applied it to every camera it found, and retried until three of them were
+locked for thirty minutes**, because not every camera shared a password, which
+is good practice rather than a mistake. That failure has two halves and this
+project already fixed the second one. `_retry_grab()` refuses to retry an `auth`
+failure inside a tick ("the only thing a second attempt can buy is a second
+entry on the camera's lockout counter"), and the item 8 ladder above it is two
+strikes, then ten minutes of silence, then 31 (`AUTH_RETRY`), which is the
+measured 30-minute Reolink lock plus margin. The first half is what this check
+closes. Four things about it:
+
+- **The static reasons cost nothing and run first**, so a camera with no
+  credentials is **never fetched from**. `camera_not_ready()` is pure and needs
+  no network: a make that signs in with a username and password while carrying
+  neither is *unfinished*, which is a different answer from *unreachable*.
+  Only when **neither** is set, since a username with no password is a
+  deliberate answer this has no business overruling, and the live test settles
+  that in one attempt.
+- **A proof is not repeated.** `proof_key()` is the URL and the credentials
+  together, not the camera: a digest camera's URL does not change when its
+  password does, so keying on the address would call a camera proved after its
+  password had been changed to a wrong one. It is held on the wizard rather
+  than the page, because every navigation destroys and rebuilds the page and a
+  proof does not stop being true because somebody pressed Back. The Test button
+  writes to the same set, so a camera you have already tested is not asked
+  again. Without this, pressing Next twice authenticates against the whole
+  fleet twice, which is the AgentDVR shape with a person driving it.
+- **A camera that fails is switched off, not refused.** The operator's call,
+  and better than either option offered them (hard block, or block with an
+  escape hatch): a camera being mounted, unplugged or behind a switch that is
+  off is not a mistake, and blocking would hold a ten-minute configuration
+  hostage to it. Disabling says so in the list, is one tick to undo, and means
+  the daemon never contacts that camera at all, so it cannot collect failed
+  sign-ins either. The one case that still keeps the operator on the page is
+  everything being disabled, which the same popup says rather than a second
+  one.
+- **One sentence for one verdict.** `UNREACHABLE` is a module constant used by
+  both the Test button and this check, pinned by a test that counts it in the
+  source, because two wordings for one fault read as two faults.
+
 **Field labels are a fixed 22 characters wide** (`LABELS`), which is what
 "Seconds between frames" needs. A `ttk.Label` with a width in characters cuts
 what does not fit, silently and only on screen, so this has been reported twice
@@ -2721,6 +2768,11 @@ not a camera). Everything else is a real click on a real widget. `scan_dialog()`
 blocks in `wait_window()`, so the driving is scheduled with `after()` *before*
 the button is pressed.
 
+It then presses Next on what the scan left behind and **counts the live tests**
+rather than only checking their result, because the thing that costs real money
+if it is wrong is a camera with no credentials reaching the network at all. One
+call, for the one camera that had credentials.
+
 **The click-through checklist**, in the order that finds problems soonest:
 
 1. **Launch it from the Start menu, not from a prompt.** No console window
@@ -2762,8 +2814,13 @@ the button is pressed.
    on hover. A camera whose make was recognised shows it; one whose make was
    not shows an empty picker and **cannot be ticked until a make is chosen**.
    Tick two, and the button counts them. They arrive as `CameraN`, enabled,
-   with the address in the box, no cadence override, and no password: select
-   each, type its credentials, and Test.
+   with the address in the box, no cadence override, and no password.
+   **Press Next without touching them:** both are switched off, named in a
+   popup as having no credentials, and the page does not change. Nothing
+   should have been fetched from them. Then give one its credentials, tick it
+   back on, press Test, and press Next: it goes through, and a camera you
+   already tested is not tested a second time. Unplug one and press Next: it
+   is switched off with a different reason, and the wizard carries on.
 10. Transfer: type a local folder, then a UNC path. Username and password appear
     only for the UNC one, and *above* the Test button. Test says which account
     it proved, and warns when that account is not the one that runs nightly.
@@ -3066,7 +3123,7 @@ scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
 scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 2301 lines
+scripts/timelapse_gui.py         the same wizard in a window, 2432 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines

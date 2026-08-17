@@ -40,6 +40,12 @@ __version__ = "0.1.9"
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 
+# One sentence, said in one place: the Test button and the check on the way off
+# the camera page are answering the same question, and two wordings for one
+# verdict read as two different faults.
+UNREACHABLE = ("No usable image came back. Check the address, and the "
+               "username and password.")
+
 # Wide enough for a UNC path and an explanation of what is wrong with it, and
 # for a camera list beside the camera being edited; short enough to sit on a
 # 1366x768 laptop, which a recorder often is, taskbar and title bar included.
@@ -661,6 +667,83 @@ def next_camera_names(cameras, count):
     return names
 
 
+def camera_not_ready(cam):
+    """Why this camera cannot work as it stands, or "". No network involved.
+
+    The case that made this necessary is the one Scan network creates: cameras
+    arrive with an address and a make and no password, enabled, and nothing
+    stopped Finish being pressed right then. A blank credential is still a
+    failed authentication attempt rather than a free one, so five scanned
+    cameras is five cameras configured to fail.
+
+    Static on purpose, and checked before anything is fetched. A make that
+    signs in with a username and password while carrying neither is
+    *unfinished*, which is a different answer from *unreachable* and needs no
+    camera to establish. Only when **neither** is set: a username with no
+    password is a deliberate answer this has no business overruling, and the
+    live test settles it in one attempt.
+    """
+    cam = cam or {}
+    if not str(cam.get("url", "") or "").strip():
+        return "No address. Select it and give it one."
+
+    known = identify_camera(cam)
+    template = preset_named(known[0])[3] if known else None
+    # Two places credentials live, and both count: the fields for a make that
+    # uses HTTP digest or basic, and the URL itself for the makes whose
+    # template names them (Reolink, RTSP).
+    wants = (str(cam.get("auth", "") or "").lower() in ("digest", "basic")
+             or bool(template and "{user}" in template))
+    if not wants:
+        return ""
+    values = camera_form_values(cam)
+    if values["username"] or values["password"]:
+        return ""
+    return "No credentials entered. Please enter camera credentials."
+
+
+def proof_key(cam):
+    """What a successful test proves, so it need not be repeated.
+
+    The address and the credentials together, because a digest camera's URL
+    does not change when its password does. Change any of the three and the
+    key changes with it, which is exactly when the answer stops being current.
+
+    This is what keeps pressing Next cheap. Testing every enabled camera on
+    every press would freeze the window for up to the fetch timeout times the
+    camera count, and put one authentication attempt on every camera each
+    time, which is the shape that locks accounts.
+    """
+    cam = cam or {}
+    values = camera_form_values(cam)
+    return (str(cam.get("url", "") or ""), values["username"],
+            values["password"])
+
+
+def disabled_report(failures, still_enabled):
+    """The popup naming what was switched off, and why.
+
+    Switched off rather than refused, which is the operator's call and a better
+    one than either option offered: a camera being mounted, unplugged or behind
+    a switch that is off is not a mistake, and blocking would hold a
+    ten-minute configuration hostage to it. Disabling says so in the list, is
+    one tick to undo, and means the daemon never contacts that camera at all,
+    so it cannot collect failed sign-ins either.
+    """
+    lines = ["These cameras were switched off, because nothing would be "
+             "captured from them as they are:", ""]
+    lines += ["    %s: %s" % (name or "(unnamed)", reason)
+              for name, reason in failures]
+    lines.append("")
+    if still_enabled:
+        lines.append("Everything else is unchanged. Fix one, tick Enable "
+                     "timelapse again, and press Test.")
+    else:
+        lines.append("That leaves nothing enabled, so nothing at all would be "
+                     "captured. Fix at least one and press Test.")
+    return "\n".join(lines)
+
+
 def build_scanned(row, name, cameras):
     """(level, message, camera) for one ticked row.
 
@@ -960,6 +1043,11 @@ def run(config_path=None, existing=None):
             # it is a property of the box, not a setting, and the nightly run
             # probes for it again anyway.
             self.codec = None
+            # Cameras whose address and credentials have been proved to work,
+            # by proof_key(). On the wizard rather than on the page, because
+            # every page rebuild destroys the page, and a proof does not stop
+            # being true because somebody pressed Back.
+            self.proven = set()
 
             self.header = ttk.Label(self, text="", font=("Segoe UI", 14, "bold"))
             self.header.pack(anchor="w", padx=16, pady=(14, 0))
@@ -1792,10 +1880,13 @@ def run(config_path=None, existing=None):
                             else setup.test_camera(built, self.cfg))
                 finally:
                     self.config(cursor="")
+                if good:
+                    # So Next need not ask this camera again. Keyed on the
+                    # address and credentials that were proved, not on the
+                    # camera, so changing any of them re-opens the question.
+                    self.proven.add(proof_key(built))
                 self.say(tested, OK if good else FAIL,
-                         "Test successful." if good else
-                         "No usable image came back. Check the address, and "
-                         "the username and password.")
+                         "Test successful." if good else UNREACHABLE)
 
             def leave_current():
                 """True when it is all right to stop editing this camera."""
@@ -1910,7 +2001,47 @@ def run(config_path=None, existing=None):
                         "Add at least one camera and tick Enable timelapse, "
                         "or nothing will be captured.")
                     return False
-                return True
+
+                # Every enabled camera has to be able to work before the page
+                # is left. The static reasons cost nothing; the live test runs
+                # only for a camera whose address or credentials have not
+                # already been proved, which is what stops a second Next press
+                # authenticating against the whole fleet again.
+                failures = []
+                self.config(cursor="watch")
+                self.update_idletasks()
+                try:
+                    for cam in cams:
+                        if not cam.get("enabled", True):
+                            continue
+                        reason = camera_not_ready(cam)
+                        if not reason:
+                            key = proof_key(cam)
+                            if key in self.proven:
+                                continue
+                            good = (setup.test_camera_rtsp(cam, self.cfg)
+                                    if cam.get("method") == "rtsp"
+                                    else setup.test_camera(cam, self.cfg))
+                            if good:
+                                self.proven.add(key)
+                                continue
+                            reason = UNREACHABLE
+                        cam["enabled"] = False
+                        failures.append((cam.get("name"), reason))
+                finally:
+                    self.config(cursor="")
+
+                if not failures:
+                    return True
+                left = [c for c in cams if c.get("enabled", True)]
+                redraw()
+                if state["cam"] is not None:
+                    # The pane is showing one of these, and its Enable box
+                    # still says otherwise until it is filled in again.
+                    show_camera(state["cam"])
+                messagebox.showwarning("Cameras",
+                                       disabled_report(failures, bool(left)))
+                return bool(left)
 
             self.commit = commit
 

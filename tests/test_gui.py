@@ -1129,6 +1129,130 @@ class TestCameraDiscovery(unittest.TestCase):
         self.assertIsNone(cam)
         self.assertTrue(message)
 
+    # -- what Next checks before it leaves the page ---------------------
+
+    def ready(self, label, **over):
+        _l, _m, cam = gui.build_scanned({"address": "192.0.2.5",
+                                         "type": label}, "Camera1", [])
+        cam.update(over)
+        return cam
+
+    def test_a_scanned_camera_is_not_ready_until_it_has_a_password(self):
+        """The state a scan leaves behind, and the reason this check exists.
+
+        Five ticked cameras is five cameras enabled and configured to fail,
+        and a blank credential is a failed sign-in attempt rather than a free
+        one.
+        """
+        for label in gui.scan_type_choices():
+            self.assertIn("credentials", gui.camera_not_ready(self.ready(label)),
+                          "%s was called ready with no credentials" % label)
+
+    def test_a_camera_with_credentials_is_ready(self):
+        for label in gui.scan_type_choices():
+            _l, _m, cam = gui.build_scanned({"address": "192.0.2.5",
+                                             "type": label}, "Camera1", [])
+            _l2, _m2, filled = gui.build_camera(
+                {"name": "Camera1", "preset": gui.preset_named(label),
+                 "address": "192.0.2.5", "username": "admin",
+                 "password": "s3cret", "enabled": True}, [], cam)
+            self.assertEqual(gui.camera_not_ready(filled), "",
+                             "%s was called unfinished" % label)
+
+    def test_a_username_with_no_password_is_left_alone(self):
+        """A deliberate answer this has no business overruling.
+
+        The live test settles it in one attempt, which is the right cost for
+        an ambiguous case; refusing it outright would be the check guessing.
+        """
+        cam = {"name": "R", "method": "http", "auth": "digest",
+               "url": "http://192.0.2.5/axis-cgi/jpg/image.cgi",
+               "username": "admin", "password": ""}
+        self.assertEqual(gui.camera_not_ready(cam), "")
+
+    def test_a_camera_that_needs_no_credentials_is_ready_without_them(self):
+        # A custom URL with auth none is an open snapshot endpoint, which is a
+        # working configuration and must not be called unfinished.
+        cam = {"name": "Open", "method": "http", "auth": "none",
+               "url": "http://192.0.2.5/snap.jpg"}
+        self.assertEqual(gui.camera_not_ready(cam), "")
+
+    def test_a_camera_with_no_address_says_so_rather_than_being_fetched(self):
+        self.assertIn("No address", gui.camera_not_ready({"name": "R",
+                                                          "url": ""}))
+
+    def test_a_reolink_carries_its_credentials_in_the_url(self):
+        """So the fields being empty proves nothing about it either way."""
+        _l, _m, cam = gui.build_camera(
+            {"name": "R", "preset": gui.preset_named("Reolink"),
+             "address": "192.0.2.5", "username": "admin",
+             "password": "s3cret", "enabled": True}, [])
+        self.assertNotIn("username", cam)         # auth is none for this make
+        self.assertEqual(gui.camera_not_ready(cam), "")
+
+    # -- not testing the same camera twice ------------------------------
+
+    def test_the_proof_covers_the_password_not_only_the_address(self):
+        """A digest camera's URL does not move when its password does.
+
+        Keying on the URL alone would call a camera proved after its password
+        had been changed to a wrong one.
+        """
+        base = {"name": "R", "method": "http", "auth": "digest",
+                "url": "http://192.0.2.5/axis-cgi/jpg/image.cgi",
+                "username": "admin", "password": "one"}
+        self.assertNotEqual(gui.proof_key(base),
+                            gui.proof_key(dict(base, password="two")))
+        self.assertNotEqual(gui.proof_key(base),
+                            gui.proof_key(dict(base, username="root")))
+
+    def test_an_unchanged_camera_keeps_its_proof(self):
+        cam = {"name": "R", "method": "http", "auth": "digest",
+               "url": "http://192.0.2.5/axis-cgi/jpg/image.cgi",
+               "username": "admin", "password": "one"}
+        self.assertEqual(gui.proof_key(cam), gui.proof_key(dict(cam)))
+        # Renaming a camera moves a folder, not an endpoint.
+        self.assertEqual(gui.proof_key(cam),
+                         gui.proof_key(dict(cam, name="Roof")))
+
+    def test_changing_a_reolink_password_moves_its_proof(self):
+        # Which it can only do by reading them back out of the URL, since that
+        # is the only place this make keeps them.
+        keys = set()
+        for password in ("one", "two"):
+            _l, _m, cam = gui.build_camera(
+                {"name": "R", "preset": gui.preset_named("Reolink"),
+                 "address": "192.0.2.5", "username": "admin",
+                 "password": password, "enabled": True}, [])
+            keys.add(gui.proof_key(cam))
+        self.assertEqual(len(keys), 2)
+
+    # -- what the popup says --------------------------------------------
+
+    def test_the_report_names_every_camera_and_its_reason(self):
+        text = gui.disabled_report([("Camera1", "No credentials entered."),
+                                    ("Yard", "No usable image came back.")],
+                                   True)
+        for word in ("Camera1", "Yard", "No credentials entered.",
+                     "No usable image came back."):
+            self.assertIn(word, text)
+        self.assertIn("switched off", text)
+        self.assertIn("Enable timelapse", text)
+
+    def test_the_report_says_when_nothing_is_left(self):
+        text = gui.disabled_report([("Camera1", "No credentials entered.")],
+                                   False)
+        self.assertIn("nothing at all", text)
+        self.assertNotIn("Everything else is unchanged", text)
+
+    def test_one_wording_for_one_verdict(self):
+        """The Test button and the check on the way out answer the same
+        question, and two wordings for one fault read as two faults."""
+        self.assertIn("username and password", gui.UNREACHABLE)
+        source = SOURCE.read_text(encoding="utf-8")
+        self.assertEqual(source.count("No usable image came back"), 1,
+                         "the sentence is spelled out more than once")
+
     def test_nothing_answering_is_not_the_same_as_no_cameras(self):
         # Multicast does not cross subnets or VLANs, and a camera VLAN is
         # common in exactly the deployments with the most cameras.

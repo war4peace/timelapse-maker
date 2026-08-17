@@ -61,6 +61,15 @@ While the version is `0.x`, the configuration format may change in any release.
   that is not the same as there being no cameras: this kind of query does not
   cross subnets or VLANs, and many cameras ship with ONVIF switched off.
 
+  **Leaving the camera page checks that every camera you have switched on can
+  actually be reached**, and switches off the ones that cannot, telling you
+  which and why. A camera you added but have not given a password to is caught
+  without anything being sent to it at all; one that was asked and did not
+  answer is switched off too, so a camera that happens to be unplugged while
+  you are setting up cannot stop you finishing what you were doing. Tick it
+  back on once it is working. A camera you have already tested is not tested
+  again, so pressing Next twice does not sign in to your whole fleet twice.
+
   **The summary names the encoder your machine will actually use**, and the
   quality setting that goes with it, which is the difference between a 300 MB
   day and a 900 MB one. It is read from the arguments the nightly run will be
