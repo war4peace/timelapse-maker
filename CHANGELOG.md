@@ -39,6 +39,15 @@ While the version is `0.x`, the configuration format may change in any release.
   one page for the same reason, since each was a single question with a window
   to itself.
 
+  **Each camera can have its own capture interval and frame rate**, which the
+  configuration format has always supported and no wizard has ever asked
+  about, so until now it meant editing the file by hand. Leave the boxes empty
+  and the camera follows the global setting, including any later change to it.
+
+  **A camera reads back as the make it was added as.** It used to come back as
+  Custom URL showing the address it had been given, which was correct but read
+  as the wizard having forgotten.
+
   **The summary names the encoder your machine will actually use**, and the
   quality setting that goes with it, which is the difference between a 300 MB
   day and a 900 MB one. It is read from the arguments the nightly run will be

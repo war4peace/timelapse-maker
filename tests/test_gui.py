@@ -578,14 +578,50 @@ class TestCameraBuilding(unittest.TestCase):
         self.assertIn("reserves", message)
 
     def test_editing_keeps_the_keys_it_was_not_asked_about(self):
+        # timeout_seconds is not on the page and never was, so an edit here
+        # has no business touching it.
         existing = {"name": "Roof", "url": "http://x", "method": "http",
-                    "interval_seconds": 10, "enabled": True}
+                    "timeout_seconds": 9, "enabled": True}
         _level, _m, cam = gui.build_camera(
             {"name": "Roof", "preset": self.preset("Custom URL"),
              "url": "http://y", "auth": "none", "method": "http",
              "enabled": True}, [existing], cam=existing)
-        self.assertEqual(cam["interval_seconds"], 10,
-                         "a per-camera cadence must survive an edit here")
+        self.assertEqual(cam["timeout_seconds"], 9)
+
+    def test_a_per_camera_cadence_is_carried_by_the_page(self):
+        """It is asked about now, so the page carries it rather than luck.
+
+        Until the pane offered cadence and frame rate, build_camera() left
+        both alone and a per-camera value survived an edit because nothing
+        here knew it was there. That is not a property to rely on once the
+        page has a box for it: what it saves has to be what the box holds.
+        """
+        existing = {"name": "Roof", "url": "http://x", "method": "http",
+                    "interval_seconds": 10, "framerate": 30}
+        _level, _m, cam = gui.build_camera(
+            {"name": "Roof", "preset": self.preset("Custom URL"),
+             "url": "http://x", "auth": "none", "method": "http",
+             "interval_seconds": 10, "framerate": 30},
+            [existing], cam=existing)
+        self.assertEqual(cam["interval_seconds"], 10)
+        self.assertEqual(cam["framerate"], 30)
+
+    def test_an_override_is_removed_rather_than_stored_as_a_copy(self):
+        """The whole reason per-camera settings are keyed on ABSENCE.
+
+        A camera carrying no key follows the global, which is what lets a
+        later change to the global still move it. Writing a value that merely
+        equals today's global would pin every camera anybody had opened.
+        """
+        existing = {"name": "Roof", "url": "http://x", "method": "http",
+                    "interval_seconds": 10, "framerate": 30}
+        _level, _m, cam = gui.build_camera(
+            {"name": "Roof", "preset": self.preset("Custom URL"),
+             "url": "http://x", "auth": "none", "method": "http",
+             "interval_seconds": None, "framerate": None},
+            [existing], cam=existing)
+        self.assertNotIn("interval_seconds", cam)
+        self.assertNotIn("framerate", cam)
 
     def test_disabling_is_carried_through(self):
         _level, _m, cam = gui.build_camera(
@@ -626,7 +662,17 @@ class TestCameraPane(unittest.TestCase):
     of rules: what these check is the three things the pane has to get right
     on its own, which are what it shows in the list, what it fills the fields
     with, and whether it has been edited since.
+
+    `preset()` is the same helper TestCameraBuilding uses; a camera has to be
+    built before it can be identified again, and building it here rather than
+    hand-writing a URL is the point of most of these.
     """
+
+    def preset(self, label):
+        for entry in gui.camera_types():
+            if entry[0] == label:
+                return entry
+        raise AssertionError("no preset called %s" % label)
 
     def test_the_list_shows_the_name(self):
         self.assertEqual(gui.camera_label({"name": "Roof", "enabled": True}),
@@ -646,16 +692,85 @@ class TestCameraPane(unittest.TestCase):
         self.assertEqual(gui.camera_label({}), "(new camera)")
         self.assertEqual(gui.camera_label(None), "(new camera)")
 
-    def test_an_existing_camera_opens_on_custom_showing_its_url(self):
-        """Rather than guessing which template produced the URL.
+    def test_a_url_nothing_built_opens_on_custom(self):
+        """Which is the honest answer, not a fallback.
 
-        Guessing wrong would silently rewrite a working camera, which is the
-        console wizard's reasoning for showing the URL on its edit path.
+        Nothing in the list produces this URL, so no make can be claimed for
+        it, and Custom carries it through untouched.
         """
         values = gui.camera_form_values({"name": "Roof", "method": "http",
                                          "url": "http://10.0.0.1/snap"})
         self.assertEqual(values["type"], gui.camera_types()[-1][0])
         self.assertEqual(values["url"], "http://10.0.0.1/snap")
+
+    def test_a_camera_opens_on_the_make_it_was_added_as(self):
+        """Reported as an inconsistency: a Dahua came back as Custom URL.
+
+        The config records the URL, not the make, so the make has to be worked
+        out again. Accepted only when rebuilding reproduces the URL exactly,
+        which makes claiming a make a claim that Save changes nothing.
+        """
+        _l, _m, built = gui.build_camera(
+            {"name": "Street4K", "preset": self.preset("Dahua / Amcrest"),
+             "address": "192.168.1.9", "username": "admin",
+             "password": "secret"}, [])
+        values = gui.camera_form_values(built)
+        self.assertEqual(values["type"], "Dahua / Amcrest")
+        self.assertEqual(values["address"], "192.168.1.9")
+        # Digest, so these live in their own fields and not in the URL. Taking
+        # the extracted ones blindly would blank both.
+        self.assertEqual(values["username"], "admin")
+        self.assertEqual(values["password"], "secret")
+
+    def test_a_make_that_keeps_its_credentials_in_the_url_round_trips(self):
+        _l, _m, built = gui.build_camera(
+            {"name": "Drive", "preset": self.preset("Reolink"),
+             "address": "10.0.0.4", "username": "admin",
+             "password": "hunt&r 2"}, [])
+        values = gui.camera_form_values(built)
+        self.assertEqual(values["type"], "Reolink")
+        self.assertEqual(values["address"], "10.0.0.4")
+        # Through quote() on the way in and back out again, ampersand and
+        # space included, which is the case that would silently corrupt.
+        self.assertEqual(values["password"], "hunt&r 2")
+
+    def test_every_make_survives_the_round_trip(self):
+        """Each preset in the list, built and then identified again.
+
+        A new preset whose template this cannot reverse would quietly fall
+        back to Custom for every camera using it.
+        """
+        for label, _method, _auth, template in gui.camera_types():
+            if template is None:
+                continue
+            _l, _m, built = gui.build_camera(
+                {"name": "C", "preset": self.preset(label),
+                 "address": "10.0.0.8", "username": "u", "password": "p"}, [])
+            found = gui.identify_camera(built)
+            self.assertIsNotNone(found, label)
+            self.assertEqual(found[1], "10.0.0.8", label)
+
+    def test_an_ipv6_camera_comes_back_as_it_was_typed(self):
+        _l, _m, built = gui.build_camera(
+            {"name": "V6", "preset": self.preset("Axis"),
+             "address": "2001:db8::1"}, [])
+        values = gui.camera_form_values(built)
+        # Bracketed inside the URL, bare in the box that produced it.
+        self.assertEqual(values["address"], "2001:db8::1")
+
+    def test_nothing_is_claimed_for_a_url_with_no_make(self):
+        self.assertIsNone(gui.identify_camera({"url": "http://x/y.jpg"}))
+        self.assertIsNone(gui.identify_camera({}))
+        self.assertIsNone(gui.identify_camera(None))
+
+    def test_a_hand_edited_template_url_is_not_claimed(self):
+        """The check is the round trip, not the shape.
+
+        A URL that looks like a Dahua but is not what the template produces
+        must not be claimed, because saving would rewrite it.
+        """
+        self.assertIsNone(gui.identify_camera(
+            {"url": "http://10.0.0.1/cgi-bin/snapshot.cgi?channel=2&subtype=0"}))
 
     def test_a_new_camera_opens_on_a_make_where_an_address_is_enough(self):
         values = gui.camera_form_values({})
@@ -686,6 +801,50 @@ class TestCameraPane(unittest.TestCase):
         # The box still offers a number, so switching it on needs one click
         # rather than a click and a guess at what a sensible value is.
         self.assertEqual(off["smoothing"], str(SMOOTH_DEFAULT))
+
+    def test_a_camera_with_no_override_offers_empty_boxes(self):
+        """Empty is the only rendering of "follows the global" that is safe.
+
+        A box prefilled with the global would be saved as a copy, pinning
+        every camera anybody had merely opened to today's setting.
+        """
+        values = gui.camera_form_values({"name": "R", "url": "http://x"})
+        self.assertEqual(values["interval"], "")
+        self.assertEqual(values["framerate"], "")
+
+    def test_a_camera_with_overrides_shows_them(self):
+        values = gui.camera_form_values({"name": "R", "url": "http://x",
+                                         "interval_seconds": 10,
+                                         "framerate": 30})
+        self.assertEqual(values["interval"], "10")
+        self.assertEqual(values["framerate"], "30")
+
+    def test_blank_means_follow_the_global(self):
+        for level, message, value in (gui.check_camera_interval("", 5),
+                                      gui.check_camera_framerate("", 60)):
+            self.assertEqual(level, gui.OK)
+            self.assertIsNone(value)
+            self.assertIn("global", message)
+
+    def test_the_same_as_the_global_is_not_stored(self):
+        # Answering with the global value has to mean "follow it", or a later
+        # change to the global stops reaching this camera.
+        self.assertIsNone(gui.check_camera_interval("5", 5)[2])
+        self.assertIsNone(gui.check_camera_framerate("60", 60)[2])
+
+    def test_a_real_override_is_kept(self):
+        self.assertEqual(gui.check_camera_interval("10", 5)[2], 10)
+        self.assertEqual(gui.check_camera_framerate("30", 60)[2], 30)
+
+    def test_an_override_is_checked_as_hard_as_the_global(self):
+        # 900s a frame is under min_frames for a whole day, which produces no
+        # video at all, silently and for ever.
+        level, message, value = gui.check_camera_interval("900", 5)
+        self.assertEqual(level, gui.FAIL)
+        self.assertIsNone(value)
+        self.assertIn("skipped", message)
+        self.assertEqual(gui.check_camera_framerate("0", 60)[0], gui.FAIL)
+        self.assertEqual(gui.check_camera_interval("often", 5)[0], gui.FAIL)
 
     def test_an_untouched_pane_is_not_dirty(self):
         values = gui.camera_form_values({"name": "R", "url": "http://x"})

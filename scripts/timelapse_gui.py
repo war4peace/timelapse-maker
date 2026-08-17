@@ -299,6 +299,62 @@ def credentials_go_in_the_url(preset):
     return bool(preset[3] and "{password}" in preset[3])
 
 
+def identify_camera(cam):
+    """(label, address, username, password) for a stored camera, or None.
+
+    Which make a camera was set up as. Reported as an inconsistency from a real
+    run: a camera added as a Dahua came back as Custom URL the next time the
+    page was opened, because the config records the URL and not the make it was
+    built from.
+
+    The old behaviour was deliberate and its reasoning was sound: guessing
+    wrong would silently rewrite a working camera. What was wrong was treating
+    this as a guess. **A candidate is accepted only when the whole round trip
+    reproduces the stored URL exactly**, template filled in from what was
+    extracted, credentials put back through `quote()` the same way saving will.
+    So claiming a make is a claim that pressing Save changes nothing, which is
+    the only thing that had to be true.
+
+    Two templates in the list are identical (Hikvision ONVIF and Generic ONVIF
+    snapshot), so one of them cannot be told from the other. The first match
+    wins, and it does not matter: they build the same URL, so either answer
+    saves the same config.
+    """
+    import re
+    from urllib.parse import unquote
+
+    url = str((cam or {}).get("url") or "")
+    if not url:
+        return None
+    holes = {"ip": r"(?P<ip>[^/]+?)", "user": r"(?P<user>.*?)",
+             "password": r"(?P<password>.*?)"}
+    for preset in camera_types():
+        template = preset[3]
+        if template is None:
+            continue
+        pattern = "".join(holes[part[1:-1]] if part[:1] == "{" else
+                          re.escape(part)
+                          for part in re.split(r"(\{[a-z]+\})", template))
+        found = re.match(pattern + "$", url)
+        if not found:
+            continue
+        got = found.groupdict()
+        user = unquote(got.get("user", ""))
+        password = unquote(got.get("password", ""))
+        address = got["ip"]
+        # The round trip, not the match: re-quoting has to land back on the
+        # same string, or an operator who presses Save without touching
+        # anything would silently get a different URL.
+        if template.format(ip=setup.url_host(address),
+                           user=setup.quote(user),
+                           password=setup.quote(password)) != url:
+            continue
+        if address.startswith("[") and address.endswith("]"):
+            address = address[1:-1]         # an IPv6 literal, as it was typed
+        return preset[0], address, user, password
+    return None
+
+
 def build_camera(fields, cameras, cam=None):
     """(level, message, camera) from what the dialog is holding.
 
@@ -361,7 +417,48 @@ def build_camera(fields, cameras, cam=None):
     else:
         camera.pop("smooth_frames", None)
 
+    # Per-camera settings are keyed on ABSENCE, and that is what makes a later
+    # change to the global still move this camera. Storing a copy that happens
+    # to equal the global would pin every camera anybody had merely opened
+    # here, silently, which is the one way this page could do real damage.
+    for key in ("interval_seconds", "framerate"):
+        value = fields.get(key)
+        if value:
+            camera[key] = int(value)
+        else:
+            camera.pop(key, None)
+
     return (WARN if name_note else OK), name_note, camera
+
+
+def check_camera_interval(text, default):
+    """(level, message, seconds or None). None means follow the global.
+
+    Blank and "the same as the global" are the same answer, and both remove
+    the key rather than storing it.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return OK, "Follows the global setting.", None
+    level, message, value = check_interval(raw)
+    if level == FAIL:
+        return FAIL, message, None
+    if value == default:
+        return OK, "The same as the global, so it follows it.", None
+    return level, message, value
+
+
+def check_camera_framerate(text, default, interval=None):
+    """(level, message, fps or None). None means follow the global."""
+    raw = str(text or "").strip()
+    if not raw:
+        return OK, "Follows the global setting.", None
+    level, message, value = check_framerate(raw, interval)
+    if level == FAIL:
+        return FAIL, message, None
+    if value == default:
+        return OK, "The same as the global, so it follows it.", None
+    return level, message, value
 
 
 def check_smoothing(text):
@@ -399,24 +496,39 @@ def camera_label(cam):
 def camera_form_values(cam):
     """What the detail pane starts out holding for this camera.
 
-    An existing camera opens on Custom URL showing the URL it actually has,
-    which is the console wizard's edit path: working out which template
-    produced a stored URL would be guesswork, and guessing wrong would
-    silently rewrite a working camera. A new one opens on the first make in
-    the list, where an address is all that is wanted.
+    An existing camera opens on the make its URL was built from, worked out by
+    identify_camera(), which only answers when rebuilding reproduces that URL
+    exactly. Anything it cannot account for opens on Custom URL showing the URL
+    itself, which is the honest answer and the console wizard's edit path. A
+    new one opens on the first make in the list, where an address is all that
+    is wanted.
+
+    The cadence and frame rate boxes are blank when the camera carries neither
+    key, because blank is what "follows the global" looks like, and an empty
+    box is the only rendering of that which cannot be saved as a copy.
     """
     from timelapse_encode import SMOOTH_DEFAULT
 
     cam = cam or {}
     types = camera_types()
     smooth = cam.get("smooth_frames") or 0
+    known = identify_camera(cam)
     return {"name": str(cam.get("name", "") or ""),
-            "type": types[-1][0] if cam.get("url") else types[0][0],
-            "address": "",
+            "type": (known[0] if known else
+                     types[-1][0] if cam.get("url") else types[0][0]),
+            "address": known[1] if known else "",
             "url": str(cam.get("url", "") or ""),
             "auth": str(cam.get("auth", "") or "digest"),
-            "username": str(cam.get("username", "") or ""),
-            "password": str(cam.get("password", "") or ""),
+            # A template that names no credentials extracts none, so the
+            # stored fields are what a digest camera's Username and Password
+            # come from. Taking the extracted ones unconditionally would
+            # blank both for every preset except Reolink and RTSP.
+            "username": (known and known[2]) or str(cam.get("username", "")
+                                                    or ""),
+            "password": (known and known[3]) or str(cam.get("password", "")
+                                                    or ""),
+            "interval": str(cam.get("interval_seconds") or ""),
+            "framerate": str(cam.get("framerate") or ""),
             "smoothing_on": bool(smooth),
             "smoothing": str(smooth or SMOOTH_DEFAULT),
             "enabled": bool(cam.get("enabled", True))}
@@ -1121,6 +1233,28 @@ def run(config_path=None, existing=None):
                 row=place[0], column=0, columnspan=2, sticky="w", pady=(8, 0))
             place[0] += 1
 
+            # The two per-camera overrides. Empty means "follow the global",
+            # which is what the schema means by the key being absent, so the
+            # box has to be able to *be* empty: a value prefilled from the
+            # global would be saved as a copy and pin the camera to today's
+            # setting for ever.
+            cap = self.cfg.get("capture", {})
+            enc_cfg = self.cfg.get("encode", {})
+            globals_ = {"interval": int(cap.get("interval_seconds", 5) or 5),
+                        "framerate": int(enc_cfg.get("framerate", 60) or 60)}
+            interval, framerate = tk.StringVar(), tk.StringVar()
+            for label, var, key, unit in (
+                    ("Seconds between frames", interval, "interval",
+                     "seconds"),
+                    ("Frames per second", framerate, "framerate", "fps")):
+                holder = ttk.Frame(right)
+                ttk.Entry(holder, textvariable=var, width=6).pack(side="left")
+                ttk.Label(holder,
+                          text="%s   empty follows the global, which is %d"
+                               % (unit, globals_[key]),
+                          foreground="#555").pack(side="left", padx=(6, 0))
+                add_row(label, holder)
+
             smooth_bar = ttk.Frame(right)
             smooth_bar.grid(row=place[0], column=0, columnspan=2, sticky="w",
                             pady=(4, 0))
@@ -1162,6 +1296,8 @@ def run(config_path=None, existing=None):
                         "address": address.get(), "url": url.get(),
                         "auth": auth.get(), "username": user.get(),
                         "password": password.get(),
+                        "interval": interval.get(),
+                        "framerate": framerate.get(),
                         "smoothing_on": smooth_on.get(),
                         "smoothing": smoothing.get(), "enabled": enabled.get()}
 
@@ -1189,6 +1325,8 @@ def run(config_path=None, existing=None):
                 auth.set(values["auth"])
                 user.set(values["username"])
                 password.set(values["password"])
+                interval.set(values["interval"])
+                framerate.set(values["framerate"])
                 smooth_on.set(values["smoothing_on"])
                 smoothing.set(values["smoothing"])
                 enabled.set(values["enabled"])
@@ -1237,6 +1375,17 @@ def run(config_path=None, existing=None):
                 if level == FAIL:
                     self.say(saved, FAIL, message)
                     return False
+                level, message, seconds = check_camera_interval(
+                    values["interval"], globals_["interval"])
+                if level == FAIL:
+                    self.say(saved, FAIL, message)
+                    return False
+                level, message, rate = check_camera_framerate(
+                    values["framerate"], globals_["framerate"],
+                    seconds or globals_["interval"])
+                if level == FAIL:
+                    self.say(saved, FAIL, message)
+                    return False
                 fields = {"name": values["name"],
                           "preset": preset_named(values["type"]),
                           "address": values["address"], "url": values["url"],
@@ -1244,6 +1393,7 @@ def run(config_path=None, existing=None):
                           "username": values["username"],
                           "password": values["password"],
                           "enabled": values["enabled"], "smoothing": frames,
+                          "interval_seconds": seconds, "framerate": rate,
                           "method": "rtsp" if values["url"].lower()
                           .startswith("rtsp://") else "http"}
                 level, message, built = build_camera(fields, cams, cam)

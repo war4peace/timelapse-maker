@@ -1895,6 +1895,19 @@ operator with eight cameras is doing that constantly. The pane carries the
 name, the make, the address or URL, the authentication, the credentials, the
 enable switch, smoothing, Test and Save. Four things about it are deliberate:
 
+- **A camera opens on the make it was added as**, worked out by
+  `identify_camera()` rather than stored. Until 0.2.0 every existing camera
+  opened on Custom URL, and the reasoning for that was sound: guessing which
+  template produced a URL, and guessing wrong, would silently rewrite a working
+  camera. What was wrong was treating it as a guess. A candidate is accepted
+  only when the **whole round trip reproduces the stored URL exactly**,
+  credentials put back through `quote()` the way saving will, so claiming a
+  make is a claim that pressing Save changes nothing. Anything unaccounted for
+  still opens on Custom, which is the honest answer rather than a fallback: a
+  hand-edited Dahua URL with `channel=2` is not what that template produces and
+  is not claimed. Two presets share one template (Hikvision ONVIF and Generic
+  ONVIF snapshot) and cannot be told apart; the first wins, and it does not
+  matter, since they build the same URL.
 - **The pane holds a camera by identity, never by position.** Saving can rename
   it and removing shifts everything after it, so an index captured when the row
   was clicked is a stale answer by the time it is used.
@@ -1904,6 +1917,16 @@ enable switch, smoothing, Test and Save. Four things about it are deliberate:
 - **`exportselection=False` on the Listbox.** Without it, clicking into any
   Entry on the right hands over the X selection and the list silently
   unhighlights the camera being edited.
+- **The cadence and frame rate boxes are empty when there is no override**,
+  and empty is the only rendering of "follows the global" that is safe here.
+  Per-camera settings are keyed on **absence**: a camera carrying neither key
+  follows the global, which is what lets a later change to the global still
+  move it. A box prefilled with the current global would be saved as a copy and
+  pin every camera anybody had merely opened. `check_camera_interval()` and
+  `check_camera_framerate()` therefore return `None` both for blank and for a
+  value equal to the global, and `build_camera()` pops the key rather than
+  writing it. They validate as hard as the global page does, so a per-camera
+  900s cadence is refused here too rather than producing nothing for ever.
 - **Each verdict sits beside the button that produced it**, Test on the left
   and Save on the right, and switching camera clears both. One shared line at
   the bottom made "Saved." and "Test successful." interchangeable, and a
@@ -2663,10 +2686,14 @@ into it.
    username and password appearing for the makes that need them, and every row
    staying where it was. Reolink says the password goes in the URL. Test
    reaches a real camera and says "Test successful".
-7. **Select an existing camera in the list.** Its make reads Custom URL and the
-   URL, username, password, smoothing and enable switch are all filled in from
-   the config. Change the password, click a different camera, and it must offer
-   to save first. Save keeps any per-camera cadence the entry had.
+7. **Select an existing camera in the list.** One added by make reads back as
+   that make with its address in the box; one whose URL nothing here produces
+   reads Custom URL. Username, password, cadence, frame rate, smoothing and
+   the enable switch are all filled in from the config, and the cadence and
+   frame rate boxes are **empty** unless that camera really has an override.
+   Change the password, click a different camera, and it must offer to save
+   first. Set a cadence equal to the global and save: the key must not appear
+   in `config.json`.
 8. Cameras: press Add and then Next without filling anything in. Refused,
    naming what to do. Press Add, click away, answer no: the empty row goes.
    Remove asks before it removes.
@@ -2972,7 +2999,7 @@ scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
 scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 1784 lines
+scripts/timelapse_gui.py         the same wizard in a window, 1934 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
