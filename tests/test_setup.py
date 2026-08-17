@@ -3307,6 +3307,70 @@ class TestVendorPreselection(unittest.TestCase):
             self.assertIn(label, labels)
 
 
+class TestFillTemplate(unittest.TestCase):
+    """The one place a preset becomes a URL.
+
+    Both wizards and the window's identify_camera() come here, so what a
+    preset produces cannot be two different strings depending on who asked.
+    """
+
+    def preset(self, label):
+        for entry in setup.CAMERA_PRESETS:
+            if entry[0] == label:
+                return entry
+        raise AssertionError("no preset called %s" % label)
+
+    def test_credentials_are_filled_in(self):
+        url = setup.fill_template(self.preset("Reolink")[3], "192.0.2.5",
+                                  "admin", "s3cret")
+        self.assertIn("user=admin", url)
+        self.assertIn("password=s3cret", url)
+
+    def test_an_open_stream_carries_no_userinfo(self):
+        """An RTSP stream with no login is a real thing, and rtsp://:@host is
+        a legal but strange way to spell one: it reads as a mistake, and it
+        invites a client to attempt an authentication nobody asked for."""
+        url = setup.fill_template(self.preset("RTSP only (no snapshot URL)")[3],
+                                  "192.0.2.5", "", "")
+        self.assertEqual(url, "rtsp://192.0.2.5:554/stream1")
+        self.assertNotIn(":@", url)
+
+    def test_a_username_with_no_password_is_left_alone(self):
+        # A different and deliberate answer, not the same as having neither.
+        url = setup.fill_template(self.preset("RTSP only (no snapshot URL)")[3],
+                                  "192.0.2.5", "admin", "")
+        self.assertEqual(url, "rtsp://admin:@192.0.2.5:554/stream1")
+
+    def test_a_query_string_carrying_credentials_is_never_stripped(self):
+        """A Reolink's &user=&password= is part of the address of the
+        resource, not how it is authenticated, so removing it would change
+        what is being asked for."""
+        url = setup.fill_template(self.preset("Reolink")[3], "192.0.2.5",
+                                  "", "")
+        self.assertIn("user=", url)
+        self.assertIn("password=", url)
+        self.assertTrue(url.startswith("http://192.0.2.5/"))
+
+    def test_an_ipv6_literal_keeps_its_brackets(self):
+        url = setup.fill_template(self.preset("Axis")[3], "[2001:db8::5]",
+                                  "", "")
+        self.assertTrue(url.startswith("http://[2001:db8::5]/"))
+
+    def test_the_console_wizard_builds_through_it(self):
+        """Or the two front doors produce different URLs for one camera,
+        which is the drift tools/ was deleted for.
+
+        Counted rather than forbidden, because the one legitimate occurrence
+        is fill_template()'s own body: a scan for the thing a rule bans will
+        always find the code implementing it, which has bitten this project
+        three times now.
+        """
+        source = Path(_support.SCRIPTS).joinpath(
+            "timelapse_setup.py").read_text(encoding="utf-8")
+        self.assertEqual(source.count("template.format("), 1,
+                         "a preset is being expanded outside fill_template()")
+
+
 class TestDiscoveryIsNeverFatal(unittest.TestCase):
     """Discovery is an offer. Nothing it does may stop a camera being added."""
 

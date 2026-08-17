@@ -70,6 +70,15 @@ While the version is `0.x`, the configuration format may change in any release.
   back on once it is working. A camera you have already tested is not tested
   again, so pressing Next twice does not sign in to your whole fleet twice.
 
+  **A camera that genuinely needs no username and password can say so**, with
+  a "No credentials required" box that is off unless you tick it. Open RTSP
+  streams are real, and so are cameras whose ONVIF authentication is switched
+  off or cannot be switched on at all, so refusing them would be refusing
+  working hardware. Ticking it clears and locks the two credential boxes, and
+  the camera is then tested like any other. Leaving it off is what makes an
+  empty password mean "not filled in yet", which is what gets a camera
+  switched off rather than quietly left unable to connect.
+
   **The summary names the encoder your machine will actually use**, and the
   quality setting that goes with it, which is the difference between a 300 MB
   day and a 900 MB one. It is read from the arguments the nightly run will be

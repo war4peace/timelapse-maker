@@ -859,6 +859,30 @@ CAMERA_PRESETS = [
 ]
 
 
+def fill_template(template, ip, user, password):
+    """Build a camera URL from a preset template. The only place that happens.
+
+    The console wizard, the window and `identify_camera()`'s round-trip check
+    all come here, so none of them can disagree about what a preset produces.
+
+    **Credentials that are both empty produce no userinfo at all.** An open
+    RTSP stream is a real thing (a webcam served by VLC has no login), and
+    `rtsp://:@host/stream1` is a legal but strange way to spell one: it reads
+    as a mistake in the config, and it invites a client to attempt an
+    empty-credential authentication that nobody asked for. Only the
+    `user:password@` form is dropped, and only when *both* are empty, since a
+    username with an empty password is a different and deliberate answer.
+
+    A query string carrying credentials is never touched. A Reolink's
+    `&user=&password=` is part of the address of the resource, and removing it
+    would change what is being asked for rather than how it is authenticated.
+    """
+    url = template.format(ip=ip, user=quote(user), password=quote(password))
+    if not user and not password:
+        url = url.replace("://:@", "://", 1)
+    return url
+
+
 def url_host(raw):
     """Bracket an IPv6 literal so it can go inside a URL.
 
@@ -1092,7 +1116,7 @@ def add_one_camera(cfg, n, found=None):
         if auth in ("digest", "basic") or method == "rtsp" or "{user}" in template:
             user = ask("Username", "admin")
             pwd = ask_secret("Password")
-        url = template.format(ip=host, user=quote(user), password=quote(pwd))
+        url = fill_template(template, host, user, pwd)
 
     cam = {"name": name, "enabled": True, "method": method, "url": url}
     if method == "http":

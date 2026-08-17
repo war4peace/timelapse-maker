@@ -1159,6 +1159,104 @@ class TestCameraDiscovery(unittest.TestCase):
             self.assertEqual(gui.camera_not_ready(filled), "",
                              "%s was called unfinished" % label)
 
+    # -- declaring a camera open ----------------------------------------
+
+    def test_a_declared_camera_is_ready_without_credentials(self):
+        """The box exists because blank meant two things at once.
+
+        "This camera needs none" and "I have not filled these in yet" were one
+        state, and the wizard had to guess which. Ticking it splits them, and
+        the live pull is then the authority on whether the operator was right.
+        """
+        _l, _m, cam = gui.build_camera(
+            {"name": "Webcam",
+             "preset": gui.preset_named("RTSP only (no snapshot URL)"),
+             "address": "192.0.2.5", "no_credentials": True,
+             "enabled": True}, [])
+        self.assertEqual(gui.camera_not_ready(cam), "")
+        self.assertTrue(cam["no_credentials"])
+
+    def test_an_open_stream_gets_a_url_with_no_userinfo(self):
+        _l, _m, cam = gui.build_camera(
+            {"name": "Webcam",
+             "preset": gui.preset_named("RTSP only (no snapshot URL)"),
+             "address": "192.0.2.5", "no_credentials": True,
+             "enabled": True}, [])
+        self.assertEqual(cam["url"], "rtsp://192.0.2.5:554/stream1")
+
+    def test_an_open_camera_still_reads_back_as_its_make(self):
+        """Which needs identify_camera() to know both shapes a template has.
+
+        Without the second shape an open RTSP stream reads as Custom URL,
+        which is the defect identify_camera() was written to fix arriving by
+        a new route.
+        """
+        for label in gui.scan_type_choices():
+            _l, _m, cam = gui.build_camera(
+                {"name": "W", "preset": gui.preset_named(label),
+                 "address": "192.0.2.5", "no_credentials": True,
+                 "enabled": True}, [])
+            values = gui.camera_form_values(cam)
+            self.assertEqual(gui.preset_named(values["type"])[3],
+                             gui.preset_named(label)[3],
+                             "%s lost its make when declared open" % label)
+            self.assertTrue(values["no_credentials"],
+                            "%s did not remember the declaration" % label)
+
+    def test_declaring_it_open_moves_the_authentication_mode(self):
+        """Or requests answers the 401 challenge with an empty username.
+
+        Which is a real failed sign-in against a camera that wanted none, and
+        the whole reason this cannot be a cosmetic flag.
+        """
+        _l, _m, cam = gui.build_camera(
+            {"name": "Yard", "preset": gui.preset_named("Dahua / Amcrest"),
+             "address": "192.0.2.5", "no_credentials": True,
+             "enabled": True}, [])
+        self.assertEqual(cam["auth"], "none")
+        self.assertNotIn("username", cam)
+        self.assertNotIn("password", cam)
+
+    def test_credentials_typed_before_ticking_it_are_not_kept(self):
+        # What is stored has to be what is shown. A password left behind
+        # under a ticked box is a credential the operator believes is gone.
+        _l, _m, cam = gui.build_camera(
+            {"name": "Yard", "preset": gui.preset_named("Dahua / Amcrest"),
+             "address": "192.0.2.5", "username": "admin",
+             "password": "s3cret", "no_credentials": True,
+             "enabled": True}, [])
+        self.assertNotIn("s3cret", repr(cam))
+
+    def test_unticking_it_removes_the_key(self):
+        # Keyed on absence like every other optional camera setting here, so
+        # a camera that is no longer open does not carry a stale claim.
+        _l, _m, open_cam = gui.build_camera(
+            {"name": "Yard", "preset": gui.preset_named("Dahua / Amcrest"),
+             "address": "192.0.2.5", "no_credentials": True,
+             "enabled": True}, [])
+        _l2, _m2, closed = gui.build_camera(
+            {"name": "Yard", "preset": gui.preset_named("Dahua / Amcrest"),
+             "address": "192.0.2.5", "username": "admin",
+             "password": "s3cret", "enabled": True}, [], open_cam)
+        self.assertNotIn("no_credentials", closed)
+        self.assertEqual(closed["auth"], "digest")
+
+    def test_a_scanned_camera_is_not_declared_open(self):
+        """The default is off, and a scan must not be a way around that.
+
+        A camera the operator has never looked at has not been declared
+        anything.
+        """
+        for label in gui.scan_type_choices():
+            _l, _m, cam = gui.build_scanned({"address": "192.0.2.5",
+                                             "type": label}, "Camera1", [])
+            self.assertNotIn("no_credentials", cam)
+
+    def test_the_declaration_counts_as_an_edit(self):
+        values = gui.camera_form_values({"name": "R", "url": "http://x"})
+        self.assertTrue(gui.form_is_dirty(values,
+                                          dict(values, no_credentials=True)))
+
     def test_a_username_with_no_password_is_left_alone(self):
         """A deliberate answer this has no business overruling.
 

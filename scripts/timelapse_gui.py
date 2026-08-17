@@ -338,26 +338,35 @@ def identify_camera(cam):
         template = preset[3]
         if template is None:
             continue
-        pattern = "".join(holes[part[1:-1]] if part[:1] == "{" else
-                          re.escape(part)
-                          for part in re.split(r"(\{[a-z]+\})", template))
-        found = re.match(pattern + "$", url)
-        if not found:
-            continue
-        got = found.groupdict()
-        user = unquote(got.get("user", ""))
-        password = unquote(got.get("password", ""))
-        address = got["ip"]
-        # The round trip, not the match: re-quoting has to land back on the
-        # same string, or an operator who presses Save without touching
-        # anything would silently get a different URL.
-        if template.format(ip=setup.url_host(address),
-                           user=setup.quote(user),
-                           password=setup.quote(password)) != url:
-            continue
-        if address.startswith("[") and address.endswith("]"):
-            address = address[1:-1]         # an IPv6 literal, as it was typed
-        return preset[0], address, user, password
+        # Two shapes per template, because fill_template() emits two: an open
+        # camera's URL carries no `user:password@` at all. Without the second
+        # shape an open RTSP stream would read back as Custom URL, which is
+        # the very defect identify_camera() was written to fix.
+        shapes = [template]
+        if "{user}:{password}@" in template:
+            shapes.append(template.replace("{user}:{password}@", "", 1))
+        for shape in shapes:
+            pattern = "".join(holes[part[1:-1]] if part[:1] == "{" else
+                              re.escape(part)
+                              for part in re.split(r"(\{[a-z]+\})", shape))
+            found = re.match(pattern + "$", url)
+            if not found:
+                continue
+            got = found.groupdict()
+            user = unquote(got.get("user", ""))
+            password = unquote(got.get("password", ""))
+            address = got["ip"]
+            # The round trip, not the match: rebuilding has to land back on
+            # the same string, or an operator who presses Save without
+            # touching anything would silently get a different URL. Through
+            # fill_template(), which is what Save will use, rather than a
+            # second opinion about what a template produces.
+            if setup.fill_template(template, setup.url_host(address),
+                                   user, password) != url:
+                continue
+            if address.startswith("[") and address.endswith("]"):
+                address = address[1:-1]     # an IPv6 literal, as it was typed
+            return preset[0], address, user, password
     return None
 
 
@@ -380,6 +389,15 @@ def build_camera(fields, cameras, cam=None):
     user = str(fields.get("username") or "")
     password = str(fields.get("password") or "")
 
+    # Declared, never inferred. Blank credentials used to mean both "this
+    # camera needs none" and "I have not filled these in yet", and one state
+    # meaning two things is the shape this project keeps paying for. The box
+    # is off unless it is ticked, so an unsecured camera is something the
+    # operator said, not something they got by leaving a field empty.
+    unsecured = bool(fields.get("no_credentials"))
+    if unsecured:
+        user = password = ""
+
     if template is None:
         method = str(fields.get("method") or "http")
         auth = str(fields.get("auth") or "none").lower()
@@ -395,12 +413,22 @@ def build_camera(fields, cameras, cam=None):
         # rule lives in timelapse_encode and is reached through the wizard,
         # which is where every other caller reads it from.
         host = setup.url_host(address)
-        url = template.format(ip=host, user=setup.quote(user),
-                              password=setup.quote(password))
+        url = setup.fill_template(template, host, user, password)
+
+    # And the declaration has a functional consequence, which is the whole
+    # reason it cannot be cosmetic: leaving `auth` at the preset's digest with
+    # no credentials makes `requests` answer the 401 challenge with an empty
+    # username, which is a real failed sign-in on a camera that wanted none.
+    if unsecured:
+        auth = "none"
 
     camera = dict(cam or {})
     camera.update({"name": name, "method": method, "url": url,
                    "enabled": bool(fields.get("enabled", True))})
+    if unsecured:
+        camera["no_credentials"] = True
+    else:
+        camera.pop("no_credentials", None)
     if method == "http":
         camera["auth"] = auth or "none"
         if camera["auth"] in ("digest", "basic"):
@@ -533,6 +561,7 @@ def camera_form_values(cam):
                                                     or ""),
             "password": (known and known[3]) or str(cam.get("password", "")
                                                     or ""),
+            "no_credentials": bool(cam.get("no_credentials")),
             "interval": str(cam.get("interval_seconds") or ""),
             "framerate": str(cam.get("framerate") or ""),
             "smoothing_on": bool(smooth),
@@ -686,6 +715,13 @@ def camera_not_ready(cam):
     cam = cam or {}
     if not str(cam.get("url", "") or "").strip():
         return "No address. Select it and give it one."
+    if cam.get("no_credentials"):
+        # The operator said so, and the live pull is the authority on whether
+        # they were right. Refusing here would be the wizard overruling a
+        # measurement with a policy, which is the try_rsync_args error: an
+        # open RTSP stream and an unauthenticated snapshot endpoint are both
+        # real, and one of them cannot even be secured on some hardware.
+        return ""
 
     known = identify_camera(cam)
     template = preset_named(known[0])[3] if known else None
@@ -1665,6 +1701,14 @@ def run(config_path=None, existing=None):
             user, user_row = entry_row("Username")
             password, pw_row = entry_row("Password", secret=True)
 
+            # Off unless ticked, which is the point: an unsecured camera has
+            # to be declared rather than arrived at by leaving two boxes
+            # empty. Sits under the two boxes it switches off, so what it
+            # applies to needs no explaining.
+            unsecured = tk.BooleanVar(value=False)
+            open_row = add_row("", ttk.Checkbutton(
+                right, text="No credentials required", variable=unsecured))
+
             enabled = tk.BooleanVar(value=True)
             # "Enable timelapse", not "Enabled": sitting directly above the
             # smoothing controls, one word could as easily have meant them.
@@ -1736,6 +1780,7 @@ def run(config_path=None, existing=None):
                         "address": address.get(), "url": url.get(),
                         "auth": auth.get(), "username": user.get(),
                         "password": password.get(),
+                        "no_credentials": unsecured.get(),
                         "interval": interval.get(),
                         "framerate": framerate.get(),
                         "smoothing_on": smooth_on.get(),
@@ -1748,9 +1793,19 @@ def run(config_path=None, existing=None):
                 for widgets, wanted in ((address_row, not custom),
                                         (url_row, custom),
                                         (auth_row, custom),
-                                        (user_row, wants), (pw_row, wants)):
+                                        (user_row, wants), (pw_row, wants),
+                                        (open_row, wants)):
                     for widget in widgets:
                         widget.grid() if wanted else widget.grid_remove()
+                # Emptied as well as disabled, so what is stored is what is
+                # shown: a greyed-out password still reading admin would be a
+                # credential the config does not have.
+                for box in (user_row[1], pw_row[1]):
+                    box.state(["disabled"] if unsecured.get() else
+                              ["!disabled"])
+                if unsecured.get():
+                    user.set("")
+                    password.set("")
                 count.state(["!disabled"] if smooth_on.get() else ["disabled"])
                 self.say(note, WARN,
                          "This make carries the password inside the URL, so "
@@ -1765,6 +1820,7 @@ def run(config_path=None, existing=None):
                 auth.set(values["auth"])
                 user.set(values["username"])
                 password.set(values["password"])
+                unsecured.set(values["no_credentials"])
                 interval.set(values["interval"])
                 framerate.set(values["framerate"])
                 smooth_on.set(values["smoothing_on"])
@@ -1832,6 +1888,7 @@ def run(config_path=None, existing=None):
                           "auth": values["auth"],
                           "username": values["username"],
                           "password": values["password"],
+                          "no_credentials": values["no_credentials"],
                           "enabled": values["enabled"], "smoothing": frames,
                           "interval_seconds": seconds, "framerate": rate,
                           "method": "rtsp" if values["url"].lower()
@@ -1865,6 +1922,7 @@ def run(config_path=None, existing=None):
                           "auth": values["auth"],
                           "username": values["username"],
                           "password": values["password"],
+                          "no_credentials": values["no_credentials"],
                           "enabled": True, "smoothing": frames,
                           "method": "rtsp" if values["url"].lower()
                           .startswith("rtsp://") else "http"}
@@ -1980,6 +2038,7 @@ def run(config_path=None, existing=None):
 
             kind.trace_add("write", refresh)
             smooth_on.trace_add("write", refresh)
+            unsecured.trace_add("write", refresh)
             listing.bind("<<ListboxSelect>>", on_select)
             redraw()
             show_camera(cams[0] if cams else None)

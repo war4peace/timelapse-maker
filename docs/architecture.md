@@ -2033,6 +2033,62 @@ closes. Four things about it:
   both the Test button and this check, pinned by a test that counts it in the
   source, because two wordings for one fault read as two faults.
 
+**"No credentials required" is a declaration, and default off.** Blank
+credentials used to mean two things at once, "this camera needs none" and "I
+have not filled these in yet", which is the falsy-return shape this project has
+now paid for six times. The tick splits them. Default off is what makes an
+unsecured camera something the operator *said* rather than something they got
+by leaving two boxes empty.
+
+It is not cosmetic, and that is the part worth remembering. Ticking it sets
+`auth` to `none`, because leaving a preset's `digest` in place with no
+credentials makes `requests` answer the 401 challenge with an empty username,
+which is a real failed sign-in against a camera that wanted none. It also
+empties the two boxes rather than merely greying them, since a greyed password
+still reading `admin` is a credential the config does not have. It is stored as
+`no_credentials: true`, keyed on absence like every other optional camera
+setting here.
+
+**Whether this case is real was researched rather than assumed** (2026-08-17).
+The ONVIF Core Specification requires everything outside the `PRE_AUTH` access
+class to be protected by digest authentication, and in the same breath permits
+a device to support a custom access policy set by the user. Vendors ship that
+switch: Dahua and Amcrest expose Setup, Network, Connection, ONVIF,
+Authentication with values Digest or **None**, and it is used in the field as
+the workaround for getting newer cameras to talk to an NVR. A 2025 Shodan study
+found ONVIF-compatible models with **no option to disable anonymous login at
+all**. Open RTSP is more common still. So refusing a credential-less camera
+outright would be refusing working hardware, which is the `try_rsync_args`
+error; declaring it is the right answer.
+
+Note that "an ONVIF camera with no credentials" is a narrower thing than it
+sounds *here*, for the reason recorded in §4.4a: this project never speaks ONVIF
+to capture. The `Hikvision (ONVIF)` and `Generic ONVIF snapshot` presets are
+plain HTTP GETs on a path with `onvif` in it, and WS-Discovery sends nothing at
+all. The vendor toggle governs the SOAP device service, while the snapshot URL
+goes through the camera's ordinary web account.
+
+**`setup.fill_template()` is the one place a preset becomes a URL**, reached by
+the console wizard, `build_camera()` and `identify_camera()`'s round-trip check
+alike, so none of them can disagree about what a preset produces. It drops the
+`user:password@` form when **both** are empty, because `rtsp://:@host/stream1`
+is a legal but strange spelling of an open stream: it reads as a mistake, and it
+invites a client to attempt an authentication nobody asked for. A username with
+an empty password is a different and deliberate answer and is left alone, and a
+query string carrying credentials is never touched, since a Reolink's
+`&user=&password=` is part of the address of the resource rather than how it is
+authenticated. `identify_camera()` therefore tries **two shapes per template**;
+without the second, an open RTSP stream would read back as Custom URL, which is
+the defect that function exists to fix arriving by a new route.
+
+The declaration is **GUI only**, which is a scope decision rather than an
+oversight: the operator's direction 2026-08-17 is that on Windows the console
+wizard should eventually not be a user-facing path at all, with the GUI the only
+place a camera is configured. That is Windows-only. On Linux the GUI refuses to
+run (`TestItRefusesOffWindows`), so `timelapse setup` remains the only wizard
+there and keeps every question it has. `fill_template()` is shared regardless,
+because a URL is not a user interface.
+
 **Field labels are a fixed 22 characters wide** (`LABELS`), which is what
 "Seconds between frames" needs. A `ttk.Label` with a width in characters cuts
 what does not fit, silently and only on screen, so this has been reported twice
@@ -2795,7 +2851,10 @@ call, for the one camera that had credentials.
    turn:** an address field for the presets and a URL field for Custom, with
    username and password appearing for the makes that need them, and every row
    staying where it was. Reolink says the password goes in the URL. Test
-   reaches a real camera and says "Test successful".
+   reaches a real camera and says "Test successful". **Tick No credentials
+   required:** both credential boxes empty and grey, and the camera saves with
+   `no_credentials` and `auth: none` and no username in `config.json`. An RTSP
+   camera declared that way gets `rtsp://host:554/stream1`, with no `:@` in it.
 7. **Select an existing camera in the list.** One added by make reads back as
    that make with its address in the box; one whose URL nothing here produces
    reads Custom URL. Username, password, cadence, frame rate, smoothing and
@@ -3123,7 +3182,7 @@ scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
 scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 2432 lines
+scripts/timelapse_gui.py         the same wizard in a window, 2491 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
