@@ -39,7 +39,8 @@ from timelapse_platform import (
     SERVICE_STATES, STATE_DIR_DEFAULT, WATCH_UNIT, WEB_STATE_DIR_DEFAULT,
     daily_trigger, disconnect_share, drive_is_local, elevation_hint, find_tool,
     install_service, install_task, is_elevated, is_reserved_name, is_scheduled,
-    is_unc, log_hint, native_name, network_path, os_disk_mount, remove_service,
+    is_unc, log_hint, native_name, network_path, no_console, os_disk_mount,
+    remove_service,
     remove_task, repeating_trigger, resolve_tool, restart_hint,
     restart_service, same_file_name, scan_filesystems, secure_secret_file,
     service_is_active, service_state, share_root, start_hint, stop_hint,
@@ -2008,7 +2009,8 @@ def test_camera_rtsp(cam, cfg):
                "-loglevel", "error", "-rtsp_transport", "tcp",
                "-i", cam["url"], "-frames:v", "1", "-q:v", "2", str(out)]
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+            p = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=45, **no_console())
         except subprocess.TimeoutExpired:
             fail("RTSP grab timed out after 45s.")
             return False
@@ -2034,7 +2036,7 @@ def probe_sample(cfg, data):
         r = subprocess.run(
             [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
              "stream=width,height", "-of", "csv=p=0:s=x", str(tmp)],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, timeout=20, **no_console())
         tmp.unlink(missing_ok=True)
         out = r.stdout.strip()
         return f", {out}" if out else ""
@@ -2310,7 +2312,8 @@ def ensure_cifs_utils():
             continue
         env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
         try:
-            subprocess.run([mgr] + args, capture_output=True, timeout=300, env=env)
+            subprocess.run([mgr] + args, capture_output=True, timeout=300,
+                           env=env, **no_console())
         except Exception:
             pass
         break
@@ -2329,7 +2332,8 @@ def try_mount_cifs(unc, mountpoint, opts_base):
         try:
             r = subprocess.run(["mount", "-t", "cifs", unc, mountpoint,
                                 "-o", opts],
-                               capture_output=True, text=True, timeout=60)
+                               capture_output=True, text=True, timeout=60,
+                               **no_console())
         except Exception as exc:
             return False, "", str(exc)[:200]
         if r.returncode == 0:
@@ -2504,7 +2508,7 @@ def sync_unit_readwritepaths(cfg, unitdir="/etc/systemd/system"):
     note(f"  {paths}")
     try:
         subprocess.run(["systemctl", "daemon-reload"],
-                       capture_output=True, timeout=30)
+                       capture_output=True, timeout=30, **no_console())
     except Exception:
         pass
     note("Restart the encoder timer for it to take effect:")
@@ -2563,7 +2567,7 @@ def persist_cifs_mount(unc, mountpoint, opts, vers):
     good("Added to /etc/fstab (backup taken) - it will remount at boot")
     try:
         subprocess.run(["systemctl", "daemon-reload"], capture_output=True,
-                       timeout=30)
+                       timeout=30, **no_console())
     except Exception:
         pass
 
@@ -2692,7 +2696,8 @@ def host_addresses():
     found = []
     try:
         r = subprocess.run(["ip", "-j", "addr"], stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, timeout=10)
+                           stderr=subprocess.DEVNULL, timeout=10,
+                           **no_console())
         if r.returncode == 0:
             for iface in json.loads(r.stdout.decode("utf-8", "replace") or "[]"):
                 for info in iface.get("addr_info", []):
@@ -2703,7 +2708,8 @@ def host_addresses():
     if not found:
         try:
             r = subprocess.run(["hostname", "-I"], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, timeout=10)
+                               stderr=subprocess.DEVNULL, timeout=10,
+                               **no_console())
             if r.returncode == 0:
                 found = r.stdout.decode("utf-8", "replace").split()
         except (OSError, subprocess.SubprocessError):

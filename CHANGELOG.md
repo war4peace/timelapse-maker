@@ -39,6 +39,12 @@ While the version is `0.x`, the configuration format may change in any release.
   one page for the same reason, since each was a single question with a window
   to itself.
 
+  **No command prompt windows flash up while it works.** Testing ffmpeg used to
+  blink a run of them across the screen, which looks like something left in by
+  mistake. They came from Windows, not from ffmpeg: a program with no console
+  of its own gets given one for every command it runs, and that console is a
+  window. Nothing this program runs behind the scenes opens one now.
+
   **The destination page lists your mapped network drives.** Setup runs as
   Administrator, and drive mappings belong to the account that made them, so
   Windows' own folder browser shows this program only the local disks: it would

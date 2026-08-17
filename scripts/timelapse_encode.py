@@ -38,7 +38,8 @@ from urllib import request as urlrequest
 # called platform in one file is a trap waiting for a reader in a hurry.
 from timelapse_platform import (CONFIG_PATH, IS_WINDOWS, NET_ERRORS,
                                 STATE_DIR_DEFAULT, connect_share, is_unc,
-                                log_handler, net_error, share_root)
+                                log_handler, net_error, no_console,
+                                share_root)
 
 __version__ = "0.1.9"
 
@@ -357,7 +358,8 @@ def list_encoders(ffmpeg):
     """
     try:
         out = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
-                             capture_output=True, text=True, timeout=30)
+                             capture_output=True, text=True, timeout=30,
+                             **no_console())
     except Exception:
         return None
     if out.returncode != 0:
@@ -382,7 +384,8 @@ def probe_encoder_detail(ffmpeg, candidate):
             "-frames:v", "1", "-pix_fmt", PIX_FMT]
            + candidate["args"] + ["-f", "null", "-"])
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90,
+                           **no_console())
     except FileNotFoundError:
         return False, f"{ffmpeg} not found"
     except subprocess.TimeoutExpired:
@@ -421,7 +424,8 @@ def probe_encoder_verbose(ffmpeg, candidate, size=None):
             "-frames:v", "1", "-pix_fmt", PIX_FMT]
            + candidate["args"] + ["-f", "null", "-"])
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90,
+                           **no_console())
     except Exception as exc:
         return [f"could not run verbose probe: {exc}"]
     lines, seen = [], set()
@@ -519,7 +523,7 @@ def probe_dimensions(ffprobe, path):
     out = subprocess.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
-        capture_output=True, text=True, timeout=30)
+        capture_output=True, text=True, timeout=30, **no_console())
     m = re.search(r"(\d+)x(\d+)", out.stdout)
     if not m:
         raise RuntimeError(f"could not probe dimensions of {path.name}")
@@ -950,7 +954,8 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
             result["seconds"] = time.time() - started
             return result
 
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              **no_console())
         if proc.returncode != 0:
             tail = (proc.stderr or "").strip().splitlines()[-3:]
             raise RuntimeError(f"ffmpeg rc={proc.returncode}: {' | '.join(tail)}")
@@ -1118,7 +1123,8 @@ def try_rsync_args(dest, args, svcuser=None):
         cmd = list(prefix) + ["rsync"] + list(args) + [
             str(probe), str(dest).rstrip("/") + "/"]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+            r = subprocess.run(cmd, capture_output=True, text=True,
+                               timeout=90, **no_console())
         except Exception as exc:                # noqa: BLE001
             return None, f"could not run rsync: {exc}"
         if r.returncode == 0:
@@ -1361,7 +1367,8 @@ def transfer(cfg, dry_run):
         return {"ok": True, "moved": 0, "detail": "dry run"}
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              **no_console())
     except FileNotFoundError:
         # Linux only now: Windows returns above, through transfer_windows(),
         # and never reaches the code that looks for rsync.

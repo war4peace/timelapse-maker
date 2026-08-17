@@ -14,6 +14,7 @@ platform as an argument, so the Windows answers are asserted on Linux and the
 Linux answers on Windows, and neither leg is trusting the other to have looked.
 """
 
+import ast
 import contextlib
 import ctypes
 import io
@@ -1627,6 +1628,75 @@ class TestNetworkPath(unittest.TestCase):
                 plat.unc_for_drive(given)
                 called = api.return_value.mpr.WNetGetConnectionW.call_args[0]
                 self.assertEqual(called[0], "U:", given)
+
+
+class TestNoConsole(unittest.TestCase):
+    """Nothing this project starts may put a window on the screen.
+
+    Reported from a real run: testing ffmpeg in the graphical wizard, and then
+    pressing Next, flashed up a run of command prompt windows. pythonw.exe has
+    no console, so Windows gives a new one to every console child, and a new
+    console is a window.
+    """
+
+    # These three are exempt, each for its own reason, and the reasons are the
+    # point: an exemption without one is how a rule stops meaning anything.
+    #
+    # capture: the daemon imports no sibling at module scope (§4.1), and it
+    #   cannot flash anything in any case, since under the SCM there is no
+    #   desktop and in the foreground it already has a console for its child
+    #   to inherit.
+    # update, web: Linux only in practice, and pulling in a platform import
+    #   for a call that is a no-op there is a coupling bought for nothing.
+    EXEMPT = {"timelapse_capture.py", "timelapse_update.py",
+              "timelapse_web.py"}
+
+    def scripts(self):
+        root = Path(__file__).resolve().parent.parent / "scripts"
+        return sorted(p for p in root.glob("timelapse_*.py")
+                      if p.name not in self.EXEMPT)
+
+    def test_it_is_a_windows_only_flag(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertEqual(plat.no_console(),
+                             {"creationflags": plat.CREATE_NO_WINDOW})
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            # Not creationflags=0: subprocess rejects the argument outright on
+            # POSIX, so the keyword has to be absent rather than empty.
+            self.assertEqual(plat.no_console(), {})
+
+    def test_every_captured_child_asks_for_no_window(self):
+        """Captured, and only captured: that is the whole rule.
+
+        A child that inherits the console in order to print to it would have
+        that console taken away and its output would go nowhere, which is why
+        the `timelapse` dispatcher and the editor are not covered.
+        """
+        checked = 0
+        for path in self.scripts():
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and isinstance(node.func.value, ast.Name)
+                        and node.func.value.id == "subprocess"
+                        and node.func.attr in ("run", "Popen", "call",
+                                               "check_output")):
+                    continue
+                names = [k.arg for k in node.keywords]
+                if not ({"capture_output", "stdout", "stderr"} & set(names)):
+                    continue
+                asked = any(k.arg is None
+                            and isinstance(k.value, ast.Call)
+                            and getattr(k.value.func, "id", "") == "no_console"
+                            for k in node.keywords)
+                self.assertTrue(
+                    asked,
+                    "%s line %d captures a child without **no_console(), so "
+                    "it will flash a window when started from pythonw"
+                    % (path.name, node.lineno))
+                checked += 1
+        self.assertGreater(checked, 12, "no call sites were found at all")
 
 
 class TestMappedDrives(unittest.TestCase):

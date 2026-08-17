@@ -1929,6 +1929,31 @@ the **UNC** in the box before continuing into the ordinary folder dialog
 rooted there. A letter is never stored: it belongs to one logon session and the
 nightly encode has its own.
 
+**Nothing it starts may put a window on screen.** Testing ffmpeg, and then
+pressing Next, flashed up a run of command prompt windows on a real install,
+which reads as a development leftover rather than as a program working. The
+cause is not ffmpeg and not the wizard: `pythonw.exe` has no console, so
+Windows gives a *new* one to every console child, and a new console is a
+window. `no_console()` in the platform module returns `CREATE_NO_WINDOW` on
+Windows and nothing at all on Linux, where the keyword is rejected outright.
+
+It is applied to **captured children and only captured children**, and a test
+holds every call site to that. A child that inherits the console in order to
+print to it would have that console taken away and its output would go
+nowhere, which is why the `timelapse` dispatcher and the editor `timelapse
+config` opens are exempt, along with three modules: the capture daemon, which
+imports no sibling at module scope and has no desktop under the SCM anyway,
+and `timelapse_update.py` and `timelapse_web.py`, which are Linux-only in
+practice.
+
+Measured rather than reasoned about, under `pythonw` and with a control, in
+`temp/noflash_check.py`: **six windows without the flag, none with it.** The
+first version of that probe counted `ConsoleWindowClass` and reported zero for
+both arms, because Windows 11 hosts consoles in Windows Terminal
+(`CASCADIA_HOSTING_WINDOW_CLASS`, plus a `PseudoConsoleWindow`). A check that
+cannot fail is not a check; it counts every window that appears now, whoever
+drew it.
+
 **The notification page fits, and had to be made to.** Three services, each
 with a switch, an explanation, up to three fields, a Test button and a verdict,
 ran off the bottom of the window with no way to scroll, which reads as there
@@ -2941,9 +2966,9 @@ scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
 scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 1733 lines
+scripts/timelapse_gui.py         the same wizard in a window, 1729 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_platform.py    the only platform branch, 2120 lines
+scripts/timelapse_platform.py    the only platform branch, 2149 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes

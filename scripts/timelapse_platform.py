@@ -869,6 +869,33 @@ def _report_error(on_error, text):
 
 
 # ----------------------------------------------------------------------------
+# Starting a child process without putting a window on screen
+#
+# Reported from a real run of the graphical wizard: testing ffmpeg, and then
+# pressing Next, flashed up a series of command prompt windows, which reads as
+# a development leftover rather than as a program working.
+#
+# The cause is not ffmpeg and not the wizard. `pythonw.exe` has no console of
+# its own, so Windows gives a *new* one to any console child it starts, and a
+# new console is a window on the screen. CREATE_NO_WINDOW says the child is a
+# console application to be run without one.
+#
+# **Only where the child's output is captured**, which is the rule every call
+# site is held to by a test. A child that inherits the parent's console in
+# order to print to it would have that console taken away and its output would
+# go nowhere; the `timelapse` dispatcher and the editor `timelapse config`
+# opens are both exactly that, and are deliberately left alone.
+# ----------------------------------------------------------------------------
+
+CREATE_NO_WINDOW = 0x08000000
+
+
+def no_console():
+    """Keyword arguments that keep a captured child off the screen."""
+    return {"creationflags": CREATE_NO_WINDOW} if IS_WINDOWS else {}
+
+
+# ----------------------------------------------------------------------------
 # Scheduled tasks, which is where the batch jobs live
 #
 # The XML is built rather than the command line being used, because the two
@@ -994,7 +1021,8 @@ def _schtasks(args):
     """
     try:
         r = subprocess.run(["schtasks"] + list(args), stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=60)
+                           stderr=subprocess.STDOUT, timeout=60,
+                           **no_console())
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
     text = r.stdout.decode("utf-8", "replace").strip() if r.stdout else ""
@@ -1109,7 +1137,8 @@ def task_info(unit):
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive",
                             "-Command", script], stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, timeout=60)
+                           stderr=subprocess.DEVNULL, timeout=60,
+                           **no_console())
     except (OSError, subprocess.SubprocessError):
         return None
     if r.returncode != 0 or not r.stdout:

@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import timelapse_setup as setup                            # noqa: E402
 from timelapse_platform import (CONFIG_PATH, FFMPEG_URL,   # noqa: E402
                                 IS_WINDOWS, elevation_hint, is_elevated,
-                                is_unc, share_root)
+                                is_unc, no_console, share_root)
 
 __version__ = "0.1.9"
 
@@ -855,7 +855,7 @@ def run(config_path=None, existing=None):
             between them worth seeing.
             """
             self.heading(
-                "The basics",
+                "Global configuration",
                 "Where the frames go, which ffmpeg turns them into video, and "
                 "how often a frame is taken. Frames are deleted once their day "
                 "has been encoded, so the folder needs room for about a day at "
@@ -886,15 +886,11 @@ def run(config_path=None, existing=None):
             # packed labels cannot be kerned into one line of prose, and a
             # gap before a full stop reads as a rendering fault.
             blurb = ttk.Frame(tools)
-            blurb.pack(anchor="w")
+            blurb.pack(anchor="w", pady=(0, 4))
             ttk.Label(blurb, text="Path to ffmpeg.exe. You can download and "
                                   "install it from",
                       foreground="#555").pack(side="left")
             self.link(blurb, "here", FFMPEG_URL).pack(side="left", padx=(5, 0))
-            ttk.Label(tools,
-                      text="A folder holding ffmpeg.exe and ffprobe.exe is "
-                           "accepted too, and both are taken from it.",
-                      foreground="#555").pack(anchor="w", pady=(0, 4))
             ff, ff_row = self.field(tools, "Folder or ffmpeg.exe",
                                     self.cfg["paths"].get("ffmpeg", "")
                                     or setup.find_binary("ffmpeg", ""),
@@ -1020,7 +1016,7 @@ def run(config_path=None, existing=None):
             rather than three clicks away.
             """
             self.heading(
-                "Which cameras?",
+                "Camera setup",
                 "Pick one on the left to change it on the right. A camera's "
                 "name becomes the folder its frames live in, so renaming one "
                 "later means moving that folder.")
@@ -1659,7 +1655,7 @@ def run(config_path=None, existing=None):
             box.config(cursor="watch")
             try:
                 done = subprocess.run(argv, capture_output=True, text=True,
-                                      timeout=900)
+                                      timeout=900, **no_console())
                 output = (done.stdout or "") + (done.stderr or "")
             except Exception as exc:                        # noqa: BLE001
                 output = "Could not run the checks: %s" % exc

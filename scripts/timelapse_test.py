@@ -37,7 +37,7 @@ except ImportError:
 
 from timelapse_platform import (CONFIG_PATH, IS_WINDOWS,  # noqa: E402
                                 admin_cmd, is_reserved_name, is_unc,
-                                use_colour)
+                                no_console, use_colour)
 
 __version__ = "0.1.9"
 
@@ -84,7 +84,8 @@ def dimensions(ffprobe, path):
         r = subprocess.run([ffprobe, "-v", "error", "-select_streams", "v:0",
                             "-show_entries", "stream=width,height,pix_fmt",
                             "-of", "csv=p=0", str(path)],
-                           capture_output=True, text=True, timeout=20)
+                           capture_output=True, text=True, timeout=20,
+                           **no_console())
         return r.stdout.strip()
     except Exception as exc:
         return f"probe failed: {exc}"
@@ -158,7 +159,8 @@ def test_rtsp(cam, cfg):
            "-i", cam["url"], "-frames:v", "1", "-q:v", "2", str(sample)]
     t0 = time.time()
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=45,
+                           **no_console())
     except subprocess.TimeoutExpired:
         bad(f"{name}: RTSP grab timed out after 45s")
         return None
@@ -271,7 +273,7 @@ def diagnose_encoders(cfg):
     print("\n=== ffmpeg ===")
     try:
         v = subprocess.run([ffmpeg, "-version"], capture_output=True,
-                           text=True, timeout=30)
+                           text=True, timeout=30, **no_console())
     except Exception as exc:
         bad(f"cannot run {ffmpeg}: {exc}")
         return
@@ -299,7 +301,8 @@ def diagnose_encoders(cfg):
     try:
         q = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,driver_version,encoder.stats.sessionCount",
-             "--format=csv,noheader"], capture_output=True, text=True, timeout=30)
+             "--format=csv,noheader"], capture_output=True, text=True,
+            timeout=30, **no_console())
         if q.returncode == 0 and q.stdout.strip():
             for line in q.stdout.strip().splitlines():
                 info(line.strip())
@@ -678,7 +681,8 @@ def test_transfer(cfg):
     if ":" in dest and not dest.startswith("/"):
         host = dest.split(":")[0]
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                            host, "true"], capture_output=True, text=True)
+                            host, "true"], capture_output=True, text=True,
+                           **no_console())
         if r.returncode == 0:
             ok(f"SSH to {host} works with key auth")
         else:
