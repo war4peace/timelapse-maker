@@ -86,6 +86,13 @@ $FFMPEGURL = 'https://ffmpeg.org/download.html#build-windows'
 # comes to offer it as the default answer without being told.
 $FFMPEGDIR = Join-Path $Root 'ffmpeg'
 
+# UTF-8 with no byte order mark. Add-Content -Encoding UTF8 writes one on 5.1,
+# and this log is what gets pasted into a bug report, where a leading EF BB BF
+# turns the first line into mojibake and makes the tool look broken at exactly
+# the moment somebody is already reporting that it is. Same family as the .ps1
+# encoding rule, one layer out.
+$LOGENC = New-Object Text.UTF8Encoding($false)
+
 function Write-Log {
     param($Text, $Colour = 'Gray')
     $stamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
@@ -94,7 +101,8 @@ function Write-Log {
         if (-not (Test-Path $dir)) {
             New-Item -ItemType Directory -Force -Path $dir | Out-Null
         }
-        Add-Content -Path $Log -Value "$stamp  $Text" -Encoding UTF8
+        [IO.File]::AppendAllText($Log, "$stamp  $Text" + [Environment]::NewLine,
+                                 $LOGENC)
     } catch {
         # A log that cannot be written must not stop an install. The console
         # copy below is still there, and so is Inno's own log.
@@ -283,9 +291,19 @@ function Find-Ffmpeg {
     param($Python)
     $platform = Join-Path $Root 'scripts\timelapse_platform.py'
     if (-not (Test-Path $platform)) { return $null }
-    $out = & $Python $platform --find-tool ffmpeg 2>$null
+    # Relaxed for the same reason as everywhere else here: this call is
+    # EXPECTED to fail on a machine with no ffmpeg, that failure is the answer,
+    # and under Stop a traceback on stderr would end the install instead.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = -1
+    try {
+        $out = (& $Python $platform --find-tool ffmpeg 2>$null | Out-String).Trim()
+    } finally {
+        $ErrorActionPreference = $previous
+    }
     if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
-    return $out.Trim()
+    return $out
 }
 
 function Install-Ffmpeg {
@@ -328,15 +346,49 @@ function Install-Ffmpeg {
         Fail "ffmpeg.exe is not at $exe after unpacking."
         return $null
     }
-    # 2>$null rather than 2>&1: redirecting a native command's stderr into the
-    # pipeline wraps each line in an ErrorRecord, and with $ErrorActionPreference
-    # set to Stop that turns ffmpeg's ordinary banner into a thrown exception.
-    # `-version` writes to stdout anyway.
-    $banner = & $exe -version 2>$null | Select-Object -First 1
-    if ($LASTEXITCODE -ne 0) {
+    # Everything it says is kept, and that is a rule this project already had
+    # and this function broke: never discard a probe's stderr. "Unknown
+    # encoder" and "No capable devices found" need opposite fixes and share an
+    # exit code, and the same applies to a binary that will not start at all,
+    # where the message is the only thing separating a download the machine
+    # blocked from a missing runtime. The first version reported "will not run"
+    # and nothing else, which told an operator a conclusion and no evidence.
+    #
+    # The error preference is relaxed around it because under Stop a native
+    # command's stderr is a terminating error, and keyed on the banner rather
+    # than on $LASTEXITCODE because that variable is only written by a process
+    # that actually started: one that did not leaves the previous call's code
+    # sitting there to be misread as this one's answer.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = -1
+    try {
+        $said = (& $exe -version 2>&1 | Out-String)
+    } catch {
+        $said = $_.Exception.Message
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    $code = $LASTEXITCODE
+    $banner = @($said -split "`r?`n" |
+                Where-Object { $_ -match '^ffmpeg version' }) |
+              Select-Object -First 1
+
+    if (-not $banner) {
         Fail 'ffmpeg unpacked but will not run.'
+        Note "exit code $code, from $exe"
+        foreach ($line in @($said -split "`r?`n" |
+                            Where-Object { $_.Trim() } |
+                            Select-Object -First 6)) {
+            Note $line.Trim()
+        }
+        if (-not $said.Trim()) {
+            Note 'It said nothing at all, which usually means the process never'
+            Note 'started: antivirus, or a policy blocking a downloaded binary.'
+        }
         return $null
     }
+
     Note "$banner"
     return $exe
 }
@@ -419,7 +471,8 @@ foreach ($stream in @($out, $err)) {
     if (Test-Path $stream) {
         $text = (Get-Content -Raw -Path $stream)
         if ($text -and $text.Trim()) {
-            Add-Content -Path $Log -Value $text.TrimEnd() -Encoding UTF8
+            [IO.File]::AppendAllText($Log, $text.TrimEnd() +
+                                     [Environment]::NewLine, $LOGENC)
         }
         Remove-Item $stream -Force -ErrorAction SilentlyContinue
     }

@@ -231,6 +231,94 @@ class TestPrepareStage(unittest.TestCase):
         self.assertIn("install.log", self.code)
 
 
+class TestNativeCallsUnderStop(unittest.TestCase):
+    """The defect a clean VM found, and it had shipped.
+
+    Every .ps1 here sets $ErrorActionPreference to Stop, which is right for the
+    cmdlets: a Copy-Item that fails must not be walked past. But PowerShell 5.1
+    wraps every stderr line from a NATIVE command in a NativeCommandError
+    record, and under Stop that throws. So `python -c import requests` on a
+    machine without requests, which is a probe whose whole purpose is to fail,
+    killed install.ps1 with a traceback instead of returning 1.
+
+    It survived from the first Windows release because every machine it had run
+    on already had requests: the probe succeeded, wrote nothing to stderr, and
+    the trap never fired. Reproduced here 2026-08-18 and then fixed.
+
+    These scan for the shape rather than for the one call site, because the
+    next one will be somewhere else.
+    """
+
+    FILES = ("install.ps1", "installer/prepare.ps1")
+
+    def sources(self):
+        return [(name, (ROOT / name).read_text(encoding="ascii"))
+                for name in self.FILES]
+
+    def test_a_probe_that_is_meant_to_fail_goes_through_the_helper(self):
+        source = (ROOT / "install.ps1").read_text(encoding="ascii")
+        block = source.split("function Test-Requests", 1)[1]
+        block = block.split("\nfunction Protect-", 1)[0]
+        self.assertIn("Invoke-Tool", block)
+
+    def test_the_helper_relaxes_the_preference_and_puts_it_back(self):
+        source = (ROOT / "install.ps1").read_text(encoding="ascii")
+        block = source.split("function Invoke-Tool", 1)[1]
+        block = block.split("\nfunction ", 1)[0]
+        self.assertIn("$ErrorActionPreference = 'Continue'", block)
+        self.assertIn("finally", block)
+        self.assertIn("$ErrorActionPreference = $previous", block)
+
+    def test_the_helper_does_not_trust_a_stale_exit_code(self):
+        """$LASTEXITCODE is only written by a process that actually started.
+
+        One that could not leaves the previous call's code sitting there, which
+        is then read as this one's answer. The harness for this installer had
+        the same bug on the same day, in the other direction: it reported PASS
+        for a command that did not exist.
+        """
+        source = (ROOT / "install.ps1").read_text(encoding="ascii")
+        block = source.split("function Invoke-Tool", 1)[1]
+        block = block.split("\nfunction ", 1)[0]
+        self.assertIn("$global:LASTEXITCODE = -1", block)
+
+    def test_no_bare_native_call_redirects_stderr_to_null(self):
+        """`& $thing ... 2>$null` outside a try or the helper is the trap.
+
+        2>$null looks like "ignore the errors" and is the opposite: it routes
+        them into PowerShell's error stream, where Stop makes them fatal. The
+        allowed forms are inside a try/catch, or through Invoke-Tool.
+        """
+        for name, source in self.sources():
+            for number, line in enumerate(source.splitlines(), 1):
+                if "2>$null" not in line or line.lstrip().startswith("#"):
+                    continue
+                # The guarded ones assign, so the surrounding try/catch or the
+                # relaxed preference is visible within a few lines above.
+                above = "\n".join(source.splitlines()[max(0, number - 12):number])
+                guarded = ("try {" in above
+                           or "$ErrorActionPreference = 'Continue'" in above)
+                self.assertTrue(guarded,
+                                "%s:%d redirects a native stderr with nothing "
+                                "catching it: %s" % (name, number, line.strip()))
+
+    def test_the_ffmpeg_probe_keeps_what_it_was_told(self):
+        """The rule this project already had, broken here and restored.
+
+        Never discard a probe's stderr: "Unknown encoder" and "No capable
+        devices found" need opposite fixes and share an exit code. The same
+        applies to a binary that will not start at all, where the message is
+        the only thing separating a blocked download from a missing runtime.
+        The first version of this said "will not run" and nothing else, which
+        is a conclusion with no evidence under it.
+        """
+        source = (ROOT / "installer" / "prepare.ps1").read_text(encoding="ascii")
+        block = source.split("ffmpeg unpacked but will not run", 1)[1]
+        block = block.split("return $null", 1)[0]
+        self.assertIn("exit code", block)
+        self.assertIn("Note", block)
+
+
 class TestInnoScript(unittest.TestCase):
     """installer/timelapse-maker.iss: what the .exe is made of."""
 

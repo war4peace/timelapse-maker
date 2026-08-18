@@ -93,6 +93,45 @@ function Fail { param($m) Write-Host "  FAIL  " -ForegroundColor Red -NoNewline;
 function Step { param($m) Write-Host ''; Write-Host "-- $m" -ForegroundColor Cyan }
 function Die  { param($m) Fail $m; exit 1 }
 
+function Invoke-Tool {
+    <#
+      Run a native command and return its exit code, without letting its
+      stderr become a terminating error.
+
+      $ErrorActionPreference is Stop for this whole script, which is right for
+      the cmdlets: a Copy-Item that fails must not be walked past. But for a
+      native executable, PowerShell 5.1 wraps every stderr line in a
+      NativeCommandError record, and under Stop that THROWS. So an entirely
+      ordinary probe, `python -c import requests` on a machine that has not got
+      requests, killed this installer with a traceback where it should have
+      returned 1.
+
+      Measured on a clean VM 2026-08-18, and it had been that way since the
+      Windows port shipped. It survived because every machine this had ever run
+      on already had requests, so the probe succeeded, wrote nothing to stderr,
+      and the trap never fired. The one branch nobody had exercised was the one
+      that mattered: a fresh install is the whole point of an installer.
+
+      LASTEXITCODE is set to a sentinel first, because it is only written by a
+      native command: when one fails to start, the previous call's code is
+      still sitting there and would be read as this one's answer.
+    #>
+    param($Exe, [string[]]$Arguments = @(), [switch]$Quiet)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = -1
+    try {
+        if ($Quiet) {
+            & $Exe @Arguments 2>&1 | Out-Null
+        } else {
+            & $Exe @Arguments
+        }
+        return $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+}
+
 function Test-Admin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($id)
@@ -145,27 +184,47 @@ function Test-PythonVersion {
       So: no quotes in anything passed after -c, and the formatting is done on
       this side where the quoting rules are known.
     #>
-    $out = & $Python -c 'import sys; print(sys.version_info[0], sys.version_info[1])'
-    if ($LASTEXITCODE -ne 0) { return $null }
+    # The preference is relaxed for the same reason Invoke-Tool exists: an
+    # interpreter that prints a deprecation warning at startup writes to stderr,
+    # and under Stop that would end the install instead of answering a question
+    # about the version. This one captures stdout, so it cannot use the helper.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    $global:LASTEXITCODE = -1
+    try {
+        $out = & $Python -c 'import sys; print(sys.version_info[0], sys.version_info[1])' 2>$null
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($LASTEXITCODE -ne 0 -or -not $out) { return $null }
     $parts = $out.Trim() -split '\s+'
     if ($parts.Count -lt 2) { return $null }
     return "$($parts[0]).$($parts[1])"
 }
 
+function Test-Requests {
+    # Through Invoke-Tool, never as a bare call: on a machine without requests
+    # this probe writes a traceback to stderr, which is exactly what it is for,
+    # and a bare call turns that into a terminating error.
+    param($Python)
+    return (Invoke-Tool $Python @('-c', 'import requests') -Quiet) -eq 0
+}
+
 function Install-Requests {
     param($Python)
-    & $Python -c 'import requests' 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    if (Test-Requests $Python) {
         Ok 'requests is already available'
         return
     }
     Note 'Installing requests...'
-    & $Python -m pip install --quiet --upgrade requests
-    if ($LASTEXITCODE -ne 0) {
+    # pip writes to stderr in the ordinary course of events (a new pip version,
+    # a script directory not on PATH), so this one needs the same treatment
+    # even though it is expected to succeed.
+    if ((Invoke-Tool $Python @('-m', 'pip', 'install', '--quiet', '--upgrade',
+                               'requests')) -ne 0) {
         Die 'Could not install requests. Check the network, then run: python -m pip install requests'
     }
-    & $Python -c 'import requests' 2>$null
-    if ($LASTEXITCODE -ne 0) { Die 'requests still will not import.' }
+    if (-not (Test-Requests $Python)) { Die 'requests still will not import.' }
     Ok 'Installed requests'
 }
 
@@ -179,9 +238,10 @@ function Protect-ConfigDir {
       editor's temporary copies. Inheritance is broken first, or the permissive
       ACL from %ProgramData% comes along with it.
     #>
-    & icacls $CONFDIR /inheritance:r /grant 'SYSTEM:(OI)(CI)F' `
-        'Administrators:(OI)(CI)F' | Out-Null
-    if ($LASTEXITCODE -eq 0) {
+    $code = Invoke-Tool 'icacls' @($CONFDIR, '/inheritance:r', '/grant',
+                                   'SYSTEM:(OI)(CI)F',
+                                   'Administrators:(OI)(CI)F') -Quiet
+    if ($code -eq 0) {
         Ok "Restricted $CONFDIR to SYSTEM and Administrators"
     } else {
         Warn "Could not restrict $CONFDIR; it holds your camera passwords."
@@ -272,7 +332,8 @@ function Invoke-Uninstall {
     Step 'Removing'
     $setup = Join-Path $Prefix 'timelapse_setup.py'
     if (Test-Path $setup) {
-        & $Python $setup --remove-units --output $CONFIG
+        [void](Invoke-Tool $Python @($setup, '--remove-units',
+                                     '--output', $CONFIG))
     } else {
         Warn 'The scripts are already gone; nothing to deregister with.'
         Note 'If a service or task is left over, remove it by hand:'
@@ -417,9 +478,10 @@ Step 'Services'
 # The one thing this script must not reimplement. --install-units builds the
 # service command line and both task definitions from one table in Python, so
 # there is no second copy here to drift from it.
-& $python (Join-Path $Prefix 'timelapse_setup.py') --install-units `
-    --scripts-dir $Prefix --output $CONFIG
-if ($LASTEXITCODE -ne 0) {
+$code = Invoke-Tool $python @((Join-Path $Prefix 'timelapse_setup.py'),
+                              '--install-units', '--scripts-dir', $Prefix,
+                              '--output', $CONFIG)
+if ($code -ne 0) {
     Warn 'Registration did not fully succeed; see above.'
 }
 
@@ -447,7 +509,9 @@ if (Test-Path $CONFIG) {
     $wizard = @('--output', $CONFIG, '--template',
                 (Join-Path $CONFDIR 'config.example.json'))
     if ($Unattended) { $wizard += '--defaults' }
-    & $python (Join-Path $Prefix 'timelapse_setup.py') @wizard
+    # Interactive, so its output and its prompts are left alone; only the
+    # error preference is relaxed, and that by Invoke-Tool rather than here.
+    [void](Invoke-Tool $python (@((Join-Path $Prefix 'timelapse_setup.py')) + $wizard))
 }
 
 # After the wizard, never during registration. Registering replaces the files
@@ -455,7 +519,8 @@ if (Test-Path $CONFIG) {
 # config underneath it. Restarting any earlier picks up the new build with the
 # old settings, which is the worst of the three possible orderings because
 # nothing about it looks wrong.
-& $python (Join-Path $Prefix 'timelapse_setup.py') --restart-units
+[void](Invoke-Tool $python @((Join-Path $Prefix 'timelapse_setup.py'),
+                             '--restart-units'))
 
 Step 'Next steps'
 # Both halves of this were wrong to leave implicit. NEW, because a PATH change
