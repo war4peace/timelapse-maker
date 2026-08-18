@@ -35,6 +35,17 @@ the arguments for them are recorded rather than left to be re-made.
 
 ---
 
+## Contents
+
+- [Item 11: a Windows variant, sharing the Python](#item-11-a-windows-variant-sharing-the-python)
+  - [11a. Why this is worth considering at all](#11a-why-this-is-worth-considering-at-all)
+  - [11b. What already works, measured](#11b-what-already-works-measured)
+  - [11c. What has to be built](#11c-what-has-to-be-built)
+  - [11d. Traps, measured](#11d-traps-measured)
+  - [11e. How the codebase stays shared](#11e-how-the-codebase-stays-shared)
+  - [11f. Recommendation](#11f-recommendation)
+- [What this file taught, while it had things in it](#what-this-file-taught-while-it-had-things-in-it)
+
 ## Item 11: a Windows variant, sharing the Python
 
 **Status: research only.** Nothing is designed and nothing is committed. This
@@ -1315,6 +1326,8 @@ effort, not doubt.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## What this file taught, while it had things in it
 
 Worth keeping, because these are the reasons to write the next entry down
@@ -1354,3 +1367,5 @@ idiom can fail there). Both are Windows-only and neither depends on the port
 being built. This is the second time an entry has done this, after item 10.
 **Look for what the research says about today's code, not only about the
 proposed feature.**
+
+<sub>[&uarr; Contents](#contents)</sub>

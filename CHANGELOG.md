@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 While the version is `0.x`, the configuration format may change in any release.
 
+## Contents
+
+- [0.2.0 - 2026-08-18](#020---2026-08-18)
+- [0.1.9 - 2026-08-15](#019---2026-08-15)
+- [0.1.8 - 2026-08-15](#018---2026-08-15)
+- [0.1.7 - 2026-08-14](#017---2026-08-14)
+- [0.1.6 - 2026-08-14](#016---2026-08-14)
+- [0.1.5 - 2026-08-12](#015---2026-08-12)
+- [0.1.4 - 2026-08-11](#014---2026-08-11)
+- [0.1.3 - 2026-08-11](#013---2026-08-11)
+- [0.1.2 - 2026-08-10](#012---2026-08-10)
+- [0.1.1 - 2026-08-09](#011---2026-08-09)
+- [0.1.0 - 2026-08-09](#010---2026-08-09)
+- [0.0.9 - 2026-08-07](#009---2026-08-07)
+- [0.0.8 - 2026-08-06](#008---2026-08-06)
+- [0.0.7 - 2026-08-06](#007---2026-08-06)
+- [0.0.6 - 2026-08-06](#006---2026-08-06)
+- [0.0.5 - 2026-08-06](#005---2026-08-06)
+- [0.0.4 - 2026-08-06](#004---2026-08-06)
+- [0.0.3 - 2026-08-05](#003---2026-08-05)
+- [0.0.2 - 2026-08-05](#002---2026-08-05)
+- [0.0.1 - 2026-08-05](#001---2026-08-05)
+
 ## [0.2.0] - 2026-08-18
 
 ### Added
@@ -328,6 +351,8 @@ While the version is `0.x`, the configuration format may change in any release.
   asserts that the cadence column starts at the same offset whether or not the
   camera is disabled, rather than checking for one bad string.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.1.9] - 2026-08-15
 
 ### Added
@@ -395,6 +420,8 @@ While the version is `0.x`, the configuration format may change in any release.
   command output exactly as it came back, which is what makes them worth
   pasting into a bug report.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.1.8] - 2026-08-15
 
 ### Changed
@@ -435,6 +462,8 @@ While the version is `0.x`, the configuration format may change in any release.
   on a five-minute interval rather than at a fixed time of day, and systemd
   reports those two kinds of schedule in different places; only one of them was
   being read. Timer rows also say when they last ran.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## [0.1.7] - 2026-08-14
 
@@ -518,6 +547,8 @@ While the version is `0.x`, the configuration format may change in any release.
 - A unit introduced by a release is adopted automatically on upgrade, but
   **only if it is a timer**. A new *service* is never switched on for you,
   which is what keeps the web UI opt-in.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## [0.1.6] - 2026-08-14
 
@@ -651,6 +682,8 @@ While the version is `0.x`, the configuration format may change in any release.
   missing one stops both daemons with an error that names neither the
   directory nor the release that added it.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.1.5] - 2026-08-12
 
 ### Added
@@ -728,6 +761,8 @@ While the version is `0.x`, the configuration format may change in any release.
   runs, which here is twenty minutes and more, and the word for a daemon
   caught mid-boot describes a job that never got going when it is held for
   that long. It now reads "Running", with the time the run began.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## [0.1.4] - 2026-08-11
 
@@ -832,6 +867,8 @@ While the version is `0.x`, the configuration format may change in any release.
   writing `checked` on a failed poll and `sync_unit_readwritepaths()` returning
   a count: **"could not check" collapsed into "checked, and it is broken"**.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.1.3] - 2026-08-11
 
 A security release. Camera passwords were reaching the log, and from there the
@@ -925,6 +962,8 @@ where the UI said less than it should have.
   the content, which also fixes an encode over an hour knocking every column
   after it out of line: `1h 02m 03s` never fitted the fixed 8. The same seven
   cameras now come out at 39 columns rather than 62.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## [0.1.2] - 2026-08-10
 
@@ -1022,6 +1061,8 @@ midnight so a day is never half one rate and half another.
   inside functions. They are installed side by side, so it resolves for either
   entry point.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.1.1] - 2026-08-09
 
 A maintenance release. Everything here came out of the first day of running
@@ -1073,6 +1114,8 @@ something found by reading the code.
 ### Documentation
 - **README now marks which `timelapse` subcommands need `sudo`.** Anything
   that reads or writes the config does; `status`, `logs` and `version` do not.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## [0.1.0] - 2026-08-09
 
@@ -1138,6 +1181,8 @@ GitHub Release rather than a bare tag. Everything below came out of running
   playback itself was fine; the log was reporting normal behaviour as a
   crash. Disconnects are now recorded at debug level, and genuine faults go
   through the logger with a timestamp and a level instead of to bare stderr.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## [0.0.9] - 2026-08-07
 
@@ -1219,7 +1264,7 @@ GitHub Release rather than a bare tag. Everything below came out of running
   just this part later without walking the whole wizard. It shows you which
   path it will read videos from and why (the answer surprises people), and it
   states plainly that there is no login and no HTTPS before asking what address
-  to listen on. Operator guide: [docs/install.md §10](docs/install.md#10-the-web-ui).
+  to listen on. Operator guide: [docs/install.md §10](docs/install.md#11-the-web-ui).
 - **`timelapse usage`**, a disk report: frames, bytes and date range per camera,
   totals, videos and free space. It also names the directories nothing will
   ever encode: a camera removed from the config (`ORPHAN`) or merely disabled
@@ -1283,6 +1328,8 @@ GitHub Release rather than a bare tag. Everything below came out of running
   `ask_secret()` keeps them out of scroll-back when typed, so printing the
   camera table would defeat it.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.0.8] - 2026-08-06
 
 ### Fixed
@@ -1338,6 +1385,8 @@ GitHub Release rather than a bare tag. Everything below came out of running
   duration, so it is a second client rather than a flaky one; `Cov%` in the
   nightly summary is the signal to watch.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.0.7] - 2026-08-06
 
 ### Added
@@ -1367,6 +1416,8 @@ GitHub Release rather than a bare tag. Everything below came out of running
   one shipped a `_comment_cifs` still describing the removed script. Every
   `_`-prefixed key is now stripped, not the three that existed at the time.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.0.6] - 2026-08-06
 
 ### Fixed
@@ -1393,6 +1444,8 @@ GitHub Release rather than a bare tag. Everything below came out of running
 - An unmounted or unwritable destination is called out during setup instead of
   at 00:05 the following morning.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.0.5] - 2026-08-06
 
 ### Fixed
@@ -1410,6 +1463,8 @@ GitHub Release rather than a bare tag. Everything below came out of running
   filter chain uses, so the two cannot drift apart again.
 - `encoder_hint()` recognises a pixel-format rejection and says so, instead of
   folding it into the generic "no capable devices" advice.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## [0.0.4] - 2026-08-06
 
@@ -1432,6 +1487,8 @@ GitHub Release rather than a bare tag. Everything below came out of running
   `--encoders`.
 - `nvidia-smi` cannot report NVENC codec capability at all; the diagnosis says
   so explicitly rather than leaving people to hunt for it.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## [0.0.3] - 2026-08-05
 
@@ -1491,6 +1548,8 @@ Bugs from the first real install on someone else's hardware.
   `forceuid`/`forcegid` can make it succeed. The tool measures it rather than
   assuming either way.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## [0.0.2] - 2026-08-05
 
 ### Added
@@ -1525,6 +1584,8 @@ Bugs from the first real install on someone else's hardware.
 - `scan_filesystems()` and `_base_device()` take injectable inputs
   (`mounts_path`, `statvfs`, `rotational`, `sys_block`) so the filtering rules
   can be tested against synthetic input on any machine. No behaviour change.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## [0.0.1] - 2026-08-05
 
@@ -1608,3 +1669,5 @@ Found while reviewing the private codebase for publication:
 [0.1.0]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.0
 [0.0.9]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.0.9
 [0.0.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.0.1
+
+<sub>[&uarr; Contents](#contents)</sub>

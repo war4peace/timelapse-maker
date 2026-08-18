@@ -5,6 +5,44 @@ Operator guide. For how the system is built and why, see
 
 ---
 
+## Contents
+
+- [1. On-disk layout](#1-on-disk-layout)
+- [2. Install](#2-install)
+  - [The short way](#the-short-way)
+  - [Windows (early preview)](#windows-early-preview)
+  - [Upgrading](#upgrading)
+  - [The manual way](#the-manual-way)
+- [3. The setup wizard](#3-the-setup-wizard)
+- [4. Test before enabling anything](#4-test-before-enabling-anything)
+  - [Check the ONVIF profiles first](#check-the-onvif-profiles-first)
+  - [Common snags](#common-snags)
+- [5. Enable](#5-enable)
+- [6. Transfer destination](#6-transfer-destination)
+  - [If the destination is unavailable](#if-the-destination-is-unavailable)
+- [6a. Notifications](#6a-notifications)
+- [7. Sizing](#7-sizing)
+- [8. Day to day: the `timelapse` command](#8-day-to-day-the-timelapse-command)
+  - [Asking for help without posting your passwords](#asking-for-help-without-posting-your-passwords)
+  - [Checking disk usage](#checking-disk-usage)
+- [9. Adding, editing and removing cameras](#9-adding-editing-and-removing-cameras)
+  - [Letting it find the cameras](#letting-it-find-the-cameras)
+  - [Skipping the menu](#skipping-the-menu)
+  - [Giving one camera its own interval and frame rate](#giving-one-camera-its-own-interval-and-frame-rate)
+  - [Smoothing one camera's motion](#smoothing-one-cameras-motion)
+  - [It will not let you strand frames silently](#it-will-not-let-you-strand-frames-silently)
+- [10. Config backups and restoring](#10-config-backups-and-restoring)
+  - [Where camera passwords can turn up, and one place they used to](#where-camera-passwords-can-turn-up-and-one-place-they-used-to)
+- [11. The web UI](#11-the-web-ui)
+  - [The update check, and the only packet this UI sends](#the-update-check-and-the-only-packet-this-ui-sends)
+  - [Your videos are probably not in `video_output`](#your-videos-are-probably-not-in-video_output)
+  - [It is not secured, so bind it accordingly](#it-is-not-secured-so-bind-it-accordingly)
+  - [The optional login](#the-optional-login)
+  - [Turning it on and off, and changing the password](#turning-it-on-and-off-and-changing-the-password)
+  - [What it is allowed to write](#what-it-is-allowed-to-write)
+  - [The index](#the-index)
+  - [Snags](#snags)
+
 ## 1. On-disk layout
 
 ```
@@ -16,6 +54,8 @@ Operator guide. For how the system is built and why, see
 
 Filenames are zero-padded `HHMMSS`, so lexical order **is** chronological.
 Nothing depends on file mtime.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 2. Install
 
@@ -301,6 +341,8 @@ put frames anywhere other than `/var/lib/timelapse`, the `paths` block.
 > mentions neither the directory nor the setting. The installer does this for
 > you; only a hand-built install has to remember.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 3. The setup wizard
 
 The installer runs it automatically. Run it again any time with:
@@ -343,6 +385,8 @@ Network filesystems (NFS, CIFS, 9p, sshfs) are deliberately excluded as frame
 storage: `os.replace()` gives no atomicity guarantee across the wire, and 17k
 small writes per camera per day over a network is painful. They are still fine
 as a *transfer destination*, which is a nightly bulk copy.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 4. Test before enabling anything
 
@@ -434,6 +478,8 @@ budget.
   BtbN static build or `jellyfin-ffmpeg` and point `paths.ffmpeg` at it. The
   script falls back to HEVC then x264 rather than failing, but you lose AV1.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 5. Enable
 
 ```bash
@@ -465,6 +511,8 @@ python3 /opt/timelapse/timelapse_encode.py /etc/timelapse/config.json \
 
 `--dry-run --no-transfer` builds the concat list and reports frame counts
 without encoding, transferring or deleting anything. Safe on live data.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 6. Transfer destination
 
@@ -544,6 +592,8 @@ write read-only.
 Set `transfer.enabled` to `false` to keep videos on the local disk. Note that
 nothing then prunes `video_output`; add your own retention if you do this.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 6a. Notifications
 
 One summary per nightly run: what encoded, coverage, size, failures, and
@@ -580,6 +630,8 @@ token, the ntfy token and the secret half of a Discord webhook URL. The chat
 id, the topic and the webhook's numeric id survive, because they are what a
 fault report is about.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 7. Sizing
 
 At a 5s interval: **17,280 frames/camera/day** → 4:48 of video at 60fps.
@@ -595,6 +647,8 @@ write-once/read-once.
 
 Write endurance is a non-issue on SSD: even 110 GB/day is ~40 TB/year against a
 typical 600 TBW consumer rating.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 8. Day to day: the `timelapse` command
 
@@ -731,6 +785,8 @@ one. You will only ever notice this if you keep your frames
 the default, the marker goes with them. Two ways to encode a day again:
 `--date 2026-08-01`, which ignores the marker for that one day, or `--force`,
 which ignores it for the whole backlog. Deleting the marker file works too.
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 9. Adding, editing and removing cameras
 
@@ -1005,6 +1061,8 @@ restart and the stranding checks are yours to remember.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 10. Config backups and restoring
 
 A backup is taken **before every change**, automatically, and the five most
@@ -1095,6 +1153,8 @@ extra copy that nothing rotates, so it can still be holding a password you
 have since changed. `sudo ls -la /etc/timelapse` shows anything left there.
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 11. The web UI
 
@@ -1334,3 +1394,5 @@ and delete them by whatever means you prefer. The UI will not do it for you.
 | Library is empty but the directory is right | The scan may still be running; the page says so. Otherwise nothing there matched a video extension. |
 | Clicking *Play* downloads a file instead of opening VLC | Your browser has no handler for `.m3u`. Tell it to always open that type, or copy the stream URL shown under each entry into VLC's *Open Network Stream*. |
 | Seeking does nothing in a player | Check you are on 0.0.9 or later; earlier builds sent `Accept-Ranges: none`. |
+
+<sub>[&uarr; Contents](#contents)</sub>

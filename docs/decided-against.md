@@ -14,6 +14,22 @@ demand rather than on facts; those entries say so. Things still wanted live in
 
 ---
 
+## Contents
+
+- [Frame retention beyond encode](#frame-retention-beyond-encode)
+- [Frozen-camera detection](#frozen-camera-detection)
+- [Restarting a camera automatically](#restarting-a-camera-automatically)
+- [Alerting when a camera stops answering](#alerting-when-a-camera-stops-answering)
+- [An ONVIF client library](#an-onvif-client-library)
+- [In-browser `<video>` playback](#in-browser-video-playback)
+- [Thumbnails and poster frames](#thumbnails-and-poster-frames)
+- [Live status updates, history and coverage graphs](#live-status-updates-history-and-coverage-graphs)
+- [Any control action from the web UI](#any-control-action-from-the-web-ui)
+- [Remote library browsing over SFTP](#remote-library-browsing-over-sftp)
+- [Motion interpolation to smooth the judder](#motion-interpolation-to-smooth-the-judder)
+- [A monitoring client for other Windows PCs](#a-monitoring-client-for-other-windows-pcs)
+- [Where the rest of the "no" decisions live](#where-the-rest-of-the-no-decisions-live)
+
 ## Frame retention beyond encode
 
 **Refused on scope, 2026-08-12. This program makes one timelapse per camera
@@ -59,6 +75,8 @@ queue to be encoded a second time.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## Frozen-camera detection
 
 **Refused on evidence, 2026-08-13: in five years of running IP cameras for
@@ -98,6 +116,8 @@ against a guess, and the byte-identity half is genuinely cheap if there turns
 out to be anything to catch.
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## Restarting a camera automatically
 
@@ -150,6 +170,8 @@ knowing what else touches that camera, and nothing in this program's design
 gives it that.
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## Alerting when a camera stops answering
 
@@ -234,6 +256,8 @@ the daemon exactly as connectionless as it is today.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## An ONVIF client library
 
 **Refused on install risk, 2026-08-14. `onvif-python` is a decent library,
@@ -285,6 +309,8 @@ worth having here and needs no SOAP stack at all.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## In-browser `<video>` playback
 
 **Refused because the output format is close to the worst case for a browser,
@@ -313,6 +339,8 @@ converge on Matroska (they have not in a decade).
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## Thumbnails and poster frames
 
 **Refused on the cost of the first scan, and on the second writable path.**
@@ -334,6 +362,8 @@ writes into the existing `state_dir` and never blocks a page. That is a real
 design, not a small feature, which is why it is here rather than in the plan.
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## Live status updates, history and coverage graphs
 
@@ -371,6 +401,8 @@ argued separately.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## Any control action from the web UI
 
 **Refused structurally, and this one is close to permanent.**
@@ -396,6 +428,8 @@ or off, because that would mean writing `config.json`. The CLI answer is
 separate, separately-hardened unit, not a feature of this one.
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## Remote library browsing over SFTP
 
@@ -448,6 +482,8 @@ avoid giving the web service an SSH key to the archive.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## Motion interpolation to smooth the judder
 
 **Refused on evidence, 2026-08-15, while building per-camera smoothing
@@ -492,6 +528,8 @@ a shorter capture interval, which is the only real fix for fast objects and is
 a storage decision for the operator rather than a code change.
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## A monitoring client for other Windows PCs
 
@@ -548,6 +586,8 @@ Explorer covers it. Notifications are the current answer, and they are the
 reason this is deferrable at all: a failed run already reaches you without
 anything being looked at.
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## Where the rest of the "no" decisions live
 
 Several refusals are recorded next to the code they constrain, because that is
@@ -562,3 +602,5 @@ second copy that can drift:
 | Rendering release-note markdown in the update panel | A markdown renderer is a dependency or a parser to maintain, for a paragraph nobody reads twice. GitHub already renders it one click away. | architecture.md, CHANGELOG 0.1.4 |
 | A `tools/` directory of helper scripts | It duplicated what the wizard should do, and `install.sh` never shipped it. A wizard must not tell you to go and do it yourself. | CHANGELOG 0.0.x |
 | Polling anything in the web UI | On request, never on a timer: a service nobody looks at should cost nothing. | architecture.md §4.5 |
+
+<sub>[&uarr; Contents](#contents)</sub>

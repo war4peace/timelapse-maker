@@ -7,6 +7,44 @@ guide.
 
 ---
 
+## Contents
+
+- [1. Purpose and scope](#1-purpose-and-scope)
+- [2. System overview](#2-system-overview)
+- [3. The on-disk contract](#3-the-on-disk-contract)
+  - [3a. Runtime state (0.1.6)](#3a-runtime-state-016)
+- [4. Component reference](#4-component-reference)
+  - [4.1 `timelapse_capture.py`](#41-timelapse_capturepy)
+  - [4.2 `timelapse_encode.py`](#42-timelapse_encodepy)
+  - [4.3 `timelapse_test.py`](#43-timelapse_testpy)
+  - [4.4 `timelapse_setup.py`](#44-timelapse_setuppy)
+  - [4.5 `timelapse_web.py`](#45-timelapse_webpy)
+  - [4.6 `timelapse_update.py`](#46-timelapse_updatepy)
+  - [4.6a `timelapse_platform.py` (0.2.0)](#46a-timelapse_platformpy-020)
+  - [4.6b `install.ps1` and `timelapse_cli.py` (0.2.0)](#46b-installps1-and-timelapse_clipy-020)
+  - [4.6c Moving the videos on Windows (0.2.0)](#46c-moving-the-videos-on-windows-020)
+  - [4.6d `timelapse_gui.py` and its launcher (0.2.0)](#46d-timelapse_guipy-and-its-launcher-020)
+  - [4.6e The .exe installer (0.2.0)](#46e-the-exe-installer-020)
+  - [4.7 `install.sh`](#47-installsh)
+  - [4.8 Per-camera interval and frame rate](#48-per-camera-interval-and-frame-rate)
+  - [4.8a Per-camera motion smoothing](#48a-per-camera-motion-smoothing)
+  - [4.9 Credential redaction](#49-credential-redaction)
+- [5. Configuration reference](#5-configuration-reference)
+  - [`paths`](#paths)
+  - [`capture`](#capture)
+  - [`encode`](#encode)
+  - [`transfer`](#transfer)
+  - [`notify`](#notify)
+  - [`web`](#web)
+  - [`cameras`](#cameras)
+- [6. Failure handling matrix](#6-failure-handling-matrix)
+- [7. Extension points](#7-extension-points)
+- [8. Known limitations](#8-known-limitations)
+- [9. Testing notes](#9-testing-notes)
+  - [The low-space guard, and three checks that could not see it](#the-low-space-guard-and-three-checks-that-could-not-see-it)
+- [9a. Appendix: the destination library, surveyed 2026-08-07](#9a-appendix-the-destination-library-surveyed-2026-08-07)
+- [10. File inventory](#10-file-inventory)
+
 ## 1. Purpose and scope
 
 Produce daily timelapse videos from IP cameras, unattended.
@@ -39,6 +77,8 @@ reboots, missed midnight runs, full disks and network failures without human
 intervention, and it should say so on Discord when it can't.
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 2. System overview
 
@@ -84,6 +124,8 @@ them would mean an encoder bug can stop capture, the one failure that loses
 data permanently.
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 3. The on-disk contract
 
@@ -142,6 +184,8 @@ Rules that hold this together:
 | **`paths.state_dir` must exist before the units start** | It is named in `ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths` points at nothing, with an error about mount namespaces that names neither the directory nor the release that added it. `install.sh` creates it in `sync_units()`, which is what makes the upgrade path safe for an install that answers "don't reconfigure" and never runs the wizard. |
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 4. Component reference
 
@@ -2739,6 +2783,8 @@ status.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 5. Configuration reference
 
 Single JSON file, default `/etc/timelapse/config.json`, mode `640`. Both programs
@@ -2825,6 +2871,8 @@ is read with `.get(key, default)`.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 6. Failure handling matrix
 
 | Failure | Behaviour |
@@ -2844,6 +2892,8 @@ is read with `.get(key, default)`.
 | Encode never succeeds for a camera | Frames accumulate. `max_backlog_days` bounds the work; DiskGuard bounds the damage; nightly Discord shows repeated failures. |
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 7. Extension points
 
@@ -2898,6 +2948,8 @@ help.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 8. Known limitations
 
 - **DST fall-back**: local time repeats an hour, so `HHMMSS` names collide.
@@ -2918,6 +2970,8 @@ help.
   ~96% on DST days.
 
 ---
+
+<sub>[&uarr; Contents](#contents)</sub>
 
 ## 9. Testing notes
 
@@ -3511,6 +3565,8 @@ for i,f in enumerate(sorted(glob.glob('src_*.jpg'))):
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 9a. Appendix: the destination library, surveyed 2026-08-07
 
 Reference data, not a plan. This is the measurement `parse_name()` was built
@@ -3592,6 +3648,8 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 
 ---
 
+<sub>[&uarr; Contents](#contents)</sub>
+
 ## 10. File inventory
 
 ```
@@ -3663,3 +3721,5 @@ confusing read-only error. `timelapse-web.service` is scoped to a single
 directory, its index, and must stay that way: it is the only network-facing
 unit, and widening it to match the others would give it write access to every
 captured frame for nothing.
+
+<sub>[&uarr; Contents](#contents)</sub>
