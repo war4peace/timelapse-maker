@@ -2082,6 +2082,16 @@ def ffmpeg_roots(env=None):
         return ["/usr/bin", "/usr/local/bin"]
     env = os.environ if env is None else env
     roots = []
+    # First, and it is the only one here this project puts anything in. The
+    # graphical installer unpacks a pinned build to exactly this path when the
+    # machine had none, and it runs it once before believing it, so if this
+    # directory exists then something already proved it works. An ffmpeg the
+    # operator installed themselves is somewhere else entirely and PATH finds
+    # it ahead of every root here, which is what keeps item 11c.6a's promise:
+    # a build somebody chose deliberately is never overruled by ours.
+    managed = env.get("ProgramFiles")
+    if managed:
+        roots.append(ntpath.join(managed, "timelapse-maker", "ffmpeg", "bin"))
     for var in ("ProgramFiles", "ProgramFiles(x86)"):
         base = env.get(var)
         if base:
@@ -2143,7 +2153,23 @@ if __name__ == "__main__":
     # installer's version listing reads.
     import sys
 
-    if "--version" in sys.argv[1:]:
+    argv = sys.argv[1:]
+    if "--version" in argv:
         print("timelapse_platform.py " + __version__)
+    elif "--find-tool" in argv:
+        # For the installer's prerequisite stage, which has to decide whether to
+        # download ffmpeg and must ask exactly the question the wizard will ask
+        # a minute later. Answering it again in PowerShell would be a second
+        # opinion, and the one that matters is the one the product uses.
+        #
+        # The status carries the answer and the output carries the path, so a
+        # caller branches on the status rather than on empty output: this module
+        # imports nothing, but a traceback on stdout is still not a path.
+        at = argv.index("--find-tool")
+        name = argv[at + 1] if at + 1 < len(argv) else ""
+        found = find_tool(name) if name else ""
+        if found:
+            print(found)
+        raise SystemExit(0 if found else 1)
     else:
         print(__doc__.strip())

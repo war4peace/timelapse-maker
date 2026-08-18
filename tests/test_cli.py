@@ -260,8 +260,16 @@ class TestEveryPowerShellFile(unittest.TestCase):
 
     @staticmethod
     def files():
+        """Every .ps1 this project ships, which is now two directories.
+
+        temp/ is left out on purpose: those are throwaway probes, gitignored,
+        and nothing reaches an operator from there. Everything else is in, and
+        the reason to glob rather than list is that the file which opts out of
+        a rule is always the one added after the rule was written.
+        """
         found = sorted(ROOT.glob("*.ps1"))
-        assert found, "no PowerShell files found to check"
+        found += sorted((ROOT / "installer").glob("*.ps1"))
+        assert len(found) >= 3, "the scan found almost no PowerShell files"
         return found
 
     def test_they_are_pure_ascii(self):

@@ -51,8 +51,48 @@ not yet, and neither does upgrading in place. Everything else below applies:
 the same config file, the same wizard, the same `timelapse` command, the same
 `timelapse test`.
 
-Get the prerequisites first, because the installer deliberately supplies
-neither:
+There are two ways in. The **installer** is the one to use unless you have a
+reason not to; the PowerShell script underneath it is documented after it,
+because it is what the installer runs and what a scripted deployment wants.
+
+#### The installer
+
+Download `timelapse-maker-setup-<version>.exe` from the
+[releases page](https://github.com/war4peace/timelapse-maker/releases) and run
+it. It asks for administrator rights, copies the files, and then opens the
+graphical wizard so you can add your cameras.
+
+It is **not code-signed**, so Windows SmartScreen will say "Windows protected
+your PC". Choose "More info" and then "Run anyway". Every release publishes a
+`.sha256` beside the installer if you would rather check the download first:
+
+```powershell
+Get-FileHash .\timelapse-maker-setup-0.2.0.exe -Algorithm SHA256
+```
+
+Two checkboxes on the way through, both ticked and both worth leaving that way:
+
+| Checkbox | What it does |
+|---|---|
+| Install Python | Only if the machine has none. An existing Python 3.9 or newer is used as it is. |
+| Install ffmpeg | Only if the machine has none. An ffmpeg you installed yourself is never replaced. |
+
+Both look first and download only what is missing, so on a machine that already
+has them the boxes cost nothing. What gets fetched is pinned by version and by
+SHA-256 in `installer/prerequisites.json`, and nothing is run before it matches.
+
+Uninstall it from **Settings, Apps** like anything else. That deregisters the
+service and both tasks and removes the program; your configuration, frames and
+videos are left alone, exactly as on Linux.
+
+If something goes wrong, the installer says so rather than reporting success,
+and the whole log is at `%ProgramData%\timelapse\install.log`.
+
+#### The PowerShell installer
+
+This is what the .exe runs, and running it directly is the right thing for a
+scripted deployment or an upgrade. It supplies neither prerequisite, so get
+them first:
 
 - **Python 3.9 or newer** from [python.org](https://www.python.org/downloads/windows/).
   Prefer "install for all users". A per-user Python works, and the installer

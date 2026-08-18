@@ -1,0 +1,140 @@
+name: Installer
+
+# Builds the Windows .exe that the release page offers, so that the artifact
+# people download is one CI produced from a tag rather than whatever happened
+# to be in somebody's working tree. Nobody needs Inno Setup installed to cut a
+# release, and the same tag always produces the same installer.
+#
+# workflow_dispatch builds it without a tag, which is how you check a change to
+# the .iss without releasing anything: the exe lands as a build artifact and is
+# not attached to any release.
+
+on:
+  push:
+    # main as well as tags, and without a paths filter on either. A tag push
+    # carries no new commits, so a paths filter would skip exactly the run that
+    # matters and the release would go out with no installer on it. Pushes to
+    # main are rare enough here (a release merge) that compiling every time is
+    # the cheap way to know the .iss still builds before it is tagged.
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v5
+
+      # Nine files carry the version string and this would be the tenth, so it
+      # is derived from the tag instead and install.ps1 is held against it. A
+      # tag that disagrees with the tree is a release that reports the wrong
+      # version from `timelapse version` for ever, and the tag cannot be moved
+      # once anybody has fetched it.
+      - name: Version, from the tag
+        id: version
+        run: |
+          $source = Get-Content install.ps1 -Raw
+          if ($source -notmatch "\`$VERSION\s*=\s*'([0-9.]+)'") {
+            throw "could not read `$VERSION out of install.ps1"
+          }
+          $tree = $Matches[1]
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $tag = $env:GITHUB_REF_NAME -replace '^v', ''
+            if ($tag -ne $tree) {
+              throw "tag $env:GITHUB_REF_NAME says $tag, install.ps1 says $tree"
+            }
+            Write-Host "tag and tree agree on $tree"
+          } else {
+            Write-Host "no tag; building $tree from the tree"
+          }
+          "version=$tree" >> $env:GITHUB_OUTPUT
+
+      # The pinned downloads are used at install time, not here, so nothing in
+      # this build would notice one going stale: the first person to run the
+      # installer would. A HEAD apiece is cheap insurance.
+      #
+      # A wrong size or a 404 fails the build, because that pin is broken for
+      # everybody. A connection that will not open is a warning, because a
+      # vendor being down for ten minutes is not a reason to block a release.
+      - name: The pinned prerequisites are still there
+        run: |
+          $pins = Get-Content installer/prerequisites.json -Raw | ConvertFrom-Json
+          $broken = @()
+          foreach ($name in @('python', 'ffmpeg')) {
+            $pin = $pins.$name
+            try {
+              $head = Invoke-WebRequest -Uri $pin.url -Method Head -UseBasicParsing
+            } catch {
+              Write-Host "::warning::could not reach the $name pin: $($_.Exception.Message)"
+              continue
+            }
+            $length = [int64]($head.Headers['Content-Length'] | Select-Object -First 1)
+            if ($length -ne $pin.bytes) {
+              $broken += "$name pin is $length bytes, prerequisites.json says $($pin.bytes)"
+            } else {
+              Write-Host "OK $name $($pin.version) ($length bytes)"
+            }
+          }
+          if ($broken) { throw ($broken -join "; ") }
+
+      # Inno Setup was preinstalled on the Server 2022 image and is not on
+      # Server 2025, which windows-latest now is. Installing it explicitly means
+      # this does not silently start failing the next time the image moves.
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Compile the installer
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe is not at $iscc" }
+          & $iscc /DAppVersion=${{ steps.version.outputs.version }} `
+                  installer\timelapse-maker.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC exited $LASTEXITCODE" }
+
+      # Published beside the exe because this installer is not code-signed, so
+      # SmartScreen will warn about it and a checksum is the only way anybody
+      # can tell the download apart from something that looks like it.
+      - name: Checksum
+        id: artifact
+        run: |
+          $exe = Get-ChildItem dist\*.exe | Select-Object -First 1
+          $hash = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLower()
+          "$hash  $($exe.Name)" | Out-File "$($exe.FullName).sha256" -Encoding ascii
+          Write-Host "$($exe.Name)  $([math]::Round($exe.Length / 1MB, 1)) MB"
+          Write-Host $hash
+          "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: dist/*
+
+      # A draft is created when the tag has no release yet, which is the normal
+      # order of events: the tag is pushed first and the release body is written
+      # afterwards, by a person, for the operator installing it. Without this the
+      # build would race that person and lose about half the time. If the release
+      # already exists the asset simply lands on it.
+      #
+      # --clobber so re-running the workflow replaces the asset rather than
+      # failing on a name that is already taken.
+      - name: Attach to the release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "no release for $tag yet; creating a draft to hold the installer"
+            gh release create $tag --draft --title $tag --notes "Draft. Write the body and publish."
+            if ($LASTEXITCODE -ne 0) { throw "could not create a draft release for $tag" }
+          }
+          $files = Get-ChildItem dist\* | ForEach-Object FullName
+          gh release upload $tag @files --clobber
+          if ($LASTEXITCODE -ne 0) { throw "could not upload the installer to $tag" }

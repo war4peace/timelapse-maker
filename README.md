@@ -221,23 +221,34 @@ For a fully manual install, see [docs/install.md](docs/install.md).
 <details>
 <summary>Windows (early preview)</summary>
 
-Download or clone the repository, open **PowerShell as administrator** and run:
+Download `timelapse-maker-setup-<version>.exe` from the
+[releases page](https://github.com/war4peace/timelapse-maker/releases) and run
+it. It asks for administrator rights, installs Python and ffmpeg if the machine
+has neither, registers the capture daemon as a real Windows service and the
+nightly encode and credential check as scheduled tasks, and then opens the
+graphical wizard so you can add your cameras. Uninstall from Settings, Apps.
+
+It is not code-signed, so SmartScreen will warn: "More info", then "Run
+anyway". A `.sha256` is published beside it.
+
+Neither prerequisite is ever replaced. An **ffmpeg** you installed yourself is
+the one that gets used, because a recorder usually already has one you chose
+deliberately, and the same goes for an existing **Python** 3.9 or newer. The
+downloads only happen on a machine that has none.
+
+Or, from a clone, with **PowerShell as administrator**:
 
 ```powershell
 .\install.ps1
 ```
 
-It finds your Python, places the scripts, registers the capture daemon as a
-real Windows service and the nightly encode and credential check as scheduled
-tasks, then runs the same wizard. `.\install.ps1 -Uninstall` removes all of
-that and leaves your configuration, frames and videos alone.
-
-Two things it does **not** install, deliberately. **ffmpeg**: Windows has no
-package manager worth relying on, and a recorder usually already has one you
-chose, so the wizard asks where it is and verifies it by running it. Get a
-build from [ffmpeg.org](https://ffmpeg.org/download.html) first, with NVENC if
-the machine has an NVIDIA card. And **Python**: install 3.9 or newer from
-python.org, preferably "for all users".
+That is what the installer runs, and it is the right one for a scripted
+deployment. It supplies neither prerequisite: get
+[Python](https://www.python.org/downloads/windows/) 3.9 or newer, preferably
+"for all users", and a build of
+[ffmpeg](https://ffmpeg.org/download.html) with NVENC if the machine has an
+NVIDIA card. `.\install.ps1 -Uninstall` removes everything it registered and
+leaves your configuration, frames and videos alone.
 
 What is not there yet: the web UI, and upgrading in place. To upgrade, download
 the new release and run `install.ps1` again; it keeps everything.

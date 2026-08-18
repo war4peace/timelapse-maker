@@ -34,3 +34,10 @@ logs/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Built installers (installer/timelapse-maker.iss). Local only: the release
+# artifact is the one the Installer workflow builds from a tag.
+dist/
+
+# An ffmpeg unpacked by installer/prepare.ps1 when it is run from a checkout.
+/ffmpeg/

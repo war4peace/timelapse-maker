@@ -26,9 +26,17 @@
       running is restarted onto the new build, because a service already
       running is executing the scripts it read at startup.
 
+  The first two of those refusals are right for THIS front door and not for
+  every one. Somebody running this from a checkout already has a terminal open
+  and can go and fetch an interpreter; somebody who downloaded a .exe from the
+  release page cannot reasonably be told to. So the graphical installer has a
+  prerequisite stage, installer\prepare.ps1, which finds or fetches Python and
+  ffmpeg and then calls this script. It places nothing and registers nothing:
+  the split is prerequisites there, installation here.
+
   Everything that decides anything lives in the Python scripts, and this file
   calls them: registration is `timelapse_setup.py --install-units`, which is
-  also what a future GUI installer must front-end rather than reimplement.
+  also what the GUI installer front-ends rather than reimplements.
   Two installers that both know how to register a service disagree within one
   release; this project has already deleted one directory over exactly that.
 

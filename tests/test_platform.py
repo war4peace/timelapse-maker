@@ -1767,6 +1767,23 @@ class TestFindingTools(unittest.TestCase):
             roots = plat.ffmpeg_roots({})
         self.assertEqual(roots, ["C:\\ffmpeg\\bin"])
 
+    def test_the_installers_own_ffmpeg_is_looked_for_first(self):
+        """The one root here this project ever writes to.
+
+        installer/prepare.ps1 unpacks a pinned build to exactly this path when
+        the machine had none, so if it exists then something has already run it
+        once and watched it work. Ahead of the others because we know that
+        about it and about none of them; behind PATH, which find_tool checks
+        before any root, because an ffmpeg the operator put on PATH is a
+        decision and item 11c.6a says we do not overrule those.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            roots = plat.ffmpeg_roots({"ProgramFiles": r"C:\Program Files"})
+        self.assertEqual(roots[0],
+                         r"C:\Program Files\timelapse-maker\ffmpeg\bin")
+        self.assertLess(roots.index(r"C:\Program Files\timelapse-maker\ffmpeg\bin"),
+                        roots.index(r"C:\Program Files\ffmpeg\bin"))
+
     def test_a_file_is_taken_as_given(self):
         self.assertEqual(
             plat.resolve_tool(r"C:\ffmpeg\bin\ffmpeg.exe", "ffmpeg",

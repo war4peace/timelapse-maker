@@ -10,6 +10,27 @@ While the version is `0.x`, the configuration format may change in any release.
 ## [Unreleased]
 
 ### Added
+- **An installer you download and double-click, on Windows.** The release page
+  now carries `timelapse-maker-setup-<version>.exe`. Run it, allow the
+  administrator prompt, and it copies everything, registers the capture service
+  and both scheduled tasks, and opens the setup wizard so you can add your
+  cameras. Uninstalling is through Settings, Apps, like anything else, and it
+  leaves your configuration, frames and videos alone. **Nothing changes on
+  Linux**, and `install.ps1` still works exactly as it did: the installer runs
+  it rather than replacing it, so a scripted deployment carries on unchanged.
+
+  **It can supply Python and ffmpeg if the machine has neither**, which is what
+  makes it a single download rather than a third errand. Two checkboxes, both
+  ticked, and both only act on something missing: an ffmpeg you installed
+  yourself is the one that gets used, because a recorder usually already has
+  one chosen deliberately, and the same goes for an existing Python. What does
+  get fetched is pinned by version and checked against a SHA-256 before it is
+  run.
+
+  It is not code-signed, so Windows SmartScreen will say "Windows protected
+  your PC": choose "More info", then "Run anyway". A `.sha256` is published
+  beside the installer if you would rather check the download first.
+
 - **A setup wizard with a window, on Windows.** **Nothing changes on Linux**,
   where the console wizard is the right tool for a machine you reach over a
   terminal. The installer adds **Timelapse Setup** to the Start menu; it

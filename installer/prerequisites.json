@@ -1,0 +1,21 @@
+{
+  "_note": "Read by installer/prepare.ps1, checked by tests/test_installer.py, and HEAD-verified by .github/workflows/installer.yml. Every field matters: bytes catches a captive portal or a proxy error page arriving as a successful download, sha256 catches the asset being replaced. Refresh both together, never one alone.",
+
+  "python": {
+    "version": "3.14.7",
+    "url": "https://www.python.org/ftp/python/3.14.7/python-3.14.7-amd64.exe",
+    "sha256": "9d9eb2709ef81bf5cd30db3c2096bdbc4ea10087c22e62f27d356b36f6ae9649",
+    "bytes": 33258168,
+    "refresh": "Download the installer from www.python.org over HTTPS and hash it. python.org publishes no .sha256 sidecar, so the pin records what was fetched rather than what a vendor asserts. 3.14 is what the author's deployment runs and what a CI leg exercises; the floor stays 3.9 and any Python already on the machine is used as it is, so this version only ever reaches a machine that had none."
+  },
+
+  "ffmpeg": {
+    "version": "9.0.1",
+    "url": "https://www.gyan.dev/ffmpeg/builds/packages/ffmpeg-9.0.1-essentials_build.zip",
+    "sha256": "fec81ae03971d9dd4be3ebe02e263bd2ec1d789483f931bdba5f5715e65da2e9",
+    "bytes": 111253802,
+    "binaries": "ffmpeg-9.0.1-essentials_build/bin",
+    "refresh": "gyan.dev publishes a .sha256 sidecar beside every versioned package, so the hash and the size can be read without downloading 111 MB: fetch <url>.sha256 and read Content-Length. But do download it once per bump and run temp/check_pins.py, because two fields here cannot be read off a sidecar: binaries, which is the folder name inside the zip, and whether the build still has NVENC. Both were measured on this pin rather than believed. Use the versioned packages/ path, never ffmpeg-release-essentials.zip: that one moves, and a pin against a moving target fails at the next vendor release.",
+    "verified": "2026-08-18: sha256 and bytes match the downloaded file; the archive holds one top-level folder; ffmpeg.exe reports 9.0.1 and lists av1_nvenc, h264_nvenc and hevc_nvenc, built with --enable-nvenc, --enable-cuda-llvm, --enable-libx264 and --enable-libx265. Those are the three encoders detect_encoders() probes for."
+  }
+}

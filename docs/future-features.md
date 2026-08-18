@@ -1213,10 +1213,38 @@ stops being worth it:
    shape. A GUI is a good way to find them, because it cannot fall back on a
    terminal the way every other caller quietly did.
 
-   **Still to do here:** a compiled `.exe` so the release page offers a
-   download-and-double-click artifact rather than a `.cmd`, which is packaging
-   rather than function and brings a signing question with it; and an installer
-   front end over `install.ps1`, which is the other half of 6b.
+   **The installer half is BUILT 2026-08-18**, which closes 6b:
+   `installer/timelapse-maker.iss` compiles with Inno Setup 6 into
+   `timelapse-maker-setup-<version>.exe`, built and attached by
+   `.github/workflows/installer.yml` on a `v*` tag. It is 2.3 MB, which is the
+   size this entry's second correction predicted and a tenth of what its first
+   draft did: no Python is bundled, the .exe stages into
+   `installer/prepare.ps1`, and that stages into `install.ps1`, which is the
+   shape the operator's own installer uses and the shape the front-end rule
+   already demanded.
+
+   Four decisions, all put to the operator and all answered with the
+   recommendation. **Python is downloaded when there is none** (pinned version,
+   pinned SHA-256), because "install Python first and run me again" is the
+   whole experience of a .exe that does not. **ffmpeg likewise, but only when
+   absent**, which keeps 11c.6a intact rather than reopening it: the refusal
+   there was about overriding a build the operator chose, and a machine with no
+   build has no choice to override. **The build is CI's**, so nobody needs Inno
+   Setup to cut a release and the artifact is the tag rather than somebody's
+   working tree. And **install.ps1 runs hidden with its output captured to
+   `%ProgramData%\timelapse\install.log`**, because a console appearing out of
+   a graphical installer is the complaint that moved the Start menu shortcut.
+
+   **The pins were measured, not believed**, and two of their fields could not
+   have been read off a vendor checksum: the folder name inside the ffmpeg zip,
+   which `prepare.ps1` moves by name, and whether the build still carries
+   NVENC. Both confirmed against the real files.
+
+   **Not code-signed**, deliberately for now: SmartScreen warns, the docs say
+   so, and every build publishes a `.sha256`. A certificate costs real money
+   and comes with a reputation-building period, which is not a trade worth
+   making for software still marked EXPERIMENTAL. Revisit when the audience is
+   larger than the author's recorder.
 6. ~~The web UI.~~ **Deferred indefinitely on the operator's scope decision,
    2026-08-16**, together with the monitoring client that was weighed against
    it. Both are written up in decided-against.md; the short form is that

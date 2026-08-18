@@ -167,17 +167,26 @@ jobs:
       # install.ps1 cannot be *run* here (it registers services and needs
       # elevation) but it can be parsed, which catches the whole class of
       # mistake that would otherwise be found by an operator mid-install.
-      - name: install.ps1 parses
+      #
+      # Globbed rather than listed, and temp/ is not in the glob. The first
+      # version of this step named temp/step3b_check.ps1, which is gitignored:
+      # it passed on the branch it was written on and would have failed on the
+      # first push to main, on a file CI cannot see. Third time this project
+      # has met "a local branch is a branch CI has never seen".
+      - name: Every PowerShell file parses
         run: |
-          foreach ($file in @('install.ps1', 'temp/step3b_check.ps1')) {
+          $files = @(Get-ChildItem -Path . -Filter *.ps1) +
+                   @(Get-ChildItem -Path installer -Filter *.ps1)
+          if ($files.Count -lt 3) { throw "found almost no PowerShell files" }
+          foreach ($file in $files) {
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path $file), [ref]$null, [ref]$errors)
+              $file.FullName, [ref]$null, [ref]$errors)
             if ($errors) {
               $errors | ForEach-Object { Write-Host $_.Message }
-              throw "$file does not parse"
+              throw "$($file.Name) does not parse"
             }
-            Write-Host "$file parses"
+            Write-Host "$($file.Name) parses"
           }
 
       - name: The command wrapper dispatches

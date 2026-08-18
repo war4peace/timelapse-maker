@@ -2284,6 +2284,108 @@ a wizard nobody can find is a wizard nobody uses. Failing to create it is a
 warning and never fatal: a shortcut is a convenience, and a locked-down profile
 refusing one must not cost an install.
 
+### 4.6e The .exe installer (0.2.0)
+
+`installer/timelapse-maker.iss` compiles with Inno Setup 6 into
+`timelapse-maker-setup-<version>.exe`, which is what the release page offers.
+It completes item 11c.6b: a Windows user downloads one file, double-clicks it,
+and ends with a configured install.
+
+**Three layers, and the boundary between them is the whole design.** The .iss
+lays the release tree down and calls `installer\prepare.ps1`, which makes sure
+Python and ffmpeg exist and calls `install.ps1`, which is the only program in
+this project that knows how to install anything. Nothing in the first two
+layers registers a service, writes a task, sets an ACL or writes a config. That
+is the rule `tools/` was deleted over, met on its third and fourth files, and
+it is asserted rather than promised: `tests/test_installer.py` scans both for
+`sc.exe`, `schtasks`, `New-Service`, `icacls` and `--install-units`, and
+requires `install.ps1` on both the install and the uninstall path.
+
+**Prerequisites are a different question from installation, and that is why
+`prepare.ps1` exists rather than `install.ps1` growing a downloader.**
+`install.ps1` refuses to install Python or ffmpeg, and both refusals are right
+for it: somebody running it from a checkout has a terminal open and can go and
+fetch an interpreter. Neither is right for a .exe from a release page, where
+"install Python first and run me again" is the entire experience of the thing.
+So the split is prerequisites there, installation here, and `install.ps1` is
+unchanged apart from a paragraph saying so.
+
+**Neither prerequisite is ever replaced.** Each download needs two conditions,
+the operator's checkbox *and* the tool being absent, which is what makes a
+ticked box safe to leave ticked. An ffmpeg already on the machine is very often
+a deliberate choice made for NVENC or for a codec, and overriding it is what
+item 11c.6a refused; nothing here reopens that. The narrow case this exists for
+is a clean Windows box, where the alternative is an installer that finishes and
+leaves no working product.
+
+**The ffmpeg question is asked of the product, not answered again.**
+`prepare.ps1` runs `timelapse_platform.py --find-tool ffmpeg`, so the question
+"will the wizard find one" is answered by the function the wizard uses. A
+PowerShell reimplementation would be a second opinion that disagrees on the
+machines nobody tests. A downloaded build is unpacked to
+`%ProgramFiles%\timelapse-maker\ffmpeg\bin`, which `ffmpeg_roots()` now checks
+first: it is the one root this project ever writes to, and if it exists then
+something has already run the binary once and watched it work. It stays behind
+PATH, because `find_tool()` checks PATH before any root and an ffmpeg the
+operator put there is a decision.
+
+**Everything downloaded is pinned by version, size and SHA-256** in
+`installer/prerequisites.json`, and nothing runs before it matches. The size is
+not redundant: a 404 page, a captive portal and a proxy error all arrive as a
+successful HTTP response, a trap this project already met in `timelapse
+update`, and it was met again while building this, when
+`jrsoftware.org/download.php/is.exe` returned ten kilobytes of HTML with a 200.
+Reporting that as a hash mismatch reads as a corrupt download; reporting it as
+ten kilobytes where thirty megabytes were expected reads as the network.
+
+The pins were verified against the real files rather than against the vendors'
+claims, which mattered: the `binaries` field naming the folder *inside* the zip
+cannot be read off a checksum sidecar, and neither can whether the build still
+carries NVENC. Measured 2026-08-18: the archive holds one top-level folder as
+pinned, and `ffmpeg.exe` lists `av1_nvenc`, `hevc_nvenc` and `h264_nvenc`,
+which are exactly the three `detect_encoders()` probes for. `temp/check_pins.py`
+is that check and should be run at every bump; the release workflow HEADs both
+URLs and compares `Content-Length`, which is the cheap half and catches a dead
+pin before a release rather than after one.
+
+**Two directories, on purpose.** `{app}` is `%ProgramFiles%\timelapse-maker`
+and holds the release tree, the docs, the uninstaller and any downloaded
+ffmpeg; the scripts that actually run go to `%ProgramFiles%\timelapse`, which
+`install.ps1` owns and has since the first Windows release. They are separate
+because the uninstaller lives in the first and deletes the second, and a
+program that recursively deletes the directory it is running from mid-uninstall
+is a different sort of bug report.
+
+**It runs hidden and logs, which is a decision about what the operator sees.**
+`install.ps1` prints things worth reading: the per-user Python warning, the ACL
+result, the PATH note. Behind a progress bar all of that goes nowhere unless it
+is captured, which is the same trap as a service writing to a stderr the SCM
+discards, and it gets the same answer: both streams into
+`%ProgramData%\timelapse\install.log`, offered to the operator if a stage
+fails. The finish page is rewritten on failure, because Inno's own text says
+"Setup has finished installing" whatever happened, and the last thing somebody
+reads about a failed install should not be a success.
+
+**No `[Icons]` section, and its absence is a decision.** `install.ps1` already
+creates the Start menu entry on both front doors, so a line here would write
+the same shortcut twice and hand its removal to a second uninstaller.
+
+**It is not code-signed.** SmartScreen therefore warns, and the answer for now
+is to say so in the README and in `install.md` and to publish a `.sha256`
+beside every build. A certificate is a real cost with a reputation-building
+period attached, and it is not worth it for software still marked
+EXPERIMENTAL; revisit it when the audience is larger than the author's own
+recorder.
+
+**The build is CI's, not a workstation's.** `.github/workflows/installer.yml`
+installs Inno Setup (it was preinstalled on the Server 2022 image and is not on
+Server 2025, which `windows-latest` now is), compiles with `/DAppVersion` taken
+from the tag, and attaches the exe and its checksum to the release, creating a
+draft if the tag has none yet. The tag is checked against `install.ps1`'s
+`$VERSION` first: a tag cannot be moved once anybody has fetched it, so a
+release built from a tree still carrying the previous version would report the
+wrong one from `timelapse version` for ever.
+
 ### 4.7 `install.sh`
 
 Bootstrap. Detects the package manager (apt/dnf/yum/pacman/zypper/apk), installs
@@ -2870,7 +2972,59 @@ wrapper** rather than through Python (a broken `.cmd` is invisible to every
 other check and is the first thing anybody touches), then a real uninstall and
 checks that it removed all of that and left the recordings alone. CI parses
 both PowerShell files and asserts `install.ps1` is ASCII, which is the Windows
-analogue of the `shell` job's `bash -n` and shellcheck.
+analogue of the `shell` job's `bash -n` and shellcheck. That parse step is
+globbed over `*.ps1` and `installer/*.ps1` rather than listed, because the
+first version of it named `temp/step3b_check.ps1`, which is **gitignored**: it
+passed on the branch it was written on and would have failed on the first push
+to `main`, on a file CI cannot see. Third time this project has met "a local
+branch is a branch CI has never seen", and the first where the trap was in the
+CI file itself.
+
+**The .exe installer is checked in four places and none of them is a unit
+test.** Inno Setup is not on the Linux runners, and compiling on the Windows
+one would prove that the script compiles rather than that it installs. So:
+`tests/test_installer.py` holds the properties that are cheap here and
+expensive to find there (the pins' shape, the version agreement, the payload
+file list, and above all the seam, which is the scan for `sc.exe`, `schtasks`,
+`New-Service` and `icacls` in both the .iss and `prepare.ps1`); the release
+workflow compiles it on every push to `main` and every tag, so a broken .iss is
+found before a release rather than during one; `temp/check_pins.py` downloads
+both pinned files and checks the hash, the folder inside the zip and whether
+the build still has NVENC; and `prepare.ps1 -NoInstall` runs its whole
+detection path on any machine without changing anything, which is what found
+its first defect. That defect is worth keeping: `$PSScriptRoot` is not
+reliably populated while a param block is being bound on 5.1, so
+`[string]$Root = (Split-Path -Parent $PSScriptRoot)` failed **at the bind**,
+before a line of the script ran, with an error naming `Split-Path` that reads
+as a bad argument rather than a bad default. Same family as the wizard's
+`NameError`: the entry point is the worst place to learn this, and running the
+thing is the only way to.
+
+**What none of that reaches is a real elevated install from the .exe**, which
+is a checklist, on a machine that can be put back:
+
+1. On a box that already has both prerequisites, run it with **both boxes left
+   ticked**. Nothing should be downloaded and the log should say so for each,
+   naming the Python and the ffmpeg it found. This is the case that would
+   otherwise overwrite an operator's own ffmpeg, so it is first.
+2. SmartScreen warns; "More info", "Run anyway". Confirm the publisher line
+   reads as unsigned rather than as somebody else.
+3. The progress page names the prerequisite stage rather than sitting on a bare
+   bar, the finish page offers the wizard, and clicking Finish opens it with
+   **no console window** anywhere in the sequence.
+4. Check the two directories: the release tree and the uninstaller under
+   `Program Files\timelapse-maker`, the scripts under `Program Files\timelapse`.
+   Then `timelapse version` **in a new terminal**, which exercises the PATH
+   entry and the `.cmd` wrapper at once.
+5. Run it a second time over the top. It must reconfigure rather than refuse,
+   and must not walk the wizard again.
+6. Uninstall from Settings, Apps. The service and both tasks are gone, both
+   directories are gone, and `%ProgramData%\timelapse` with its config, frames
+   and videos is untouched.
+7. Only on a machine with **neither** prerequisite: the download path, which is
+   the half nothing else here can exercise. Watch for the pinned Python landing
+   in `Program Files`, `py -3` working afterwards, and the wizard opening,
+   which is the one that proves `Include_tcltk` was passed.
 
 All 21 of its checks passed on 2026-08-16, on the second run. The first failed
 11 of 18, and every one of those was the same quoting bug cascading rather than
@@ -3318,9 +3472,12 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 
 ```
 install.sh                       bootstrap installer, 978 lines
-install.ps1                      the Windows one, 459 lines
+install.ps1                      the Windows one, 483 lines
 setup-gui.ps1                    launcher for the graphical wizard, 111 lines
 timelapse-setup.cmd              double-click shim for the above
+installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
+installer/prepare.ps1            prerequisites, then install.ps1, 433 lines
+installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
@@ -3336,6 +3493,7 @@ tests/test_cli.py                unit tests
 tests/test_encode.py             unit tests
 tests/test_grammar.py            the 3.9 floor, incl. the PEP 701 gap
 tests/test_gui.py                the graphical wizard's decide layer
+tests/test_installer.py          the .exe, its pins and the seam below it
 tests/test_platform.py           unit tests
 tests/test_setup.py              unit tests
 tests/test_update.py             unit tests
@@ -3353,6 +3511,7 @@ docs/architecture.md             this file
 docs/install.md                  operator guide
 docs/future-features.md          planned work, in build order
 .github/check_windows_config.py  CI: the wizard's Windows locations
+.github/workflows/installer.yml  CI: builds and attaches the .exe
 docs/decided-against.md          considered and refused, and why
 ```
 
