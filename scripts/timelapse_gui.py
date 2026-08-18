@@ -25,6 +25,7 @@ machines and CI runners with no window station at all, and an import at module
 scope would take them all down.
 """
 
+import base64
 import os
 import sys
 from pathlib import Path
@@ -46,10 +47,23 @@ OK, WARN, FAIL = "ok", "warn", "fail"
 UNREACHABLE = ("No usable image came back. Check the address, and the "
                "username and password.")
 
+# The box the fetched frame is scaled into beside the Test button, and the
+# share of the screen the full-size view may take. Small enough that a 4K
+# snapshot still leaves the detail pane readable, large enough to tell a main
+# stream from a sub-stream at a glance, which is the whole point of showing it.
+THUMB = (208, 117)
+SCREEN_SHARE = 0.85
+
 # Wide enough for a UNC path and an explanation of what is wrong with it, and
 # for a camera list beside the camera being edited; short enough to sit on a
 # 1366x768 laptop, which a recorder often is, taskbar and title bar included.
-WINDOW = "820x620"
+#
+# 660 rather than the 620 it was until the snapshot preview: with a frame on
+# the camera pane that pane wanted 527 of the 533 it had, and six pixels is not
+# a margin. What clips first is the Test and Save buttons, which is the worst
+# thing on the page to lose, and it would clip on somebody else's font scaling
+# rather than here. Measured (temp/pane_height.py), not eyeballed.
+WINDOW = "820x660"
 
 # Field labels are a fixed width so the boxes line up down a page, which means
 # the widest label sets it: "Seconds between frames" is 22 characters, and at
@@ -306,7 +320,7 @@ def credentials_go_in_the_url(preset):
 
 
 def identify_camera(cam):
-    """(label, address, username, password) for a stored camera, or None.
+    """(label, address, username, password, stream) for a camera, or None.
 
     Which make a camera was set up as. Reported as an inconsistency from a real
     run: a camera added as a Dahua came back as Custom URL the next time the
@@ -345,11 +359,18 @@ def identify_camera(cam):
         shapes = [template]
         if "{user}:{password}@" in template:
             shapes.append(template.replace("{user}:{password}@", "", 1))
+        # A camera switched to its largest stream carries a URL the template
+        # cannot produce, so the selector is wound back to the template's own
+        # before matching and reported separately. Without this, picking a
+        # bigger profile would cost the camera its make.
+        default = setup.stream_token(template)
+        token = setup.stream_token(url) if default else ""
+        probe = setup.with_stream(url, default) if token else url
         for shape in shapes:
             pattern = "".join(holes[part[1:-1]] if part[:1] == "{" else
                               re.escape(part)
                               for part in re.split(r"(\{[a-z]+\})", shape))
-            found = re.match(pattern + "$", url)
+            found = re.match(pattern + "$", probe)
             if not found:
                 continue
             got = found.groupdict()
@@ -362,11 +383,12 @@ def identify_camera(cam):
             # fill_template(), which is what Save will use, rather than a
             # second opinion about what a template produces.
             if setup.fill_template(template, setup.url_host(address),
-                                   user, password) != url:
+                                   user, password) != probe:
                 continue
             if address.startswith("[") and address.endswith("]"):
                 address = address[1:-1]     # an IPv6 literal, as it was typed
-            return preset[0], address, user, password
+            return (preset[0], address, user, password,
+                    token if token != default else "")
     return None
 
 
@@ -401,6 +423,9 @@ def build_camera(fields, cameras, cam=None):
     if template is None:
         method = str(fields.get("method") or "http")
         auth = str(fields.get("auth") or "none").lower()
+        # A custom URL carries its own stream in the text the operator typed;
+        # there is no template to wind it back to, so nothing is stored.
+        stream = ""
         url_level, url_message, url = check_camera_url(method,
                                                        fields.get("url"))
         if url_level == FAIL:
@@ -414,6 +439,21 @@ def build_camera(fields, cameras, cam=None):
         # which is where every other caller reads it from.
         host = setup.url_host(address)
         url = setup.fill_template(template, host, user, password)
+        # Measured, not chosen: Test fetches every stream the template's
+        # selector can name and keeps whichever carried the most pixels. Held
+        # as a token rather than as the finished URL so that changing the
+        # address or the password still rebuilds from the preset.
+        # Kept only when applying it actually moved the URL, which settles
+        # three cases at once: the make's own default, a token naming a knob
+        # this template does not have, and a make with no selector at all. A
+        # stored stream the URL does not carry would be a claim about the
+        # picture that nothing fetches.
+        stream = str(fields.get("stream") or "")
+        moved = setup.with_stream(url, stream) if stream else url
+        if moved != url:
+            url = moved
+        else:
+            stream = ""
 
     # And the declaration has a functional consequence, which is the whole
     # reason it cannot be cosmetic: leaving `auth` at the preset's digest with
@@ -429,6 +469,10 @@ def build_camera(fields, cameras, cam=None):
         camera["no_credentials"] = True
     else:
         camera.pop("no_credentials", None)
+    if stream:
+        camera["stream"] = stream
+    else:
+        camera.pop("stream", None)
     if method == "http":
         camera["auth"] = auth or "none"
         if camera["auth"] in ("digest", "basic"):
@@ -562,6 +606,9 @@ def camera_form_values(cam):
             "password": (known and known[3]) or str(cam.get("password", "")
                                                     or ""),
             "no_credentials": bool(cam.get("no_credentials")),
+            # From the URL rather than from the stored key, so a config that
+            # was hand-edited still shows the stream it is actually fetching.
+            "stream": (known and known[4]) or "",
             "interval": str(cam.get("interval_seconds") or ""),
             "framerate": str(cam.get("framerate") or ""),
             "smoothing_on": bool(smooth),
@@ -754,6 +801,73 @@ def proof_key(cam):
     values = camera_form_values(cam)
     return (str(cam.get("url", "") or ""), values["username"],
             values["password"])
+
+
+def snapshot_line(detail):
+    """The one-line verdict for a frame that arrived.
+
+    What the console wizard has always printed, assembled from the same
+    finding rather than from a second reading of it. It matters more here than
+    there: under pythonw there is no console at all, so a boolean was all the
+    graphical wizard could ever say, and "Test successful" cannot tell an
+    operator that their 4K camera answered with a 640x360 thumbnail.
+    """
+    parts = ["%.0f KB" % (detail.get("bytes", 0) / 1024.0)]
+    if detail.get("size"):
+        parts.append("%dx%d" % tuple(detail["size"]))
+    parts.append("%.2fs" % detail.get("seconds", 0.0))
+    return ", ".join(parts)
+
+
+def stream_label(token):
+    """"profile=2" as something to show an operator."""
+    name, _, value = str(token or "").partition("=")
+    return ("%s %s" % (name, value)).strip()
+
+
+def pick_stream(measured):
+    """(token, size) of the largest frame measured, or None.
+
+    `measured` is [(token, size)] with the configured stream first. Ties go to
+    whichever came first, which is what stops a camera whose profiles are all
+    the same size being rewritten to a different spelling of itself on every
+    press of Test.
+    """
+    best = None
+    for token, size in measured or []:
+        if not size:
+            continue
+        if best is None or size[0] * size[1] > best[1][0] * best[1][1]:
+            best = (token, tuple(size))
+    return best
+
+
+def stream_report(chosen, current, measured):
+    """What to say about the stream that was picked. (level, message).
+
+    Silence when there was nothing to choose between, because a line about
+    streams on every single test is noise that hides the one time it matters.
+
+    `measured` is every stream that was fetched, the configured one included,
+    so what it replaced can be named with its own size rather than as "was
+    smaller". An operator deciding whether to keep the switch needs the number
+    it is being compared against.
+    """
+    if not chosen or chosen[0] == current:
+        return OK, ""
+    was = dict(measured or []).get(current)
+    return WARN, ("Switched to %s, %dx%d (%s was %s)." % (
+        stream_label(chosen[0]), chosen[1][0], chosen[1][1],
+        stream_label(current) or "the configured stream",
+        ("%dx%d" % was) if was else "smaller"))
+
+
+def fit_box(width, height, maxw, maxh):
+    """`width` x `height` scaled to fit inside the box, never enlarged."""
+    if width <= 0 or height <= 0:
+        return maxw, maxh
+    scale = min(1.0, float(maxw) / width, float(maxh) / height)
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
 
 
 def disabled_report(failures, still_enabled):
@@ -1220,6 +1334,58 @@ def run(config_path=None, existing=None):
             widget.bind("<Destroy>", leave)
             return widget
 
+        def show_image(self, frame, title):
+            """The fetched frame, as large as the screen will take.
+
+            Scaled down to fit rather than shown 1:1 in a scrolling canvas: at
+            this point the operator is asking "is that the right view", which
+            is a question about the whole picture, and a 4K frame answered
+            1:1 would need dragging around to see at all.
+
+            Four ways out, because a picture filling the screen with no
+            obvious exit is alarming: the button, the window's own close box,
+            a click anywhere on the image, and Escape. The Escape binding is
+            why the button takes focus.
+            """
+            wide, tall = fit_box(*(setup.jpeg_size(frame) or (0, 0)),
+                                 maxw=int(self.winfo_screenwidth()
+                                          * SCREEN_SHARE),
+                                 maxh=int(self.winfo_screenheight()
+                                          * SCREEN_SHARE))
+            png = setup.render_png(self.cfg, frame, wide, tall)
+            if not png:
+                return messagebox.showwarning(
+                    "Snapshot",
+                    "ffmpeg could not turn that frame into something this "
+                    "window can draw. The camera answered; only the picture "
+                    "is missing.")
+            box = tk.Toplevel(self)
+            box.title(title)
+            box.transient(self)
+            image = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"))
+            shown = ttk.Label(box, image=image, cursor="hand2")
+            # Tk keeps no reference of its own, and a PhotoImage collected
+            # while it is on screen leaves an empty label behind.
+            shown.image = image
+            shown.pack()
+            close = ttk.Button(box, text="Close", command=box.destroy)
+            close.pack(pady=6)
+            shown.bind("<Button-1>", lambda _e: box.destroy())
+            box.bind("<Escape>", lambda _e: box.destroy())
+            box.protocol("WM_DELETE_WINDOW", box.destroy)
+            # Size and position in one call. A geometry string carrying only a
+            # position is a hint this window manager has been measured
+            # ignoring, which is how an earlier screenshot run captured the
+            # desktop instead of the window.
+            box.update_idletasks()
+            box.geometry("%dx%d+%d+%d" % (
+                box.winfo_reqwidth(), box.winfo_reqheight(),
+                max(0, (box.winfo_screenwidth() - box.winfo_reqwidth()) // 2),
+                max(0, (box.winfo_screenheight() - box.winfo_reqheight()) // 2)))
+            box.grab_set()
+            close.focus_set()
+            box.wait_window()
+
         def browse_into(self, var, directory=True):
             # Opening where the box already points, which the first version did
             # not: it started wherever the dialog felt like and the operator had
@@ -1642,7 +1808,7 @@ def run(config_path=None, existing=None):
             labels = [p[0] for p in presets]
             # The camera being edited, by identity rather than by position: a
             # save can rename it and a remove can shift everything after it.
-            state = {"cam": None, "loaded": {}}
+            state = {"cam": None, "loaded": {}, "frame": None, "thumb": None}
 
             panes = ttk.Frame(self.body)
             panes.pack(fill="both", expand=True)
@@ -1692,6 +1858,13 @@ def run(config_path=None, existing=None):
                     ttk.Combobox(right, textvariable=kind, values=labels,
                                  state="readonly", width=32))
             address, address_row = entry_row("IP address or host")
+            # Not a picker, and not typed: which stream carries the most pixels
+            # is a measurement Test makes, and this is where it reports what it
+            # settled on. Hidden while the camera is on its make's default,
+            # because a row saying "profile 1" on every camera is furniture.
+            stream, stream_text = tk.StringVar(), tk.StringVar()
+            stream_row = add_row("Stream", ttk.Label(
+                right, textvariable=stream_text, foreground="#555"))
             url, url_row = entry_row("Snapshot or stream URL")
             auth = tk.StringVar()
             auth_row = add_row("Authentication",
@@ -1762,6 +1935,22 @@ def run(config_path=None, existing=None):
             right.rowconfigure(place[0], weight=1)
             place[0] += 1
 
+            # The frame the camera last sent, directly above the button that
+            # fetched it. A picture settles in one glance what no verdict can
+            # say: that the lens is pointed somewhere useful, that it is in
+            # focus, that this is the stream the operator meant. Empty and
+            # hidden until a test has actually produced one.
+            shot_bar = ttk.Frame(right)
+            shot_bar.grid(row=place[0], column=0, columnspan=2, sticky="w",
+                          pady=(6, 0))
+            place[0] += 1
+            thumb = ttk.Label(shot_bar, cursor="hand2")
+            thumb.pack(side="left")
+            shot_note = ttk.Label(shot_bar, text="", foreground="#555",
+                                  wraplength=200, justify="left")
+            shot_note.pack(side="left", padx=(8, 0))
+            shot_bar.grid_remove()
+
             bar = ttk.Frame(right)
             bar.grid(row=place[0], column=0, columnspan=2, sticky="we",
                      pady=(10, 0))
@@ -1781,6 +1970,7 @@ def run(config_path=None, existing=None):
                         "auth": auth.get(), "username": user.get(),
                         "password": password.get(),
                         "no_credentials": unsecured.get(),
+                        "stream": stream.get(),
                         "interval": interval.get(),
                         "framerate": framerate.get(),
                         "smoothing_on": smooth_on.get(),
@@ -1790,9 +1980,12 @@ def run(config_path=None, existing=None):
                 preset = preset_named(kind.get())
                 custom = preset_is_custom(preset)
                 wants = preset_wants_credentials(preset)
+                stream_text.set(stream_label(stream.get()))
                 for widgets, wanted in ((address_row, not custom),
                                         (url_row, custom),
                                         (auth_row, custom),
+                                        (stream_row, bool(stream.get())
+                                         and not custom),
                                         (user_row, wants), (pw_row, wants),
                                         (open_row, wants)):
                     for widget in widgets:
@@ -1821,6 +2014,7 @@ def run(config_path=None, existing=None):
                 user.set(values["username"])
                 password.set(values["password"])
                 unsecured.set(values["no_credentials"])
+                stream.set(values["stream"])
                 interval.set(values["interval"])
                 framerate.set(values["framerate"])
                 smooth_on.set(values["smoothing_on"])
@@ -1839,6 +2033,7 @@ def run(config_path=None, existing=None):
                 # row would be read as being about this one.
                 self.say(tested, OK, "")
                 self.say(saved, OK, "")
+                show_shot(None, "")
                 # After fill(), never before: filling runs refresh(), which
                 # owns the note and would wipe anything written first.
                 fill(camera_form_values(cam))
@@ -1889,6 +2084,7 @@ def run(config_path=None, existing=None):
                           "username": values["username"],
                           "password": values["password"],
                           "no_credentials": values["no_credentials"],
+                          "stream": values["stream"],
                           "enabled": values["enabled"], "smoothing": frames,
                           "interval_seconds": seconds, "framerate": rate,
                           "method": "rtsp" if values["url"].lower()
@@ -1909,6 +2105,50 @@ def run(config_path=None, existing=None):
                          message or "Saved.")
                 return True
 
+            def show_shot(frame, caption):
+                """Hold the frame Test fetched, and show it small.
+
+                The PhotoImage is kept on `state` rather than only on the
+                widget: Tk holds no reference of its own to an image, so one
+                that goes out of scope here is garbage collected and the label
+                renders empty, which looks exactly like a failed fetch.
+                """
+                state["frame"] = frame
+                png = (setup.render_png(self.cfg, frame, *THUMB)
+                       if frame else None)
+                if not png:
+                    state["thumb"] = None
+                    thumb.config(image="")
+                    shot_bar.grid_remove()
+                    return
+                state["thumb"] = tk.PhotoImage(
+                    data=base64.b64encode(png).decode("ascii"))
+                thumb.config(image=state["thumb"])
+                shot_note.config(text=caption)
+                shot_bar.grid()
+
+            def fetch(built):
+                """One frame, then the other streams worth measuring.
+
+                The configured URL is fetched first and alone if it fails.
+                Every candidate is another sign-in attempt, and a camera that
+                has just refused one credential must not be handed two more:
+                that is the shape which locked three of the operator's cameras
+                for half an hour under another tool.
+                """
+                if built.get("method") == "rtsp":
+                    return setup.grab_snapshot_rtsp(built, self.cfg), []
+                data, detail = setup.grab_snapshot(built, self.cfg)
+                if data is None:
+                    return (data, detail), []
+                others = []
+                for token, other in setup.stream_candidates(built["url"]):
+                    got, _ = setup.grab_snapshot(dict(built, url=other),
+                                                 self.cfg)
+                    others.append((token, setup.jpeg_size(got) if got else None,
+                                   got))
+                return (data, detail), others
+
             def test():
                 cam = state["cam"]
                 if cam is None:
@@ -1923,6 +2163,7 @@ def run(config_path=None, existing=None):
                           "username": values["username"],
                           "password": values["password"],
                           "no_credentials": values["no_credentials"],
+                          "stream": values["stream"],
                           "enabled": True, "smoothing": frames,
                           "method": "rtsp" if values["url"].lower()
                           .startswith("rtsp://") else "http"}
@@ -1933,18 +2174,43 @@ def run(config_path=None, existing=None):
                 self.config(cursor="watch")
                 self.update_idletasks()
                 try:
-                    good = (setup.test_camera_rtsp(built, self.cfg)
-                            if built.get("method") == "rtsp"
-                            else setup.test_camera(built, self.cfg))
+                    (frame, detail), others = fetch(built)
                 finally:
                     self.config(cursor="")
-                if good:
-                    # So Next need not ask this camera again. Keyed on the
-                    # address and credentials that were proved, not on the
-                    # camera, so changing any of them re-opens the question.
-                    self.proven.add(proof_key(built))
-                self.say(tested, OK if good else FAIL,
-                         "Test successful." if good else UNREACHABLE)
+                if frame is None:
+                    show_shot(None, "")
+                    # Three answers, not two: nothing was fetched because
+                    # requests is missing is not the camera's fault and must
+                    # not be reported as the camera refusing.
+                    return self.say(tested,
+                                    WARN if detail["skipped"] else FAIL,
+                                    detail["reason"] or UNREACHABLE)
+
+                current = setup.stream_token(built["url"])
+                measured = ([(current, detail["size"])] +
+                            [(token, size) for token, size, _ in others])
+                chosen = pick_stream(measured)
+                level, news = stream_report(chosen, current, measured)
+                if news:
+                    for token, size, got in others:
+                        if token == chosen[0]:
+                            frame, detail = got, dict(detail, size=size,
+                                                      bytes=len(got))
+                    # Into the form, so the ordinary Save carries it. Setting
+                    # the var re-runs refresh(), which is what makes the
+                    # Stream row appear.
+                    stream.set(chosen[0])
+                    fields["stream"] = chosen[0]
+                    _l, _m, built = build_camera(fields, cams, cam)
+
+                # So Next need not ask this camera again. Keyed on the address
+                # and credentials that were proved, not on the camera, so
+                # changing any of them re-opens the question.
+                self.proven.add(proof_key(built))
+                show_shot(frame, (news + " " if news else "") +
+                          "Click the picture to see it full size.")
+                self.say(tested, level, "Test successful: %s"
+                         % snapshot_line(detail))
 
             def leave_current():
                 """True when it is all right to stop editing this camera."""
@@ -2036,9 +2302,13 @@ def run(config_path=None, existing=None):
             ttk.Button(bar, text="Save", command=save).pack(side="right")
             saved.pack(side="right", padx=(0, 8))
 
+            thumb.bind("<Button-1>", lambda _e: state["frame"] and
+                       self.show_image(state["frame"],
+                                       str(name.get() or "Camera")))
             kind.trace_add("write", refresh)
             smooth_on.trace_add("write", refresh)
             unsecured.trace_add("write", refresh)
+            stream.trace_add("write", refresh)
             listing.bind("<<ListboxSelect>>", on_select)
             redraw()
             show_camera(cams[0] if cams else None)
@@ -2078,13 +2348,20 @@ def run(config_path=None, existing=None):
                             key = proof_key(cam)
                             if key in self.proven:
                                 continue
-                            good = (setup.test_camera_rtsp(cam, self.cfg)
-                                    if cam.get("method") == "rtsp"
-                                    else setup.test_camera(cam, self.cfg))
-                            if good:
+                            # grab_snapshot rather than test_camera: the
+                            # console version asks whether to retry a 401
+                            # under the other auth scheme, and with no
+                            # terminal behind this window ask() hands back the
+                            # default, so a graphical run would answer yes to
+                            # a question nobody was shown, silently.
+                            got, detail = (
+                                setup.grab_snapshot_rtsp(cam, self.cfg)
+                                if cam.get("method") == "rtsp"
+                                else setup.grab_snapshot(cam, self.cfg))
+                            if got is not None or detail["skipped"]:
                                 self.proven.add(key)
                                 continue
-                            reason = UNREACHABLE
+                            reason = detail["reason"] or UNREACHABLE
                         cam["enabled"] = False
                         failures.append((cam.get("name"), reason))
                 finally:

@@ -3371,6 +3371,356 @@ class TestFillTemplate(unittest.TestCase):
                          "a preset is being expanded outside fill_template()")
 
 
+def jpeg(width, height, marker=0xC0, before=b""):
+    """The smallest JPEG header carrying a size, with `before` in front of it.
+
+    Built rather than fetched so a test can say what it is measuring. Only the
+    header is real; nothing decodes this.
+    """
+    frame = (bytes(bytearray([0xFF, marker, 0x00, 0x11, 0x08,
+                              height >> 8, height & 0xFF,
+                              width >> 8, width & 0xFF, 0x03]))
+             + b"\x01\x22\x00\x02\x11\x01\x03\x11\x01")
+    return b"\xff\xd8" + before + frame + b"\xff\xd9"
+
+
+def app0(payload=b"JFIF\x00"):
+    """An APP0 segment, which every real JPEG carries before its SOF."""
+    return (b"\xff\xe0" + bytes(bytearray([(len(payload) + 2) >> 8,
+                                           (len(payload) + 2) & 0xFF]))
+            + payload)
+
+
+class TestJpegSize(unittest.TestCase):
+    """Reading a frame's size out of its own header.
+
+    Worth having in Python rather than as an ffprobe call because picking the
+    largest stream measures three images per test, and three subprocesses to
+    read nine bytes is a poor trade.
+    """
+
+    def test_a_baseline_frame_is_measured(self):
+        self.assertEqual(setup.jpeg_size(jpeg(2560, 1440)), (2560, 1440))
+
+    def test_width_and_height_are_not_swapped(self):
+        # The header stores height first, which is the easy one to get wrong
+        # and the hard one to notice on a square test image.
+        self.assertEqual(setup.jpeg_size(jpeg(640, 360)), (640, 360))
+
+    def test_segments_before_the_frame_header_are_stepped_over(self):
+        self.assertEqual(setup.jpeg_size(jpeg(1920, 1080, before=app0())),
+                         (1920, 1080))
+        self.assertEqual(
+            setup.jpeg_size(jpeg(1920, 1080,
+                                 before=app0() + app0(b"Exif\x00" + b"x" * 40))),
+            (1920, 1080))
+
+    def test_a_progressive_frame_is_measured_the_same_way(self):
+        # SOF2 rather than SOF0, and the size sits in the same four bytes.
+        self.assertEqual(setup.jpeg_size(jpeg(800, 600, marker=0xC2)),
+                         (800, 600))
+
+    def test_a_fill_byte_before_a_marker_is_legal(self):
+        self.assertEqual(setup.jpeg_size(jpeg(320, 240, before=b"\xff")),
+                         (320, 240))
+
+    def test_nothing_is_claimed_for_what_is_not_a_jpeg(self):
+        for data in (b"", None, b"not an image at all", b"\x89PNG\r\n\x1a\n",
+                     b"\xff\xd8", b"\xff\xd8\xff"):
+            self.assertIsNone(setup.jpeg_size(data), repr(data))
+
+    def test_a_frame_with_no_size_in_it_is_not_guessed_at(self):
+        """A scan with no SOF before it is a JPEG this cannot measure, and
+        the answer to that is None rather than a plausible number."""
+        self.assertIsNone(setup.jpeg_size(b"\xff\xd8" + app0() + b"\xff\xda"
+                                          + b"\x00\x08" + b"\x01" * 6))
+
+    def test_a_lost_segment_chain_stops_rather_than_hunting(self):
+        self.assertIsNone(setup.jpeg_size(b"\xff\xd8" + b"garbage" * 20))
+
+
+class TestStreamKnobs(unittest.TestCase):
+    """Which stream a URL selects, and what else the camera may offer.
+
+    Three presets carry a selector. The rest test once, because guessing a
+    URL a camera never advertised is a request that can only fail.
+    """
+
+    def preset(self, label):
+        for entry in setup.CAMERA_PRESETS:
+            if entry[0] == label:
+                return entry
+        raise AssertionError("no preset called %s" % label)
+
+    def test_each_knob_is_recognised_in_its_own_templates_url(self):
+        for label, token in (("Dahua / Amcrest", "subtype=0"),
+                             ("Hikvision (ONVIF)", "profile=1"),
+                             ("Hikvision (ISAPI)", "stream=1"),
+                             ("Generic ONVIF snapshot", "profile=1")):
+            url = setup.fill_template(self.preset(label)[3], "10.0.0.5", "", "")
+            self.assertEqual(setup.stream_token(url), token, label)
+
+    def test_a_preset_with_no_selector_offers_nothing(self):
+        for label in ("Reolink", "Axis", "RTSP only (no snapshot URL)"):
+            url = setup.fill_template(self.preset(label)[3], "10.0.0.5",
+                                      "u", "p")
+            self.assertEqual(setup.stream_token(url), "", label)
+            self.assertEqual(setup.stream_candidates(url), [], label)
+
+    def test_the_configured_stream_is_never_among_the_candidates(self):
+        url = setup.fill_template(self.preset("Dahua / Amcrest")[3],
+                                  "10.0.0.5", "", "")
+        tokens = [token for token, _u in setup.stream_candidates(url)]
+        self.assertEqual(tokens, ["subtype=1", "subtype=2"])
+
+    def test_a_candidate_differs_from_the_configured_url_in_one_place(self):
+        url = setup.fill_template(self.preset("Generic ONVIF snapshot")[3],
+                                  "10.0.0.5", "", "")
+        got = dict(setup.stream_candidates(url))
+        self.assertEqual(got["profile=2"],
+                         "http://10.0.0.5/onvif-http/snapshot?Profile_2")
+        self.assertEqual(sorted(got), ["profile=2", "profile=3"])
+
+    def test_only_the_stream_digit_of_an_isapi_channel_moves(self):
+        """101 is camera 1 stream 1 and 201 is camera 2 stream 1, so the
+        camera number has to survive being switched to the sub-stream."""
+        url = "http://10.0.0.5/ISAPI/Streaming/channels/201/picture"
+        self.assertEqual(setup.stream_token(url), "stream=1")
+        self.assertEqual(setup.stream_candidates(url),
+                         [("stream=2",
+                           "http://10.0.0.5/ISAPI/Streaming/channels/202/"
+                           "picture")])
+
+    def test_setting_a_stream_is_reversible(self):
+        url = setup.fill_template(self.preset("Dahua / Amcrest")[3],
+                                  "10.0.0.5", "", "")
+        moved = setup.with_stream(url, "subtype=2")
+        self.assertNotEqual(moved, url)
+        self.assertEqual(setup.stream_token(moved), "subtype=2")
+        self.assertEqual(setup.with_stream(moved, "subtype=0"), url)
+
+    def test_a_url_with_no_knob_is_returned_untouched(self):
+        for token in ("subtype=1", "profile=2", "stream=2", "", None):
+            self.assertEqual(setup.with_stream("http://10.0.0.5/snap.jpg",
+                                               token),
+                             "http://10.0.0.5/snap.jpg")
+
+    def test_a_knob_is_not_read_out_of_another_makes_url(self):
+        """Reolink's channel=0 and an RTSP /stream1 both look enough like a
+        selector to be mistaken for one, and neither selects anything this
+        can change."""
+        for url in ("http://10.0.0.5/cgi-bin/api.cgi?cmd=Snap&channel=0",
+                    "rtsp://10.0.0.5:554/stream1"):
+            self.assertEqual(setup.stream_token(url), "", url)
+
+
+class FakeResponse(object):
+    def __init__(self, status, content):
+        self.status_code = status
+        self.content = content
+
+
+class FakeSession(object):
+    """Enough of requests.Session for grab_snapshot, and a record of the asks.
+
+    The record is the point in two of the tests below: how many times a camera
+    is contacted is a property worth pinning, not an implementation detail.
+    """
+
+    def __init__(self, reply):
+        self.auth = None
+        self.reply = reply
+        self.asked = []
+
+    def get(self, url, timeout=None):
+        self.asked.append((url, timeout))
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return self.reply(url) if callable(self.reply) else self.reply
+
+
+@contextlib.contextmanager
+def fake_requests(reply):
+    """Stand a fake `requests` up in sys.modules for the duration.
+
+    grab_snapshot imports it inside the function, so this reaches it. Patching
+    an attribute would not: there is no module-level name to patch, which is
+    deliberate, since the daemon must run where requests is absent.
+    """
+    import types
+    session = FakeSession(reply)
+    module = types.ModuleType("requests")
+    module.Session = lambda: session
+    auth = types.ModuleType("requests.auth")
+    auth.HTTPBasicAuth = lambda user, password: ("basic", user, password)
+    auth.HTTPDigestAuth = lambda user, password: ("digest", user, password)
+    module.auth = auth
+    was = {name: sys.modules.get(name)
+           for name in ("requests", "requests.auth")}
+    sys.modules["requests"] = module
+    sys.modules["requests.auth"] = auth
+    try:
+        yield session
+    finally:
+        for name, before in was.items():
+            if before is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = before
+
+
+class TestGrabSnapshot(unittest.TestCase):
+    """One fetch, reported rather than printed.
+
+    The graphical wizard shows the frame and measures it, and neither is
+    reachable through a report that goes to a console pythonw does not have.
+    """
+
+    def setUp(self):
+        self.cfg = {"capture": {"timeout_seconds": 6, "interval_seconds": 5}}
+        self.cam = {"method": "http", "url": "http://10.0.0.5/snap.jpg",
+                    "auth": "digest", "username": "u", "password": "p"}
+
+    def test_a_frame_comes_back_measured(self):
+        with fake_requests(FakeResponse(200, jpeg(2560, 1440))):
+            data, detail = setup.grab_snapshot(self.cam, self.cfg)
+        self.assertTrue(data)
+        self.assertEqual(detail["size"], (2560, 1440))
+        self.assertEqual(detail["status"], 200)
+        self.assertEqual(detail["bytes"], len(data))
+        self.assertEqual(detail["reason"], "")
+
+    def test_every_key_exists_however_the_fetch_went(self):
+        """A caller reading detail['said'] must not have to know how far the
+        request got. Four kinds of failure, one shape of answer."""
+        replies = [FakeResponse(401, b""), FakeResponse(503, b""),
+                   FakeResponse(200, b"<html>no</html>"), OSError("down")]
+        for reply in replies:
+            with fake_requests(reply):
+                data, detail = setup.grab_snapshot(self.cam, self.cfg)
+            self.assertIsNone(data, repr(reply))
+            self.assertTrue(detail["reason"], repr(reply))
+            for key in ("said", "notes", "status", "seconds", "bytes", "size",
+                        "skipped"):
+                self.assertIn(key, detail, repr(reply))
+
+    def test_a_401_is_reported_as_itself(self):
+        with fake_requests(FakeResponse(401, b"")):
+            _data, detail = setup.grab_snapshot(self.cam, self.cfg)
+        self.assertEqual(detail["status"], 401)
+        self.assertIn("401", detail["reason"])
+
+    def test_a_camera_that_answers_200_with_a_complaint_is_quoted(self):
+        """Reolink refuses a bad password with 200 and a JSON error, so the
+        body is where the real cause is. Reporting only 'not a JPEG' hides
+        it."""
+        body = (b'[{"cmd":"Snap","code":1,"error":{"detail":"login failed",'
+                b'"rspCode":-7}}]')
+        with fake_requests(FakeResponse(200, body)):
+            _data, detail = setup.grab_snapshot(self.cam, self.cfg)
+        self.assertEqual(detail["said"], "login failed")
+        self.assertTrue(detail["notes"])
+
+    def test_the_camera_is_contacted_exactly_once(self):
+        with fake_requests(FakeResponse(200, jpeg(640, 480))) as session:
+            setup.grab_snapshot(self.cam, self.cfg)
+        self.assertEqual(len(session.asked), 1)
+        self.assertEqual(session.asked[0][0], self.cam["url"])
+
+    def test_the_timeout_leaves_room_beyond_the_configured_one(self):
+        with fake_requests(FakeResponse(200, jpeg(640, 480))) as session:
+            setup.grab_snapshot(self.cam, self.cfg)
+        self.assertEqual(session.asked[0][1], 10)
+
+    def test_nothing_fetched_at_all_is_not_the_cameras_fault(self):
+        """Third answer, not a second. requests being absent and the camera
+        refusing need opposite remedies, and a bare False says neither."""
+        was = {name: sys.modules.get(name)
+               for name in ("requests", "requests.auth")}
+        sys.modules["requests"] = None          # import raises ImportError
+        try:
+            data, detail = setup.grab_snapshot(self.cam, self.cfg)
+        finally:
+            for name, before in was.items():
+                if before is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = before
+        self.assertIsNone(data)
+        self.assertTrue(detail["skipped"])
+        self.assertIsNone(detail["status"])
+
+    def test_the_console_wizard_still_prints_what_it_always_did(self):
+        out = io.StringIO()
+        with fake_requests(FakeResponse(200, jpeg(2560, 1440))), \
+             contextlib.redirect_stdout(out):
+            self.assertTrue(setup.test_camera(dict(self.cam), self.cfg))
+        printed = out.getvalue()
+        self.assertIn("2560x1440", printed)
+        self.assertIn("KB", printed)
+
+    def test_the_console_wizard_still_offers_the_other_auth_scheme(self):
+        """A 401 under digest is often basic, and the console has a terminal
+        to ask on. Answering no must not then retry anyway."""
+        out = io.StringIO()
+        with fake_requests(FakeResponse(401, b"")) as session, \
+             contextlib.redirect_stdout(out), \
+             mock.patch.object(setup, "ask_yes", return_value=False):
+            self.assertFalse(setup.test_camera(dict(self.cam), self.cfg))
+        self.assertEqual(len(session.asked), 1)
+        self.assertIn("401", out.getvalue())
+
+
+class TestRenderPng(unittest.TestCase):
+    """Converting a fetched frame into something tkinter can draw.
+
+    tkinter reads PNG, GIF and PPM and no JPEG at all, so this is what stands
+    between a camera's answer and the operator seeing it.
+    """
+
+    def cfg(self):
+        return {"paths": {"ffmpeg": "ffmpeg"}}
+
+    def test_the_frame_is_piped_rather_than_written_to_disk(self):
+        """A snapshot on its way to a preview has no business becoming a file:
+        it would land in a temp directory this project does not control, and
+        the camera's own view of a house is not something to leave lying
+        about."""
+        with mock.patch.object(setup.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0,
+                                         stdout=b"\x89PNG\r\n\x1a\n" + b"x")
+            setup.render_png(self.cfg(), b"\xff\xd8jpeg", 240, 135)
+        argv, kwargs = run.call_args[0][0], run.call_args[1]
+        self.assertEqual(kwargs["input"], b"\xff\xd8jpeg")
+        self.assertIn("-", argv)
+        self.assertEqual(argv[-1], "-")
+        self.assertIn("scale=240:135:force_original_aspect_ratio=decrease",
+                      argv)
+
+    def test_an_unscaled_conversion_asks_for_no_filter(self):
+        with mock.patch.object(setup.subprocess, "run") as run:
+            run.return_value = mock.Mock(returncode=0,
+                                         stdout=b"\x89PNG\r\n\x1a\n")
+            setup.render_png(self.cfg(), b"\xff\xd8jpeg")
+        self.assertNotIn("-vf", run.call_args[0][0])
+
+    def test_anything_that_is_not_a_png_is_refused(self):
+        """ffmpeg exiting 0 having written a warning is not a picture, and
+        handing that to PhotoImage raises inside the draw."""
+        for returncode, stdout in ((0, b"not a png"), (1, b""),
+                                   (0, b""), (0, None)):
+            with mock.patch.object(setup.subprocess, "run") as run:
+                run.return_value = mock.Mock(returncode=returncode,
+                                             stdout=stdout)
+                self.assertIsNone(
+                    setup.render_png(self.cfg(), b"\xff\xd8jpeg", 8, 8))
+
+    def test_a_machine_with_no_ffmpeg_loses_the_picture_and_nothing_else(self):
+        with mock.patch.object(setup.subprocess, "run",
+                               side_effect=FileNotFoundError()):
+            self.assertIsNone(setup.render_png(self.cfg(), b"\xff\xd8jpeg"))
+
+
 class TestDiscoveryIsNeverFatal(unittest.TestCase):
     """Discovery is an offer. Nothing it does may stop a camera being added."""
 

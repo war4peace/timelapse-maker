@@ -1360,6 +1360,203 @@ class TestCameraDiscovery(unittest.TestCase):
         self.assertEqual(gui.scan_summary([], []), "")
 
 
+class TestSnapshotPreview(unittest.TestCase):
+    """What Test reports now that it keeps the frame rather than a boolean.
+
+    The reason this matters more in the window than in the console: under
+    pythonw there is no stdout at all, so everything the console wizard prints
+    about a fetched frame was going nowhere, and "Test successful" cannot say
+    that a 4K camera answered with a 640x360 thumbnail.
+    """
+
+    def preset(self, label):
+        for entry in gui.camera_types():
+            if entry[0] == label:
+                return entry
+        raise AssertionError("no preset called %s" % label)
+
+    def detail(self, **over):
+        found = {"reason": "", "said": "", "notes": [], "status": 200,
+                 "seconds": 0.31, "bytes": 421888, "size": (2560, 1440),
+                 "skipped": False}
+        found.update(over)
+        return found
+
+    def test_the_line_says_what_arrived(self):
+        self.assertEqual(gui.snapshot_line(self.detail()),
+                         "412 KB, 2560x1440, 0.31s")
+
+    def test_a_frame_of_unknown_size_still_reports_the_rest(self):
+        line = gui.snapshot_line(self.detail(size=None))
+        self.assertEqual(line, "412 KB, 0.31s")
+
+    def test_the_largest_stream_wins_on_pixels_not_on_width(self):
+        """A 2048x1536 frame is bigger than a 2560x720 one, and picking on
+        width alone would take the letterbox."""
+        chosen = gui.pick_stream([("profile=1", (2560, 720)),
+                                  ("profile=2", (2048, 1536))])
+        self.assertEqual(chosen[0], "profile=2")
+
+    def test_a_tie_stays_where_it_is(self):
+        """Or a camera whose profiles are all the same size gets rewritten to
+        a different spelling of itself on every press of Test, and the page
+        reports a change that changed nothing."""
+        chosen = gui.pick_stream([("profile=1", (1920, 1080)),
+                                  ("profile=2", (1920, 1080))])
+        self.assertEqual(chosen[0], "profile=1")
+
+    def test_a_stream_that_did_not_answer_is_not_picked(self):
+        chosen = gui.pick_stream([("profile=1", (640, 360)),
+                                  ("profile=2", None)])
+        self.assertEqual(chosen, ("profile=1", (640, 360)))
+        self.assertIsNone(gui.pick_stream([]))
+        self.assertIsNone(gui.pick_stream([("profile=1", None)]))
+
+    def test_nothing_is_said_when_there_was_nothing_to_choose(self):
+        """A line about streams on every test is furniture, and furniture is
+        what hides the one time it matters."""
+        level, message = gui.stream_report(("profile=1", (1920, 1080)),
+                                           "profile=1", [])
+        self.assertEqual(message, "")
+        self.assertEqual(level, gui.OK)
+        self.assertEqual(gui.stream_report(None, "", [])[1], "")
+
+    def test_a_switch_names_both_sizes(self):
+        """The number it was compared against is the whole basis for the
+        change, and an operator deciding whether to keep it needs to see it
+        rather than the word "smaller"."""
+        level, message = gui.stream_report(
+            ("profile=2", (2560, 1440)), "profile=1",
+            [("profile=1", (640, 360)), ("profile=2", (2560, 1440)),
+             ("profile=3", (320, 180))])
+        self.assertEqual(level, gui.WARN)
+        self.assertIn("profile 2, 2560x1440", message)
+        self.assertIn("profile 1 was 640x360", message)
+
+    def test_a_stream_that_was_never_measured_is_not_given_a_size(self):
+        _level, message = gui.stream_report(("profile=2", (2560, 1440)),
+                                            "profile=1", [])
+        self.assertIn("smaller", message)
+        self.assertNotIn("x0", message)
+
+    def test_a_token_is_not_shown_to_an_operator_as_a_token(self):
+        self.assertEqual(gui.stream_label("profile=2"), "profile 2")
+        self.assertEqual(gui.stream_label(""), "")
+        self.assertEqual(gui.stream_label(None), "")
+
+    def test_a_frame_is_scaled_down_to_fit_and_never_up(self):
+        self.assertEqual(gui.fit_box(2560, 1440, 208, 117), (208, 117))
+        self.assertEqual(gui.fit_box(1920, 1080, 1600, 1600), (1600, 900))
+        # Smaller than the box: left alone rather than blown up into mush.
+        self.assertEqual(gui.fit_box(320, 240, 1600, 1600), (320, 240))
+        # Nothing to scale, and no ZeroDivisionError on the way to saying so.
+        self.assertEqual(gui.fit_box(0, 0, 800, 600), (800, 600))
+
+    def test_a_switched_camera_still_reads_back_as_its_make(self):
+        """The whole design turns on this. A camera moved to its largest
+        profile carries a URL its template cannot produce, and without the
+        selector being wound back it would come back as Custom URL, which is
+        the defect identify_camera() exists to prevent arriving by a new
+        route.
+        """
+        _l, _m, built = gui.build_camera(
+            {"name": "Roof", "preset": self.preset("Generic ONVIF snapshot"),
+             "address": "10.0.0.5", "username": "u", "password": "p",
+             "stream": "profile=2"}, [])
+        self.assertTrue(built["url"].endswith("Profile_2"))
+        values = gui.camera_form_values(built)
+        self.assertEqual(values["type"], "Hikvision (ONVIF)")
+        self.assertEqual(values["address"], "10.0.0.5")
+        self.assertEqual(values["stream"], "profile=2")
+
+    def test_re_saving_a_switched_camera_changes_nothing(self):
+        """The round trip is the claim identify_camera() makes, and a stream
+        that survived being read back but not being written again would move
+        the camera to a different picture on the next Save."""
+        _l, _m, built = gui.build_camera(
+            {"name": "Yard", "preset": self.preset("Dahua / Amcrest"),
+             "address": "10.0.0.9", "username": "u", "password": "p",
+             "stream": "subtype=2"}, [])
+        values = gui.camera_form_values(built)
+        _l, _m, again = gui.build_camera(
+            {"name": values["name"], "preset": self.preset(values["type"]),
+             "address": values["address"], "username": values["username"],
+             "password": values["password"], "stream": values["stream"]},
+            [], built)
+        self.assertEqual(again["url"], built["url"])
+        self.assertEqual(again.get("stream"), "subtype=2")
+
+    def test_the_makes_own_default_is_not_stored(self):
+        """Keyed on absence, like every other per-camera setting here: a
+        stored copy of the default would pin the camera to today's template."""
+        _l, _m, built = gui.build_camera(
+            {"name": "Yard", "preset": self.preset("Dahua / Amcrest"),
+             "address": "10.0.0.9", "stream": "subtype=0"}, [])
+        self.assertNotIn("stream", built)
+        self.assertEqual(gui.camera_form_values(built)["stream"], "")
+
+    def test_dropping_back_to_the_default_removes_the_key(self):
+        _l, _m, built = gui.build_camera(
+            {"name": "Yard", "preset": self.preset("Dahua / Amcrest"),
+             "address": "10.0.0.9", "stream": "subtype=2"}, [])
+        self.assertEqual(built["stream"], "subtype=2")
+        _l, _m, back = gui.build_camera(
+            {"name": "Yard", "preset": self.preset("Dahua / Amcrest"),
+             "address": "10.0.0.9", "stream": ""}, [], built)
+        self.assertNotIn("stream", back)
+
+    def test_a_custom_url_stores_no_stream_of_its_own(self):
+        """It carries its stream in the text the operator typed, and there is
+        no template to wind it back to."""
+        _l, _m, built = gui.build_camera(
+            {"name": "Odd", "preset": self.preset("Custom URL"),
+             "url": "http://10.0.0.9/cgi-bin/snapshot.cgi?channel=1&subtype=2",
+             "auth": "digest", "username": "u", "password": "p",
+             "stream": "subtype=1"}, [])
+        self.assertNotIn("stream", built)
+        self.assertIn("subtype=2", built["url"])
+
+    def test_a_make_with_no_selector_cannot_be_given_one(self):
+        for label in ("Reolink", "Axis", "RTSP only (no snapshot URL)"):
+            _l, _m, built = gui.build_camera(
+                {"name": "C", "preset": self.preset(label),
+                 "address": "10.0.0.9", "username": "u", "password": "p",
+                 "stream": "subtype=2"}, [])
+            self.assertNotIn("stream", built, label)
+
+    def test_a_hand_edited_stream_is_read_from_the_url(self):
+        """Not from the stored key. A config edited by hand is exactly the
+        case where the two would disagree, and the URL is what gets
+        fetched."""
+        values = gui.camera_form_values(
+            {"name": "Roof", "method": "http", "auth": "digest",
+             "url": "http://10.0.0.5/ISAPI/Streaming/channels/102/picture"})
+        self.assertEqual(values["type"], "Hikvision (ISAPI)")
+        self.assertEqual(values["stream"], "stream=2")
+
+    def test_the_window_asks_no_console_question(self):
+        """test_camera() offers to retry a 401 under the other auth scheme,
+        and with no terminal behind the window ask() hands back the default,
+        so a graphical run would answer yes to a question nobody was shown.
+        The window fetches through grab_snapshot instead.
+        """
+        source = SOURCE.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        called = set()
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "setup"):
+                called.add(node.func.attr)
+        self.assertIn("grab_snapshot", called)
+        for banned in ("test_camera", "test_camera_rtsp", "ask_yes", "ask",
+                       "ask_secret"):
+            self.assertNotIn(banned, called,
+                             "%s prompts or prints on a console this window "
+                             "does not have" % banned)
+
+
 class TestReview(unittest.TestCase):
 
     def config(self, **over):

@@ -79,6 +79,23 @@ While the version is `0.x`, the configuration format may change in any release.
   empty password mean "not filled in yet", which is what gets a camera
   switched off rather than quietly left unable to connect.
 
+  **Test shows you the picture.** Pressing Test now reports the size of the
+  frame that came back, its dimensions and how long it took, rather than only
+  that it worked, and puts the frame itself above the button. Click it to see
+  it full size, and press Escape or Close to put it away. A camera that answers
+  is not necessarily a camera pointed anywhere useful, and until now nothing
+  short of waiting for the first night's video would tell you.
+
+  **And it picks the largest stream on its own.** Some cameras offer several
+  pictures on slightly different addresses, and the one the make ships as its
+  default is not always the biggest: a snapshot arriving at 640x360 from a 4K
+  camera is a setting nobody chose. Where the make has such a setting, Dahua,
+  Amcrest, Hikvision and generic ONVIF, Test now fetches each and keeps
+  whichever carried the most pixels, tells you it did and what it replaced,
+  and shows you the result. Press Save to keep it. Cameras with no such choice
+  are asked once, and nothing else is tried at all when the first attempt
+  fails, so a wrong password still costs exactly one attempt.
+
   **The summary names the encoder your machine will actually use**, and the
   quality setting that goes with it, which is the difference between a 300 MB
   day and a 900 MB one. It is read from the arguments the nightly run will be
@@ -189,6 +206,16 @@ While the version is `0.x`, the configuration format may change in any release.
   both runners and neither leg is trusting the other to have looked.
 
 ### Fixed
+- **The graphical wizard could report a camera as working under a sign-in
+  method it would not then save.** When a camera answered Test with "not
+  authorised", the shared code underneath offered to try the other sign-in
+  method, and that offer is a question asked on a command line. The window has
+  no command line behind it, so the question was answered yes without being
+  shown; if the second attempt worked the camera was reported as fine and then
+  saved with the method that had just been refused, which would have failed
+  every night thereafter. The window no longer takes that path at all, and now
+  reports what the camera actually said. `timelapse setup` in a terminal still
+  asks, and still does exactly what it did.
 - **Three more Windows-only defects, and one that is not.** **Nothing changes
   on a Linux install** except the last of them. First, the log file: the
   rotating handler works by renaming, and Windows refuses to rename a file

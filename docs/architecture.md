@@ -2089,6 +2089,98 @@ run (`TestItRefusesOffWindows`), so `timelapse setup` remains the only wizard
 there and keeps every question it has. `fill_template()` is shared regardless,
 because a URL is not a user interface.
 
+#### Test shows the frame, and picks the stream (0.2.0)
+
+Until this, Test answered with a boolean. `test_camera()` measured the frame,
+timed the round trip and printed `OK  412 KB, 2560x1440, 0.31s`, and **every
+word of that went nowhere**, because under `pythonw.exe` there is no stdout at
+all. The window could say "Test successful" and no more, which cannot tell an
+operator that their 4K camera has just answered with a 640x360 thumbnail. The
+same split that hid the camera's own complaint hid the picture: a fetched JPEG
+was discarded three lines after it arrived.
+
+So `grab_snapshot()` and `grab_snapshot_rtsp()` in `timelapse_setup.py` are now
+where a frame is fetched, and they return `(data, detail)`. `detail` carries
+everything that used to be printed: the status, the seconds, the byte count,
+the dimensions, the camera's own complaint out of a 200-with-an-error body, and
+the note lines that go with each. `test_camera()` is the printing wrapper over
+it and prints exactly what it always did; the window reads the same finding.
+Two front ends, one fetch, and **no way for them to hold different opinions
+about one request**, which is `try_rsync_args()`'s rule about living beside the
+code it describes.
+
+**The window no longer calls `test_camera()` anywhere**, and that closed a real
+defect rather than tidying an interface. `test_camera()` answers a 401 by
+asking `ask_yes("Retry with auth 'other'?", True)`. The GUI never calls
+`init_tty()`, so `_TTY` is `None`, so `ask()` returns the default: **yes, to a
+question nobody was shown**. It then retried against a throwaway dict, so a
+camera could report "Test successful" under a scheme that `save()` would not
+store. Reachable through Custom URL, where the Authentication picker is shown,
+and it would have produced a green tick over a camera that 401s for ever, held
+off 31 minutes at a time by the item 8 back-off ladder. A test pins it: no
+`setup.test_camera`, `setup.ask_yes` or `setup.ask` call anywhere in the module,
+found through the AST rather than by scanning text.
+
+**`jpeg_size()` reads the frame's size out of its own header**, nine bytes into
+an SOF segment, rather than shelling out to ffprobe. Not premature: picking a
+stream measures three images per test, and three subprocesses to read four
+bytes is a poor trade. `probe_sample()` delegates to it and keeps ffprobe as the
+fallback for anything it cannot parse, so there is still one answer to "how big
+is this frame".
+
+**Streams are picked by measuring, not by believing.** `STREAM_KNOBS` names the
+three presets whose URL selects a stream (ONVIF `Profile_N`, Dahua `subtype=N`,
+and the last digit of a Hikvision ISAPI channel id, which is the stream rather
+than the camera), `stream_candidates()` returns the siblings, and the largest
+frame by **pixel count** wins. Deliberately probed even where the default is
+documented as the main stream: that is a claim about firmware, and the rule
+here is that an advertisement is a claim and a fetch is a measurement, which
+`test_onvif_profiles()` learned on a Tapo advertising a 640x360 JPEG profile
+that renders as garbage. A tie stays where it is, or a camera whose profiles
+are all one size would be rewritten to a different spelling of itself on every
+press.
+
+**The configured URL is fetched first, and alone if it fails.** Every candidate
+is another sign-in attempt, and the operator's own account of AgentDVR locking
+three cameras for half an hour is what that rule is written against: a camera
+that has just refused one credential must not be handed two more. At most three
+requests, and only one when anything is wrong.
+
+The chosen stream is stored as a **token** (`"subtype=2"`), not as the finished
+URL, and only when applying it actually moved the URL. That last condition
+settles three cases at once: the make's own default, a token naming a knob this
+template does not have, and a make with no selector at all. Keyed on absence
+like `interval_seconds` and `framerate`, so changing the address or the password
+still rebuilds from the preset. `identify_camera()` winds the selector back to
+the template's own before matching and reports it separately, **without which
+picking a bigger profile would cost the camera its make** and it would read back
+as Custom URL: the defect that function exists to prevent, arriving by a third
+route.
+
+**tkinter cannot display a JPEG.** `PhotoImage` reads PNG, GIF and PPM, and
+Pillow is not a dependency this project will take, so `render_png()` pipes the
+frame through ffmpeg and gets a scaled PNG back on stdout. It never touches
+disk: a camera's view of somebody's house has no business becoming a file in a
+temp directory this project does not control. ffmpeg is configured on the page
+*before* the cameras, so it is always available by then, and a machine without
+it loses the picture and nothing else. The `PhotoImage` is held on `state`
+rather than only on the widget, because Tk keeps no reference of its own and a
+collected image leaves an empty label that looks exactly like a failed fetch.
+
+Clicking the thumbnail opens the frame **scaled to fit 85% of the screen**
+rather than 1:1 in a scrolling canvas: at that point the question is "is that
+the right view", which is about the whole picture. Four ways out, because an
+image filling the screen with no obvious exit is alarming: the Close button, the
+window's close box, a click anywhere on the image, and Escape. The button takes
+focus so the Escape binding has somewhere to land.
+
+**`WINDOW` grew from 820x620 to 820x660 because of this, and the number was
+measured rather than eyeballed** (`temp/pane_height.py`): with a frame on it the
+detail pane wanted 527 of the 533 pixels it had, and six pixels is not a margin.
+What clips first is the Test and Save buttons, and it would clip on somebody
+else's font scaling rather than here. 660 still fits a 1366x768 screen with the
+title bar and taskbar.
+
 **Field labels are a fixed 22 characters wide** (`LABELS`), which is what
 "Seconds between frames" needs. A `ttk.Label` with a width in characters cuts
 what does not fit, silently and only on screen, so this has been reported twice
@@ -2829,6 +2921,20 @@ rather than only checking their result, because the thing that costs real money
 if it is wrong is a camera with no credentials reaching the network at all. One
 call, for the one camera that had credentials.
 
+The snapshot half stubs the fetch and uses **real pictures**: two JPEGs made by
+the configured ffmpeg, a small one on the make's default stream and a large one
+on another, so the switch fires, the thumbnail is really rendered and really
+drawn, and the modal is really opened and closed with Escape. That is the case
+no unit test can reach, because everything interesting in it happens between
+ffmpeg and a Tk `PhotoImage`. Its Escape is scheduled with `after()` before the
+click that opens the window, for the same reason the scan's driving is.
+
+Layout, though, is still only visible in a screenshot, and this feature is the
+fourth defect that workflow has caught: `temp/shot_snapshot.py` parks the camera
+page with a tested camera on it (or the full-size view, with `full`), and
+`temp/pane_height.py` measures what the pane wants against what it has, which is
+how `WINDOW` came to be 660 rather than a guess.
+
 **The click-through checklist**, in the order that finds problems soonest:
 
 1. **Launch it from the Start menu, not from a prompt.** No console window
@@ -2850,11 +2956,22 @@ call, for the one camera that had credentials.
    name. Refused, corrected with a warning, refused. **Pick each camera type in
    turn:** an address field for the presets and a URL field for Custom, with
    username and password appearing for the makes that need them, and every row
-   staying where it was. Reolink says the password goes in the URL. Test
-   reaches a real camera and says "Test successful". **Tick No credentials
-   required:** both credential boxes empty and grey, and the camera saves with
-   `no_credentials` and `auth: none` and no username in `config.json`. An RTSP
-   camera declared that way gets `rtsp://host:554/stream1`, with no `:@` in it.
+   staying where it was. Reolink says the password goes in the URL. **Tick No
+   credentials required:** both credential boxes empty and grey, and the camera
+   saves with `no_credentials` and `auth: none` and no username in
+   `config.json`. An RTSP camera declared that way gets
+   `rtsp://host:554/stream1`, with no `:@` in it.
+6a. **Press Test against a real camera.** The verdict names the size in KB, the
+   dimensions and the seconds, not just "successful", and **the frame itself
+   appears above the button**. Check the picture is the right camera and the
+   right way up, which is the one thing this whole feature exists for. On a
+   Dahua, Hikvision or ONVIF preset the wizard also tries the other streams: if
+   a larger one exists, a Stream row appears saying which, the caption names
+   both sizes, and Save is what keeps it. **Click the picture:** it opens as
+   large as the screen allows, and closes on the Close button, the window's X,
+   a click on the image and Escape, all four. Press Test on a camera with the
+   wrong password: no picture, and the reason says 401 rather than a generic
+   failure. Press Test on a camera that is off: the reason names the timeout.
 7. **Select an existing camera in the list.** One added by make reads back as
    that make with its address in the box; one whose URL nothing here produces
    reads Custom URL. Username, password, cadence, frame rate, smoothing and
@@ -2899,7 +3016,8 @@ call, for the one camera that had credentials.
 14. Run it again with that config present. Every page opens on the saved
     answers rather than on defaults.
 
-Steps 6, 7 and 10 are the ones worth repeating after any change: they are where
+Steps 6, 6a, 7 and 10 are the ones worth repeating after any change: they are
+where
 the GUI has to agree with the console wizard, and where disagreeing stays
 invisible until an install fails. Ten of the defects in the first operator run
 were in this list's territory, and none of them was reachable by a unit test.
@@ -3181,8 +3299,8 @@ timelapse-setup.cmd              double-click shim for the above
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
-scripts/timelapse_setup.py       configuration wizard, 4204 lines
-scripts/timelapse_gui.py         the same wizard in a window, 2491 lines
+scripts/timelapse_setup.py       configuration wizard, 4438 lines
+scripts/timelapse_gui.py         the same wizard in a window, 2768 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines

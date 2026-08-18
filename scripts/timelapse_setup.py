@@ -1964,15 +1964,136 @@ def quote(s):
     return "".join(out)
 
 
-def test_camera(cam, cfg):
-    if cam["method"] == "rtsp":
-        return test_camera_rtsp(cam, cfg)
+# SOF0 through SOF15, minus the three markers in that range that are not frame
+# headers at all (DHT at C4, JPG at C8, DAC at CC). Every one of the rest
+# carries the frame size in the same four bytes, which is what makes a
+# progressive or lossless JPEG as readable here as a baseline one.
+_SOF_MARKERS = frozenset((0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                          0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF))
+
+
+def jpeg_size(data):
+    """(width, height) of a JPEG held in memory, or None.
+
+    Read from the header rather than by shelling out to ffprobe because
+    picking the largest stream means measuring three images per test, and
+    three subprocesses to answer a question that sits nine bytes into a
+    segment is a poor trade. ffprobe stays as probe_sample()'s fallback for
+    anything this cannot parse.
+    """
+    if not data or data[:2] != b"\xff\xd8":
+        return None
+    at, end = 2, len(data)
+    while at + 3 < end:
+        if data[at] != 0xFF:
+            return None                 # lost the segment chain; a wrong
+        marker = data[at + 1]           # answer here is worse than none
+        if marker == 0xFF:              # fill byte, legal before any marker
+            at += 1
+            continue
+        if marker == 0x01 or 0xD0 <= marker <= 0xD9:
+            at += 2                     # standalone: no length, no payload
+            continue
+        if marker == 0xDA:              # start of scan: the header is over
+            return None
+        length = (data[at + 2] << 8) | data[at + 3]
+        if length < 2:
+            return None
+        if marker in _SOF_MARKERS and at + 9 <= end:
+            return ((data[at + 7] << 8) | data[at + 8],
+                    (data[at + 5] << 8) | data[at + 6])
+        at += 2 + length
+    return None
+
+
+# The three presets whose URL selects a stream, and the values worth trying.
+# A short list of documented spellings rather than an enumeration: what else a
+# camera offers is advertised only over SOAP, which this project has refused a
+# stack for. Group 2 of each pattern is the part that varies.
+#
+# Deliberately probed even where the default is meant to be the largest
+# (subtype 0 and ISAPI channel x01 are both the main stream): that is a claim
+# about firmware, and this project's rule is that an advertisement is a claim
+# and a fetch is a measurement.
+STREAM_KNOBS = (
+    ("profile", re.compile(r"(?i)(?<=[?&])(Profile_)(\d+)"), ("1", "2", "3")),
+    ("subtype", re.compile(r"(?i)(?<=[?&])(subtype=)(\d+)"), ("0", "1", "2")),
+    ("stream", re.compile(r"(?i)(/ISAPI/Streaming/channels/\d+)(\d)(?=/)"),
+     ("1", "2")),
+)
+
+
+def stream_token(url):
+    """The stream this URL selects, as "<knob>=<value>", or "".
+
+    A spelling stable enough to store, so a camera whose largest image turned
+    out to be on Profile_2 still reads back as its make rather than falling
+    through to Custom URL.
+    """
+    for name, pattern, _choices in STREAM_KNOBS:
+        found = pattern.search(url or "")
+        if found:
+            return "%s=%s" % (name, found.group(2))
+    return ""
+
+
+def with_stream(url, token):
+    """`url` with its stream selector set to what `token` names."""
+    name, _, value = str(token or "").partition("=")
+    for knob, pattern, _choices in STREAM_KNOBS:
+        if knob != name:
+            continue
+        found = pattern.search(url or "")
+        if not found:
+            return url
+        start, end = found.span(2)
+        return url[:start] + value + url[end:]
+    return url
+
+
+def stream_candidates(url):
+    """[(token, url)] for the other streams this camera may offer.
+
+    The configured URL is never among them: it has already been fetched, and
+    it is what the alternatives get measured against.
+    """
+    for name, pattern, choices in STREAM_KNOBS:
+        found = pattern.search(url or "")
+        if not found:
+            continue
+        return [(name + "=" + value, with_stream(url, name + "=" + value))
+                for value in choices if value != found.group(2)]
+    return []
+
+
+def _grab_detail():
+    """The empty finding, so every key exists however the fetch went.
+
+    A caller reading detail["said"] must not have to know whether the request
+    got far enough for there to be one.
+    """
+    return {"reason": "", "said": "", "notes": [], "status": None,
+            "seconds": 0.0, "bytes": 0, "size": None, "skipped": False}
+
+
+def grab_snapshot(cam, cfg, timeout=None):
+    """Fetch one frame. (data, detail), data None when nothing usable arrived.
+
+    Split out of test_camera() because the graphical wizard shows the frame it
+    fetched and measures it to pick a stream, and neither is reachable through
+    a report that is printed. detail carries everything test_camera() used to
+    print, so the two front ends cannot end up with different findings about
+    one request. Falsy data always comes with a reason, except when `skipped`
+    says no request was made at all.
+    """
+    detail = _grab_detail()
     try:
         import requests
         from requests.auth import HTTPBasicAuth, HTTPDigestAuth
     except ImportError:
-        warn("python3-requests is not installed; skipping the live test.")
-        return True
+        detail["skipped"] = True
+        detail["reason"] = "python3-requests is not installed."
+        return None, detail
 
     sess = requests.Session()
     mode = (cam.get("auth") or "none").lower()
@@ -1981,52 +2102,85 @@ def test_camera(cam, cfg):
     elif mode == "basic":
         sess.auth = HTTPBasicAuth(cam.get("username"), cam.get("password"))
 
-    import time
+    if timeout is None:
+        timeout = cfg["capture"]["timeout_seconds"] + 4
     t0 = time.time()
     try:
-        r = sess.get(cam["url"], timeout=cfg["capture"]["timeout_seconds"] + 4)
+        r = sess.get(cam["url"], timeout=timeout)
     except Exception as exc:
-        fail(f"Could not reach the camera: {type(exc).__name__}")
-        note("Check the IP, that the camera is on this network, and that HTTP")
-        note("snapshots are enabled on it.")
-        return False
-    dt = time.time() - t0
+        detail["seconds"] = time.time() - t0
+        detail["reason"] = f"Could not reach the camera: {type(exc).__name__}"
+        detail["notes"] = ["Check the IP, that the camera is on this network, "
+                           "and that HTTP", "snapshots are enabled on it."]
+        return None, detail
+    detail["seconds"] = time.time() - t0
+    detail["status"] = r.status_code
+    detail["bytes"] = len(r.content)
 
     if r.status_code == 401:
-        fail("HTTP 401 Unauthorized - wrong credentials or wrong auth scheme.")
-        other = "basic" if mode == "digest" else "digest"
-        if ask_yes(f"Retry with auth '{other}'?", True):
-            cam["auth"] = other
-            return test_camera(cam, cfg)
-        return False
+        detail["reason"] = ("HTTP 401 Unauthorized - wrong credentials or "
+                            "wrong auth scheme.")
+        return None, detail
     if r.status_code != 200:
-        fail(f"HTTP {r.status_code} from the camera.")
-        return False
+        detail["reason"] = f"HTTP {r.status_code} from the camera."
+        return None, detail
     if r.content[:2] != b"\xff\xd8":
         # The body is where the camera says what is actually wrong. Reolink in
         # particular answers 200 OK with a JSON error when auth fails, so
         # reporting only "not a JPEG" hides the real cause.
         head, reason = explain_payload(r.content)
-        fail("Responded, but the payload is not a JPEG.")
+        detail["reason"] = "Responded, but the payload is not a JPEG."
         if reason:
-            fail(f"The camera said: {reason}")
-            note("That is an authentication or permission error, not a URL")
-            note("problem. Check the username and password, and that the")
-            note("account is allowed to take snapshots.")
+            detail["said"] = reason
+            detail["notes"] = [
+                "That is an authentication or permission error, not a URL",
+                "problem. Check the username and password, and that the",
+                "account is allowed to take snapshots."]
         else:
-            note(f"First bytes: {head}")
+            detail["notes"] = [f"First bytes: {head}"]
+        return None, detail
+
+    detail["size"] = jpeg_size(r.content)
+    return r.content, detail
+
+
+def test_camera(cam, cfg):
+    if cam["method"] == "rtsp":
+        return test_camera_rtsp(cam, cfg)
+    data, detail = grab_snapshot(cam, cfg)
+    if detail["skipped"]:
+        warn("python3-requests is not installed; skipping the live test.")
+        return True
+    if data is None:
+        fail(detail["reason"])
+        if detail["status"] == 401:
+            other = "basic" if (cam.get("auth") or "").lower() == "digest" \
+                else "digest"
+            if ask_yes(f"Retry with auth '{other}'?", True):
+                cam["auth"] = other
+                return test_camera(cam, cfg)
+            return False
+        if detail["said"]:
+            fail(f"The camera said: {detail['said']}")
+        for line in detail["notes"]:
+            note(line)
         return False
 
-    dims = probe_sample(cfg, r.content)
-    good(f"{len(r.content)/1024:.0f} KB{dims}, {dt:.2f}s")
+    dt = detail["seconds"]
+    dims = (", %dx%d" % detail["size"] if detail["size"]
+            else probe_sample(cfg, data))
+    good(f"{len(data)/1024:.0f} KB{dims}, {dt:.2f}s")
     if dt > cfg["capture"]["interval_seconds"] * 0.6:
         warn(f"{dt:.2f}s is slow for a "
              f"{cfg['capture']['interval_seconds']}s interval.")
     return True
 
 
-def test_camera_rtsp(cam, cfg):
+def grab_snapshot_rtsp(cam, cfg):
+    """One frame off an RTSP stream, through ffmpeg. (data, detail)."""
+    detail = _grab_detail()
     import tempfile
+    t0 = time.time()
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "frame.jpg"
         cmd = [cfg["paths"]["ffmpeg"], "-y", "-nostdin", "-hide_banner",
@@ -2036,22 +2190,66 @@ def test_camera_rtsp(cam, cfg):
             p = subprocess.run(cmd, capture_output=True, text=True,
                                timeout=45, **no_console())
         except subprocess.TimeoutExpired:
-            fail("RTSP grab timed out after 45s.")
-            return False
+            detail["seconds"] = time.time() - t0
+            detail["reason"] = "RTSP grab timed out after 45s."
+            return None, detail
+        detail["seconds"] = time.time() - t0
         if p.returncode != 0 or not out.exists():
             # ffmpeg quotes the URL it was handed, password and all. The
             # wizard asks for that password with ask_secret() precisely to
-            # keep it out of the scroll-back; printing ffmpeg's complaint
+            # keep it out of the scroll-back; reporting ffmpeg's complaint
             # verbatim would hand it straight back.
-            fail(f"RTSP grab failed: {redact_url((p.stderr or '').strip())[:160]}")
-            return False
-        good(f"RTSP frame captured ({out.stat().st_size/1024:.0f} KB)")
-        return True
+            detail["reason"] = ("RTSP grab failed: %s"
+                                % redact_url((p.stderr or "").strip())[:160])
+            return None, detail
+        data = out.read_bytes()
+    detail["bytes"] = len(data)
+    detail["size"] = jpeg_size(data)
+    return data, detail
+
+
+def test_camera_rtsp(cam, cfg):
+    data, detail = grab_snapshot_rtsp(cam, cfg)
+    if data is None:
+        fail(detail["reason"])
+        return False
+    dims = ", %dx%d" % detail["size"] if detail["size"] else ""
+    good(f"RTSP frame captured ({len(data)/1024:.0f} KB{dims})")
+    return True
+
+
+def render_png(cfg, data, width=0, height=0):
+    """`data` re-encoded as a PNG that fits width x height, or None.
+
+    tkinter reads PNG, GIF and PPM and no JPEG at all, and Pillow is not a
+    dependency this project is willing to take, so showing an operator the
+    frame their camera just sent means converting it. ffmpeg is already
+    required and is configured a page earlier than the cameras, which is what
+    makes that affordable; a machine without it loses the picture and nothing
+    else.
+    """
+    ffmpeg = cfg["paths"].get("ffmpeg", "ffmpeg")
+    scale = (["-vf", "scale=%d:%d:force_original_aspect_ratio=decrease"
+              % (width, height)] if width and height else [])
+    try:
+        p = subprocess.run(
+            [ffmpeg, "-y", "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-f", "image2pipe", "-i", "-"] + scale +
+            ["-frames:v", "1", "-c:v", "png", "-f", "image2pipe", "-"],
+            input=data, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=20, **no_console())
+    except Exception:
+        return None
+    out = p.stdout or b""
+    return out if p.returncode == 0 and out[:8] == b"\x89PNG\r\n\x1a\n" else None
 
 
 def probe_sample(cfg, data):
     """Report WxH of a JPEG held in memory, if ffprobe is usable."""
     import tempfile
+    size = jpeg_size(data)
+    if size:
+        return ", %dx%d" % size
     ffprobe = cfg["paths"].get("ffprobe", "ffprobe")
     try:
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tf:
