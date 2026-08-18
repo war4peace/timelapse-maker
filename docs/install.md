@@ -1165,7 +1165,17 @@ have since changed. `sudo ls -la /etc/timelapse` shows anything left there.
 ## 11. The web UI
 
 Optional, off by default, and read-only: it never triggers an encode, controls
-a camera, edits the config or deletes anything. Turn it on with:
+a camera, edits the config or deletes anything.
+
+![The Overview page](../screenshots/webui-overview.png)
+
+*The Overview, from a real eight-camera deployment. The camera table is the
+part `systemctl` cannot produce: Gate is answering and has still lost 88
+fetches today, and Roof is deliberately at a different cadence. The version
+panel is showing an out-of-date install on purpose, so that the update notice
+is visible.*
+
+Turn it on with:
 
 ```bash
 sudo timelapse web
@@ -1374,10 +1384,44 @@ the sandbox its parent is read-only anyway.
 
 ### The index
 
+![The Library tab: where the videos are, and every camera name found in
+them](../screenshots/webui-library-1.png)
+
+*The same real library: 6,922 files, 2.8 TB, spanning five years and three
+tools. `Garaj`/`Garage`, `Roof`/`roof` and `Workshop`/`workshop` are each two
+entries sorted together, never one. `(no name in filename)` is 450 files whose
+names carry no camera at all, which a parser that only understood this tool's
+own convention would have dropped silently.*
+
 The first scan runs in the background, so the page is usable immediately and
 reports progress. After that, opening a folder re-reads that one directory and
 opening a video re-checks that one file, so browsing does not walk your whole
 NAS. *Rescan* forces a full pass.
+
+Below the camera list are the days and the folders it found:
+
+![Recent days, with one playlist per day](../screenshots/webui-library-2.png)
+
+![Folders, which on this library are the months the predecessor tool wrote
+into](../screenshots/webui-library-3.png)
+
+Opening a day lists every video for that date:
+
+![A single day expanded](../screenshots/webui-library-daily-view.png)
+
+*Each entry carries the exact path it came from, so a file you did not expect
+can be traced without guessing. The duplicate names here are real and worth
+understanding: a **second install writing to the same destination**, into its
+own folder, so `Roof` and `Street4K` each appear twice for 2026-08-17 at
+different sizes. The index lists both, because the primary key is the **path**,
+not the camera and the date. Two files can legitimately be one camera's same
+day, and which one you wanted is not the index's decision to make.*
+
+**Two installs can share a destination.** Nothing coordinates them, and nothing
+needs to: each writes its own files, and the index reads whatever is there.
+Point the second one at a subfolder rather than the same directory, or the two
+will write the same `<Camera>.<YYYYMMDD>.mkv` name and the later transfer will
+overwrite the earlier one.
 
 It reads whatever is in the destination, not only what this tool wrote. Six
 different filename conventions from predecessor tools are recognised, including

@@ -374,6 +374,31 @@ including one playlist per day, so reviewing a day means opening a single file
 instead of one per camera. It reads the destination you already keep your
 timelapses in, recognising the naming conventions of whatever tool came before.
 
+![The overview page: a row per camera with its last frame, cadence, frame count
+and failures; what last night's encode produced; the state of each service; and
+the version panel](screenshots/webui-overview.png)
+
+The top table is the question `systemctl` cannot answer. Every camera there is
+"running" as far as the service manager is concerned, including the two quietly
+accumulating failed fetches. Frames and coverage are counted from the files on
+disk rather than from a counter the daemon keeps, so they survive a restart and
+work for RTSP cameras, where ffmpeg rather than this program writes the frames.
+
+![The library index: every camera found in the destination, with file counts,
+sizes and date ranges, and a list of recent days](screenshots/webui-library-1.png)
+
+The library is read from wherever you already keep your timelapses, which on a
+recorder that has been running for years is not a directory this program made.
+That one holds 6,922 files over five years in six different naming conventions,
+from three tools. `Garaj` and `Garage`, `Roof` and `roof`, `Workshop` and
+`workshop` are each **sorted next to each other and never merged**: a camera
+name is a place, places get recycled between cameras, and deciding that two
+labels mean the same place is a judgement only you can make.
+
+![One day expanded: every video for that date with its size, a Play link, a
+Download link and the exact path it came
+from](screenshots/webui-library-daily-view.png)
+
 It is the only part of this that listens on a network port, and it is
 structurally read-only: it binds localhost unless you change that, and its
 systemd unit runs with `ProtectSystem=strict` and exactly one writable
