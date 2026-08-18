@@ -611,5 +611,77 @@ class TestOnePythonFinder(unittest.TestCase):
             self.assertIn("3.9", (ROOT / name).read_text(encoding="ascii"), name)
 
 
+class TestArgumentLists(unittest.TestCase):
+    """A path with a space, handed to Start-Process, must be quoted.
+
+    Reported from a clean VM 2026-08-18: Python was installed to C:\\Program.
+    Start-Process joins ArgumentList with spaces and does NO quoting of its
+    own, so TargetDir=C:\\Program Files\\Python314 arrived at the Python
+    installer as two arguments, and the bundle took the first as the whole
+    path. It reported success, because it had installed a Python; just not
+    where the next line was about to look for it.
+
+    Measured before fixing (temp/argprobe.ps1): bare splits into two argv
+    entries, and both quoting forms survive as one.
+
+    The rule is scanned for rather than fixed at the one call site, because
+    the other three Start-Process calls in this tree were already quoted and
+    this one was not, which is how it got in. Quoting a value with no space in
+    it costs nothing, so the rule is universal and needs no judgement about
+    which variables can hold a space. Note the trailing-backslash trap that
+    comes with the fix: under CommandLineToArgvW a backslash before the
+    closing quote escapes it, gluing the next argument onto the path, so a
+    value that could end in one is trimmed first.
+    """
+
+    FILES = ("install.ps1", "setup-gui.ps1", "installer/prepare.ps1")
+
+    def argument_arrays(self, source):
+        """Every @(...) that is an argument list, as raw text."""
+        found = []
+        for opener in ("-ArgumentList", "$arguments ="):
+            start = 0
+            while True:
+                at = source.find(opener, start)
+                if at < 0:
+                    break
+                start = at + 1
+                bracket = source.find("@(", at)
+                if bracket < 0 or bracket > at + 40:
+                    continue
+                depth, i = 0, bracket + 2
+                while i < len(source):
+                    if source[i] == "(":
+                        depth += 1
+                    elif source[i] == ")":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    i += 1
+                found.append(source[bracket:i])
+        return found
+
+    def test_every_interpolated_argument_is_quoted(self):
+        for name in self.FILES:
+            source = (ROOT / name).read_text(encoding="ascii")
+            for block in self.argument_arrays(source):
+                for literal in re.findall(r'"[^"]*"', block.replace('`"', "\x01")):
+                    if "$" not in literal:
+                        continue
+                    self.assertIn(
+                        "\x01", literal,
+                        "%s: %s interpolates a value into a Start-Process "
+                        "argument without quoting it, so a path containing a "
+                        "space arrives as two arguments" % (name, literal))
+
+    def test_the_python_target_is_quoted_and_trimmed(self):
+        """The call site itself, so a rewrite cannot lose both halves at once."""
+        source = (ROOT / "installer/prepare.ps1").read_text(encoding="ascii")
+        block = source.split("function Install-Python", 1)[1]
+        block = block.split("\nfunction ", 1)[0]
+        self.assertIn("TrimEnd", block)
+        self.assertIn('TargetDir=`"$where`"', block)
+
+
 if __name__ == "__main__":
     unittest.main()

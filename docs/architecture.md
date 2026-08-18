@@ -3047,6 +3047,28 @@ It reported "ffmpeg unpacked but will not run" and nothing else, which is a
 conclusion with no evidence under it. It prints the exit code and what the
 process said now, and keys on the version banner rather than on the exit code.
 
+The third came from the case the checklist calls the one nothing here can
+reach: a machine with **no Python at all**. `Start-Process` joins its
+`-ArgumentList` with spaces and does **no quoting of its own**, so
+`TargetDir=$target` reached the Python bundle as `TargetDir=C:\Program` plus a
+stray `Files\Python314`, and Python was installed to `C:\Program`. The bundle
+exited 0, because it had installed a Python; just not where the next line was
+about to look. Measured before fixing (`temp/argprobe.ps1`): the bare form
+arrives as two argv entries, quoting either the value or the whole pair arrives
+as one.
+
+Three things worth keeping about it. The **strict check is what caught it**:
+`Install-Python` verifies `python.exe` is at the target rather than trusting
+the exit code, so a silent misinstall became a clear refusal instead of a
+failure three steps later with nothing pointing back here. The other three
+`Start-Process` calls in this tree were **already quoted**, which is how one
+unquoted call site got in, so the test scans every argument array rather than
+that one line; quoting a value with no space in it costs nothing, so the rule
+needs no judgement about which variables can hold one. And the fix carries its
+own trap: under `CommandLineToArgvW` a **backslash before the closing quote
+escapes it**, so a value ending in one swallows the argument after it
+(measured: `AFTER=1` was absorbed into the path). Hence the `TrimEnd`.
+
 **What none of that reaches is a real elevated install from the .exe**, which
 is a checklist, on a machine that can be put back:
 
@@ -3523,7 +3545,7 @@ install.ps1                      the Windows one, 483 lines
 setup-gui.ps1                    launcher for the graphical wizard, 111 lines
 timelapse-setup.cmd              double-click shim for the above
 installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
-installer/prepare.ps1            prerequisites, then install.ps1, 433 lines
+installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines

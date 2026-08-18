@@ -256,10 +256,17 @@ function Install-Python {
     # two events. Include_tcltk, because the graphical wizard is tkinter and a
     # Python without it produces a wizard that cannot open. Include_launcher,
     # because `py -3` is the first thing every stage here looks for.
+    # TargetDir is QUOTED. Start-Process joins ArgumentList with spaces and does
+    # no quoting of its own, and the default target is under %ProgramFiles%, so
+    # the bare form reached the installer as TargetDir=C:\Program plus a stray
+    # Files\Python314 and Python was installed to C:\Program. TrimEnd first: a
+    # backslash before the closing quote escapes it under CommandLineToArgvW,
+    # which would glue the next argument onto the path instead.
+    $where = $target.TrimEnd('\')
     $arguments = @('/quiet', 'InstallAllUsers=1', 'PrependPath=1',
                    'Include_launcher=1', 'Include_tcltk=1', 'Include_pip=1',
                    'Include_test=0', 'Include_doc=0', 'AssociateFiles=0',
-                   'Shortcuts=0', "TargetDir=$target")
+                   'Shortcuts=0', "TargetDir=`"$where`"")
     $proc = Start-Process -FilePath $file -ArgumentList $arguments -Wait -PassThru
     Remove-Item $file -Force -ErrorAction SilentlyContinue
 
