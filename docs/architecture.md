@@ -2128,6 +2128,31 @@ bytes is a poor trade. `probe_sample()` delegates to it and keeps ffprobe as the
 fallback for anything it cannot parse, so there is still one answer to "how big
 is this frame".
 
+**It has to resynchronise, and the first version did not.** Reported from a real
+run: every Dahua reported no dimensions while its picture drew perfectly.
+Measured 2026-08-18 against three of them (192.168.2.202, .203 and .205) with
+`temp/jpeg_walk.py`, and all three are identical: a `COM` segment declaring
+4094 bytes, then **608 zero bytes belonging to no segment at all**, then a
+second `COM`, then the frame header. Stepping by the declared length lands in
+the padding, and the first version gave up there on the principle that a wrong
+answer is worse than none. libjpeg and ffmpeg hunt for the next marker and say
+nothing about it, which is exactly why the thumbnail was fine and only the
+number was missing. The hunt is now done here too, on a budget
+(`RESYNC_BUDGET`, 64 KB, against a measured 608), and **the frame header is
+validated before it is believed** (sample precision 8, 12 or 16, both
+dimensions non-zero), because after a resync the alternative to checking is a
+plausible number read out of the wrong place.
+
+Two things about this are worth carrying. **The fallback hid it**: the console
+wizard prints dimensions for a Dahua and always has, because `probe_sample()`
+drops through to ffprobe, so the defect existed only where there was nothing to
+fall back on. And **the consequence was larger than the symptom**: with every
+size `None`, `pick_stream()` skips every candidate and returns `None`, so the
+stream picker was *inert on the one make whose selector prompted the feature*.
+A missing number on a label was the visible half of a feature that was not
+running. `temp/revert_check_jpeg.py` holds the old parser beside the new one and
+shows exactly three of six cases moving.
+
 **Streams are picked by measuring, not by believing.** `STREAM_KNOBS` names the
 three presets whose URL selects a stream (ONVIF `Profile_N`, Dahua `subtype=N`,
 and the last digit of a Hikvision ISAPI channel id, which is the stream rather
@@ -3299,7 +3324,7 @@ timelapse-setup.cmd              double-click shim for the above
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
-scripts/timelapse_setup.py       configuration wizard, 4438 lines
+scripts/timelapse_setup.py       configuration wizard, 4468 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2768 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines

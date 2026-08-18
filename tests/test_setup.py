@@ -3435,6 +3435,47 @@ class TestJpegSize(unittest.TestCase):
         self.assertIsNone(setup.jpeg_size(b"\xff\xd8" + app0() + b"\xff\xda"
                                           + b"\x00\x08" + b"\x01" * 6))
 
+    def test_the_shape_three_real_dahua_cameras_send(self):
+        """Measured 2026-08-18 against 192.168.2.202, .203 and .205, all
+        three identical: a COM segment declaring 4094 bytes, then **608 zero
+        bytes belonging to no segment at all**, then a second COM, then the
+        frame header. Stepping by the declared length lands in the padding,
+        which is why every Dahua reported no dimensions while its picture
+        drew perfectly: ffmpeg resynchronises and says nothing about it.
+        """
+        comment = b"\xff\xfe\x0f\xfe" + b"D" * 4092
+        padding = b"\x00" * 608
+        second = b"\xff\xfe\x00\xfe" + b"D" * 252
+        self.assertEqual(
+            setup.jpeg_size(jpeg(2560, 1440,
+                                 before=app0() + comment + padding + second)),
+            (2560, 1440))
+
+    def test_padding_that_is_not_zero_is_stepped_over_too(self):
+        """Only one vendor's padding has been measured, and keying the fix on
+        its byte value would be fitting the rule to the one sample."""
+        self.assertEqual(
+            setup.jpeg_size(jpeg(800, 600,
+                                 before=app0() + b"\x11\x22\x33" * 40)),
+            (800, 600))
+
+    def test_the_hunt_is_bounded(self):
+        """Or a corrupt file turns a nine-byte header read into a scan of the
+        whole picture, three times per test."""
+        junk = bytes(bytearray([0x7F])) * (setup.RESYNC_BUDGET + 4096)
+        self.assertIsNone(setup.jpeg_size(b"\xff\xd8" + junk + jpeg(64, 48)[2:]))
+
+    def test_something_that_is_not_a_frame_header_is_not_believed(self):
+        """After a resync, the alternative to checking is a plausible number
+        read out of the wrong place, and a wrong size picks the wrong
+        stream."""
+        # FFC0 with a sample precision of 3, which no JPEG has.
+        bogus = b"\xff\xc0\x00\x11\x03\x01\x02\x03\x04" + b"\x00" * 8
+        self.assertIsNone(setup.jpeg_size(b"\xff\xd8" + bogus + b"\xff\xda"
+                                          + b"\x00\x08" + b"\x01" * 6))
+        # And a frame header claiming a zero dimension is not a measurement.
+        self.assertIsNone(setup.jpeg_size(jpeg(0, 1080)))
+
     def test_a_lost_segment_chain_stops_rather_than_hunting(self):
         self.assertIsNone(setup.jpeg_size(b"\xff\xd8" + b"garbage" * 20))
 

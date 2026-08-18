@@ -1972,6 +1972,14 @@ _SOF_MARKERS = frozenset((0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
                           0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF))
 
 
+# How far jpeg_size() may hunt for the next marker before giving up, summed
+# over one image. Measured against the real fleet: a Dahua pads 608 bytes and
+# nothing else pads at all, so this is three orders of magnitude of headroom
+# and still stops a corrupt file turning a header read into a scan of the
+# whole picture.
+RESYNC_BUDGET = 64 * 1024
+
+
 def jpeg_size(data):
     """(width, height) of a JPEG held in memory, or None.
 
@@ -1980,14 +1988,34 @@ def jpeg_size(data):
     three subprocesses to answer a question that sits nine bytes into a
     segment is a poor trade. ffprobe stays as probe_sample()'s fallback for
     anything this cannot parse.
+
+    It resynchronises, which the first version did not, and that cost the
+    dimensions of every Dahua snapshot: all three models here write a COM
+    segment declaring 4094 bytes and then pad with **608 zero bytes** that
+    belong to no segment at all, so stepping by the declared length lands in
+    the padding. libjpeg and ffmpeg hunt for the next marker and say nothing
+    about it, which is why the picture drew and only the number was missing.
+    The hunt is budgeted and the frame header is validated before it is
+    believed, because after a resync the alternative to checking is a
+    plausible number read out of the wrong place, and a wrong size here picks
+    the wrong stream.
     """
     if not data or data[:2] != b"\xff\xd8":
         return None
-    at, end = 2, len(data)
+    at, end, slack = 2, len(data), RESYNC_BUDGET
     while at + 3 < end:
         if data[at] != 0xFF:
-            return None                 # lost the segment chain; a wrong
-        marker = data[at + 1]           # answer here is worse than none
+            step = at
+            while (step + 1 < end and slack > 0
+                   and not (data[step] == 0xFF
+                            and data[step + 1] not in (0x00, 0xFF))):
+                step += 1
+                slack -= 1
+            if slack <= 0 or step + 1 >= end:
+                return None
+            at = step
+            continue
+        marker = data[at + 1]
         if marker == 0xFF:              # fill byte, legal before any marker
             at += 1
             continue
@@ -2000,8 +2028,10 @@ def jpeg_size(data):
         if length < 2:
             return None
         if marker in _SOF_MARKERS and at + 9 <= end:
-            return ((data[at + 7] << 8) | data[at + 8],
-                    (data[at + 5] << 8) | data[at + 6])
+            height = (data[at + 5] << 8) | data[at + 6]
+            width = (data[at + 7] << 8) | data[at + 8]
+            if data[at + 4] in (8, 12, 16) and width and height:
+                return width, height
         at += 2 + length
     return None
 

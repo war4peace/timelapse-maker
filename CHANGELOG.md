@@ -206,6 +206,15 @@ While the version is `0.x`, the configuration format may change in any release.
   both runners and neither leg is trusting the other to have looked.
 
 ### Fixed
+- **Dahua cameras reported no picture size, and were never offered a larger
+  stream.** Pressing Test on one showed the thumbnail and the file size but no
+  dimensions, while every other make showed them. Those cameras write a block
+  of padding into the image header that no other camera here does, and this
+  program stopped reading at it; ffmpeg steps over the same padding without
+  comment, which is why the picture always looked right. The missing number
+  was the smaller half of it: without a size to compare, the search for a
+  larger stream could not run at all, on the one make whose settings it was
+  written for.
 - **The graphical wizard could report a camera as working under a sign-in
   method it would not then save.** When a camera answered Test with "not
   authorised", the shared code underneath offered to try the other sign-in
