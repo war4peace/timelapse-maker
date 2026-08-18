@@ -168,28 +168,30 @@ sudo timelapse update
 
 ### After installing, on both platforms
 
-**Run the pre-flight before enabling anything.** It fetches one snapshot per
-camera and reports size, resolution, latency and authentication result, probes
-the encoders, checks the low-space threshold against the disk, and projects
-real usage from your actual snapshot sizes.
+**Say yes when it offers to run the checks.** Both installers end by offering
+the same pre-flight: it fetches a snapshot from every camera and reports size,
+resolution, latency and authentication result, probes the encoders, checks the
+low-space threshold against the disk, and projects real usage from your own
+snapshot sizes.
 
-On Linux:
+On **Linux** the installer runs it *as the service account*, so a permission
+problem surfaces then rather than at 00:05 tonight, and it goes on to offer to
+enable capture and the nightly encode. On **Windows** the wizard's closing
+dialog has a **Run the checks now** button, and capture has already been
+started by the time you see it.
+
+Then leave it alone. The first videos appear after midnight, once a whole day
+has been captured.
+
+To run the checks again at any point:
 
 ```bash
 sudo timelapse test
 ```
 
-On Windows, from an **Administrator** PowerShell or Command Prompt:
-
-```powershell
-timelapse test
-```
-
-Open that prompt *after* installing: the installer adds `timelapse` to the
-system PATH, and only new processes inherit it.
-
-Then leave it alone. Capture starts on its own, and the first videos appear
-after midnight, once a whole day has been captured.
+On Windows the same command needs an **Administrator** prompt and no `sudo`.
+Open that prompt after installing: `timelapse` is added to the system PATH, and
+only new processes inherit it.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
