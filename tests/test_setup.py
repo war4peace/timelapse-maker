@@ -3842,6 +3842,51 @@ class TestIPv6CameraAddresses(unittest.TestCase):
         self.assertEqual(parsed.port, 554)
 
 
+class TestStartCapture(unittest.TestCase):
+    """Starting a service that has never run, which is not restarting one.
+
+    install.sh ends an install with `systemctl enable --now`; the Windows port
+    had no counterpart, so a fresh install registered a delayed-auto-start
+    service and left it stopped until the next reboot. Reported from a real
+    install, where the graphical wizard said capture was already running.
+    """
+
+    def test_a_service_already_running_is_left_alone(self):
+        with mock.patch.object(setup, "service_is_active", return_value=True),              mock.patch.object(setup, "start_service") as started:
+            self.assertEqual(setup.start_capture(), (True, ""))
+        started.assert_not_called()
+
+    def test_a_stopped_service_is_started(self):
+        with mock.patch.object(setup, "service_is_active", return_value=False),              mock.patch.object(setup, "start_service",
+                               return_value=(True, "")) as started:
+            self.assertEqual(setup.start_capture(), (True, ""))
+        started.assert_called_once_with(setup.CAPTURE_UNIT)
+
+    def test_an_unanswerable_state_is_tried_rather_than_assumed(self):
+        """service_is_active() answers three ways and None means the question
+
+        could not be put. That is not "stopped", but it is no reason to refuse
+        either: start_service() waits for RUNNING, so attempting it gives an
+        authoritative answer where treating None as either state would be a
+        guess.
+        """
+        with mock.patch.object(setup, "service_is_active", return_value=None),              mock.patch.object(setup, "start_service",
+                               return_value=(False, "access denied")) as started:
+            self.assertEqual(setup.start_capture(), (False, "access denied"))
+        started.assert_called_once_with(setup.CAPTURE_UNIT)
+
+    def test_it_is_not_folded_into_restart_units(self):
+        """They answer opposite questions and merging them would lose that.
+
+        restart_units() must keep skipping a service that is not running,
+        because its job is an upgrade: restarting one the operator had stopped
+        would overrule a decision they made deliberately.
+        """
+        with mock.patch.object(setup, "service_is_active", return_value=False),              mock.patch.object(setup, "restart_service") as restarted:
+            setup.restart_units()
+        restarted.assert_not_called()
+
+
 class TestLocaliseLocations(unittest.TestCase):
     """A template is a source of settings, not of locations.
 

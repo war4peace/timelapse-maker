@@ -1657,6 +1657,66 @@ class TestReview(unittest.TestCase):
         cfg = self.config(transfer={"enabled": True, "destination": "\\\\t\\s"})
         self.assertIn("\\\\t\\s", " ".join(gui.next_steps(cfg)))
 
+    def test_it_does_not_claim_capture_is_running_when_it_is_not(self):
+        """Reported from a real Windows install 2026-08-18.
+
+        The service is registered delayed-auto-start and nothing on the
+        Windows path ever started it, so a fresh install captured nothing
+        until the next reboot while this dialog said "Capture starts on its
+        own and keeps running". A wizard that asserts something it has not
+        checked is the same defect as a summary reading a different source
+        from the code it summarises.
+        """
+        said = " ".join(gui.next_steps(self.config(), False))
+        self.assertIn("NOT running", said)
+        # And a remedy, because this is the one path where naming a command
+        # beats saying nothing: the operator cannot act on "it did not start".
+        #
+        # Asserted against start_hint() rather than against `sc start`, which
+        # is what the first version did: start_hint is platform-aware, so a
+        # literal Windows command passed here and failed on all three Linux
+        # legs. A test whose behaviour turns on the platform must DECLARE what
+        # it is or assert the relationship, never inherit the answer from the
+        # machine it happens to run on.
+        self.assertIn(setup.start_hint(setup.CAPTURE_UNIT), said)
+
+    def test_it_says_so_plainly_when_capture_did_start(self):
+        said = " ".join(gui.next_steps(self.config(), True))
+        self.assertIn("keeps running", said)
+        self.assertNotIn(setup.start_hint(setup.CAPTURE_UNIT), said)
+
+
+class TestStartsCapture(unittest.TestCase):
+    """The GUI must START the service, not merely describe it.
+
+    Windows had no counterpart to install.sh ending with
+    `systemctl enable --now`, and restart_units() is deliberately not one: it
+    touches only what is already running, because its job is an upgrade and
+    restarting a service the operator had stopped would overrule them.
+    """
+
+    def test_the_wizard_calls_the_shared_starter(self):
+        # Patching the module that OWNS the function, and asserting the GUI
+        # has no copy of the rule: if it had reimplemented "start it if it is
+        # stopped", this patch could not change its answer.
+        text = SOURCE.read_text(encoding="utf-8")
+        source = text.split("def finish(self)", 1)[1].split("def done_dialog", 1)[0]
+        self.assertIn("setup.start_capture()", source)
+        for forbidden in ("start_service(", "sc start"):
+            self.assertNotIn(forbidden, source, forbidden)
+
+    def test_it_starts_after_the_config_is_written(self):
+        """Ordering, and it is the same trap as restarting during
+
+        registration: starting the daemon before write_config() would put it
+        on the previous settings, and nothing about that looks wrong.
+        """
+        text = SOURCE.read_text(encoding="utf-8")
+        source = text.split("def finish(self)", 1)[1].split("def done_dialog", 1)[0]
+        self.assertLess(source.index("write_config"),
+                        source.index("start_capture"))
+
+
 
 class TestFfmpegCheck(unittest.TestCase):
     """Reuses detect_encoders(), which is why that stopped printing."""

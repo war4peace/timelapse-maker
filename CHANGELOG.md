@@ -227,6 +227,13 @@ While the version is `0.x`, the configuration format may change in any release.
   both runners and neither leg is trusting the other to have looked.
 
 ### Fixed
+- **Capture did not start until the machine was restarted, on Windows.** A
+  fresh install registered the capture service and left it stopped, so nothing
+  was collected until the next reboot, while the setup wizard finished by
+  saying "Capture starts on its own and keeps running". The wizard starts it
+  itself now, once your settings are saved, and says so plainly if it could
+  not. Upgrades are unchanged: a service you had deliberately stopped stays
+  stopped.
 - **The Windows setup wizard offered `/usr/bin/ffmpeg`.** A Linux path, in a
   window, on a machine that has no such file, presented in a filled field that
   reads as a discovered answer rather than as a default. Reported from a real

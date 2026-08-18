@@ -43,7 +43,8 @@ from timelapse_platform import (
     remove_service,
     remove_task, repeating_trigger, resolve_tool, restart_hint,
     restart_service, same_file_name, scan_filesystems, secure_secret_file,
-    service_is_active, service_state, share_root, start_hint, stop_hint,
+    service_is_active, service_state, share_root, start_hint,
+    start_service, stop_hint,
     stop_service, task_exists, task_info, task_result, task_xml, use_colour,
 )
 
@@ -1738,6 +1739,34 @@ def restart_units():
             note(f"It is still running the previous build: {restart_hint(unit)}")
             ok_all = False
     return ok_all
+
+
+def start_capture():
+    """Start the capture service if it is not already running. (ok, detail).
+
+    The half the Windows port was missing. install.sh ends an install with
+    `systemctl enable --now`, so on Linux installing gets you a running
+    capture; here the service was registered delayed-auto-start and then left
+    stopped, so a fresh install captured nothing until the next reboot. What
+    made that a defect rather than a documentation gap is that the graphical
+    wizard said "Capture starts on its own and keeps running" while it sat
+    there stopped, and the only text that said otherwise was install.ps1's
+    closing line, which the .exe runs hidden.
+
+    Deliberately NOT part of restart_units(), which touches only what is
+    already running because its job is an upgrade: restarting a service the
+    operator had stopped would be overruling a decision they made. Starting one
+    that has never run is the opposite case, and merging the two would lose
+    that distinction.
+
+    `is True` rather than a plain truth test, because service_is_active()
+    answers three ways and None means the question could not be put. That is
+    not "stopped", but it is also no reason to refuse: start_service() waits
+    for RUNNING and so gives an authoritative answer where a guess would not.
+    """
+    if service_is_active(CAPTURE_UNIT) is True:
+        return True, ""
+    return start_service(CAPTURE_UNIT)
 
 
 def remove_units():

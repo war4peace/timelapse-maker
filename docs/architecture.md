@@ -2386,6 +2386,22 @@ draft if the tag has none yet. The tag is checked against `install.ps1`'s
 release built from a tree still carrying the previous version would report the
 wrong one from `timelapse version` for ever.
 
+**Starting is not restarting, and Windows had only one of them.**
+`restart_units()` touches a service only when it is already running, which is
+right because its job is an upgrade: restarting one the operator had stopped
+would overrule a decision they made. Nothing did the other half.
+`install.sh` ends with `systemctl enable --now`, so on Linux installing gets
+you a running capture; on Windows the service was registered delayed
+auto-start and left stopped, so a fresh install collected nothing until the
+next reboot. What made that a defect rather than a documentation gap is that
+the graphical wizard finished by saying "Capture starts on its own and keeps
+running" while it sat there stopped, and the only text that said otherwise was
+`install.ps1`'s closing line, which the .exe runs hidden. `start_capture()` is
+the missing half, called by the wizard after `write_config()` (the same
+ordering rule as the restart), and `next_steps()` takes the outcome as an
+argument so the dialog cannot assert something nobody checked. The two
+scheduled tasks never had this gap: Task Scheduler fires them on its own.
+
 ### 4.7 `install.sh`
 
 Bootstrap. Detects the package manager (apt/dnf/yum/pacman/zypper/apk), installs

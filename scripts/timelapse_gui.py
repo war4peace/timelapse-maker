@@ -1138,17 +1138,31 @@ def summary_lines(cfg, codec=None):
     return rows
 
 
-def next_steps(cfg):
+def next_steps(cfg, capturing=True):
     """What to tell the operator once the config is written.
 
-    No commands. The first version ended by telling them to open an
-    Administrator prompt and run `timelapse test`, from a window built so that
-    they would not have to, which rather gave the game away. The checks are a
-    button on the same dialog now.
+    No commands, on the path where everything worked. The first version ended
+    by telling them to open an Administrator prompt and run `timelapse test`,
+    from a window built so that they would not have to, which rather gave the
+    game away. The checks are a button on the same dialog now.
+
+    `capturing` is the exception, and it is why this takes an argument at all.
+    The line "Capture starts on its own and keeps running" was printed
+    unconditionally and was FALSE on every fresh Windows install: the service
+    is registered delayed-auto-start and nothing started it, so it first ran at
+    the next reboot while this dialog said it was already going. Reported from
+    a real install. The wizard starts it now, and when that does not work this
+    says so and names the one command that fixes it, because a remedy is worth
+    a command where a routine next step is not.
     """
-    lines = ["Capture starts on its own and keeps running.",
-             "The first video appears after midnight, once a whole day has "
-             "been captured."]
+    if capturing:
+        lines = ["Capture starts on its own and keeps running."]
+    else:
+        lines = ["Capture is registered but is NOT running yet.",
+                 "It will start by itself after the next restart, or start it "
+                 "now with:    " + setup.start_hint(setup.CAPTURE_UNIT)]
+    lines.append("The first video appears after midnight, once a whole day "
+                 "has been captured.")
     t = cfg.get("transfer", {})
     if t.get("enabled"):
         lines.append("Finished videos are then moved to " + t["destination"] +
@@ -1188,6 +1202,7 @@ def run(config_path=None, existing=None):
             self.cfg = existing or setup.default_config()
             setup.localise_locations(self.cfg)
             self.written = False
+            self.capturing = True
             # Which encoder this machine will actually use. Found by the
             # ffmpeg check on the first page, and carried rather than stored:
             # it is a property of the box, not a setting, and the nightly run
@@ -2625,6 +2640,10 @@ def run(config_path=None, existing=None):
             # running daemon on the new build with the old settings, and
             # nothing about that looks wrong.
             setup.restart_units()
+            # And started, which is the half Windows was missing entirely.
+            # restart_units() touches only what is already running, correctly,
+            # so on a fresh install nothing ever started the capture service.
+            self.capturing = setup.start_capture()[0]
             self.done_dialog()
 
         def done_dialog(self):
@@ -2643,7 +2662,7 @@ def run(config_path=None, existing=None):
 
             ttk.Label(frame, text="Setup is complete.",
                       font=("Segoe UI", 12, "bold")).pack(anchor="w")
-            ttk.Label(frame, text="\n".join(next_steps(self.cfg)),
+            ttk.Label(frame, text="\n".join(next_steps(self.cfg, self.capturing)),
                       wraplength=520, justify="left").pack(anchor="w",
                                                            pady=(8, 12))
             ttk.Label(frame,
