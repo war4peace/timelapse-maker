@@ -162,6 +162,11 @@ jobs:
           $out = python scripts/timelapse_setup.py --remove-units 2>&1 | Out-String
           Write-Host $out
           if ($out -match 'Traceback') { throw "it tracebacked" }
+          # Cleared for the reason the comment above gives: a refusal is a
+          # correct answer here, and GitHub's PowerShell wrapper ends the step
+          # with whatever $LASTEXITCODE holds, so leaving it would fail the
+          # step on exactly the outcome this step says is acceptable.
+          $global:LASTEXITCODE = 0
 
       # The Windows analogue of the `shell` job's bash -n and shellcheck.
       # install.ps1 cannot be *run* here (it registers services and needs
@@ -193,8 +198,17 @@ jobs:
         run: |
           python scripts/timelapse_cli.py --help
           python scripts/timelapse_cli.py version
+          # An unknown command must SAY so and must EXIT non-zero, so both are
+          # asserted; the exit code was not checked before and is the half that
+          # a script calling this would act on. Then it is cleared, because
+          # GitHub's PowerShell wrapper ends the step with whatever
+          # $LASTEXITCODE holds and this probe exists to fail. Same trap as a
+          # native probe under $ErrorActionPreference = 'Stop' in install.ps1,
+          # met in a different language.
           $out = python scripts/timelapse_cli.py nonsense 2>&1 | Out-String
+          if ($LASTEXITCODE -eq 0) { throw "an unknown command exited 0" }
           if ($out -notmatch 'unknown command') { throw "no usage error" }
+          $global:LASTEXITCODE = 0
 
   shell:
     runs-on: ubuntu-latest
