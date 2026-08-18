@@ -80,8 +80,65 @@ LABELS = 22
 # read and the level is what the window colours. Tested directly.
 # ---------------------------------------------------------------------------
 
-def check_storage(base):
-    """Is this a usable place to put frames, videos and logs?"""
+def free_on(base):
+    """Free bytes on the volume holding this path, or None if it cannot say.
+
+    Only ever used to choose a default, so an unanswerable path is not a
+    finding: default_min_free_gb() falls back on its own.
+    """
+    text = str(base or "").strip().strip('"')
+    if not text:
+        return None
+    try:
+        import shutil
+        path = Path(text).expanduser()
+        return shutil.disk_usage(path.anchor or str(path)).free
+    except OSError:
+        return None
+
+
+def guard_for(stored, free_bytes):
+    """What to put in the pause-below box when the page opens.
+
+    A stored value wins, because it is somebody's deliberate answer and the
+    .get(key, default) rule says an upgrade keeps what is already there. The
+    exception is a stored value this disk cannot satisfy, which is not a
+    preference but the shipped default of 60 meeting a disk smaller than it:
+    default_config() always supplies that key, so "absent" never happens on a
+    fresh config and keying only on absence would have left the 29 GB VM on 60
+    exactly as before.
+    """
+    if stored is None:
+        return setup.default_min_free_gb(free_bytes)
+    if free_bytes and stored * 1024 ** 3 >= free_bytes:
+        return setup.default_min_free_gb(free_bytes)
+    return stored
+
+
+def check_guard(text):
+    """(level, message, gb) for the pause-below-N-GB field."""
+    raw = str(text or "").strip()
+    if not raw:
+        return FAIL, "Give a number of GB, or 0 to never pause.", None
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return FAIL, "Give a whole number of GB.", None
+    if value < 0:
+        return FAIL, "Cannot be negative. Use 0 to never pause.", None
+    return OK, "", value
+
+
+def check_storage(base, guard_gb=None):
+    """Is this a usable place to put frames, videos and logs?
+
+    The guard is part of the question, not a separate one. Capture pauses
+    below capture.min_free_gb and resumes only at 110% of it, so free space
+    is only meaningful relative to that threshold: 29 GB free is fine at a
+    10 GB guard and is a daemon that never writes a frame at 60. This used to
+    report a flat "29.0 GB free" in green while the shipped default of 60
+    stood, which is what a 29 GB VM found.
+    """
     text = str(base or "").strip().strip('"')
     if not text:
         return FAIL, "Choose a folder to keep the frames and videos in."
@@ -97,9 +154,34 @@ def check_storage(base):
         return FAIL, f"{root} cannot be read: {exc}"
 
     gb = free / 1024 ** 3
-    # Not a hard floor: this only has to hold one day of frames at a time, and
-    # what "enough" means depends on the cadence and the camera count, which
-    # the capture page works out properly. This is the obviously-wrong check.
+    if guard_gb:
+        usable = gb - guard_gb
+        # The same shape as an interval below encode.min_frames, and the same
+        # verdict: a configuration that produces nothing at all, silently and
+        # for ever, is a refusal rather than a warning. The remedy is in the
+        # box beside this one.
+        if usable <= 0:
+            # Naming a number that works, because the alternative is telling
+            # somebody their configuration is impossible and leaving them to
+            # work out what is not. Same function the console wizard defaults
+            # from, so the two cannot suggest different things.
+            suggest = setup.default_min_free_gb(free)
+            return FAIL, (f"{setup.human(free)} free on {root}, but capture "
+                          f"pauses below {guard_gb} GB, so it would pause on "
+                          f"the first frame and never resume. Try {suggest}, "
+                          f"or choose a folder on a bigger disk.")
+        if usable < 5:
+            return WARN, (f"{setup.human(free)} free on {root}, only "
+                          f"{usable:.0f} GB of it above the {guard_gb} GB "
+                          f"pause threshold. That is very little for a day of "
+                          f"full-resolution frames.")
+        return OK, (f"{setup.human(free)} free on {root}, {usable:.0f} GB "
+                    f"usable above the {guard_gb} GB pause threshold.")
+
+    # Guard disabled, so free space is the whole story. Not a hard floor: this
+    # only has to hold one day of frames at a time, and what "enough" means
+    # depends on the cadence and the camera count, which the capture page works
+    # out properly. This is the obviously-wrong check.
     if gb < 5:
         return WARN, (f"{setup.human(free)} free on {root}. That is very "
                       f"little for a day of full-resolution frames.")
@@ -1671,6 +1753,16 @@ def run(config_path=None, existing=None):
             ttk.Button(row, text="Browse",
                        command=lambda: self.browse_into(folder)).pack(
                            side="left", padx=6)
+            # Beside the free-space line, because the two numbers only mean
+            # anything together. The default follows the disk rather than the
+            # shipped 60, which no wizard had ever adjusted here.
+            guard_default = guard_for(cap.get("min_free_gb"),
+                                      free_on(current))
+            guard, guard_row = self.field(
+                store, "Pause capture below", str(guard_default),
+                width=8, label_width=LABELS, grow=False)
+            ttk.Label(guard_row, text="GB free  (0 never pauses)",
+                      foreground="#555").pack(side="left", padx=(6, 0))
             store_note = self.status(store)
             derived = ttk.Label(store, text="", foreground="#555",
                                 justify="left")
@@ -1744,8 +1836,12 @@ def run(config_path=None, existing=None):
                       foreground="#555").pack(anchor="w", pady=(6, 0))
 
             def refresh(*_a):
-                level, message = check_storage(folder.get())
-                self.say(store_note, level, message)
+                level, message, guard_gb = check_guard(guard.get())
+                if level == FAIL:
+                    self.say(store_note, level, message)
+                else:
+                    level, message = check_storage(folder.get(), guard_gb)
+                    self.say(store_note, level, message)
                 if folder.get().strip():
                     p = storage_paths(folder.get())
                     derived.config(text="frames  -> %s\nvideos  -> %s\n"
@@ -1759,12 +1855,16 @@ def run(config_path=None, existing=None):
                 level, message, _rate = check_framerate(fps.get(), seconds)
                 self.say(fps_note, level, message)
 
-            for var in (folder, iv, fps):
+            for var in (folder, guard, iv, fps):
                 var.trace_add("write", refresh)
             refresh()
 
             def commit():
-                level, message = check_storage(folder.get())
+                level, message, guard_gb = check_guard(guard.get())
+                if level == FAIL:
+                    messagebox.showerror("Storage", message)
+                    return False
+                level, message = check_storage(folder.get(), guard_gb)
                 if level == FAIL:
                     messagebox.showerror("Storage", message)
                     return False
@@ -1792,6 +1892,7 @@ def run(config_path=None, existing=None):
                 if ffprobe:
                     self.cfg["paths"]["ffprobe"] = ffprobe
                 self.codec = _codec
+                cap["min_free_gb"] = guard_gb
                 cap["interval_seconds"] = interval
                 # The fetch timeout must stay under the interval, or a slow
                 # camera's request outlives the tick that asked for it.

@@ -410,6 +410,23 @@ def test_disk(cfg, avg_bytes, n_cameras):
     mixed = len(set(frames)) > 1
 
     info(f"{free/1024**3:.0f} GB free on {probe}")
+
+    # Before the projection, because this one decides whether a frame is ever
+    # written at all. DiskGuard pauses below the threshold and resumes only at
+    # 110% of it, so a threshold at or above the free space pauses on the first
+    # tick and can never resume: no frames, no error, nothing but one line in
+    # capture.log. The projection below cannot see it, and reported "Headroom
+    # fine" on a 29 GB VM carrying the shipped default of 60.
+    guard = cfg["capture"].get("min_free_gb", 0) * (1024 ** 3)
+    if guard and free <= guard:
+        bad(f"Capture pauses below {guard/1024**3:.0f} GB free and there is "
+            f"only {free/1024**3:.0f} GB, so it would pause immediately and "
+            f"never resume. Lower capture.min_free_gb.")
+    elif guard and free < guard * 1.1:
+        warn(f"Only {(free - guard)/1024**3:.0f} GB above the "
+             f"{guard/1024**3:.0f} GB pause threshold, and capture resumes "
+             f"only above {guard*1.1/1024**3:.0f} GB.")
+
     if avg_bytes and n_cameras and per_day:
         daily = avg_bytes * per_day
         shape = (f"{per_day:,} frames/day across {len(enabled)} cameras"

@@ -3069,6 +3069,61 @@ own trap: under `CommandLineToArgvW` a **backslash before the closing quote
 escapes it**, so a value ending in one swallows the argument after it
 (measured: `AFTER=1` was absorbed into the path). Hence the `TrimEnd`.
 
+### The low-space guard, and three checks that could not see it
+
+Reported from a 29 GB VM 2026-08-18, and the shape is one this project keeps
+meeting: **a number that decides everything, which nothing checked against.**
+
+`DiskGuard` pauses capture below `capture.min_free_gb` and resumes only at
+110% of it. So a threshold at or above the disk's free space does not make
+capture tight, it makes capture **impossible**: paused on the first tick, never
+resumed, no error anywhere, one line in `capture.log`. `default_config()` ships
+60, which is wrong on any disk with less than about 66 GB free.
+
+Three surfaces all reported a healthy machine, measured before fixing
+(`temp/minfree_probe.py`):
+
+| surface | said | why it could not see it |
+|---|---|---|
+| GUI Storage box | `ok  29.0 GB free` | compared against an unrelated 5 GB floor |
+| `timelapse test` | `Headroom fine` | projected a day of frames, never read the threshold |
+| console wizard | correct | it asks, and scales its default to the disk |
+
+The console wizard was right all along, which is what makes this drift rather
+than an oversight: **the graphical wizard never asked**, so the flat 60 stood on
+every Windows install and could only be changed by hand-editing the file the
+wizard exists to write. That is the `tools/` rule met from the other side, and
+the reason `default_min_free_gb()` is now one function both wizards default
+from rather than a formula sitting inside `choose_capture()`.
+
+Four things worth keeping.
+
+**FAIL, not WARN.** A threshold the disk cannot satisfy gets the same verdict
+`check_interval()` gives an interval below `encode.min_frames`, for the reason
+stated there: a configuration that produces nothing at all, silently and for
+ever, is a refusal. The precedent settled the question; it was not re-argued.
+
+**Keying on absence was not enough, and driving the page is what showed it.**
+The first cut read `cap.get("min_free_gb")` and scaled only when the key was
+missing. `default_config()` always supplies it, so on a fresh config the key is
+never missing and the VM would have opened on 60 exactly as before. Unit tests
+could not see this: they call `check_storage()` directly and never construct the
+page. `guard_for()` now replaces a stored value the disk cannot satisfy, and
+`temp/guard_page_probe.py` builds page 1 through `run()`, reads the field back
+and types into it. **A decide layer that is fully tested still says nothing
+about what the page hands it.**
+
+**The refusal names a number that works.** Telling somebody their configuration
+is impossible and leaving them to work out what is not is half an answer, and
+the suggestion comes from the same `default_min_free_gb()` the console wizard
+defaults from, so the two cannot disagree.
+
+**The pre-flight fix is a Linux fix.** `test_disk()` has never compared the
+threshold to free space on any platform. It was found on Windows because that
+is where a small disk met a wizard that did not ask, but the check was blind
+everywhere, which is the third time a Windows transcript has turned up
+something that was wrong on Linux for releases.
+
 **What none of that reaches is a real elevated install from the .exe**, which
 is a checklist, on a machine that can be put back:
 
@@ -3549,9 +3604,9 @@ installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2088 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 973 lines
-scripts/timelapse_setup.py       configuration wizard, 4468 lines
-scripts/timelapse_gui.py         the same wizard in a window, 2768 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 994 lines
+scripts/timelapse_setup.py       configuration wizard, 4562 lines
+scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines

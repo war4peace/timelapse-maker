@@ -453,6 +453,25 @@ def detect_encoders(ffmpeg):
     return None, failures, ""
 
 
+def default_min_free_gb(free_bytes=None):
+    """A sensible capture.min_free_gb for a disk with this much free.
+
+    One copy, because both wizards offer it and a flat 60 is wrong on any
+    disk smaller than about 66 GB: the guard pauses capture below the
+    threshold and only resumes at 110% of it, so a threshold above the disk's
+    free space pauses on the first tick and can never resume. That is not a
+    tight fit, it is a capture daemon that writes nothing, for ever, with the
+    only evidence a line in capture.log. Reported from a 29 GB VM 2026-08-18,
+    where the graphical wizard never asked and default_config()'s flat 60
+    stood.
+
+    A tenth of what is free, never below 10 and never above 60.
+    """
+    if not free_bytes:
+        return 60
+    return max(10, min(60, int(free_bytes / 1024 ** 3 * 0.1)))
+
+
 def choose_capture(cfg, disk):
     heading("Capture")
     interval = ask_int("Seconds between snapshots", 5, 1, 3600)
@@ -469,9 +488,7 @@ def choose_capture(cfg, disk):
     n_cams = ask_int("Roughly how many cameras will you run?", 4, 1, 64)
     estimate_budget(cfg, disk, n_cams, per_day)
 
-    default_guard = 60
-    if disk:
-        default_guard = max(10, min(60, int(disk["free"] / 1024 ** 3 * 0.1)))
+    default_guard = default_min_free_gb(disk["free"] if disk else None)
     print()
     note("Capture pauses instead of filling the disk when free space is low.")
     cfg["capture"]["min_free_gb"] = ask_int(

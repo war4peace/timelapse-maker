@@ -9,6 +9,7 @@ what the wizard does with the answer, which is the same on either platform.
 import contextlib
 import inspect
 import io
+import collections
 import json
 import re
 import shutil
@@ -4794,6 +4795,107 @@ class TestUnitRegistrationCommands(unittest.TestCase):
              contextlib.redirect_stdout(out):
             setup.print_unit_status()
         self.assertIn("failed", out.getvalue())
+
+
+class TestDefaultMinFreeGb(unittest.TestCase):
+    """A flat 60 is wrong on any disk with less than about 66 GB free.
+
+    Not "tight": DiskGuard pauses below the threshold and resumes at 110% of
+    it, so the guard has to fit inside the disk twice over before capture can
+    ever run. Reported from a 29 GB VM 2026-08-18.
+    """
+
+    GB = 1024 ** 3
+
+    def test_an_unknown_disk_keeps_the_shipped_default(self):
+        for unknown in (None, 0):
+            self.assertEqual(setup.default_min_free_gb(unknown), 60)
+
+    def test_a_small_disk_gets_the_floor_not_the_shipped_default(self):
+        # The VM. 60 would pause capture for ever; 10 leaves 19 GB to work in.
+        self.assertEqual(setup.default_min_free_gb(29 * self.GB), 10)
+
+    def test_a_large_disk_is_capped(self):
+        self.assertEqual(setup.default_min_free_gb(4000 * self.GB), 60)
+
+    def test_in_between_it_is_a_tenth(self):
+        self.assertEqual(setup.default_min_free_gb(200 * self.GB), 20)
+
+    def test_the_result_always_fits_the_disk_it_was_measured_from(self):
+        """The property that matters, over the whole plausible range.
+
+        A default this function returns must leave capture able to run, or it
+        has reproduced the reported bug at a different size.
+        """
+        for gb in (12, 20, 29, 50, 100, 250, 500, 1000, 4000):
+            guard = setup.default_min_free_gb(gb * self.GB)
+            self.assertLess(guard, gb,
+                            "%d GB disk got a %d GB guard" % (gb, guard))
+
+    def test_the_console_wizard_has_no_second_copy(self):
+        source = (Path(_support.SCRIPTS) / "timelapse_setup.py").read_text(
+            encoding="utf-8")
+        body = "\n".join(line for line in source.splitlines()
+                          if not line.lstrip().startswith("#"))
+        self.assertEqual(body.count("min(60,"), 1)
+
+
+class TestPreflightSeesTheGuard(unittest.TestCase):
+    """The pre-flight said "Headroom fine" on the VM as well.
+
+    It projected a day of frames against free space and never compared free
+    space to the threshold that decides whether a frame is written at all.
+    Three surfaces agreed the machine was healthy; the daemon wrote nothing.
+    """
+
+    GB = 1024 ** 3
+
+    def setUp(self):
+        sys.path.insert(0, str(_support.SCRIPTS))
+        import timelapse_test
+        self.checker = timelapse_test
+
+    def run_check(self, free_gb, guard_gb):
+        Usage = collections.namedtuple("Usage", "total used free")
+        cfg = {"paths": {"frames_root": str(Path(tempfile.gettempdir()))},
+               "capture": {"min_free_gb": guard_gb, "interval_seconds": 5},
+               "cameras": [{"name": "a", "enabled": True}]}
+        said = {"bad": [], "warn": [], "ok": [], "info": []}
+        import shutil as _shutil
+        with mock.patch.object(_shutil, "disk_usage",
+                               return_value=Usage(600 * self.GB, 0,
+                                                  int(free_gb * self.GB))), \
+             mock.patch.object(self.checker, "bad",
+                               lambda m: said["bad"].append(m)), \
+             mock.patch.object(self.checker, "warn",
+                               lambda m: said["warn"].append(m)), \
+             mock.patch.object(self.checker, "ok",
+                               lambda m: said["ok"].append(m)), \
+             mock.patch.object(self.checker, "info",
+                               lambda m: said["info"].append(m)):
+            self.checker.test_disk(cfg, 0, 1)
+        return said
+
+    def test_a_guard_above_the_free_space_is_reported_bad(self):
+        said = self.run_check(29, 60)
+        self.assertTrue(said["bad"], "the pre-flight said nothing")
+        self.assertIn("never resume", " ".join(said["bad"]))
+
+    def test_a_workable_guard_is_not_reported(self):
+        said = self.run_check(29, 10)
+        self.assertFalse(said["bad"])
+        self.assertFalse(said["warn"])
+
+    def test_a_guard_just_under_the_free_space_warns(self):
+        """Above the threshold but below the resume point, so capture would
+        pause on the first quiet day and not come back."""
+        said = self.run_check(63, 60)
+        self.assertTrue(said["warn"])
+
+    def test_a_disabled_guard_says_nothing_about_it(self):
+        said = self.run_check(29, 0)
+        self.assertFalse(said["bad"])
+        self.assertFalse(said["warn"])
 
 
 if __name__ == "__main__":

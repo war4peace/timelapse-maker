@@ -227,6 +227,27 @@ While the version is `0.x`, the configuration format may change in any release.
   both runners and neither leg is trusting the other to have looked.
 
 ### Fixed
+- **`timelapse test` did not check the low-space threshold against the disk.**
+  Capture pauses when free space falls below `capture.min_free_gb` and resumes
+  only once there is 10% more than that, so a threshold set at or above what
+  the disk has free pauses capture on its very first frame and can never
+  resume: no video, no error, and one line in `capture.log` as the only sign.
+  The pre-flight projected a day of frames against free space and never
+  compared the two numbers that decide, so it reported "Headroom fine" on a
+  machine that would never record anything. It now says so, and names the
+  setting to change. **This affects Linux as well**, and has since the check
+  was written.
+- **The Windows setup wizard never asked about the low-space threshold, and
+  showed free space in green that was not enough.** It wrote the shipped
+  default of 60 GB on every install with no way to change it short of editing
+  the configuration file by hand, and the Storage box reported free space
+  against an unrelated 5 GB floor, so a machine with 29 GB free was shown in
+  green while capture could never run on it. There is now a **Pause capture
+  below** box beside the folder, filled in from the size of the disk you chose
+  rather than from a fixed number, and the line under it reports how much room
+  that actually leaves. A threshold the disk cannot satisfy is refused, and the
+  refusal names one that works. Reported from a 29 GB virtual machine. The
+  console wizard has always asked this and scaled its default, and is unchanged.
 - **Capture did not start until the machine was restarted, on Windows.** A
   fresh install registered the capture service and left it stopped, so nothing
   was collected until the next reboot, while the setup wizard finished by

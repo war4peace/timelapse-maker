@@ -11,6 +11,8 @@ wizard does not already decide.
 """
 
 import ast
+import collections
+import os
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,6 +24,10 @@ import timelapse_setup as setup
 
 
 SOURCE = Path(_support.SCRIPTS) / "timelapse_gui.py"
+
+# A drive-lettered path so check_storage gets past its is_absolute()
+# guard on Windows and its anchor test on Linux alike.
+BASE = "C:\\timelapse" if os.name == "nt" else "/srv/timelapse"
 
 
 class TestNoDisplayNeeded(unittest.TestCase):
@@ -173,6 +179,187 @@ class TestStorage(unittest.TestCase):
     def test_quotes_pasted_from_explorer_are_stripped(self):
         paths = gui.storage_paths('"D:\\data"')
         self.assertNotIn('"', paths["frames_root"])
+
+
+class TestStorageGuard(unittest.TestCase):
+    """Free space only means something next to capture.min_free_gb.
+
+    Reported from a 29 GB VM 2026-08-18. DiskGuard pauses capture below the
+    threshold and resumes only at 110% of it, so the shipped default of 60
+    against 29 GB free is a daemon that pauses on the first tick and can never
+    resume: no frames, no error, one line in capture.log. This page reported a
+    flat "29.0 GB free" in green, because it compared against an unrelated
+    5 GB floor and never saw the number that decides.
+
+    FAIL rather than WARN for the impossible case, which is the same verdict
+    check_interval() gives an interval below encode.min_frames, and for the
+    same stated reason: a configuration that produces nothing at all, silently
+    and for ever.
+    """
+
+    GB = 1024 ** 3
+
+    def free(self, gb):
+        Usage = collections.namedtuple("Usage", "total used free")
+        return mock.patch.object(gui.shutil if hasattr(gui, "shutil")
+                                 else __import__("shutil"), "disk_usage",
+                                 return_value=Usage(600 * self.GB, 0,
+                                                    int(gb * self.GB)))
+
+    def check(self, free_gb, guard):
+        import shutil
+        Usage = collections.namedtuple("Usage", "total used free")
+        with mock.patch.object(shutil, "disk_usage",
+                               return_value=Usage(600 * self.GB, 0,
+                                                  int(free_gb * self.GB))):
+            return gui.check_storage(BASE, guard)
+
+    def test_a_guard_above_the_free_space_is_refused(self):
+        level, message = self.check(29, 60)
+        self.assertEqual(level, gui.FAIL)
+        self.assertIn("never resume", message)
+
+    def test_a_guard_equal_to_the_free_space_is_refused(self):
+        level, _message = self.check(60, 60)
+        self.assertEqual(level, gui.FAIL)
+
+    def test_the_refusal_names_both_numbers(self):
+        """So the operator can see which one to change, in the box beside it."""
+        _level, message = self.check(29, 60)
+        self.assertIn("29", message)
+        self.assertIn("60", message)
+
+    def test_a_guard_leaving_almost_nothing_warns(self):
+        level, message = self.check(12, 10)
+        self.assertEqual(level, gui.WARN)
+        self.assertIn("very little", message)
+
+    def test_a_comfortable_guard_reports_what_is_usable(self):
+        level, message = self.check(29, 10)
+        self.assertEqual(level, gui.OK)
+        self.assertIn("19", message)
+
+    def test_free_space_alone_is_not_the_answer(self):
+        """29 GB is fine at one threshold and impossible at another.
+
+        The whole defect in one assertion: the old check saw only the left
+        number and so could not tell these two apart.
+        """
+        self.assertEqual(self.check(29, 10)[0], gui.OK)
+        self.assertEqual(self.check(29, 60)[0], gui.FAIL)
+
+    def test_a_disabled_guard_falls_back_to_the_plain_report(self):
+        for guard in (0, None):
+            level, message = self.check(29, guard)
+            self.assertEqual(level, gui.OK, guard)
+            self.assertNotIn("threshold", message)
+
+
+class TestGuardField(unittest.TestCase):
+
+    def test_a_blank_answer_is_refused(self):
+        level, _message, value = gui.check_guard("")
+        self.assertEqual(level, gui.FAIL)
+        self.assertIsNone(value)
+
+    def test_a_non_number_is_refused(self):
+        level, _message, _value = gui.check_guard("lots")
+        self.assertEqual(level, gui.FAIL)
+
+    def test_a_negative_is_refused(self):
+        level, message, _value = gui.check_guard("-5")
+        self.assertEqual(level, gui.FAIL)
+        self.assertIn("0", message)
+
+    def test_zero_is_accepted_and_means_never_pause(self):
+        level, _message, value = gui.check_guard("0")
+        self.assertEqual(level, gui.OK)
+        self.assertEqual(value, 0)
+
+    def test_a_number_comes_back_as_an_int(self):
+        level, _message, value = gui.check_guard(" 10 ")
+        self.assertEqual(level, gui.OK)
+        self.assertEqual(value, 10)
+
+
+class TestGuardDefault(unittest.TestCase):
+    """What the pause-below box opens on.
+
+    Keying on absence alone was not enough and driving the real page is what
+    showed it: default_config() always supplies min_free_gb, so cap.get() never
+    returns None on a fresh config and the 29 GB VM would have opened on 60
+    exactly as before the fix. A stored value that this disk cannot satisfy is
+    the shipped default meeting a small disk, not a preference.
+    """
+
+    GB = 1024 ** 3
+
+    def test_an_absent_value_is_scaled_to_the_disk(self):
+        self.assertEqual(gui.guard_for(None, 29 * self.GB), 10)
+
+    def test_a_deliberate_value_that_fits_is_kept(self):
+        self.assertEqual(gui.guard_for(40, 200 * self.GB), 40)
+
+    def test_the_shipped_default_on_a_small_disk_is_replaced(self):
+        # The reported case exactly: 60 stored, 29 GB free.
+        self.assertEqual(gui.guard_for(60, 29 * self.GB), 10)
+
+    def test_a_value_equal_to_the_free_space_is_replaced(self):
+        self.assertEqual(gui.guard_for(29, 29 * self.GB), 10)
+
+    def test_an_unknown_disk_keeps_whatever_was_stored(self):
+        """No disk means no evidence, and a checker's own limitations are
+        never a finding about what it checks."""
+        self.assertEqual(gui.guard_for(60, None), 60)
+        self.assertEqual(gui.guard_for(0, None), 0)
+
+    def test_zero_is_a_real_answer_and_survives(self):
+        """0 disables the guard, so it can never be impossible."""
+        self.assertEqual(gui.guard_for(0, 29 * self.GB), 0)
+
+    def test_what_it_returns_always_leaves_room_to_capture(self):
+        for free_gb in (12, 29, 50, 200, 1000):
+            for stored in (None, 0, 10, 60, 500):
+                guard = gui.guard_for(stored, free_gb * self.GB)
+                self.assertLess(guard, free_gb,
+                                "stored %s on %d GB gave %d"
+                                % (stored, free_gb, guard))
+
+
+class TestGuardIsAskedAndSaved(unittest.TestCase):
+    """The other half of the report: on Windows this could not be changed.
+
+    The console wizard has asked for it since the beginning and scales its
+    default to the disk. The graphical one never asked, so default_config()'s
+    flat 60 stood on every Windows install, and the only way to change it was
+    to hand-edit config.json, which is the thing this wizard exists to avoid.
+    """
+
+    def source(self):
+        return SOURCE.read_text(encoding="utf-8")
+
+    def test_the_page_writes_the_key(self):
+        self.assertIn('cap["min_free_gb"] = guard_gb', self.source())
+
+    def test_the_default_comes_from_the_console_wizard(self):
+        """Pinned by reuse, not by a matching literal.
+
+        A second copy of the formula here is exactly the drift that got
+        tools/ deleted, and it would be invisible: both would be right on the
+        day it was written.
+        """
+        self.assertIn("setup.default_min_free_gb(", self.source())
+
+    def test_it_carries_no_second_copy_of_the_formula(self):
+        body = "\n".join(line for line in self.source().splitlines()
+                          if not line.lstrip().startswith("#"))
+        self.assertNotIn("min(60,", body)
+
+    def test_an_existing_value_is_kept_rather_than_recomputed(self):
+        """Opening the wizard again must not silently re-scale somebody's
+        deliberate answer, which is the .get(key, default) rule applied to a
+        value the operator has already given."""
+        self.assertIn('cap.get("min_free_gb")', self.source())
 
 
 class TestCadence(unittest.TestCase):
