@@ -175,21 +175,21 @@ low-space threshold against the disk, and projects real usage from your own
 snapshot sizes.
 
 On **Linux** the installer runs it *as the service account*, so a permission
-problem surfaces then rather than at 00:05 tonight, and it goes on to offer to
-enable capture and the nightly encode. On **Windows** the wizard's closing
-dialog has a **Run the checks now** button, and capture has already been
-started by the time you see it.
+problem surfaces then rather than past midnight, when the encoder runs,
+and it goes on to offer to enable capture and the nightly encode. 
+On **Windows** the wizard's closing dialog has a **Run the checks now** button,
+and capture has already been started by the time you see it.
 
-Then leave it alone. The first videos appear after midnight, once a whole day
-has been captured.
+From that point forward, everything is automated.
+The first videos appear after midnight, once a whole day has been captured.
 
-To run the checks again at any point:
+To run the checks again at any point, under *Linux*:
 
 ```bash
 sudo timelapse test
 ```
 
-On Windows the same command needs an **Administrator** prompt and no `sudo`.
+On *Windows*, the same command needs an **Administrator** prompt and no `sudo`.
 Open that prompt after installing: `timelapse` is added to the system PATH, and
 only new processes inherit it.
 
@@ -315,6 +315,25 @@ than filling the volume.
 
 ## Cameras
 
+**Set the cameras up first, in their own web interfaces.** This tool only
+fetches; it never changes a camera setting, so anything it needs has to be
+switched on at the camera beforehand. That usually means two things:
+
+- **An account it can sign in as.** A viewer or operator level account is
+  enough, and a dedicated one is worth creating rather than reusing the admin
+  login you sign in with. Camera accounts are commonly shared between several
+  programs, and a lockout triggered by one of them locks out all of them.
+- **The service the snapshot URL belongs to, enabled.** Depending on the make
+  that is ONVIF, ISAPI, or the camera's CGI or HTTP API, and several ship with
+  it off. On a number of makes, Hikvision and Dahua included, **ONVIF keeps its
+  own user list separate from the web one**, so an admin account that works
+  perfectly well in the browser can still be refused on an ONVIF endpoint until
+  you add a user there too. A TP-Link Tapo needs its third-party "camera
+  account" created in the phone app.
+
+If a camera answers on its ONVIF endpoint it will also show up under **Scan
+network** below, which is a quick way to confirm you enabled the right thing.
+
 Any camera with an HTTP snapshot URL works, and the wizard knows the URL shape
 for the common makes so you give it an address and a password rather than
 typing a URL. It offers presets for **Dahua/Amcrest**, **Hikvision** (both
@@ -331,7 +350,17 @@ and have not been exercised on real hardware; reports either way are welcome.
 **Scan network** (`timelapse discover`, or the button in the graphical wizard)
 sends one WS-Discovery query and lists what answers, with the make already
 chosen where the camera said enough about itself. No credentials are sent, so
-it cannot lock a camera account.
+it cannot lock a camera account. It will not see a camera with ONVIF turned
+off, or one on another subnet or VLAN, since multicast stops at the first
+router; an empty result means type the address in, not that there are no
+cameras.
+
+You do not have to get any of this right first time. Every camera is fetched
+from as you add it, and the wizard reports the size, resolution and
+authentication result there and then, so a camera that has not been set up yet
+says so while you are still looking at it.
+[docs/install.md](docs/install.md#common-snags) covers what each failure means,
+including the 401 that turns out to be an ONVIF user list.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
