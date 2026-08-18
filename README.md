@@ -324,12 +324,14 @@ switched on at the camera beforehand. That usually means two things:
   login you sign in with. Camera accounts are commonly shared between several
   programs, and a lockout triggered by one of them locks out all of them.
 - **The service the snapshot URL belongs to, enabled.** Depending on the make
-  that is ONVIF, ISAPI, or the camera's CGI or HTTP API, and several ship with
-  it off. On a number of makes, Hikvision and Dahua included, **ONVIF keeps its
-  own user list separate from the web one**, so an admin account that works
-  perfectly well in the browser can still be refused on an ONVIF endpoint until
-  you add a user there too. A TP-Link Tapo needs its third-party "camera
-  account" created in the phone app.
+  that is ONVIF, ISAPI, or the camera's CGI or HTTP API. **Expect ONVIF to be
+  off.** Every camera in the author's fleet arrived with it disabled, so treat
+  enabling it as a step you will have to take rather than something to check.
+  On **Dahua and Hikvision** it is two steps, not one: **ONVIF keeps its own
+  user list**, so enabling the service is not enough on its own, and an admin
+  account that works perfectly well in the browser is still refused on an ONVIF
+  endpoint until you add a user there as well. A TP-Link Tapo needs its
+  third-party "camera account" created in the phone app.
 
 If a camera answers on its ONVIF endpoint it will also show up under **Scan
 network** below, which is a quick way to confirm you enabled the right thing.

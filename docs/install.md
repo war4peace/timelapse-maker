@@ -431,10 +431,13 @@ budget.
 
 ### Common snags
 
-- **HTTP 401**: try the other auth scheme (`digest` ↔ `basic`). Some cameras
-  reject the admin account on ONVIF endpoints but accept a separate ONVIF user.
-  If the URL works with no credentials at all, set `"auth": "none"` and drop
-  the username/password.
+- **HTTP 401**: try the other auth scheme (`digest` ↔ `basic`). **On Dahua and
+  Hikvision, check that you added an ONVIF user**, which is a list of its own,
+  separate from the web users: the admin account you sign in to the browser
+  with is refused on an ONVIF endpoint until it also exists there. Enabling the
+  ONVIF service is a separate step again, and both are needed. If the URL works
+  with no credentials at all, set `"auth": "none"` and drop the
+  username/password.
 - **Reolink-style URLs** put credentials in the query string, so they need
   `"auth": "none"`. URL-encode any `&`, `#`, `+` or `%` in the password, or the
   URL silently parses wrong.
@@ -848,8 +851,11 @@ broken:
   multicast, which stops at the first router. A camera VLAN is common in
   exactly the setups that have the most cameras, so an empty result is normal
   there and means nothing about whether the cameras work. Type the address in.
-- **It will not find a camera with ONVIF turned off**, which some ship as the
-  default and which is a per-camera setting in its own web interface.
+- **It will not find a camera with ONVIF turned off**, and off is the state to
+  expect: every camera in the author's fleet arrived that way. It is a
+  per-camera setting in the camera's own web interface, so a scan that finds
+  nothing on a network full of cameras usually means exactly this rather than
+  a fault in the scan.
 
 Cameras that report nothing about their maker (a Reolink calls itself
 `IPC-BO`, a TP-Link Tapo calls itself `TC40`) show `? choose below` and you
