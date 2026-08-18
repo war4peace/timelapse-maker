@@ -423,8 +423,7 @@ connection, it is named on the page, and `update_check: false` turns it off.
 
 There has been no third-party security audit. What there is instead is a small
 and deliberately stated surface, described exactly in
-[docs/install.md §11](docs/install.md#11-the-web-ui), which is also where the
-setup instructions are.
+[docs/install.md §11](docs/install.md#11-the-web-ui), which is also where the setup instructions are.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
