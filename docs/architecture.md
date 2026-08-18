@@ -3000,6 +3000,37 @@ as a bad argument rather than a bad default. Same family as the wizard's
 `NameError`: the entry point is the worst place to learn this, and running the
 thing is the only way to.
 
+**A clean VM then found two more, and the first had shipped.** `install.ps1`
+sets `$ErrorActionPreference` to `Stop`, which is right for the cmdlets, and
+PowerShell 5.1 wraps every stderr line from a *native* command in a
+`NativeCommandError` record, which under `Stop` throws. So `python -c import
+requests` on a machine without requests, a probe whose entire purpose is to
+fail, killed the installer with a traceback instead of returning 1. It had been
+that way since the Windows port shipped, and **install.ps1 had therefore never
+been able to install on a machine without requests**: every machine it had run
+on already had it, so the probe succeeded, wrote nothing to stderr, and the trap
+never fired. `Invoke-Tool` now owns every native call there, relaxing the
+preference and putting it back, and seeding `$LASTEXITCODE` with a sentinel
+because that variable is only written by a process that actually started.
+
+The second was in the prerequisite stage and is worth keeping for how it was
+nearly misdiagnosed. `& $exe -version 2>$null | Select-Object -First 1` reports
+a **non-zero exit code**, because `Select-Object -First` stops the pipeline as
+soon as it has a line and PowerShell then terminates the upstream process, so
+the check reported a perfectly good ffmpeg as one that would not run. The first
+measurement of that took **one sample**, hit the one run in forty that finishes
+before the pipeline stops it, and cleared the pattern; a second measurement over
+forty runs found 39 failures. **A single sample of a race is not evidence**,
+which this project already knew from measuring retry recovery against an
+unanchored failure phase and had to learn again. Capture with `Out-String`, then
+take the line out of the string; a test scans for the shape.
+
+That probe had also broken a rule this project already had, and the rule is the
+reason the second bug was findable at all: **never discard a probe's stderr**.
+It reported "ffmpeg unpacked but will not run" and nothing else, which is a
+conclusion with no evidence under it. It prints the exit code and what the
+process said now, and keys on the version banner rather than on the exit code.
+
 **What none of that reaches is a real elevated install from the .exe**, which
 is a checklist, on a machine that can be put back:
 

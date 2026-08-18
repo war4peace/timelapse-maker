@@ -302,6 +302,35 @@ class TestNativeCallsUnderStop(unittest.TestCase):
                                 "%s:%d redirects a native stderr with nothing "
                                 "catching it: %s" % (name, number, line.strip()))
 
+    def test_no_native_command_feeds_select_object_first(self):
+        """Measured 2026-08-18: 39 failures in 40 runs.
+
+        Select-Object -First stops the pipeline the moment it has enough, and
+        PowerShell then terminates the upstream native process, so
+        $LASTEXITCODE comes back -1 for a command that did exactly what was
+        asked. `& ffmpeg -version | Select-Object -First 1` is therefore a
+        reliable way to conclude that ffmpeg will not run, and it is how a
+        clean VM came to be told its perfectly good download was broken.
+
+        Worth recording how it was nearly missed: the first measurement took
+        ONE sample, hit the one run in forty that finishes before the pipeline
+        stops it, and concluded the pattern was innocent. A single sample of a
+        race is not evidence, which this project already knew from measuring
+        retry recovery against an unanchored failure phase.
+
+        The fix is always the same shape: capture the whole stream with
+        Out-String, then take the line you want out of the string.
+        """
+        pattern = re.compile(r"&\s*\$\w+.*\|\s*Select-Object\s+-First")
+        for name, source in self.sources():
+            for number, line in enumerate(source.splitlines(), 1):
+                if line.lstrip().startswith("#"):
+                    continue
+                self.assertIsNone(
+                    pattern.search(line),
+                    "%s:%d terminates the process it is measuring: %s"
+                    % (name, number, line.strip()))
+
     def test_the_ffmpeg_probe_keeps_what_it_was_told(self):
         """The rule this project already had, broken here and restored.
 
