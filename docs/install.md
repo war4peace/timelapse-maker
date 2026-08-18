@@ -603,6 +603,37 @@ One summary per nightly run: what encoded, coverage, size, failures, and
 whether the transfer worked. It goes to as many places as you like, or
 nowhere, which is the default.
 
+![The nightly Discord summary from a Linux
+install](../screenshots/discord-notification-linux.png)
+
+*A full night on the Linux recorder. Roof reads 5,760 frames against the
+others' 17,280 and is still 100%: coverage is measured against the cadence
+**that camera** is running at, which is 15s there and 5s elsewhere, so a camera
+at a slower interval does not report as though it had missed most of the day.*
+
+![The same summary from a Windows
+install](../screenshots/discord-notification-windows.png)
+
+*The same night from a Windows install running two of the same cameras, which
+is what the format looks like on the other platform: identical, because it is
+the same code. Two differences are worth reading. The encoder is `hevc_nvenc`
+rather than `av1_nvenc`, chosen by probing rather than configured, because that
+GPU does not offer AV1. And **Roof is at 42% and Street4K at 17%**, which is
+correct and is the case worth recognising: that install had been running for
+part of the day only, and coverage under 100% counts the part of the day before
+capture started as missing, because it is.*
+
+Those two videos are the ones that appear twice in the library screenshot in
+[section 11](#the-index): two installs, one destination, one file each per
+camera per day.
+
+The table is sized from its contents rather than to fixed widths, because **a
+Discord embed is narrower than a Discord message**: about 50 columns of a
+monospace block survive before it wraps, and a wrapped row folds its last field
+onto a second line under the first, which reads as this program having printed
+garbage. The date is a heading rather than a column for the same reason, since
+it would otherwise repeat the same value on every row and cost ten of them.
+
 ```bash
 sudo timelapse notify
 ```

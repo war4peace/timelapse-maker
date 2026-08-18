@@ -53,6 +53,7 @@ stage; see [CONTRIBUTING.md](CONTRIBUTING.md).
 - [The `timelapse` command](#the-timelapse-command)
 - [Requirements and sizing](#requirements-and-sizing)
 - [Cameras](#cameras)
+- [Nightly summary](#nightly-summary)
 - [The web UI](#the-web-ui)
 - [Documentation](#documentation)
 - [Known limitations](#known-limitations)
@@ -363,6 +364,27 @@ authentication result there and then, so a camera that has not been set up yet
 says so while you are still looking at it.
 [docs/install.md](docs/install.md#common-snags) covers what each failure means,
 including the 401 that turns out to be an ONVIF user list.
+
+<sub>[&uarr; Contents](#contents)</sub>
+
+## Nightly summary
+
+One message per nightly run, to **Discord**, **ntfy**, **Telegram**, any
+combination, or nowhere, which is the default. Set it up with `timelapse
+notify`, which offers a test message for each as you go.
+
+![The nightly Discord summary](screenshots/discord-notification-linux.png)
+
+A row per camera with frames, coverage, size and how long it took, then the
+totals, the encoder that was actually used, free disk and whether the transfer
+worked. It is what tells you the thing worked without you going to look, and on
+Windows it is the only one of the two, since the web UI is Linux-only.
+
+Roof reads 5,760 frames against the others' 17,280 and is still 100%, because
+coverage is measured against the cadence *that* camera is running at.
+
+A failing notification can never fail the run it is reporting on, and one sink
+being down does not stop the others.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
