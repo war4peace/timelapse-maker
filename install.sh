@@ -451,7 +451,7 @@ case "\${1:-}" in
                     timelapse-encode.timer timelapse-encode.service \\
                     timelapse-web.service ;;
     version)
-        for f in capture encode test setup update platform cli web; do
+        for f in capture encode test setup update platform web cli gui; do
             printf '  %-8s %s\n' "\$f" \\
                 "\$(sed -n 's/^__version__ = "\(.*\)"/\1/p' $PREFIX/timelapse_\$f.py)"
         done
@@ -952,7 +952,7 @@ main() {
   ╚══════════════════════════════════════════════════════════╝
 BANNER
     printf '%s' "$N"
-    printf '  %sEXPERIMENTAL (v0.1.9)%s - early software, tested on one machine.\n' "$Y$B" "$N"
+    printf '  %sEXPERIMENTAL (v0.2.0)%s - early software, tested on one machine.\n' "$Y$B" "$N"
     note "Config format may change between versions. Not for production use."
 
     if [ "$DO_UNINSTALL" = "1" ]; then

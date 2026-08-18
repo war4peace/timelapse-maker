@@ -555,6 +555,70 @@ class TestVersions(unittest.TestCase):
         for name, version in found.items():
             self.assertRegex(version, r"^\d+\.\d+\.\d+", name)
 
+    def test_every_script_carries_the_same_version(self):
+        """A release bumps nine files by hand, and a partial bump is silent.
+
+        timelapse version exists to catch a stale script left by a partial
+        upgrade, which it does by comparing what is installed against a running
+        daemon. It cannot catch a release that shipped nine files with eight
+        versions between them, because that tree is internally consistent about
+        being wrong. Nothing was checking this; the .iss test next door names
+        the risk ("a version that lives in ten places drifts in one of them")
+        and only covered its own tenth.
+        """
+        found = dict(cli.installed_versions())
+        self.assertEqual(len(set(found.values())), 1,
+                         "scripts disagree: %s" % sorted(found.items()))
+
+    def test_the_installers_and_the_readme_agree_with_the_scripts(self):
+        """The other five places, in four languages.
+
+        install.ps1 and the .iss are already pinned to each other; this ties
+        that pair to the scripts, and picks up install.sh's banner and the
+        README badge, which are what an operator reads before installing.
+        """
+        version = dict(cli.installed_versions())["cli"]
+
+        ps1 = (ROOT / "install.ps1").read_text(encoding="ascii")
+        self.assertEqual(
+            re.search(r"\$VERSION\s*=\s*'([0-9.]+)'", ps1).group(1), version,
+            "install.ps1")
+
+        sh = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("EXPERIMENTAL (v%s)" % version, sh, "install.sh banner")
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("Version %s." % version, readme, "README")
+
+    def test_the_changelog_has_a_section_for_this_version(self):
+        """A release whose CHANGELOG still says Unreleased is one the update
+
+        panel cannot describe, and the link refs at the bottom are what make
+        the version in that panel clickable.
+        """
+        version = dict(cli.installed_versions())["cli"]
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        self.assertIn("## [%s]" % version, changelog, "no section")
+        self.assertIn("[%s]: https://" % version, changelog, "no link ref")
+
+    def test_install_sh_reports_the_same_scripts_as_the_dispatcher(self):
+        """Found by a real upgrade rehearsal, not by this suite.
+
+        install.sh installs nine scripts and its generated wrapper listed
+        eight, so `timelapse version` on Linux said nothing about
+        timelapse_gui.py. The comment above the install call states the exact
+        invariant that was broken: cli and gui are installed on Linux, where
+        neither runs, precisely so that "a version listing that differs by
+        platform is a listing somebody has to remember the exception to".
+
+        The neighbouring test pins the two front doors' COMMANDS. This pins
+        their script lists, which drifted underneath it.
+        """
+        source = (ROOT / "install.sh").read_text(encoding="utf-8")
+        listed = re.search(r"for f in ([a-z ]+); do", source)
+        self.assertIsNotNone(listed, "install.sh has no version listing loop")
+        self.assertEqual(set(listed.group(1).split()), set(cli.SCRIPTS))
+
     def test_the_eight_scripts_match_what_the_installers_place(self):
         """Three lists of files, in three languages, and this pins two of them
 

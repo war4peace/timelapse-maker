@@ -48,7 +48,7 @@ from timelapse_platform import (
     stop_service, task_exists, task_info, task_result, task_xml, use_colour,
 )
 
-__version__ = "0.1.9"
+__version__ = "0.2.0"
 
 # ----------------------------------------------------------------------------
 # Terminal helpers

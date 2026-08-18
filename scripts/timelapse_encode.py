@@ -41,7 +41,7 @@ from timelapse_platform import (CONFIG_PATH, IS_WINDOWS, NET_ERRORS,
                                 log_handler, net_error, no_console,
                                 share_root)
 
-__version__ = "0.1.9"
+__version__ = "0.2.0"
 
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")

@@ -252,13 +252,15 @@ timelapse version
 ```
 
 ```
-  capture  0.1.9
-  encode   0.1.9
-  test     0.1.9
-  setup    0.1.9
-  update   0.1.9
-  platform 0.1.9
-  web      0.1.9
+  capture  0.2.0
+  encode   0.2.0
+  test     0.2.0
+  setup    0.2.0
+  update   0.2.0
+  platform 0.2.0
+  web      0.2.0
+  cli      0.2.0
+  gui      0.2.0
 ```
 
 If the daemon predates the installed files it says so explicitly, which is the
