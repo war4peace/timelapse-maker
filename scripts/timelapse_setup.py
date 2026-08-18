@@ -319,10 +319,23 @@ def find_binary(name, fallback):
     return find_tool(name) or fallback
 
 
+def ffmpeg_defaults():
+    """(ffmpeg, ffprobe) for this platform when nothing has been configured.
+
+    A function rather than two constants, so it reads IS_WINDOWS when it is
+    called and a test can patch it. A module-level constant would be computed
+    at import and would answer about the machine running the tests.
+
+    Empty on Windows for the reason find_binary() gives at length: a made-up
+    path offered as though it existed is worse than no default at all.
+    """
+    return ("" if IS_WINDOWS else "/usr/bin/ffmpeg",
+            "" if IS_WINDOWS else "/usr/bin/ffprobe")
+
+
 def choose_tools(cfg):
     heading("ffmpeg")
-    ffmpeg_default = find_binary("ffmpeg", "" if IS_WINDOWS
-                                 else "/usr/bin/ffmpeg")
+    ffmpeg_default = find_binary("ffmpeg", ffmpeg_defaults()[0])
     if IS_WINDOWS:
         note("A folder is fine: give the one holding ffmpeg.exe and")
         note("ffprobe.exe and both will be taken from it.")
@@ -3559,18 +3572,47 @@ def localise_locations(cfg):
     the trap for CI, where the wizard is run *without* a template for exactly
     this reason, and then the Windows installer was given one.
 
-    Only the two state directories, deliberately. Frames, videos, logs, ffmpeg
-    and the transfer destination are all asked about, so a wrong value from a
-    template never survives the wizard; these two are the only locations
-    nobody is offered.
+    It covered only the two state directories at first, on the reasoning that
+    frames, videos, logs and ffmpeg are all *asked* about, so a wrong value
+    from a template could never survive the wizard. **That reasoning is
+    false**, and a real Windows install found it 2026-08-18: the graphical
+    wizard's ffmpeg box was pre-filled with `/usr/bin/ffmpeg`. Being asked is
+    not the same as being typed. Every one of those questions offers the
+    config's current value as its default, so a wrong value survives by being
+    accepted, and in a window it does not even look like a default: a filled
+    field reads as a discovered answer.
+
+    (The source there was not a template at all. `default_config()` hard-coded
+    the Linux tool paths in its no-template branch, three lines below a
+    state_dir that was carefully platform-aware. Both are fixed; this function
+    is the backstop that catches a config arriving by any other route.)
+
+    `transfer.destination` is deliberately still not localised. Clearing it
+    would silently disarm a configured transfer, which is worse than a wrong
+    path that the wizard asks about and the pre-flight probes by writing to.
     """
     # get(), never setdefault(). This runs on the single write path, so it sees
     # every config anything writes, and a normaliser there must correct what is
     # present and never invent what is not: the first version added empty
     # "paths" and "web" sections to configs that had neither, which its own
     # test caught by comparing the file byte for byte.
-    for section, key, default in (("paths", "state_dir", STATE_DIR_DEFAULT),
-                                  ("web", "state_dir", WEB_STATE_DIR_DEFAULT)):
+    ffmpeg, ffprobe = ffmpeg_defaults()
+    data = Path(DATA_ROOT_DEFAULT)
+    for section, key, default in (
+            ("paths", "state_dir", STATE_DIR_DEFAULT),
+            ("web", "state_dir", WEB_STATE_DIR_DEFAULT),
+            # str(Path) here, not as_posix(), and that is the distinction this
+            # project had to correct once: these are filesystem locations for
+            # the operator's own machine, so they want the platform's own
+            # spelling. The POSIX rule covers what is emitted for systemd.
+            ("paths", "frames_root", str(data / "frames")),
+            ("paths", "video_output", str(data / "videos")),
+            ("paths", "log_dir", str(data / "logs")),
+            # Empty rather than a guess, which is find_binary()'s rule: the
+            # wizard then falls back to detection and finds the real one,
+            # including an ffmpeg the installer provisioned.
+            ("paths", "ffmpeg", ffmpeg),
+            ("paths", "ffprobe", ffprobe)):
         block = cfg.get(section)
         if isinstance(block, dict) and foreign_path(block.get(key)):
             block[key] = default
@@ -3596,12 +3638,18 @@ def default_config(template_path=None):
                 for key in [k for k in block if k.startswith("_")]:
                     block.pop(key)
         cfg["cameras"] = []
-        localise_locations(cfg)
-        return cfg
-    return {
+        return localise_locations(cfg)
+    # Through localise_locations() as well, even though the values below are
+    # already right for this platform. The invariant worth having is that
+    # nothing leaves this function un-localised, rather than that each branch
+    # remembers to be: it was this branch, hard-coding /usr/bin/ffmpeg three
+    # lines below a carefully platform-aware state_dir, that put a Linux path
+    # into a Windows wizard.
+    ffmpeg, ffprobe = ffmpeg_defaults()
+    return localise_locations({
         "paths": {"frames_root": "", "video_output": "", "log_dir": "",
                   "state_dir": STATE_DIR_DEFAULT,
-                  "ffmpeg": "/usr/bin/ffmpeg", "ffprobe": "/usr/bin/ffprobe"},
+                  "ffmpeg": ffmpeg, "ffprobe": ffprobe},
         "capture": {"interval_seconds": 5, "timeout_seconds": 4,
                     "min_bytes": 4096, "min_free_gb": 60,
                     "log_every_n_failures": 60, "retry_within_tick": True,
@@ -3616,7 +3664,7 @@ def default_config(template_path=None):
         "discord": {"enabled": False, "webhook_url": "",
                     "username": "Timelapse Bot"},
         "cameras": [],
-    }
+    })
 
 
 def writable_paths(cfg):

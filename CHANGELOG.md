@@ -227,6 +227,12 @@ While the version is `0.x`, the configuration format may change in any release.
   both runners and neither leg is trusting the other to have looked.
 
 ### Fixed
+- **The Windows setup wizard offered `/usr/bin/ffmpeg`.** A Linux path, in a
+  window, on a machine that has no such file, presented in a filled field that
+  reads as a discovered answer rather than as a default. Reported from a real
+  Windows install. It now starts empty there and fills itself in from whatever
+  ffmpeg the machine actually has, including one the installer provisioned.
+
 - **Dahua cameras reported no picture size, and were never offered a larger
   stream.** Pressing Test on one showed the thumbnail and the file size but no
   dimensions, while every other make showed them. Those cameras write a block

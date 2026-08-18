@@ -3872,6 +3872,79 @@ class TestLocaliseLocations(unittest.TestCase):
         self.assertEqual(cfg["paths"]["state_dir"], plat.STATE_DIR_DEFAULT)
         self.assertEqual(cfg["web"]["state_dir"], plat.WEB_STATE_DIR_DEFAULT)
 
+    def test_a_foreign_ffmpeg_path_does_not_reach_the_wizard(self):
+        """Reported from a real Windows install 2026-08-18: the graphical
+
+        wizard's ffmpeg box was pre-filled with `/usr/bin/ffmpeg`.
+
+        This function used to cover the two state directories alone, on the
+        stated reasoning that ffmpeg is *asked* about so a wrong value could
+        never survive. Being asked is not the same as being typed: every one of
+        those questions offers the config's value as its default, so it
+        survives by being accepted, and in a window a filled field does not
+        read as a default at all. It reads as a discovered answer.
+        """
+        foreign = ({"paths": {"ffmpeg": "/usr/bin/ffmpeg",
+                              "ffprobe": "/usr/bin/ffprobe"}}
+                   if plat.IS_WINDOWS else
+                   {"paths": {"ffmpeg": r"C:\ffmpeg\bin\ffmpeg.exe",
+                              "ffprobe": r"C:\ffmpeg\bin\ffprobe.exe"}})
+        paths = setup.localise_locations(foreign)["paths"]
+        wanted = setup.ffmpeg_defaults()
+        self.assertEqual((paths["ffmpeg"], paths["ffprobe"]), wanted)
+
+    def test_the_windows_answer_is_empty_rather_than_a_guess(self):
+        """find_binary()'s rule, and the reason it is not cosmetic.
+
+        On Linux the installer has put ffmpeg at /usr/bin/ffmpeg by the time
+        any of this runs, so a wrong default is merely unhelpful. On Windows
+        nothing installed it, so a made-up path would be offered as though it
+        existed, accepted, and discovered at the first encode. Empty means "no
+        default", and the wizard then detects or insists.
+        """
+        with mock.patch.object(setup, "IS_WINDOWS", True):
+            self.assertEqual(setup.ffmpeg_defaults(), ("", ""))
+        with mock.patch.object(setup, "IS_WINDOWS", False):
+            self.assertEqual(setup.ffmpeg_defaults(),
+                             ("/usr/bin/ffmpeg", "/usr/bin/ffprobe"))
+
+    def test_the_no_template_default_config_is_localised_too(self):
+        """Where the reported defect actually came from.
+
+        Not a template at all: default_config()'s no-template branch hard-coded
+        the Linux tool paths, three lines below a state_dir that was carefully
+        platform-aware, and the graphical wizard calls exactly that branch
+        because it starts from default_config() with no template when there is
+        no config yet.
+        """
+        paths = setup.default_config()["paths"]
+        self.assertEqual((paths["ffmpeg"], paths["ffprobe"]),
+                         setup.ffmpeg_defaults())
+        for key in ("ffmpeg", "ffprobe", "state_dir"):
+            self.assertFalse(setup.foreign_path(paths[key]), key)
+
+    def test_a_foreign_data_directory_is_replaced_as_well(self):
+        # Same class as ffmpeg and found by looking rather than by being
+        # reported: the graphical wizard fills its Data folder box from
+        # frames_root, so a template's /var/lib/timelapse arrives there too.
+        foreign = ({"paths": {"frames_root": "/var/lib/timelapse/frames"}}
+                   if plat.IS_WINDOWS else
+                   {"paths": {"frames_root": r"C:\timelapse\frames"}})
+        cfg = setup.localise_locations(foreign)
+        self.assertFalse(setup.foreign_path(cfg["paths"]["frames_root"]))
+
+    def test_the_transfer_destination_is_deliberately_not_touched(self):
+        """Clearing it would silently disarm a configured transfer, which is
+
+        worse than a wrong path the wizard asks about and the pre-flight
+        probes by writing to it.
+        """
+        foreign = ({"transfer": {"destination": "/mnt/nas/tl"}}
+                   if plat.IS_WINDOWS else
+                   {"transfer": {"destination": r"U:\TL"}})
+        before = json.dumps(foreign)
+        self.assertEqual(json.dumps(setup.localise_locations(foreign)), before)
+
     def test_this_platforms_own_paths_are_left_exactly_alone(self):
         native = (self.windows_template() if plat.IS_WINDOWS
                   else self.linux_template())
