@@ -52,6 +52,23 @@ While the version is `0.x`, the configuration format may change in any release.
   exposed**, and change it on the camera. There is nothing to purge locally
   unless you redirected the output somewhere yourself.
 
+### Changed
+
+- **Windows: `timelapse` needs an Administrator prompt, whichever command it
+  is, and the documentation now says so.** It used to name `timelapse status`
+  and `timelapse version` as needing nothing, "from any window". They do:
+  `timelapse.cmd` lives in `%ProgramData%\timelapse` beside your camera
+  passwords, that folder is restricted to SYSTEM and Administrators so the
+  passwords are not readable by every account on the machine, and under UAC an
+  allow entry for Administrators does not apply to an administrator who has
+  not elevated. So an ordinary window is refused by Windows before this program
+  starts, with `Access is denied` and nothing else. The installer's closing
+  advice, `timelapse help`, the README and the install guide all say it plainly
+  now, and none of them draws a line the operator would fall over. Nothing
+  about how the software behaves has changed. If you would rather not use a
+  terminal at all, **Timelapse Setup** in the Start menu is the same wizard in
+  a window and asks for administrator by itself.
+
 ### Fixed
 
 - **A storage path with a space in it no longer stops both daemons.** A

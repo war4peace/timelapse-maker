@@ -502,6 +502,40 @@ class TestInstallerText(unittest.TestCase):
         self.assertIn("NEW", steps)
         self.assertIn("ADMINISTRATOR", steps)
 
+    def test_it_does_not_offer_a_command_as_needing_no_elevation(self):
+        """It named `status` and `version` as needing neither, and they do.
+
+        Measured unelevated on a real box: a directory granted only
+        `SYSTEM:(OI)(CI)F Administrators:(OI)(CI)F`, which is exactly what
+        Protect-ConfigDir writes, gives `UnauthorizedAccessException` on a read
+        and `Access is denied` from `cmd /c`. That is UAC's split token: an
+        allow entry for Administrators does not apply to an administrator who
+        has not elevated. `timelapse.cmd` is inside that directory, so the
+        refusal happens before any of this project's code runs and the four
+        words the operator sees are not ours to improve.
+
+        The reference install hid this: it carries a third entry for the
+        author's own account that the installer never writes, which is what
+        Explorer's "you don't currently have permission ... click Continue"
+        leaves behind. So the box this was developed on is the one box where
+        the claim was true.
+        """
+        text = self.SOURCE.decode("ascii")
+        steps = text.split("Step 'Next steps'", 1)[1]
+        # Comments dropped first, or this finds the paragraph above explaining
+        # the rule it enforces. That has bitten twice in one commit before
+        # (`tkinter is imported lazily`, `install.ps1 contains no sc.exe`), and
+        # the general form is that the unit of a source-scanning test is a
+        # token and never a substring. A leading # is PowerShell's whole
+        # comment syntax and nothing in this block puts one inside a string.
+        printed = "\n".join(line for line in steps.splitlines()
+                            if not line.lstrip().startswith("#")).lower()
+        self.assertIn("timelapse test", printed, "found no advice to check")
+        for claim in ("need neither", "needs nothing", "need nothing",
+                      "any window", "without administrator"):
+            self.assertNotIn(claim, printed,
+                             "every command here needs the elevated prompt")
+
     def test_the_commands_it_names_are_ones_the_cli_has(self):
         text = self.SOURCE.decode("ascii")
         steps = text.split("Step 'Next steps'", 1)[1]
@@ -510,7 +544,9 @@ class TestInstallerText(unittest.TestCase):
         self.assertTrue(named, "it names no commands at all")
         for line in named:
             command = line.split()[1]
-            self.assertIn(command, set(cli.COMMANDS) | set(cli.SPECIAL),
+            self.assertIn(command,
+                          set(cli.COMMANDS) | set(cli.SPECIAL)
+                          | set(cli.HELP_ALIASES),
                           "install.ps1 recommends a command that does not exist")
 
     def test_an_upgrade_does_not_walk_the_wizard_again(self):

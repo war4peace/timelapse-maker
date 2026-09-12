@@ -190,9 +190,9 @@ To run the checks again at any point, under *Linux*:
 sudo timelapse test
 ```
 
-On *Windows*, the same command needs an **Administrator** prompt and no `sudo`.
-Open that prompt after installing: `timelapse` is added to the system PATH, and
-only new processes inherit it.
+On *Windows*, the same command needs an **Administrator** prompt and no `sudo`,
+and so does every other `timelapse` command. Open that prompt after installing:
+`timelapse` is added to the system PATH, and only new processes inherit it.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
@@ -275,12 +275,22 @@ because it holds your camera passwords. On Linux
 `%ProgramData%\timelapse` is restricted to SYSTEM and Administrators. Without
 those rights the command tells you so and stops; it does not half-run.
 
-`status`, `logs`, `version` and `timelapse update --check` need nothing. On
-Linux, for `logs` to show more than your own messages you must be in the `adm`
-or `systemd-journal` group, which is usually already true of the account that
-installed this. Read-only commands (`test`, `usage`) also work if you add
-yourself to the `timelapse` group; the ones that *write* the config still need
-root, since mode `640` grants the group read but not write.
+**On Windows, run `timelapse` from an elevated prompt, whichever command it
+is.** The marks above are about the configuration file, and that part is true
+on both systems, but the `timelapse` wrapper itself lives in that restricted
+folder, so an ordinary window is refused by Windows before this program starts
+and says only `Access is denied`. Right-click PowerShell or Command Prompt in
+the Start menu and choose *Run as administrator*. Most people never need any
+of this: **Timelapse Setup** in the Start menu is the wizard in a window and
+asks for administrator itself.
+
+On Linux the unmarked ones, `status`, `logs`, `version` and
+`timelapse update --check`, need nothing. For `logs` to show more than your own
+messages you must be in the `adm` or `systemd-journal` group, which is usually
+already true of the account that installed this. Read-only commands (`test`,
+`usage`) also work if you add yourself to the `timelapse` group; the ones that
+*write* the config still need root, since mode `640` grants the group read but
+not write.
 
 Full descriptions in
 [docs/install.md](docs/install.md#8-day-to-day-the-timelapse-command).

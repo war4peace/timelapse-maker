@@ -173,8 +173,12 @@ The service runs as LocalSystem and restarts itself if it stops unexpectedly,
 which is the equivalent of `Restart=always RestartSec=15`. Start it the first
 time with `sc start "TimelapseCapture"`; after a reboot it starts itself.
 
-**Open a new terminal before using `timelapse`.** A PATH change only reaches
-processes started after it.
+**Open a new terminal, as administrator, before using `timelapse`.** New,
+because a PATH change only reaches processes started after it. Administrator
+for every command and not only the ones that change something: the wrapper
+sits in `%ProgramData%\timelapse` beside the camera passwords, and that folder
+is restricted to SYSTEM and Administrators, so an ordinary window is refused
+with `Access is denied` before this program runs. See §8.
 
 **There is a graphical wizard, if you would rather click than type.** The
 installer adds **Timelapse Setup** to the Start menu, under timelapse-maker. It
@@ -764,6 +768,23 @@ the `adm` or `systemd-journal` group, and says so when you are not.
 
 Getting this wrong is not dangerous: the command says which file it could not
 read and stops, rather than half-running.
+
+**On Windows the right-hand column is empty: open the prompt as
+administrator, whichever command you want.** The split above is about
+`config.json`, and that part is true on both systems, but `timelapse.cmd`
+itself lives in `%ProgramData%\timelapse`, which the installer restricts to
+SYSTEM and Administrators so that the camera passwords beside it are not
+readable by every account on the machine. Under UAC an allow entry for
+Administrators does not apply to an administrator who has not elevated, so
+`timelapse status` from an ordinary window is refused by Windows before this
+program starts, and the message is `Access is denied` with nothing after it.
+That is not a fault to report; it is the prompt.
+
+There is no `sudo` on Windows: privilege comes from how the window was opened.
+Right-click PowerShell or Command Prompt in the Start menu and choose **Run as
+administrator**. If you would rather not use a terminal at all, you do not have
+to: **Timelapse Setup** in the Start menu is the same wizard in a window, and
+it asks for administrator by itself.
 
 **A config change only reaches capture when it restarts.** The daemon reads its
 camera list once, at startup. `timelapse cameras` handles that for you; after a

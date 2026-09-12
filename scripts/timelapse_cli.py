@@ -211,11 +211,15 @@ HELP = """timelapse - unattended daily timelapses from IP cameras
 USAGE
   timelapse <command> [options]
 
-Commands marked [admin] read or write the configuration file, which holds your
-camera passwords. Without an elevated prompt they say so and stop; nothing
-half-runs. There is no sudo here: privilege comes from how the window was
-opened, so right-click PowerShell in the Start menu and choose "Run as
-administrator".
+EVERY command here needs an elevated prompt, including the ones that only
+look. There is no sudo: privilege comes from how the window was opened, so
+right-click PowerShell or Command Prompt in the Start menu and choose "Run as
+administrator". Without it Windows refuses `timelapse` itself, with "Access is
+denied" and nothing else, because the wrapper lives in the same folder as your
+camera passwords and that folder is restricted to administrators.
+
+[admin] marks the ones that read or write the configuration file. Those say so
+in this program's own words and stop; nothing half-runs.
 
 CONFIGURING
   gui          [admin]  The same wizard in a window, which is the one to use if
@@ -341,6 +345,12 @@ def do_config(extra):
 SPECIAL = {"logs": do_logs, "status": do_status, "version": do_version,
            "config": do_config}
 
+# Named rather than inline, because install.ps1 recommends `timelapse help` in
+# its closing advice and the test that checks it only ever recommends a real
+# command has to have somewhere to look. A command spelled three ways is still
+# one command.
+HELP_ALIASES = ("-h", "--help", "help")
+
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
@@ -350,7 +360,7 @@ def main(argv=None):
         show_help()
         return 1
     command, extra = argv[0], argv[1:]
-    if command in ("-h", "--help", "help"):
+    if command in HELP_ALIASES:
         show_help()
         return 0
     if command in ("-V", "--version"):

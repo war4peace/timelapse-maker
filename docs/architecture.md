@@ -1869,6 +1869,45 @@ new file and the config loses its group. On Windows a new file inherits the
 file created there afterwards, including an editor's temporary copies, is
 covered by where it is rather than by what the editor did.
 
+**What that ACL also covers is `bin\timelapse.cmd`, so every command needs an
+elevated prompt** (0.2.1, documentation only). The grant is `(OI)(CI)`, so it
+propagates, and under UAC's split token an allow entry for Administrators does
+not apply to an administrator who has not elevated. Measured unelevated on a
+real box against a scratch directory granted exactly what `Protect-ConfigDir`
+writes: reading the wrapper raises `UnauthorizedAccessException` and `cmd /c`
+answers `Access is denied`, exit 1. So the refusal happens **before any of this
+project's code runs**, which means the dispatcher's own careful refusal message
+is never reached and the four words the operator sees are not ours to improve.
+
+The installer's closing advice used to name `status` and `version` as needing
+neither a new window nor administrator. That was measured false, and the
+scoping call is to **say so rather than to widen the ACL**: the Windows build
+exists so that nobody has to use a terminal (Start menu, Timelapse Setup,
+which elevates itself), so the terminal being an elevated one costs the
+ordinary operator nothing, while a Users grant on the wrapper directory would
+be a second permission story to keep straight next to the one that guards the
+camera passwords. A test pins the installer text against the old claim.
+
+**The reference install is the one box where the claim was true**, which is how
+it survived: `icacls` there shows a third entry for the author's own account
+that `install.ps1` never writes, left behind by Explorer's "you don't currently
+have permission to access this folder, click Continue to permanently get
+access". So the README's "restricted to SYSTEM and Administrators" was already
+untrue of the machine it was written on. **Anything in this tree that is
+compared against a developer's own box has to be compared against a clean ACL
+too**, which is the permission-model cousin of "a local branch is a branch CI
+has never seen".
+
+**Still open, and not a CLI question.** `DATA_ROOT_DEFAULT` is that same
+directory, so an operator who accepts the default on a single-disk box gets
+`frames`, `videos` and `logs` inside the restricted tree, and opening one of
+their own timelapses in Explorer or VLC meets the same refusal, with Explorer
+offering the "click Continue" that writes the third entry above. Documenting
+the CLI does not answer that: it is the product's output rather than its
+administration. The two candidate answers are to default the data root to a
+sibling of the config directory rather than a child, or to grant Users read
+and execute on the videos subtree; neither has been chosen.
+
 **The name an administrator finds a service by is its display name.**
 `services.msc` sorts by it, and `CreateServiceW`'s third argument is
 `lpDisplayName` rather than the description. Passing the description there

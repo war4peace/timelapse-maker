@@ -524,10 +524,18 @@ if (Test-Path $CONFIG) {
 
 Step 'Next steps'
 # Both halves of this were wrong to leave implicit. NEW, because a PATH change
-# reaches only processes started after it, and ADMINISTRATOR, because the two
-# commands named here read the configuration file that holds the camera
-# passwords and refuse without it. Telling somebody to open a terminal and then
+# reaches only processes started after it, and ADMINISTRATOR, because of the
+# directory the wrapper lives in. Telling somebody to open a terminal and then
 # watching them be refused is a worse first five minutes than saying so.
+#
+# This used to name `status` and `version` as needing neither, on the reasoning
+# that they read nothing secret. That was wrong, and measured: `timelapse.cmd`
+# sits inside the directory Protect-ConfigDir restricts to SYSTEM and
+# Administrators, and under UAC's split token an allow entry for Administrators
+# does not apply to an unelevated administrator. So cmd answers `Access is
+# denied` before any of this program runs, and the four words are not ours.
+# Every command needs the elevated prompt, so say that once rather than
+# drawing a line the operator will fall over.
 Say 'To change the settings without a prompt at all:'
 Say '  Start menu -> timelapse-maker -> Timelapse Setup'
 Note 'The same questions in a window. It asks for Administrator itself.'
@@ -535,11 +543,12 @@ Write-Host ''
 Say 'Open a NEW Command Prompt or PowerShell, AS ADMINISTRATOR, then:'
 Say '  timelapse test        check the cameras, ffmpeg and the disk'
 Say '  timelapse cameras     add or edit a camera'
-Note 'New, because PATH only reaches windows opened after it changed.'
-Note 'Administrator, because those two read the file holding your camera'
-Note 'passwords. These need neither, from any window:'
 Say '  timelapse status      is the service running'
-Say '  timelapse version     what is installed'
+Say '  timelapse help        every command'
+Note 'New, because PATH only reaches windows opened after it changed.'
+Note 'Administrator for all of them, including the ones that only look:'
+Note 'timelapse lives in the folder holding your camera passwords, and an'
+Note 'ordinary window is refused by Windows before it starts.'
 Write-Host ''
 Say 'Start capturing:'
 Say '  sc start "TimelapseCapture"'
