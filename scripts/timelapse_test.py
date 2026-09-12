@@ -230,14 +230,16 @@ def probe_profiles(cam, cfg):
 
 def test_encoders(cfg):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from timelapse_encode import (build_candidates, encoder_hint,
-                                  list_encoders, probe_encoder_detail)
+    from timelapse_encode import (build_candidates, driver_mismatch,
+                                  encoder_hint, is_nvenc, list_encoders,
+                                  probe_encoder_detail)
     ffmpeg = cfg["paths"]["ffmpeg"]
     if not shutil.which(ffmpeg) and not Path(ffmpeg).exists():
         bad(f"ffmpeg not found at {ffmpeg}")
         return
     built = list_encoders(ffmpeg)
     found = False
+    mismatch, asked = None, False
     for cand in build_candidates(cfg["encode"]):
         available, message = probe_encoder_detail(ffmpeg, cand)
         if available:
@@ -249,7 +251,9 @@ def test_encoders(cfg):
         # Say *why*. "Unknown encoder" (rebuild ffmpeg) and "No capable
         # devices" (GPU/driver) share an exit code but need opposite fixes.
         in_build = None if built is None else (cand["codec"] in built)
-        hint = encoder_hint(cand["codec"], message, in_build)
+        if not asked and in_build is not False and is_nvenc(cand['codec']):
+            mismatch, asked = driver_mismatch(message), True
+        hint = encoder_hint(cand["codec"], message, in_build, mismatch)
         if hint:
             info(f"      {hint}")
         if message:
@@ -266,8 +270,9 @@ def diagnose_encoders(cfg):
     default ("No capable devices found") is the least useful of all.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from timelapse_encode import (PROBE_SIZE, encoder_hint, list_encoders,
-                                  probe_encoder_detail, probe_encoder_verbose)
+    from timelapse_encode import (PROBE_SIZE, driver_mismatch, encoder_hint,
+                                  list_encoders, probe_encoder_detail,
+                                  probe_encoder_verbose)
     ffmpeg = cfg["paths"].get("ffmpeg", "ffmpeg")
 
     print("\n=== ffmpeg ===")
@@ -298,6 +303,9 @@ def diagnose_encoders(cfg):
         info("av1_nvenc at all. jellyfin-ffmpeg or a BtbN static build will.")
 
     print("\n=== GPU ===")
+    # Tri-state, and it reaches the probe section below: None means nobody
+    # could tell, which must not read as a clean bill of health.
+    gpu_mismatch = None
     try:
         q = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,driver_version,encoder.stats.sessionCount",
@@ -309,7 +317,23 @@ def diagnose_encoders(cfg):
             info("nvidia-smi does not report which codecs NVENC supports; "
                  "only the probe below can tell you that")
         else:
-            warn("nvidia-smi returned nothing useful")
+            # Never "returned nothing useful". What it says when it fails is
+            # the most useful line on this page: a driver upgraded under a
+            # running kernel module says so here and nowhere else.
+            bad("nvidia-smi could not read the GPU")
+            for line in ((q.stderr or "") + (q.stdout or "")).strip().splitlines():
+                info(f"  {line.strip()}")
+            gpu_mismatch = driver_mismatch(
+                (q.stderr or "") + (q.stdout or ""), runner=lambda: q)
+            if gpu_mismatch is True:
+                bad("The loaded kernel module and the installed driver "
+                    "libraries are different versions.")
+                info("  An upgraded NVIDIA driver looks exactly like this "
+                     "until the machine is rebooted.")
+                info("  Nothing below will find a hardware encoder until you "
+                     "reboot; check /var/log/apt/history.log for when the")
+                info("  driver changed. Capture is unaffected, and the nightly "
+                     "encode falls back to libx264 in the meantime.")
     except FileNotFoundError:
         warn("nvidia-smi not found - no NVIDIA driver installed?")
     except Exception as exc:
@@ -325,7 +349,7 @@ def diagnose_encoders(cfg):
             ok(f"{codec} works")
             continue
         bad(f"{codec} failed")
-        hint = encoder_hint(codec, message, True)
+        hint = encoder_hint(codec, message, True, gpu_mismatch)
         if hint:
             info(f"  {hint}")
         # The reason ffmpeg hides at error level.

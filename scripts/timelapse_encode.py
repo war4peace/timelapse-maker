@@ -440,24 +440,125 @@ def probe_encoder_verbose(ffmpeg, candidate, size=None):
     return lines
 
 
-def encoder_hint(codec, message, built_in=None):
+# ffmpeg reports every NVENC API failure in one shape, "<Call> failed: <reason>
+# (<code>)", where the reason and the code come from a single fixed table in
+# libavcodec/nvenc.c. The reason is the diagnosis; the name of the call that
+# returned it is not.
+#
+# Reading the call name is how a driver upgraded under a running kernel module
+# came to be reported as "no free NVENC session - another process may be
+# holding them all". The failing call is nvEncOpenEncodeSessionEx whatever went
+# wrong, so a bare search for "session" matches every NVENC failure there is.
+# Reported from the real deployment 2026-09-13, two nights of CPU encoding
+# behind a hint that would have sent the operator to stop their NVR.
+# The code is optional because probe_encoder_detail caps stderr at 300
+# characters, so a long message can arrive with the "(10)" cut off it. The
+# reason text alone is enough to classify, and absence of evidence in truncated
+# output is not evidence of absence.
+NVENC_FAILURE = re.compile(r"failed: ([a-z][a-z ]*[a-z])(?: \((\d+)\))?")
+
+
+def nvenc_failure(message):
+    """(reason, code) from the first NVENC API failure in a probe's stderr.
+
+    `code` is 0 when the text was truncated before it. None when there is no
+    such line at all, which is the ordinary case for everything that goes wrong
+    before the API is reached: an encoder missing from the build, a library
+    that will not load, a CUDA device that will not open.
+    """
+    found = NVENC_FAILURE.search((message or "").lower())
+    if not found:
+        return None
+    return found.group(1), int(found.group(2) or 0)
+
+
+# Text that identifies a kernel module and a userspace library from different
+# driver releases. NVML prints the first when nvidia-smi itself refuses to
+# start; CUDA prints the other two. Any one of them settles it alone.
+def is_nvenc(codec):
+    """Whether a hint about the NVIDIA driver could possibly apply."""
+    return (codec or "").endswith("_nvenc")
+
+
+MISMATCH_MARKERS = (
+    "driver/library version mismatch",
+    "system_driver_mismatch",
+    "unsupported display driver",
+)
+
+
+def driver_mismatch(message="", runner=None):
+    """True if the NVIDIA kernel module and the userspace libraries disagree.
+
+    True, False, or None for "cannot tell", which is not the same answer: a
+    checker's own limitations are never a finding about what it checks.
+
+    Deliberately independent of ffmpeg. A driver package upgraded under a
+    running kernel module leaves NVENC returning an ordinary status code, so
+    the probe alone cannot tell that state apart from a GPU that is merely
+    busy, and guessing between them sends the operator to the wrong machine.
+    NVML refusing to initialise at all is the witness that can, and it is one
+    subprocess on a path that has already failed.
+    """
+    if any(marker in (message or "").lower() for marker in MISMATCH_MARKERS):
+        return True
+    run = runner or (lambda: subprocess.run(
+        ["nvidia-smi"], capture_output=True, text=True, timeout=30,
+        **no_console()))
+    try:
+        p = run()
+    except Exception:
+        return None
+    text = ((p.stdout or "") + (p.stderr or "")).lower()
+    return True if any(k in text for k in MISMATCH_MARKERS) else False
+
+
+def encoder_hint(codec, message, built_in=None, mismatch=None):
     """Plain-language cause for a failed probe, or '' if there is nothing useful.
 
     Derived from ffmpeg's message, never guessed from the codec name. An
     earlier version guessed and told an RTX 4060 owner their GPU was too old
     for AV1, which was both wrong and a dead end.
+
+    `built_in` and `mismatch` are facts the caller established elsewhere, and
+    both are tri-state: None means nobody looked. Keeping them arguments is
+    what keeps this function pure and testable without a GPU.
     """
     m = (message or "").lower()
+    # Every branch below that names a driver or a GPU applies to NVENC and to
+    # nothing else. libx264 is software: a mismatched kernel module has no
+    # bearing on why it failed, and sending someone to reboot over it is the
+    # same dead end as telling an RTX 4060 owner their GPU was too old for AV1.
+    # Blanking the reason here gates all of them at once.
+    reason = (nvenc_failure(m) or ("", 0))[0] if is_nvenc(codec) else ""
     if built_in is False or "unknown encoder" in m:
         return (f"this ffmpeg build does not include {codec}; "
                 f"try jellyfin-ffmpeg or a BtbN static build")
+    if is_nvenc(codec) and mismatch is True:
+        # Above every NVENC branch below, because it is the one answer here
+        # that is established rather than inferred, and the remedy is a reboot
+        # rather than anything about this program or the GPU.
+        return ("the loaded NVIDIA kernel module and the installed driver "
+                "libraries are different versions, which is what an upgraded "
+                "driver looks like before a reboot; reboot and this comes back")
     if "minimum required nvidia driver" in m:
         return "the NVIDIA driver is older than this ffmpeg build requires"
+    if reason == "invalid version":
+        return ("the driver and this ffmpeg build disagree about the NVENC API "
+                "version; that is a driver upgraded without a reboot, or an "
+                "ffmpeg newer than the driver")
     if "cannot load" in m or "libnvidia-encode" in m:
         return "the NVIDIA encode library is missing; install the driver's NVENC support"
-    if "out of memory" in m or "session" in m:
+    if reason == "out of memory":
+        # NVENC reports its concurrent session cap this way, and only this way.
+        # Keyed on the reason rather than on the call name so that the other
+        # dozen reasons the same call can fail with no longer land here.
         return ("no free NVENC session - another process (an NVR, a "
                 "transcoder) may be holding them all")
+    if reason in ("unsupported device", "no encode device", "invalid device"):
+        return (f"the driver refused this GPU for NVENC ({reason}). If it "
+                f"normally works, check that the driver is loaded and healthy "
+                f"with nvidia-smi")
     if "invalid param" in m and "dimension" in m:
         return "the probe frame was rejected as too small - please report this"
     if "not supported" in m and any(
@@ -465,7 +566,8 @@ def encoder_hint(codec, message, built_in=None):
         return (f"{codec} rejected the pixel format offered to it. The probe "
                 f"forces {PIX_FMT}, so seeing this means the GPU cannot "
                 f"encode {codec} even in 4:2:0")
-    if "codec not supported" in m or "no capable devices" in m:
+    if is_nvenc(codec) and ("codec not supported" in m
+                            or "no capable devices" in m):
         # Ambiguous on purpose: the driver did not advertise this codec for
         # this GPU, which is either a genuinely incapable GPU or an ffmpeg
         # whose NVENC headers predate the codec. Do not assert which.
@@ -477,6 +579,7 @@ def encoder_hint(codec, message, built_in=None):
 
 def select_encoder(ffmpeg, enc):
     built = list_encoders(ffmpeg)
+    mismatch, asked = None, False
     for cand in build_candidates(enc):
         ok, message = probe_encoder_detail(ffmpeg, cand)
         log.info("  probe %-22s %s", cand["name"],
@@ -484,11 +587,23 @@ def select_encoder(ffmpeg, enc):
         if ok:
             return cand
         in_build = None if built is None else (cand["codec"] in built)
-        hint = encoder_hint(cand["codec"], message, in_build)
+        # Once per run, and only for an NVENC codec this ffmpeg actually
+        # carries. A missing encoder is settled by that fact alone, and libx264
+        # failing has nothing to do with the NVIDIA driver, so neither is worth
+        # a subprocess. Found by reading temp/nvenc_hint_demo.py's output: an
+        # earlier version of this line said the same thing in a comment and
+        # then consulted nvidia-smi about libx264.
+        if not asked and in_build is not False and is_nvenc(cand["codec"]):
+            mismatch, asked = driver_mismatch(message), True
+        hint = encoder_hint(cand["codec"], message, in_build, mismatch)
         if hint:
             log.info("      %s", hint)
+        # INFO, not debug. This runs at INFO, so a debug call here is a
+        # discard, and probe_encoder_detail's own docstring says never swallow
+        # this. The hint is an interpretation and has been wrong; ffmpeg's own
+        # words are the only part of these two lines that cannot be.
         if message:
-            log.debug("      ffmpeg: %s", message)
+            log.info("      ffmpeg: %s", message)
     return None
 
 

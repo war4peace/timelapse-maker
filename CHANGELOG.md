@@ -9,6 +9,7 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## Contents
 
+- [Unreleased](#unreleased)
 - [0.2.0 - 2026-08-18](#020---2026-08-18)
 - [0.1.9 - 2026-08-15](#019---2026-08-15)
 - [0.1.8 - 2026-08-15](#018---2026-08-15)
@@ -29,6 +30,32 @@ While the version is `0.x`, the configuration format may change in any release.
 - [0.0.3 - 2026-08-05](#003---2026-08-05)
 - [0.0.2 - 2026-08-05](#002---2026-08-05)
 - [0.0.1 - 2026-08-05](#001---2026-08-05)
+
+## [Unreleased]
+
+### Fixed
+
+- **The nightly run no longer blames your NVR when the NVIDIA driver was
+  upgraded.** If hardware encoding stopped working, the log said `no free
+  NVENC session - another process (an NVR, a transcoder) may be holding them
+  all`, and for one real deployment that was wrong: the driver packages had
+  been upgraded by unattended-upgrades while the old kernel module was still
+  loaded, and the fix was a reboot rather than anything to do with the NVR.
+  ffmpeg names the failing call `OpenEncodeSessionEx` whatever the reason, so
+  the old message was triggered by the word "session" in a function name. The
+  reason is read properly now, and a driver upgraded without a reboot is
+  detected from `nvidia-smi` and named as exactly that.
+
+- **`timelapse test --encoders` says what `nvidia-smi` said.** It used to
+  report `nvidia-smi returned nothing useful` and discard the output, which on
+  a mismatched driver is the one line that explains the whole problem.
+
+- **The nightly log now carries ffmpeg's own words** for a failed encoder
+  probe, not just this program's interpretation of them. The interpretation
+  has been wrong; the quote cannot be.
+
+Nothing about a working install changes: capture never touches the GPU, and an
+encode that falls back to libx264 was producing correct videos all along.
 
 ## [0.2.0] - 2026-08-18
 

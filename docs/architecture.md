@@ -378,6 +378,37 @@ Pipeline, in `main()`:
    `list_encoders()` confirms whether the codec is compiled in at all. An
    earlier version guessed from the codec name and told an RTX 4060 owner their
    GPU was too old for AV1.
+   **`encoder_hint()` keys on the NVENC reason, never on the failing call.**
+   ffmpeg reports every NVENC failure as `<Call> failed: <reason> (<code>)`,
+   the reason and code coming from one fixed table in `libavcodec/nvenc.c`, and
+   the call is `nvEncOpenEncodeSessionEx` whatever went wrong. Until 0.2.1 the
+   classifier matched the bare substring `session`, so all of
+   `unsupported device (2)`, `invalid version (15)` and the genuine
+   `out of memory (10)` were announced as "no free NVENC session, another
+   process may be holding them all". `nvenc_failure()` parses the reason out
+   instead; the code is optional in that regex because `probe_encoder_detail()`
+   caps stderr at 300 characters and can truncate it away.
+   **A driver/library mismatch cannot be read from the probe at all**, which is
+   why `driver_mismatch()` exists and asks a different program. An NVIDIA
+   package upgraded under a running kernel module leaves NVENC returning
+   ordinary status codes, indistinguishable from a GPU that is merely busy;
+   NVML refusing to initialise is the witness that settles it, so the check
+   runs `nvidia-smi` and looks for `Driver/library version mismatch` (or the
+   CUDA spellings, which ffmpeg sometimes prints itself and which then save the
+   subprocess). It answers **True, False or None**, the last meaning nothing
+   here could tell, because a checker's own limitations are never a finding
+   about what it checks. It is asked **once per run**, only after a probe has
+   already failed, and never for a codec missing from the build. The result
+   outranks every NVENC reading in `encoder_hint()`, since it is established
+   rather than inferred, but only for `*_nvenc` codecs: blaming a mismatched
+   driver for libx264 failing is the RTX 4060 error in a new coat, and a test
+   caught exactly that in the first cut of this.
+   **`select_encoder()` logs ffmpeg's own message at INFO**, not `debug`. The
+   run sets the logger to INFO, so a `log.debug` there was a discard, and the
+   line it discarded is the only part of those two lines that cannot be wrong.
+   Reported from the real deployment 2026-09-13, where 595.84 was upgraded to
+   595.91 by unattended-upgrades and two nights encoded on libx264 behind a
+   hint pointing at an innocent NVR.
 2. `find_pending()` → every date directory across all enabled cameras whose name
    sorts `< today` **and carries no `.encoded.json`**, oldest first, capped to
    the newest `max_backlog_days` distinct dates. It returns `(jobs, done)`;

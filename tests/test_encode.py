@@ -687,9 +687,235 @@ class TestVerboseProbeFiltering(unittest.TestCase):
         self.assertIn("report", hint)
 
     def test_session_exhaustion_is_recognised(self):
-        hint = enc.encoder_hint("hevc_nvenc", "OpenEncodeSessionEx failed: out of memory",
+        # The real line, code and all. The old version of this test passed a
+        # truncated string containing both "out of memory" and "session", so it
+        # could not tell the two clauses apart and went on passing while the
+        # one under test matched a function name.
+        hint = enc.encoder_hint(
+            "hevc_nvenc",
+            "[hevc_nvenc @ 0x55f] OpenEncodeSessionEx failed: "
+            "out of memory (10): (no details)",
+            built_in=True)
+        self.assertIn("session", hint.lower())
+
+    def test_the_call_name_alone_does_not_mean_session_exhaustion(self):
+        """The defect this whole classifier was rewritten for.
+
+        Every NVENC failure comes back from nvEncOpenEncodeSessionEx, so the
+        word "session" is in all of them. Reported from the deployment
+        2026-09-13: a driver upgraded under a running kernel module was
+        announced as another process holding every encode session, which would
+        have sent the operator to stop an NVR that was innocent.
+        """
+        for reason in ("unsupported device (2)", "invalid version (15)",
+                       "no encode device (1)", "invalid device (4)"):
+            hint = enc.encoder_hint(
+                "hevc_nvenc",
+                f"[hevc_nvenc @ 0x55f] OpenEncodeSessionEx failed: {reason}: "
+                f"(no details) No capable devices found",
+                built_in=True)
+            self.assertNotIn("no free NVENC session", hint,
+                             f"{reason} is not session exhaustion")
+
+    def test_a_truncated_reason_still_classifies(self):
+        """probe_encoder_detail caps stderr at 300 characters.
+
+        A long message can therefore arrive with the "(10)" cut off it, and the
+        reason text alone has to be enough.
+        """
+        hint = enc.encoder_hint("hevc_nvenc",
+                                "OpenEncodeSessionEx failed: out of memory",
                                 built_in=True)
         self.assertIn("session", hint.lower())
+
+    def test_invalid_version_names_the_driver_not_the_gpu(self):
+        hint = enc.encoder_hint(
+            "av1_nvenc",
+            "OpenEncodeSessionEx failed: invalid version (15): (no details)",
+            built_in=True)
+        self.assertIn("NVENC API version", hint)
+        self.assertIn("reboot", hint)
+
+    def test_a_confirmed_mismatch_outranks_every_nvenc_reading(self):
+        """Established beats inferred.
+
+        nvidia-smi refusing to start is proof; the NVENC status code is not,
+        because a mismatched driver returns ordinary ones. So a confirmed
+        mismatch has to win even against a message that reads like something
+        else entirely.
+        """
+        hint = enc.encoder_hint(
+            "hevc_nvenc",
+            "OpenEncodeSessionEx failed: out of memory (10): (no details)",
+            built_in=True, mismatch=True)
+        self.assertIn("reboot", hint)
+        self.assertNotIn("no free NVENC session", hint)
+
+    def test_a_missing_build_still_outranks_a_mismatch(self):
+        """A codec that is not in the build cannot be fixed by rebooting."""
+        hint = enc.encoder_hint("av1_nvenc", "Unknown encoder 'av1_nvenc'",
+                                built_in=False, mismatch=True)
+        self.assertIn("build", hint)
+        self.assertNotIn("reboot", hint)
+
+
+class TestDriverMismatch(unittest.TestCase):
+    """The witness that the probe alone cannot be.
+
+    A driver upgraded under a running kernel module leaves NVENC returning
+    ordinary status codes, so ffmpeg's text cannot settle it. NVML refusing to
+    initialise can, and that is a different program.
+    """
+
+    class Reply:
+        def __init__(self, stdout="", stderr=""):
+            self.stdout, self.stderr = stdout, stderr
+
+    def test_nvml_refusing_to_start_is_conclusive(self):
+        # Exactly what the deployment's nvidia-smi printed, 2026-09-13.
+        reply = self.Reply(stderr="Failed to initialize NVML: Driver/library "
+                                  "version mismatch\nNVML library version: 595.91")
+        self.assertIs(enc.driver_mismatch(runner=lambda: reply), True)
+
+    def test_a_healthy_nvidia_smi_is_a_no(self):
+        reply = self.Reply(stdout="NVIDIA-SMI 595.91  Driver Version: 595.91  "
+                                  "CUDA Version: 13.0")
+        self.assertIs(enc.driver_mismatch(runner=lambda: reply), False)
+
+    def test_ffmpeg_saying_it_needs_no_second_opinion(self):
+        """CUDA names the mismatch itself, so nvidia-smi need not be run."""
+        def unreachable():
+            raise AssertionError("nvidia-smi must not be run when the message "
+                                 "already settles it")
+        self.assertIs(
+            enc.driver_mismatch(
+                "cuInit(0) failed -> CUDA_ERROR_SYSTEM_DRIVER_MISMATCH: system "
+                "has unsupported display driver / cuda driver combination",
+                runner=unreachable),
+            True)
+
+    def test_no_nvidia_smi_answers_neither_way(self):
+        """A checker's own limitations are never a finding about what it checks.
+
+        None, not False: "there is no mismatch" and "nothing here can tell you"
+        need different words, and a machine with no NVIDIA tooling at all must
+        not be reported as having a healthy driver.
+        """
+        def missing():
+            raise FileNotFoundError("nvidia-smi")
+        self.assertIsNone(enc.driver_mismatch(runner=missing))
+
+    def test_cannot_tell_produces_no_hint(self):
+        hint = enc.encoder_hint("hevc_nvenc", "something odd",
+                                built_in=True, mismatch=None)
+        self.assertEqual(hint, "")
+
+
+class TestSelectEncoderReporting(unittest.TestCase):
+    """The glue, which nothing executed until 0.2.1.
+
+    Every rule encoder_hint applies had a test; the function that calls it had
+    none, so `log.debug` on a logger this module sets to INFO sat there
+    discarding ffmpeg's own words for as long as it existed. Same shape as the
+    GUI entry point that raised NameError under a passing suite: a wiring
+    function with no branches worth testing still has to be executed by
+    something.
+    """
+
+    PATCHED = ("list_encoders", "probe_encoder_detail", "driver_mismatch")
+
+    def setUp(self):
+        self.saved = {n: getattr(enc, n) for n in self.PATCHED}
+
+    def tearDown(self):
+        for name, fn in self.saved.items():
+            setattr(enc, name, fn)
+
+    def drive(self, message, built=("av1_nvenc", "hevc_nvenc", "libx264"),
+              mismatch=False):
+        asked = []
+        enc.list_encoders = lambda ffmpeg: set(built)
+        enc.probe_encoder_detail = lambda ffmpeg, cand: (False, message)
+
+        def fake_mismatch(msg="", runner=None):
+            asked.append(msg)
+            return mismatch
+
+        enc.driver_mismatch = fake_mismatch
+        with self.assertLogs("encode", level="INFO") as captured:
+            result = enc.select_encoder("ffmpeg", {})
+        return result, captured.output, asked
+
+    def test_ffmpeg_own_words_reach_the_log_at_info(self):
+        """The defect, pinned.
+
+        The hint is an interpretation and has been wrong in production; the
+        message is what ffmpeg said and cannot be. It must survive at the level
+        the encode run actually logs at.
+        """
+        text = "OpenEncodeSessionEx failed: unsupported device (2): (no details)"
+        _, output, _ = self.drive(text)
+        self.assertTrue(any("ffmpeg: " in line and text in line
+                            for line in output),
+                        f"ffmpeg's message is missing from {output}")
+
+    def test_the_driver_is_asked_about_once_per_run(self):
+        """Three candidates fail; nvidia-smi is a subprocess, not a lookup."""
+        _, _, asked = self.drive("OpenEncodeSessionEx failed: out of memory (10)")
+        self.assertEqual(len(asked), 1)
+
+    def test_a_build_with_no_nvenc_asks_the_driver_nothing(self):
+        """CI runners are exactly this, and there is nothing to ask them.
+
+        A codec absent from the build is settled by that fact alone, so the
+        check must not spawn anything to confirm it.
+        """
+        _, _, asked = self.drive("Unknown encoder 'av1_nvenc'", built=())
+        self.assertEqual(asked, [])
+
+    def test_a_mismatch_is_reported_for_every_failed_nvenc_candidate(self):
+        """Both NVENC candidates, and not libx264.
+
+        Found by this test against a first cut that blamed the NVIDIA driver
+        for a software encoder failing, which is the same dead end as telling
+        an RTX 4060 owner their GPU was too old for AV1.
+        """
+        _, output, _ = self.drive(
+            "OpenEncodeSessionEx failed: out of memory (10)", mismatch=True)
+        self.assertEqual(sum("reboot" in line for line in output), 2,
+                         "exactly the two NVENC candidates should say reboot")
+
+    def test_a_software_encoder_is_never_blamed_on_the_driver(self):
+        hint = enc.encoder_hint("libx264", "some libx264 failure",
+                                built_in=True, mismatch=True)
+        self.assertEqual(hint, "")
+
+    def test_nothing_usable_returns_none(self):
+        result, _, _ = self.drive("Unknown encoder", built=())
+        self.assertIsNone(result)
+
+    def test_a_software_encoder_failing_asks_the_driver_nothing(self):
+        """libx264 has no opinion about the NVIDIA driver, and vice versa.
+
+        Found by reading temp/nvenc_hint_demo.py rather than by this suite: the
+        line had a comment saying it never consulted nvidia-smi for a codec
+        that could not care, and then did. A build carrying only libx264 is the
+        ordinary case on a machine with no GPU, so this is not a corner.
+        """
+        _, _, asked = self.drive("height not divisible by 2",
+                                 built=("libx264",))
+        self.assertEqual(asked, [])
+
+    def test_a_software_encoder_is_never_told_about_the_gpu(self):
+        """The whole "did not advertise this codec for this GPU" branch.
+
+        Keyed on message text only NVENC produces, so it cannot misfire today,
+        but the sentence is nonsense about libx264 and gating it costs one
+        condition.
+        """
+        hint = enc.encoder_hint("libx264", "No capable devices found",
+                                built_in=True)
+        self.assertEqual(hint, "")
 
     def test_unrecognised_error_yields_no_invented_cause(self):
         self.assertEqual(enc.encoder_hint("av1_nvenc", "something odd",

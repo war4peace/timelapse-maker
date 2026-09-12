@@ -480,6 +480,38 @@ budget.
 - **`av1_nvenc not available`**: distro ffmpeg builds often lack NVENC. Use a
   BtbN static build or `jellyfin-ffmpeg` and point `paths.ffmpeg` at it. The
   script falls back to HEVC then x264 rather than failing, but you lose AV1.
+- **Hardware encoding stopped working and nothing here changed**: the nightly
+  run reports every NVENC encoder as `not available`, selects
+  `H.264 (libx264)`, and an encode that took half an hour takes several. Check
+  the driver first, before the GPU and before this program:
+
+  ```bash
+  nvidia-smi
+  ```
+
+  `Failed to initialize NVML: Driver/library version mismatch` means the
+  NVIDIA packages were upgraded while the old kernel module was still loaded,
+  so the module and the userspace libraries are now different versions.
+  **Only a reboot fixes that.** On Ubuntu and Debian it is normally
+  unattended-upgrades, and `grep -i nvidia /var/log/apt/history.log` shows
+  when it happened.
+
+  Nothing is lost while it lasts: capture never touches the GPU, and the
+  nightly encode keeps producing correct videos on libx264, just slowly and in
+  H.264. If you would rather it never happened unannounced, either hold the
+  driver packages and upgrade them deliberately, or let unattended-upgrades
+  reboot for you:
+
+  ```bash
+  sudo apt-mark hold nvidia-driver-XXX     # the version from history.log
+  # or, in /etc/apt/apt.conf.d/50unattended-upgrades:
+  #   Unattended-Upgrade::Automatic-Reboot "true";
+  ```
+
+  Since 0.2.1 both `timelapse test --encoders` and the nightly log name this
+  outright. Before that the log said `no free NVENC session`, which was a
+  guess, and a wrong one: read the `ffmpeg:` line under the hint, which is
+  what ffmpeg actually said.
 
 <sub>[&uarr; Contents](#contents)</sub>
 

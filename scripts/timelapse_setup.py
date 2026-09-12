@@ -433,7 +433,8 @@ def detect_encoders(ffmpeg):
     """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        from timelapse_encode import (encoder_hint, list_encoders,
+        from timelapse_encode import (driver_mismatch, encoder_hint,
+                                      is_nvenc, list_encoders,
                                       probe_encoder_detail)
     except ImportError as exc:
         return None, [], f"could not load the encoder probe: {exc}"
@@ -443,13 +444,19 @@ def detect_encoders(ffmpeg):
         return None, [], f"could not run {ffmpeg} - is the path right?"
 
     failures = []
+    mismatch, asked = None, False
     for codec in ("av1_nvenc", "hevc_nvenc", "libx264"):
         ok, message = probe_encoder_detail(
             ffmpeg, {"codec": codec, "args": ["-c:v", codec]})
         if ok:
             return codec, failures, ""
+        # Once per call, and not for a codec this ffmpeg lacks: that failure is
+        # settled and nvidia-smi has nothing to add to it.
+        if not asked and codec in built and is_nvenc(codec):
+            mismatch, asked = driver_mismatch(message), True
         failures.append((codec, message,
-                         encoder_hint(codec, message, codec in built)))
+                         encoder_hint(codec, message, codec in built,
+                                      mismatch)))
     return None, failures, ""
 
 
