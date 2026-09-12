@@ -3692,9 +3692,9 @@ installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
-scripts/timelapse_encode.py      batch job, 2088 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 994 lines
-scripts/timelapse_setup.py       configuration wizard, 4562 lines
+scripts/timelapse_encode.py      batch job, 2210 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 1018 lines
+scripts/timelapse_setup.py       configuration wizard, 4569 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines
