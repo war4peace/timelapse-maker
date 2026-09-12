@@ -54,6 +54,23 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **A storage path with a space in it no longer stops both daemons.** A
+  systemd unit reads `ReadWritePaths=` as a whitespace-separated list, so
+  `/media/war/My Passport/frames` arrived as two entries, `/media/war/My` and
+  `Passport/frames`, and an entry that does not exist stops the unit with a
+  mount namespace error naming neither the path nor the space in it. External
+  drives mount at `/media/<you>/<Label>` and those labels carry spaces
+  routinely, and the wizard proposes those mountpoints itself, so this was
+  reachable by pressing Enter at the first storage question. The paths are
+  quoted now, and a `%`, a `"` or a `\` in one is escaped as systemd expects.
+  Nothing changes for a path without a space, and existing units are corrected
+  on upgrade.
+
+- **A share whose name contains a space now really does remount at boot.**
+  `/etc/fstab` has no quoting at all, so the line written for `//tower/My
+  Share` was a parse error and was ignored in full, while the wizard reported
+  that the entry had been added. Both fields are escaped now.
+
 - **The nightly run no longer blames your NVR when the NVIDIA driver was
   upgraded.** If hardware encoding stopped working, the log said `no free
   NVENC session - another process (an NVR, a transcoder) may be holding them

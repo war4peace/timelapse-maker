@@ -3132,7 +3132,13 @@ class TestWatchUnitWiring(unittest.TestCase):
     def test_its_writable_set_is_the_state_directory_alone(self):
         # It reads the capture heartbeat and writes one small record. Giving it
         # $rw would hand a five-minutely job write access to every frame.
-        self.assertIn("ReadWritePaths=$staterw", self.installer)
+        #
+        # The _unit suffix is not cosmetic and is asserted rather than trimmed
+        # to the stem: $staterw is the bare directory, which this script also
+        # mkdirs, and $staterw_unit is that path quoted for a unit file. Naming
+        # the wrong one is either a directory with quote marks in it or a
+        # ReadWritePaths line that splits on the first space.
+        self.assertIn("ReadWritePaths=$staterw_unit", self.installer)
 
     def test_new_timers_are_adopted_on_upgrade(self):
         # A unit that did not exist at the previous install is enabled by

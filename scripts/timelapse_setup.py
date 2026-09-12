@@ -10,7 +10,7 @@ Every question has a default in [brackets]; pressing Enter accepts it.
 
     timelapse_setup.py [--output /etc/timelapse/config.json]
                        [--defaults]        answer everything with the default
-                       [--print-paths CFG] list writable paths for ReadWritePaths
+                       [--print-paths CFG] the ReadWritePaths= value for a unit
 """
 
 import argparse
@@ -2784,7 +2784,10 @@ def sync_unit_readwritepaths(cfg, unitdir="/etc/systemd/system"):
     """
     if not is_root():
         return "denied", "needs root to edit the unit files"
-    paths = " ".join(writable_paths(cfg))
+    # Quoted, not joined with a space: see quote_unit_path(). The detail this
+    # returns is printed to the operator and is meant to be the line that went
+    # into the unit, quotes included, rather than a tidier version of it.
+    paths = unit_path_value(writable_paths(cfg))
     if not paths:
         return "empty", "the config names no writable paths"
 
@@ -2859,6 +2862,32 @@ def report_readwritepaths(status, detail):
         note(f"  {detail}")
 
 
+# The same defect as quote_unit_path(), in the other file this program writes
+# a path into, and fstab is the worse of the two because it has no quoting at
+# all: the escape is octal. A Windows share name with a space in it is
+# ordinary (//tower/My Share), and the mountpoint is one the wizard proposed.
+#
+# Measured with findmnt, which is util-linux's own parser reading a file handed
+# to it (temp/c2_fstab_probe.sh): a bare space in either field is
+# "parse error at line 1 -- ignored", so the entry does nothing at all while
+# this program says the share will remount at boot. \040 comes back as a space,
+# \011 as a tab and \134 as a backslash.
+FSTAB_ESCAPES = (("\\", "\\134"), (" ", "\\040"), ("\t", "\\011"),
+                 ("\n", "\\012"))
+
+
+def fstab_escape(field):
+    """One fstab field, with the characters that would end it escaped.
+
+    Backslash first, or it would escape the backslashes the other three are
+    about to add.
+    """
+    text = str(field)
+    for char, escape in FSTAB_ESCAPES:
+        text = text.replace(char, escape)
+    return text
+
+
 def persist_cifs_mount(unc, mountpoint, opts, vers):
     """Add an /etc/fstab entry so the share comes back after a reboot."""
     fstab = Path("/etc/fstab")
@@ -2867,14 +2896,18 @@ def persist_cifs_mount(unc, mountpoint, opts, vers):
     except OSError:
         warn("Could not read /etc/fstab; the mount will not survive a reboot.")
         return
-    if f" {mountpoint} " in current:
+    # Against the escaped spelling, which is what would be in the file: the
+    # unescaped one would never match a mountpoint containing a space and this
+    # would append a duplicate entry on every run.
+    if f" {fstab_escape(mountpoint)} " in current:
         good("/etc/fstab already has an entry for this mount point")
         return
     # nofail + x-systemd.automount: a NAS that is down must not block boot,
     # and the share mounts on first access instead.
     full = (f"{opts}{',' + vers if vers else ''},_netdev,nofail,"
             f"x-systemd.automount,x-systemd.mount-timeout=30")
-    line = f"{unc}  {mountpoint}  cifs  {full}  0  0"
+    line = (f"{fstab_escape(unc)}  {fstab_escape(mountpoint)}  cifs  "
+            f"{full}  0  0")
     try:
         shutil.copy2(fstab, f"/etc/fstab.bak.{int(__import__('time').time())}")
         with open(fstab, "a", encoding="utf-8") as fh:
@@ -3720,6 +3753,58 @@ def default_config(template_path=None):
     })
 
 
+def quote_unit_path(path):
+    """One path as a systemd unit file will read it back.
+
+    A unit value is a whitespace-separated list, so `/media/war/My Passport/
+    frames` arrives as two entries: `/media/war/My` (does not exist) and
+    `Passport/frames` (not absolute, silently ignored). The documented trap
+    then applies, and it is the worst kind: a ReadWritePaths entry that does
+    not exist stops the unit with a mount namespace error, so **both daemons
+    stop starting** and the message names neither the path nor the space in
+    it. The wizard proposes mountpoints from its own disk scan and
+    `/media/<user>/<Label>` automounts carry spaces routinely, so this is
+    reachable by pressing Enter.
+
+    Measured on systemd 255 rather than read out of the manual
+    (`temp/c2_quoting_readback.sh`, with `systemctl show` as the oracle
+    because it prints the parsed list back):
+
+        ReadWritePaths=/srv/My Disk /srv/b        -> /srv/My  /srv/b
+        ReadWritePaths="/srv/My Disk" "/srv/b"    -> /srv/My Disk  /srv/b
+
+    Three characters have to be escaped inside the quotes, and each was
+    measured because each fails differently:
+
+        \\  an escape, and eaten: "back\\slash" came back as /srv/backslash
+        "   ends the string early
+        %   a specifier, expanded even inside quotes: "fifty%full" came back
+            as /srv/fifty/c2readull, because %f is the unit's own file name
+
+    Quoting a path that needs no quoting is free: systemd prints those back
+    unquoted, and the control cases confirmed a plain path still works both
+    ways. So every entry is quoted rather than only the ones that look
+    dangerous, because a rule with an exception is a rule somebody has to
+    remember.
+    """
+    text = str(path)
+    # Order matters. The backslash pass has to run first or it would double
+    # the backslash the quote pass is about to add; the percent pass adds
+    # neither, so it can run last.
+    text = text.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return '"%s"' % text
+
+
+def unit_path_value(paths):
+    """A list of paths as the right-hand side of a systemd list setting.
+
+    Empty stays empty: `writable_paths()` returning nothing is a config that
+    names no directories, which callers report as "empty" rather than writing
+    a line with nothing after it.
+    """
+    return " ".join(quote_unit_path(p) for p in paths)
+
+
 def writable_paths(cfg):
     """Minimal set of directories systemd's ReadWritePaths must allow.
 
@@ -4295,6 +4380,8 @@ def main():
                     help="print the one path the web UI must be allowed to write")
     ap.add_argument("--print-state-path", metavar="CONFIG",
                     help="print the directory the daemons publish state into")
+    ap.add_argument("--quote-unit-path", metavar="PATH",
+                    help="quote one path for a systemd unit file")
     units = ap.add_argument_group(
         "service registration (Windows)",
         "What install.sh does with unit files, for the platform that has none. "
@@ -4349,14 +4436,29 @@ def main():
         return print_discovered()
 
     # Machine-readable mode used by install.sh to template the systemd units.
+    # This one emits the finished ReadWritePaths= value, quotes and all,
+    # because a list of paths cannot survive the trip through a shell variable
+    # once any of them contains a space: that is the whole defect. install.sh
+    # splices what comes back and nothing else reads it.
     if args.print_paths:
         with open(args.print_paths, encoding="utf-8") as fh:
-            print(" ".join(writable_paths(json.load(fh))))
+            print(unit_path_value(writable_paths(json.load(fh))))
         return 0
 
+    # Bare, unlike its sibling above, and the difference is load-bearing:
+    # install.sh both names this directory in a unit *and* creates it, so a
+    # quoted answer would have it make a directory with quote marks in its
+    # name. One directory round-trips through argv where a list cannot, so the
+    # unit line is rendered with --quote-unit-path at the point of use.
     if args.print_web_paths:
         with open(args.print_web_paths, encoding="utf-8") as fh:
             print(" ".join(web_writable_paths(json.load(fh))))
+        return 0
+
+    # The filter the two single-directory units go through. Pure, prompts for
+    # nothing and reads no config, so it costs a process and nothing else.
+    if args.quote_unit_path is not None:
+        print(quote_unit_path(args.quote_unit_path))
         return 0
 
     if args.print_state_path:

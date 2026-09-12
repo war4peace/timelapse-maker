@@ -18,6 +18,7 @@ guide.
   - [4.2 `timelapse_encode.py`](#42-timelapse_encodepy)
   - [4.3 `timelapse_test.py`](#43-timelapse_testpy)
   - [4.4 `timelapse_setup.py`](#44-timelapse_setuppy)
+  - [4.4b A path with a space in it (0.2.1)](#44b-a-path-with-a-space-in-it-021)
   - [4.5 `timelapse_web.py`](#45-timelapse_webpy)
   - [4.6 `timelapse_update.py`](#46-timelapse_updatepy)
   - [4.6a `timelapse_platform.py` (0.2.0)](#46a-timelapse_platformpy-020)
@@ -783,6 +784,13 @@ at least 20 GB; the OS disk is a poor place to write 17k files a day.
 - `--print-paths` emits the minimal set of directories systemd must allow, which
   `install.sh` splices into `ReadWritePaths=`. Paths already covered by a parent
   in the set are dropped.
+- Those directories are **quoted**, by `quote_unit_path()`. A unit value is a
+  whitespace-separated list, so `/media/war/My Passport/frames` arrived as
+  `/media/war/My` plus `Passport/frames`, and an entry that does not exist
+  stops the unit: both daemons, on a fresh install, reachable by pressing
+  Enter at the first storage question, since the wizard proposes mountpoints
+  from its own disk scan and `/media/<user>/<Label>` automounts carry spaces
+  routinely. See §4.4b for what has to be escaped and how it was measured.
 
 **Focused modes.** The wizard is also the maintenance tool, so a change after
 install never means reinstalling or re-answering everything:
@@ -835,6 +843,65 @@ otherwise `/dev/tty`, otherwise defaults-only. It must *never* silently read a
 piped stdin: under `curl … | bash` that pipe is the installer script itself.
 `--stdin` opts in explicitly for scripted runs. Passwords go through
 `getpass` when a real terminal is present, so they stay out of scroll-back.
+
+#### 4.4b A path with a space in it (0.2.1)
+
+The wizard writes paths into two files whose fields are separated by
+whitespace, and neither one was escaping them. Both are silent: the unit
+failure names the namespace rather than the path, and the fstab line is
+discarded by the parser while this program says the share will remount at
+boot. External drives mount at `/media/<user>/<Label>` and those labels carry
+spaces routinely, so the first storage question of a fresh install could
+produce either by pressing Enter.
+
+**`quote_unit_path()`** renders one path as a unit file reads it back. Every
+rule below was measured against systemd 255 with `systemctl show` as the
+oracle, because it prints the parsed list back and so distinguishes "one entry
+with a space in it" from "two entries" (`temp/c2_quoting_readback.sh`):
+
+| Written | Parsed back |
+|---|---|
+| `ReadWritePaths=/srv/My Disk /srv/b` | `/srv/My` `/srv/b`, and the unit fails 226/NAMESPACE |
+| `ReadWritePaths="/srv/My Disk" "/srv/b"` | `/srv/My Disk` `/srv/b` |
+| `"/srv/back\slash"` | `/srv/backslash`: a lone backslash is an escape and is eaten |
+| `"/srv/say\"q\""` | `/srv/say"q"` |
+| `"/srv/fifty%full"` | `/srv/fifty/c2readull`: `%` is a **specifier** and is expanded inside the quotes too, `%f` being the unit's own file name |
+| `"/srv/fifty%%full"` | `/srv/fifty%full` |
+
+So three characters are escaped, backslash first because the other two add
+one. Every entry is quoted rather than only the ones that look dangerous:
+quoting a plain path is free (systemd prints those back unquoted, measured as
+a control), and a rule with an exception is a rule somebody has to remember in
+two languages.
+
+**Where the rendering happens matters.** `writable_paths()` still returns
+plain paths, because its own logic collapses a child into its parent by string
+prefix and quotes would break that comparison; `unit_path_value()` renders
+afterwards. `--print-paths` emits the finished value because **a list cannot
+survive a shell variable** once one entry contains a space: there is no
+spelling of `ReadWritePaths=$rw` in `install.sh` that splits on the separators
+and not on the spaces. Its two siblings stay bare, because `install.sh` both
+names those directories in a unit *and* creates them, and a directory with
+quote marks in its name is not what anybody asked for; one directory
+round-trips through argv where a list cannot, so those go through
+`--quote-unit-path` at the point of use. The shell half owns no spelling of
+its own, which a test asserts.
+
+**`fstab_escape()`** is the same defect in the file with no quoting at all.
+Measured with `findmnt` reading a file handed to it (`temp/c2_fstab_probe.sh`):
+a bare space in the device or the mountpoint field is `parse error at line 1
+-- ignored`, so `//tower/My Share` produced an entry that did nothing while
+`persist_cifs_mount()` reported success. The escapes are octal, `\040` for a
+space, `\011` tab, `\012` newline, `\134` backslash, and the duplicate check
+matches on the escaped spelling or it would append a fresh entry every run.
+
+**What was checked and needed nothing.** Both rsync call sites build a list
+argv with no shell, so a spaced destination was always fine there; the review
+that found this expected otherwise. The mkdir and chown calls in `install.sh`
+are already quoted, and shellcheck agrees. Nothing refuses a space at the
+prompt, deliberately: with these two fixed a spaced path works end to end, and
+refusing a working configuration is the mistake `try_rsync_args()` exists
+because of.
 
 ### 4.5 `timelapse_web.py`
 
@@ -3022,7 +3089,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,049 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,069 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -3520,6 +3587,22 @@ changes:
   `state_dir` key publishes to the default location. That is the hazard worth
   re-testing on any future change here: a `ReadWritePaths` entry that does not
   exist stops **both** daemons, with an error about mount namespaces.
+- **A path with a space in it** (0.2.1, §4.4b): Ubuntu 24.04 under real
+  systemd, `temp/c2_wsl_e2e.sh`, a full install with a frames root of
+  `/srv/c2e2e/My Passport/frames`. Eleven checks: the emitter quotes it,
+  `install.sh` splices the quotes into the unit, `systemd-analyze verify` says
+  nothing, `systemctl show` reads it back as **one** entry, and capture starts
+  and writes frames and `capture.log` into it. **The control is the check that
+  matters**, and it is why this is worth running rather than reasoning about:
+  the same unit with the quotes taken out again fails 226/NAMESPACE, so the
+  passing half is known to be the quoting and not the directory merely
+  existing. Two things went wrong in the harness first, both of them the
+  harness agreeing with a broken product for an unrelated reason. Its data root
+  was under `/var/tmp`, which `PrivateTmp=true` hides from every unit, so the
+  first run reported 226/NAMESPACE on a directory that plainly existed: use
+  `/srv` or `/mnt`, as the note above says. And the control's `sed` used `/` as
+  its delimiter on paths full of slashes, so it never edited anything and the
+  control "passed" against a unit that was already failing.
 - **Installer and wizard**: Ubuntu 24.04 with real systemd. Confirmed: package
   detection and dependency install, service account creation, unit templating
   (`systemd-analyze verify` clean), a live capture run against a local HTTP
@@ -3708,7 +3791,7 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 978 lines
+install.sh                       bootstrap installer, 1002 lines
 install.ps1                      the Windows one, 483 lines
 setup-gui.ps1                    launcher for the graphical wizard, 111 lines
 timelapse-setup.cmd              double-click shim for the above
@@ -3718,7 +3801,7 @@ installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2210 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
-scripts/timelapse_setup.py       configuration wizard, 4569 lines
+scripts/timelapse_setup.py       configuration wizard, 4671 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2149 lines

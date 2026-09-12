@@ -495,15 +495,31 @@ install_units() {
     ok "systemd units -> $UNITDIR"
 }
 
+# One path, spelled the way a systemd unit file reads it back: quoted, with
+# the three characters systemd would otherwise act on escaped. The rule lives
+# in timelapse_setup.py and is not repeated here, for the same reason the
+# ReadWritePaths list is derived there: two implementations of an escaping rule
+# is one implementation and one liability.
+#
+# The fallback is the bare path, which is what this script spliced before the
+# rule existed. It is only reachable if python3 cannot run at all, by which
+# point every other call in sync_units has already fallen back too.
+quote_unit_path() {
+    python3 "$PREFIX/timelapse_setup.py" --quote-unit-path "$1" 2>/dev/null \
+        || printf '%s' "$1"
+}
+
 # The units run with ProtectSystem=strict, so ReadWritePaths must name every
 # directory the daemons write to. Deriving it from the config is the whole
 # reason this is scripted: getting it wrong produces a baffling read-only error.
 sync_units() {
-    local user_line="$SVCUSER" rw="/var/lib/timelapse"
+    # Already quoted: --print-paths emits the finished value because a list of
+    # paths cannot survive a shell variable once one of them has a space in it.
+    local user_line="$SVCUSER" rw='"/var/lib/timelapse"'
     if [ -f "$CONFIG" ]; then
         rw="$(python3 "$PREFIX/timelapse_setup.py" --print-paths "$CONFIG" 2>/dev/null)" \
-            || rw="/var/lib/timelapse"
-        [ -z "$rw" ] && rw="/var/lib/timelapse"
+            || rw='"/var/lib/timelapse"'
+        [ -z "$rw" ] && rw='"/var/lib/timelapse"'
     fi
     # The web UI gets its OWN ReadWritePaths, not this one. It writes exactly
     # one thing - its sqlite index - and scoping the unit to that directory is
@@ -530,6 +546,14 @@ sync_units() {
     install -d -m 0750 "$staterw" 2>/dev/null || true
     chown "$SVCUSER:$SVCUSER" "$staterw" 2>/dev/null || true
 
+    # These two stay bare above, because this script *creates* them as well as
+    # naming them in a unit, and a directory whose name contains quote marks is
+    # not what anybody asked for. One directory round-trips through argv where
+    # a list cannot, so each gets its unit spelling here instead.
+    local webrw_unit staterw_unit
+    webrw_unit="$(quote_unit_path "$webrw")"
+    staterw_unit="$(quote_unit_path "$staterw")"
+
     for unit in timelapse-capture.service timelapse-encode.service; do
         local f="$UNITDIR/$unit"
         [ -f "$f" ] || continue
@@ -546,7 +570,7 @@ sync_units() {
         sed -i \
             -e "s|^User=.*|User=$user_line|" \
             -e "s|^Group=.*|Group=$user_line|" \
-            -e "s|^ReadWritePaths=.*|ReadWritePaths=$webrw|" \
+            -e "s|^ReadWritePaths=.*|ReadWritePaths=$webrw_unit|" \
             -e "s|^ExecStart=.*timelapse_web.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_web.py $CONFIG|" \
             "$UNITDIR/timelapse-web.service"
         # ReadWritePaths on a directory that does not exist stops the unit
@@ -569,7 +593,7 @@ sync_units() {
         sed -i \
             -e "s|^User=.*|User=$user_line|" \
             -e "s|^Group=.*|Group=$user_line|" \
-            -e "s|^ReadWritePaths=.*|ReadWritePaths=$staterw|" \
+            -e "s|^ReadWritePaths=.*|ReadWritePaths=$staterw_unit|" \
             -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_encode.py --watch $CONFIG|" \
             "$UNITDIR/timelapse-watch.service"
     fi

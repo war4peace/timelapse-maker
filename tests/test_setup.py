@@ -163,6 +163,210 @@ class TestWritablePaths(unittest.TestCase):
         self.assertEqual(setup.writable_paths(cfg), ["/srv/tl", "/srv/tl-old"])
 
 
+class TestUnitPathQuoting(unittest.TestCase):
+    """A path with a space in it must reach systemd as one entry.
+
+    `/media/<user>/<Label>` automounts carry spaces routinely and the wizard
+    proposes mountpoints from its own disk scan, so this is reachable by
+    pressing Enter. Unquoted, systemd split `/media/war/My Passport/frames`
+    into `/media/war/My` (does not exist) and `Passport/frames` (not absolute,
+    silently dropped), and an entry that does not exist stops the unit with a
+    mount namespace error: both daemons, on a fresh install, with a message
+    naming neither the path nor the space.
+
+    Every expected spelling below was measured against systemd 255 rather than
+    read out of the manual; see temp/c2_quoting_readback.sh and the docstring
+    on quote_unit_path().
+    """
+
+    def test_a_space_is_kept_in_one_entry(self):
+        self.assertEqual(setup.quote_unit_path("/media/war/My Passport/frames"),
+                         '"/media/war/My Passport/frames"')
+
+    def test_a_plain_path_is_quoted_too(self):
+        # Quoting one that needs none is free: systemd prints those back
+        # unquoted. A rule with an exception is a rule somebody has to
+        # remember, and this one is applied by two front doors.
+        self.assertEqual(setup.quote_unit_path("/srv/tl"), '"/srv/tl"')
+
+    def test_a_backslash_is_doubled(self):
+        # Measured: inside double quotes systemd eats a lone backslash, so
+        # "/srv/back\\slash" arrived as /srv/backslash.
+        self.assertEqual(setup.quote_unit_path("/srv/back\\slash"),
+                         '"/srv/back\\\\slash"')
+
+    def test_a_double_quote_is_escaped(self):
+        self.assertEqual(setup.quote_unit_path('/srv/say"q"'),
+                         '"/srv/say\\"q\\""')
+
+    def test_a_percent_is_doubled(self):
+        # Measured, and the surprise of the set: % is a specifier prefix and is
+        # expanded *inside* the quotes, so "/srv/fifty%full" came back as
+        # /srv/fifty/c2readull, %f being the unit's own file name.
+        self.assertEqual(setup.quote_unit_path("/srv/fifty%full"),
+                         '"/srv/fifty%%full"')
+
+    def test_the_escapes_do_not_escape_each_other(self):
+        # Backslash first, or the backslash added by the quote escape would
+        # itself be doubled and the quote would end the string after all.
+        self.assertEqual(setup.quote_unit_path('/srv/a\\b"c%d'),
+                         '"/srv/a\\\\b\\"c%%d"')
+
+    def test_the_value_is_the_quoted_entries_joined(self):
+        self.assertEqual(
+            setup.unit_path_value(["/media/x/My Disk/f", "/srv/tl/state"]),
+            '"/media/x/My Disk/f" "/srv/tl/state"')
+
+    def test_no_paths_is_the_empty_string(self):
+        # sync_unit_readwritepaths() reads falsy as "the config names no
+        # writable paths", which is one of its six answers.
+        self.assertEqual(setup.unit_path_value([]), "")
+
+    def test_the_config_path_reaches_the_value(self):
+        """The join is not the seam that matters; the emitter is.
+
+        writable_paths() is still a list of paths, deliberately, because its
+        own logic collapses children into parents by prefix and quotes would
+        break that comparison. The rendering happens after.
+        """
+        cfg = {"paths": {"frames_root": "/media/war/My Passport/frames",
+                         "video_output": "/media/war/My Passport/videos",
+                         "log_dir": "/var/log/tl", "state_dir": "/srv/state"},
+               "transfer": {"enabled": False}}
+        value = setup.unit_path_value(setup.writable_paths(cfg))
+        self.assertIn('"/media/war/My Passport/frames"', value)
+        self.assertIn('"/media/war/My Passport/videos"', value)
+        # Four entries, not six: the count is what the bug destroyed.
+        self.assertEqual(value.count('"'), 8)
+
+
+class TestTheInstallerUsesTheEmitter(unittest.TestCase):
+    """install.sh splices what Python hands it, so both halves have to agree.
+
+    The rule lives in one place on purpose, which is the same argument that
+    deleted tools/ and that keeps registration out of install.ps1: two
+    implementations of an escaping rule is one implementation and one
+    liability. What a source scan can check is that the shell half asks.
+    """
+
+    def setUp(self):
+        self.source = (_support.REPO / "install.sh").read_text(encoding="utf-8")
+
+    def test_the_installer_does_not_quote_anything_itself(self):
+        # A printf that wraps a path in quotes here would be the second
+        # implementation. The one place allowed to know the spelling is the
+        # fallback for python3 being unrunnable, and it deliberately produces
+        # the bare path rather than a guess at the escaping.
+        body = self.source.split("quote_unit_path() {")[1].split("}")[0]
+        self.assertIn("--quote-unit-path", body)
+        self.assertNotIn('\\"', body)
+
+    def test_the_two_single_directory_units_go_through_it(self):
+        for name in ("webrw_unit", "staterw_unit"):
+            self.assertIn('%s="$(quote_unit_path "$%s")"'
+                          % (name, name[:-5]), self.source)
+
+    def test_the_directories_themselves_are_made_from_the_bare_paths(self):
+        # The other half of the same split: a directory whose name contains
+        # quote marks is not what anybody asked for.
+        for bare in ("staterw", "webrw"):
+            self.assertIn('install -d -m 0750 "$%s"' % bare, self.source)
+
+    def test_the_list_is_rendered_by_python_not_joined_by_the_shell(self):
+        """--print-paths emits the finished value, quotes included.
+
+        A list cannot survive a shell variable once one of its entries has a
+        space in it, which is the defect itself: there is no spelling of
+        `ReadWritePaths=$rw` that both splits on the separators and does not
+        split on the spaces.
+        """
+        self.assertIn("--print-paths", self.source)
+        self.assertIn("ReadWritePaths=$rw", self.source)
+        # And the fallback for a config that cannot be read is quoted too, or
+        # a default install would write a line the emitter would not have.
+        self.assertIn("""rw='"/var/lib/timelapse"'""", self.source)
+
+    def test_the_flag_answers_and_prompts_for_nothing(self):
+        # Through main(), because the filter has to return before init_tty():
+        # install.sh calls it non-interactively and an installer that can block
+        # on a question nobody can see is an installer that hangs. init_tty is
+        # patched to raise for exactly that reason.
+        out = io.StringIO()
+        argv = ["timelapse_setup.py", "--quote-unit-path", "/media/x/My Disk/f"]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(setup, "init_tty", mock.Mock(
+                    side_effect=AssertionError("asked for a terminal"))), \
+                contextlib.redirect_stdout(out):
+            rc = setup.main()
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.getvalue().strip(), '"/media/x/My Disk/f"')
+
+
+class TestFstabEscaping(unittest.TestCase):
+    """The same defect in the other file this program writes a path into.
+
+    persist_cifs_mount() appends a line to /etc/fstab, which is
+    whitespace-separated and has no quoting at all: the escape is octal.
+    Measured with findmnt reading a file handed to it
+    (temp/c2_fstab_probe.sh): a bare space in either field is "parse error at
+    line 1 -- ignored", so the entry does nothing whatever while the wizard
+    reports that the share will remount at boot. `//tower/My Share` is an
+    ordinary Windows share name.
+    """
+
+    def test_a_space_becomes_the_octal_escape(self):
+        self.assertEqual(setup.fstab_escape("//tower/My Share"),
+                         "//tower/My\\040Share")
+
+    def test_a_tab_and_a_newline_too(self):
+        self.assertEqual(setup.fstab_escape("/mnt/a\tb\nc"),
+                         "/mnt/a\\011b\\012c")
+
+    def test_a_backslash_is_escaped_first(self):
+        # Otherwise it would escape the backslashes the other rules add, and
+        # \040 would arrive as a literal backslash followed by 040.
+        self.assertEqual(setup.fstab_escape("/mnt/back\\slash here"),
+                         "/mnt/back\\134slash\\040here")
+
+    def test_an_ordinary_path_is_untouched(self):
+        self.assertEqual(setup.fstab_escape("//tower/cctv"), "//tower/cctv")
+
+    def test_the_written_line_is_escaped_in_both_fields(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fstab = tmp / "fstab"
+        fstab.write_text("# existing\n", encoding="utf-8")
+        with mock.patch.object(setup, "Path", lambda p: fstab
+                               if str(p) == "/etc/fstab" else Path(p)), \
+                mock.patch.object(setup.shutil, "copy2", lambda *a: None), \
+                mock.patch.object(setup.subprocess, "run", lambda *a, **k: None), \
+                contextlib.redirect_stdout(io.StringIO()):
+            setup.persist_cifs_mount("//tower/My Share", "/mnt/My Disk",
+                                     "credentials=/etc/tl.cred", "3.0")
+        line = [ln for ln in fstab.read_text(encoding="utf-8").splitlines()
+                if ln.startswith("//tower")][0]
+        self.assertIn("//tower/My\\040Share", line)
+        self.assertIn("/mnt/My\\040Disk", line)
+        # Six fields, which is what a parser counts. Unescaped it was eight.
+        self.assertEqual(len(line.split()), 6)
+
+    def test_an_existing_entry_is_recognised_by_its_escaped_spelling(self):
+        """Otherwise a spaced mountpoint appends a duplicate on every run."""
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        fstab = tmp / "fstab"
+        fstab.write_text("//tower/My\\040Share  /mnt/My\\040Disk  cifs  x  0  0\n",
+                         encoding="utf-8")
+        buf = io.StringIO()
+        with mock.patch.object(setup, "Path", lambda p: fstab
+                               if str(p) == "/etc/fstab" else Path(p)), \
+                contextlib.redirect_stdout(buf):
+            setup.persist_cifs_mount("//tower/My Share", "/mnt/My Disk",
+                                     "credentials=/etc/tl.cred", "3.0")
+        self.assertIn("already has an entry", buf.getvalue())
+        self.assertEqual(fstab.read_text(encoding="utf-8").count("cifs"), 1)
+
+
 class TestCredentialQuoting(unittest.TestCase):
     """A password in a query string must survive intact.
 
@@ -2504,7 +2708,9 @@ class TestSyncReadWritePaths(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.want = " ".join(setup.writable_paths(self.CFG))
+        # The rendered value, not the bare list: what goes into the unit is
+        # quoted, so that a path with a space in it is one entry and not two.
+        self.want = setup.unit_path_value(setup.writable_paths(self.CFG))
 
     def unit(self, name="timelapse-encode.service", rwp=None):
         p = self.tmp / name
