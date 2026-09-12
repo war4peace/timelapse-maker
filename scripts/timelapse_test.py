@@ -107,7 +107,14 @@ def test_http(cam, cfg):
     try:
         r = sess.get(cam["url"], timeout=timeout)
     except Exception as exc:
-        bad(f"{name}: request failed - {exc}")
+        # Same rule as the RTSP branch below and as the daemon's formatter:
+        # requests puts the URL it was handed into its exception text, and a
+        # Reolink URL *is* the credential. Measured: a refused connection
+        # prints "Max retries exceeded with url: ...&password=hunter2". This
+        # runs under sudo on every install and upgrade, and `timelapse test >
+        # report.txt` puts it in a file people paste into bug reports.
+        from timelapse_encode import redact
+        bad(f"{name}: request failed - {redact(str(exc))}")
         return None
     dt = time.time() - t0
 

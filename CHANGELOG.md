@@ -33,6 +33,25 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Security
+
+- **`timelapse test` no longer prints the camera password when a snapshot
+  fetch fails.** The pre-flight reported `request failed - <exception>`, and
+  the exception `requests` raises carries the URL it was fetching: for a
+  Reolink-style camera that URL *is* the credential. A camera that was off, or
+  an address with a typo in it, printed
+  `Max retries exceeded with url: ...&user=admin&password=<your password>`.
+  It is masked now, the same way the log and the RTSP branch beside it already
+  were, and the rest of the message survives so the failure is still
+  diagnosable.
+
+  This one goes to the screen rather than to a file, but `install.sh` runs the
+  checker on every install and every upgrade, and `timelapse test >
+  report.txt` writes it down. **If you have pasted a pre-flight transcript
+  into a bug report, a forum or a chat, treat that camera password as
+  exposed**, and change it on the camera. There is nothing to purge locally
+  unless you redirected the output somewhere yourself.
+
 ### Fixed
 
 - **The nightly run no longer blames your NVR when the NVIDIA driver was

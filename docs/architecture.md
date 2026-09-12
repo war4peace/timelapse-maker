@@ -2752,6 +2752,17 @@ by a library, so the guarantee has to sit where every record passes:
 - **`run_command()` redacts in `timelapse_web.py`**, at the source rather than
   in each renderer. Fixing the daemon does nothing for the entries already in
   the journal, and those are what the page displays.
+- **The pre-flight prints rather than logs**, so no formatter covers it and
+  each site has to call `redact()` itself. `test_rtsp()` has, since it was
+  written, with a comment about scroll-back; `test_http()` beside it did not,
+  and until 0.2.1 printed the whole `requests` exception, which for a Reolink
+  URL is the password. Measured 2026-09-13 (`temp/c1_leak_probe.py`): a
+  refused connection prints `Max retries exceeded with url:
+  ...&user=admin&password=<real>`, and a read timeout prints no URL at all,
+  which is how it survived casual testing. The fourth place this project has
+  put a password in front of somebody, and the reachable one: HTTP is the
+  deployment's only method, `install.sh` runs the checker on every install and
+  every upgrade, and `timelapse test > report.txt` writes it to a file.
 
 Four shapes are masked, being the four ways a secret reaches text here: query
 string (`password=`, and seven other spellings), URL userinfo
@@ -3011,13 +3022,26 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 1,550 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,049 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
 `writable_paths`, credential quoting, `_dest_path` including the DST
 collision suffixes, and the web UI's library resolution and routing. Anything
 needing a camera, a GPU or systemd is out of scope here by design.
+
+**The pre-flight's camera checks had no test until 0.2.1**, which is how
+`test_http()` came to print the camera password on every failed fetch for the
+life of the project. The daemon's redaction is tested thoroughly, but the
+pre-flight *prints*, so nothing proven about `RedactingFormatter` says anything
+about it, and the checker's own tests had been filed by subject into three
+other files, which made the gap easy to miss. `tests/test_preflight.py` is the
+home for them now. It patches `timelapse_test.requests`, which is the name the
+checker resolves (it imports at module level, so standing a fake up in
+`sys.modules` the way `test_setup.py` does for `grab_snapshot` would not reach
+it), and it asserts both directions: the password is gone, and the host, the
+endpoint, the username and the underlying reason are all still there. A
+redacted line nobody can diagnose from would be the next defect.
 
 **The suite runs on Windows as well as Linux, and CI runs it on both.** The
 `windows-latest` leg was added with `timelapse_platform.py` rather than at the
@@ -3693,7 +3717,7 @@ installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2210 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 1018 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
 scripts/timelapse_setup.py       configuration wizard, 4569 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
@@ -3708,6 +3732,7 @@ tests/test_grammar.py            the 3.9 floor, incl. the PEP 701 gap
 tests/test_gui.py                the graphical wizard's decide layer
 tests/test_installer.py          the .exe, its pins and the seam below it
 tests/test_platform.py           unit tests
+tests/test_preflight.py          the pre-flight's camera checks
 tests/test_setup.py              unit tests
 tests/test_update.py             unit tests
 tests/test_usage.py              unit tests
