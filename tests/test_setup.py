@@ -705,6 +705,116 @@ class TestCameraCounter(unittest.TestCase):
         self.assertEqual(len(cams), 1)
 
 
+class TestTheFirstRunWizardRefusesADuplicateName(unittest.TestCase):
+    """A camera's name is a directory, so two of them is one directory.
+
+    Platform-independent and unprivileged; it declares its own terminal.
+    choose_cameras() appended whatever add_one_camera() handed back with no
+    check at all: the check lived in manage_cameras() and camera_action(), so
+    it covered `timelapse cameras` and not the wizard everybody runs first.
+    On NTFS `Gate` and `gate` are one frames directory with two cameras
+    interleaving frames into one video; on Linux they are two entries writing
+    into one directory.
+
+    test_add_refuses_a_name_that_is_already_taken mocks add_one_camera
+    itself, so it tests the backstop and cannot see any of this.
+    """
+
+    def drive(self, keystrokes, expected=9):
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY(keystrokes, tty=False)
+        cfg = setup.default_config()
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "test_camera", return_value=True):
+                setup.choose_cameras(cfg, expected)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        return cfg["cameras"], buf.getvalue()
+
+    # configure? / scan? / type / name / ip / user / pass / smooth? / test?
+    FIRST = "y\nn\n1\nGate\n10.0.0.1\nadmin\npw\n\nn\n"
+    # add another? / type / name ... , with the name answered twice because
+    # the first answer is refused.
+    SECOND = "y\n1\n%s\nYard\n10.0.0.2\nadmin\npw\n\nn\n"
+
+    def test_a_second_camera_cannot_take_the_first_ones_name(self):
+        cams, out = self.drive(self.FIRST + self.SECOND % "Gate" + "n\n")
+        self.assertEqual([c["name"] for c in cams], ["Gate", "Yard"])
+        self.assertIn("already exists", out)
+
+    def test_the_case_variant_is_refused_too(self):
+        """`Gate` and `gate` are one directory on NTFS, which is where two
+        cameras would interleave their frames into one video. name_taken()
+        has always been case-insensitive; nothing was calling it here."""
+        cams, out = self.drive(self.FIRST + self.SECOND % "gate" + "n\n")
+        self.assertEqual([c["name"] for c in cams], ["Gate", "Yard"])
+        self.assertIn("already exists", out)
+
+    def test_the_refusal_costs_the_name_and_nothing_else(self):
+        """Refused at the prompt that asked for it, rather than after the
+        address, the credentials, the smoothing and a live camera test. Two
+        cameras were added, so the address was asked for exactly twice."""
+        _, out = self.drive(self.FIRST + self.SECOND % "Gate" + "n\n")
+        self.assertEqual(out.count("IP address or hostname"), 2)
+
+    def test_a_distinct_name_is_still_accepted(self):
+        """The control: refusing everything would pass the three above."""
+        cams, out = self.drive(self.FIRST + self.SECOND % "Yard" + "n\n")
+        self.assertEqual([c["name"] for c in cams], ["Gate", "Yard"])
+        self.assertNotIn("already exists", out)
+
+    def test_timelapse_cameras_add_re_asks_rather_than_giving_up(self):
+        """The management path checked, but only after the camera was built,
+        so a duplicate name cost every answer and ended the action. It
+        re-prompts now, and the backstop it used to rely on stays."""
+        cfg = {"paths": {"frames_root": "/nonexistent"},
+               "capture": {"interval_seconds": 5}, "encode": {"framerate": 60},
+               "cameras": [{"name": "Gate", "enabled": True, "method": "http",
+                            "url": "http://192.0.2.1/s", "auth": "none"}]}
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY("1\nGate\nShed\n10.0.0.2\nadmin\npw\n\nn\n",
+                             tty=False)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "test_camera", return_value=True), \
+                 mock.patch.object(setup, "offer_discovery", return_value=[]):
+                changed, okay = setup.camera_action(cfg, "add", None)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        self.assertEqual((changed, okay), (True, True))
+        self.assertEqual([c["name"] for c in cfg["cameras"]], ["Gate", "Shed"])
+        self.assertIn("already exists", buf.getvalue())
+        self.assertEqual(buf.getvalue().count("IP address or hostname"), 1)
+
+    def test_the_interactive_menu_re_asks_too(self):
+        """Third call site. The other two are covered above; this one had no
+        test at all, so a revert of its argument alone went unnoticed."""
+        cfg = {"paths": {"frames_root": "/nonexistent"},
+               "capture": {"interval_seconds": 5}, "encode": {"framerate": 60},
+               "cameras": [{"name": "Gate", "enabled": True, "method": "http",
+                            "url": "http://192.0.2.1/s", "auth": "none"}]}
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = False
+        setup._TTY = FakeTTY("a\n1\nGate\nShed\n10.0.0.2\nadmin\npw\n\nn\nq\n",
+                             tty=False)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "test_camera", return_value=True), \
+                 mock.patch.object(setup, "offer_discovery", return_value=[]):
+                changed = setup.manage_cameras(cfg)
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        self.assertTrue(changed)
+        self.assertEqual([c["name"] for c in cfg["cameras"]], ["Gate", "Shed"])
+        self.assertIn("already exists", buf.getvalue())
+
+
 class TestTheAuthPromptChecksItsAnswer(unittest.TestCase):
     """It listed three answers and accepted anything typed at it.
 

@@ -984,7 +984,7 @@ def choose_cameras(cfg, expected):
 
     cams = []
     while True:
-        cam = add_one_camera(cfg, len(cams) + 1, found)
+        cam = add_one_camera(cfg, len(cams) + 1, found, taken=cams)
         if cam:
             cams.append(cam)
             good(f"Added '{cam['name']}' ({len(cams)} configured)")
@@ -1121,7 +1121,13 @@ def pick_discovered(found):
     return None if choice == 0 else free[choice - 1]
 
 
-def add_one_camera(cfg, n, found=None):
+def add_one_camera(cfg, n, found=None, taken=()):
+    """Build one camera entry. `taken` is the cameras it must not collide with.
+
+    Passed in rather than read from `cfg`, because the first-run wizard holds
+    the cameras it has collected so far in a local list and only assigns them
+    at the end. The callers' own name_taken() checks stay as backstops.
+    """
     print()
     print(f"  {bold(f'Camera {n}')}")
 
@@ -1152,8 +1158,19 @@ def add_one_camera(cfg, n, found=None):
     while True:
         name = sanitise_name(ask("Name (used as the folder name)", f"Camera{n}"),
                              f"Camera{n}")
-        if not reject_reserved(name):
-            break
+        if reject_reserved(name):
+            continue
+        # Here rather than after the camera is built, which is where the two
+        # management paths checked and where the first-run wizard did not check
+        # at all. Asking the address, the credentials and the smoothing, then
+        # testing the camera, and only then saying the name is taken, throws
+        # away every answer and marks the discovered device used on the way
+        # past. A name is refused at the prompt that asked for it.
+        if name_taken(taken, name):
+            fail(f"A camera called '{name}' already exists; "
+                 "two cameras cannot share a frames directory.")
+            continue
+        break
 
     if template is None:                       # custom
         method = "rtsp" if ask_yes("Is this an RTSP stream?", False) else "http"
@@ -1890,7 +1907,7 @@ def manage_cameras(cfg):
         if action == "a":
             if found is None:
                 found = offer_discovery()
-            cam = add_one_camera(cfg, len(cams) + 1, found)
+            cam = add_one_camera(cfg, len(cams) + 1, found, taken=cams)
             if cam:
                 if name_taken(cams, cam["name"]):
                     fail(f"A camera called '{cam['name']}' already exists; "
@@ -1965,7 +1982,8 @@ def camera_action(cfg, action, token):
         return False, True
 
     if action == "add":
-        cam = add_one_camera(cfg, len(cams) + 1, offer_discovery())
+        cam = add_one_camera(cfg, len(cams) + 1, offer_discovery(),
+                             taken=cams)
         if not cam:
             note("Nothing added.")
             return False, True

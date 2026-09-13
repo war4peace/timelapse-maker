@@ -95,6 +95,20 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **The first-run wizard no longer accepts two cameras with the same name.**
+  A camera's name is the folder its frames go in, so two cameras sharing one
+  meant two cameras writing into one folder: on Windows, where `Gate` and
+  `gate` are the same folder, that is two cameras interleaved into a single
+  video. `timelapse cameras` refused it; the wizard everyone runs first did
+  not. It is refused at the name prompt now, in all three places a camera can
+  be added.
+
+  The refusal also costs less than it did. `timelapse cameras` used to check
+  the name only after asking for the address, the username, the password and
+  the smoothing, and after testing the camera, so a name clash threw away
+  every answer and dropped the camera from the discovered list. It now asks
+  for a different name and keeps the rest.
+
 - **A typo at the Auth question no longer deletes the camera's password.**
   The wizard printed `Auth (digest/basic/none)` and then stored whatever was
   typed, and anything that was not `digest` or `basic` meant no

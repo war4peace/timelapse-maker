@@ -21,6 +21,7 @@ guide.
   - [4.4b A path with a space in it (0.2.1)](#44b-a-path-with-a-space-in-it-021)
   - [4.4c A question nobody was there to answer (0.2.1)](#44c-a-question-nobody-was-there-to-answer-021)
   - [4.4d A prompt that lists its answers and takes any of them (0.2.1)](#44d-a-prompt-that-lists-its-answers-and-takes-any-of-them-021)
+  - [4.4e Three ways to add a camera, two of which checked the name (0.2.1)](#44e-three-ways-to-add-a-camera-two-of-which-checked-the-name-021)
   - [4.5 `timelapse_web.py`](#45-timelapse_webpy)
   - [4.6 `timelapse_update.py`](#46-timelapse_updatepy)
   - [4.6a `timelapse_platform.py` (0.2.0)](#46a-timelapse_platformpy-020)
@@ -1037,6 +1038,38 @@ typo. Validation belongs wherever free text is possible, which on the console
 is everywhere. The two lists are one list now (`AUTH_MODES`, read by the
 window), because two spellings of the same set is the drift `tools/` was
 deleted over.
+
+#### 4.4e Three ways to add a camera, two of which checked the name (0.2.1)
+
+A camera's name is a directory name, which is why `name_taken()` has been
+case-insensitive since 0.2.0: `Gate` and `gate` are one directory on NTFS, so
+two cameras would interleave their frames and encode into one video, and on
+Linux they are two config entries writing into one directory.
+
+`manage_cameras()` and `camera_action()` called it. `choose_cameras()`, the
+path every first install takes, appended whatever `add_one_camera()` returned
+and checked nothing. Measured through the real keystroke path, answering
+`Gate` and then `gate`: both stored, `['Gate', 'gate']`, no refusal shown.
+
+The check is inside `add_one_camera()`'s name loop now, beside
+`reject_reserved()`, with the cameras to compare against **passed in** rather
+than read from `cfg`: the first-run wizard collects into a local list and only
+assigns it at the end, so `cfg["cameras"]` is empty for the whole section. The
+two outer checks stay as backstops.
+
+**Where the check sits was the second defect**, and it is the one an operator
+would have felt more often. Both outer checks ran after the camera was fully
+built: the address, the username, the password, the smoothing question and a
+live camera test, and after `device["used"] = True` had marked the discovered
+device as spent. So a duplicate name threw away every answer, dropped the
+device from the discovery list, and ended the action. Refusing at the prompt
+that asked for it costs one prompt and keeps everything else.
+
+The general point is about the note this fix had to correct rather than about
+camera names. `CLAUDE.md` recorded, correctly reasoned and wrong, that "the
+wizard cannot create the pair". The wizard was three code paths and two of
+them had been checked. **A claim that a rule holds is a claim about every
+caller of it**, so the thing to grep for is the callers, not the rule.
 
 ### 4.5 `timelapse_web.py`
 
@@ -3311,7 +3344,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,119 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,125 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4040,7 +4073,7 @@ installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2252 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
-scripts/timelapse_setup.py       configuration wizard, 4799 lines
+scripts/timelapse_setup.py       configuration wizard, 4817 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2344 lines
