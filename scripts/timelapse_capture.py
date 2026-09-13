@@ -573,6 +573,21 @@ def day_string(ts):
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
 
 
+def next_slot(after, interval):
+    """The first tick strictly after `after` on the grid of `interval`.
+
+    Filenames come from the tick time and filenames are the sort key, so the
+    grid is what makes a day's frames evenly named. A cadence adopted at
+    midnight has to re-anchor to the new one: carrying the old phase forward
+    (`fire_t + interval`) leaves a day at 60s naming its frames at seven
+    seconds past every minute for ever, because the 7s grid it came off
+    divides nothing. Strictly after, never equal, or a grid the old tick
+    happened to sit on would fire twice at the same second and the second
+    frame would collide with the first.
+    """
+    return (math.floor(after / interval) + 1) * interval
+
+
 def seconds_to_midnight(now=None):
     """Seconds until the next local midnight, floored at 1."""
     now = datetime.now() if now is None else now
@@ -599,9 +614,13 @@ def write_cadence(day_dir, interval, framerate):
     not a reason to stop capturing it; the encoder falls back to the config.
     """
     path = Path(day_dir) / CADENCE_FILE
-    if path.exists():
-        return False
     try:
+        # exists() is inside the try, not before it. pathlib swallows only
+        # ENOENT, ENOTDIR, EBADF and ELOOP, so EACCES (an ACL change on
+        # Windows) or EIO (a network frames root hiccup) propagates out of
+        # here, and this is called from the daemon's main loop.
+        if path.exists():
+            return False
         tmp = path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"interval_seconds": int(interval),
@@ -648,6 +667,45 @@ class DayCadenceMixin:
     fetching that is easy to get subtly wrong.
     """
 
+    def __init__(self, cam, cfg, cfg_path=None):
+        """The state begin_day() reads, set in the one place that owns it.
+
+        Both camera classes used to open with the same twelve lines, which is
+        how a mixin comes to depend on attributes neither it nor its own
+        docstring mentions. `name` and `daemon` go through to Thread, which is
+        next in the MRO for both.
+        """
+        super().__init__(name=f"cap-{cam['name']}", daemon=True)
+        self.cam = cam
+        self.name_ = cam["name"]        # Thread.name is taken
+        self.url = cam["url"]
+        self.cfg_path = cfg_path
+        self.day = None
+        self.interval = camera_interval(cam, cfg)
+        self.framerate = camera_framerate(cam, cfg)
+        self.base_timeout = int(cfg["capture"]["timeout_seconds"])
+        self.timeout = camera_timeout(cam, cfg)
+        self.root = Path(cfg["paths"]["frames_root"]) / self.name_
+        self.log = logging.getLogger(self.name_)
+        # Published in the heartbeat. None means "not yet", which is a
+        # different thing from "a long time ago" and has to stay tellable.
+        self.last_attempt = None
+        self.last_success = None
+
+    def _roll_day(self, fire_t, next_t):
+        """Adopt the day `fire_t` falls in, and return the next tick time.
+
+        A method rather than four lines in the loop because the loop is the
+        one part of this daemon nothing executes, and the rule it carries is
+        worth a test: the day boundary is the only moment a cadence change is
+        allowed to land, so it is the only moment the config is re-read, and a
+        change that lands has to re-anchor the tick grid.
+        """
+        day = day_string(fire_t)
+        if day != self.day and self.begin_day(day):
+            return next_slot(fire_t, self.interval)
+        return next_t
+
     def begin_day(self, day):
         """Adopt the cadence for `day`. True if it changed.
 
@@ -678,21 +736,18 @@ class DayCadenceMixin:
 class HttpCamera(DayCadenceMixin, threading.Thread):
 
     def __init__(self, cam, cfg, cfg_path=None):
-        super().__init__(name=f"cap-{cam['name']}", daemon=True)
-        self.cam = cam
-        self.name_ = cam["name"]
-        self.url = cam["url"]
-        self.cfg_path = cfg_path
-        self.day = None
-        self.interval = camera_interval(cam, cfg)
-        self.framerate = camera_framerate(cam, cfg)
-        self.base_timeout = int(cfg["capture"]["timeout_seconds"])
-        self.timeout = camera_timeout(cam, cfg)
+        super().__init__(cam, cfg, cfg_path)
         self.min_bytes = cfg["capture"]["min_bytes"]
-        self.log_every = cfg["capture"].get("log_every_n_failures", 60)
+        # Clamped where it is read, because nothing validates this key and the
+        # failure is silent and permanent: at 0 the modulo in the failure
+        # branch raises ZeroDivisionError on the *second* consecutive failure,
+        # the thread ends, nothing restarts a dead thread, and the heartbeat
+        # goes on listing the camera with a last_attempt that never moves. int()
+        # for the same reason: "60" from a hand-edited config used to reach the
+        # same modulo as a string and kill the thread just as dead.
+        self.log_every = max(1, int(cfg["capture"].get("log_every_n_failures",
+                                                       60)))
         self.retry = cfg["capture"].get("retry_within_tick", True)
-        self.root = Path(cfg["paths"]["frames_root"]) / self.name_
-        self.log = logging.getLogger(self.name_)
 
         self.session = requests.Session()
         auth_mode = (cam.get("auth") or "none").lower()
@@ -707,10 +762,6 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
         self.fail = 0
         self.consec_fail = 0
         self.retried = 0        # ticks a second attempt rescued
-        # Published in the heartbeat. None means "not yet", which is a
-        # different thing from "a long time ago" and has to stay tellable.
-        self.last_attempt = None
-        self.last_success = None
 
         # What is currently going wrong, if anything, and since when. The class
         # is what the back-off keys on; `err_since` is also the incident's
@@ -862,8 +913,18 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
 
         final = self._dest_path(dt)
         tmp = final.parent / f".{final.stem}.tmp"
-        with open(tmp, "wb") as fh:
-            fh.write(data)
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+        except FileNotFoundError:
+            # The day directory went away under us: an operator clearing
+            # today's frames to "start again", or a dropped mount. _dest_path
+            # only creates it when the date changes, so without this every
+            # remaining tick of the day fails identically and nothing repairs
+            # it until midnight. Forgetting the directory makes the next tick
+            # create it again; the failure is still counted and logged.
+            self._last_dir = None
+            raise
         replace_atomic(tmp, final)      # atomic: no partial file ever visible
 
     # -- main loop ----------------------------------------------------------
@@ -890,9 +951,7 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
 
             # The day boundary is the only moment a cadence change is allowed
             # to land, so it is the only moment the config is re-read.
-            day = day_string(fire_t)
-            if day != self.day and self.begin_day(day):
-                next_t = fire_t + self.interval
+            next_t = self._roll_day(fire_t, next_t)
 
             # If we fell behind (slow camera, suspended host), resync forward
             # rather than trying to catch up on a backlog of missed frames.
@@ -960,29 +1019,17 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
     """
 
     def __init__(self, cam, cfg, cfg_path=None):
-        super().__init__(name=f"cap-{cam['name']}", daemon=True)
-        self.cam = cam
-        self.name_ = cam["name"]
-        self.url = cam["url"]
-        self.cfg_path = cfg_path
-        self.day = None
-        self.interval = camera_interval(cam, cfg)
-        self.framerate = camera_framerate(cam, cfg)
-        self.base_timeout = int(cfg["capture"]["timeout_seconds"])
-        self.timeout = camera_timeout(cam, cfg)
+        super().__init__(cam, cfg, cfg_path)
         self.ffmpeg = cfg["paths"]["ffmpeg"]
-        self.root = Path(cfg["paths"]["frames_root"]) / self.name_
         self.quality = str(cam.get("quality", 2))
-        self.log = logging.getLogger(self.name_)
         self.proc = None
         self.restarts = 0
         # The RTSP path cannot report per-frame success: ffmpeg writes the
         # frames and this thread only supervises the process. What it does know
         # is when that process last started and how often it has had to be
-        # restarted, so those are what it publishes, and last_success stays
-        # None rather than being invented from something that is not one.
-        self.last_attempt = None
-        self.last_success = None
+        # restarted, so that is what it publishes, and last_success (set by the
+        # mixin) stays None rather than being invented from something that is
+        # not one.
         self.last_started = None
 
     def _prepare_day(self, day):
@@ -1255,8 +1302,16 @@ def record_cadences(cams):
     today = day_string(time.time())
     for cam in cams:
         day_dir = cam.root / today
-        if day_dir.is_dir():
-            write_cadence(day_dir, cam.interval, cam.framerate)
+        # Per camera, and guarded: this runs on the daemon's main thread once a
+        # minute, so an is_dir() raising EACCES here would unwind the daemon
+        # itself rather than the camera it is about. Failure isolation is the
+        # same rule it always is, met in the housekeeping rather than in a
+        # fetch. The formatter redacts whatever the path turns out to contain.
+        try:
+            if day_dir.is_dir():
+                write_cadence(day_dir, cam.interval, cam.framerate)
+        except Exception:                                        # noqa: BLE001
+            log.exception("could not record the cadence for %s", cam.name_)
 
 
 # ----------------------------------------------------------------------------

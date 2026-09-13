@@ -111,6 +111,34 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **A camera whose frames folder is deleted while capture is running starts
+  writing again on the next tick.** Clearing today's folder to "start again",
+  or a network frames path dropping for a moment, used to leave that camera
+  failing identically every tick until midnight: the folder is created when
+  the date changes, so nothing recreated it in between. The daily video for
+  that camera would then cover only the morning.
+
+- **`log_every_n_failures: 0` no longer stops a camera.** It is how often a
+  continuing failure is repeated in the log, and setting it to zero, or to
+  anything that is not a whole number, ended that camera's thread the second
+  time a fetch failed. Nothing restarted it, and the status page went on
+  listing the camera with the time of its last attempt frozen, so the daemon
+  looked healthy and one camera had simply stopped. Any value below 1 now
+  means "log every failure".
+
+- **Capture survives a frames folder it cannot read.** Once a minute the
+  daemon annotates each camera's folder for the day; a permission change, or
+  an I/O error on a network path, used to end the whole daemon rather than
+  that one camera's annotation. systemd restarted it after 15 seconds and it
+  met the same folder again.
+
+- **Frame times stay on the clock after a cadence change.** Changing a
+  camera's interval takes effect at midnight, and the first day at the new
+  interval kept the phase of the old one: moving from 7 seconds to 60 named
+  every frame at 7 seconds past the minute for that whole day. Frame names
+  are what order a timelapse, so this was visible in the file listing rather
+  than in the video.
+
 - **Windows: testing a network share now tests the password you typed.** Both
   wizards reported a share as reachable as soon as anything could write to
   it, and on the machine you run the wizard on that is usually you: your own

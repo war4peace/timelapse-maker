@@ -337,9 +337,12 @@ class TestOneDayOneCadence(unittest.TestCase):
         self.assertEqual(cap.read_cadence(self.tmp / "Roof" / "2026-08-11"),
                          (5, 60))
 
-    def test_housekeeping_annotates_a_directory_ffmpeg_made(self):
-        # The RTSP path never creates day directories itself: ffmpeg does,
-        # through -strftime_mkdir, so the marker has to come from elsewhere.
+    def test_housekeeping_annotates_a_directory_it_did_not_create(self):
+        # Not "a directory ffmpeg made": -strftime_mkdir is an hls option that
+        # image2 ignores, which is the 0.1.7 bug, and _prepare_day() has
+        # created these in Python ever since. The backstop still earns its
+        # place, because a directory can outlive the process that made it and
+        # a marker can fail to be written.
         cam = self.camera()
         today = cap.day_string(time.time())
         (self.tmp / "Roof" / today).mkdir(parents=True)
@@ -1773,3 +1776,303 @@ class TestTheGrabberCanBeStopped(unittest.TestCase):
         second wait hint this daemon gives the Windows SCM, with the camera
         threads joined one after another."""
         self.assertLessEqual(cap.SUPERVISE_POLL, 2)
+
+
+class TestTheFailureThrottleCannotKillTheThread(unittest.TestCase):
+    """`log_every_n_failures: 0` ended the camera thread, permanently.
+
+    The throttle is `consec_fail % log_every`, outside the try, so at 0 it
+    raises ZeroDivisionError on the *second* consecutive failure. Nothing
+    restarts a camera thread, and the heartbeat goes on listing the camera
+    with a last_attempt that never moves again, so the daemon looks alive and
+    that camera is simply gone. Nothing validates the key.
+
+    Platform-independent and unprivileged: nothing is started and nothing is
+    fetched.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def build(self, value=60, omit=False):
+        cfg = make_config(self.tmp)
+        if omit:
+            cfg["capture"].pop("log_every_n_failures", None)
+        else:
+            cfg["capture"]["log_every_n_failures"] = value
+        return cap.HttpCamera({"name": "Roof", "url": "http://192.0.2.1/snap"},
+                              cfg)
+
+    def test_zero_becomes_one(self):
+        self.assertEqual(self.build(0).log_every, 1)
+
+    def test_a_negative_becomes_one(self):
+        self.assertEqual(self.build(-5).log_every, 1)
+
+    def test_a_number_written_as_text_is_read_as_a_number(self):
+        # A hand-edited config, and the same modulo killed the thread just as
+        # dead with a TypeError.
+        self.assertEqual(self.build("30").log_every, 30)
+
+    def test_an_ordinary_value_is_left_alone(self):
+        self.assertEqual(self.build(60).log_every, 60)
+
+    def test_the_default_survives(self):
+        self.assertEqual(self.build(omit=True).log_every, 60)
+
+    def test_the_throttle_can_be_evaluated_at_the_second_failure(self):
+        # The line this protects, in the shape run() uses it. With the clamp
+        # backed out this raises instead of answering.
+        cam = self.build(0)
+        self.assertEqual(2 % cam.log_every, 0)
+
+
+class TestHousekeepingCannotEndTheDaemon(unittest.TestCase):
+    """record_cadences() runs on the daemon's own thread, once a minute.
+
+    pathlib swallows only ENOENT, ENOTDIR, EBADF and ELOOP, so EACCES (an ACL
+    change on Windows) or EIO (a network frames root) propagates out of
+    is_dir() and unwinds the main thread. systemd restarts after 15 seconds;
+    the Windows SCM only since H4.
+
+    Platform-independent and unprivileged: the refusal is injected, never
+    arranged on disk, because arranging it would need a real ACL change and
+    would then only run on one platform.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def camera(self, name):
+        return cap.HttpCamera({"name": name, "url": "http://192.0.2.1/snap"},
+                              make_config(self.tmp))
+
+    def test_an_unreadable_frames_root_does_not_reach_the_caller(self):
+        cam = self.camera("Roof")
+
+        def refuse(_self):
+            raise PermissionError(13, "Permission denied")
+
+        with mock.patch.object(cap.Path, "is_dir", refuse):
+            with self.assertLogs(cap.log, level="ERROR"):
+                cap.record_cadences([cam])      # must simply return
+
+    def test_one_unreadable_camera_does_not_stop_the_others(self):
+        """Failure isolation, met in the housekeeping rather than in a fetch."""
+        bad, good = self.camera("Bad"), self.camera("Good")
+        today = cap.day_string(time.time())
+        (self.tmp / "Good" / today).mkdir(parents=True)
+        real = cap.Path.is_dir
+
+        def refuse_one(self):
+            if "Bad" in str(self):
+                raise PermissionError(13, "Permission denied")
+            return real(self)
+
+        with mock.patch.object(cap.Path, "is_dir", refuse_one):
+            with self.assertLogs(cap.log, level="ERROR"):
+                cap.record_cadences([bad, good])     # bad first, deliberately
+        self.assertEqual(cap.read_cadence(self.tmp / "Good" / today), (5, 60))
+
+    def test_an_unreadable_marker_is_not_an_exception_either(self):
+        day = self.tmp / "Roof" / "2026-08-11"
+        day.mkdir(parents=True)
+
+        def refuse(_self):
+            raise PermissionError(13, "Permission denied")
+
+        with mock.patch.object(cap.Path, "exists", refuse):
+            self.assertFalse(cap.write_cadence(day, 5, 60))
+
+
+class TestADayDirectoryRemovedMidDayIsRecreated(unittest.TestCase):
+    """_dest_path() only creates the directory when the date changes.
+
+    So an operator clearing today's frames to "start again", or a dropped
+    mount, used to fail every remaining tick of the day identically with
+    nothing repairing it until midnight.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cam = cap.HttpCamera(
+            {"name": "Roof", "url": "http://192.0.2.1/snap"},
+            make_config(self.tmp))
+        self.cam.session.get = lambda *a, **k: FakeResponse(
+            b"\xff\xd8" + b"x" * 5000)
+
+    def test_the_next_tick_makes_it_again(self):
+        day = self.tmp / "Roof" / "2026-08-11"
+        self.cam._grab(datetime(2026, 8, 11, 12, 0, 0))
+        self.assertTrue((day / "120000.jpg").exists())
+
+        shutil.rmtree(day)
+        with self.assertRaises(FileNotFoundError):
+            self.cam._grab(datetime(2026, 8, 11, 12, 0, 5))
+
+        self.cam._grab(datetime(2026, 8, 11, 12, 0, 10))
+        self.assertTrue((day / "120010.jpg").exists())
+
+    def test_the_failed_tick_is_still_a_failure(self):
+        # Repairing the directory must not swallow the tick that found it
+        # missing: that frame really was not written, and the counters and the
+        # log are what the operator sees.
+        self.cam._grab(datetime(2026, 8, 11, 12, 0, 0))
+        shutil.rmtree(self.tmp / "Roof" / "2026-08-11")
+        with self.assertRaises(FileNotFoundError):
+            self.cam._grab(datetime(2026, 8, 11, 12, 0, 5))
+
+
+class TestTheTickGridIsReAnchored(unittest.TestCase):
+    """A cadence adopted at midnight has to move to the new grid.
+
+    Filenames come from the tick time and filenames are the sort key, so
+    carrying the old phase forward leaves a 60s day naming every frame at
+    seven seconds past the minute.
+    """
+
+    def test_the_next_slot_is_strictly_after_the_time_given(self):
+        self.assertGreater(cap.next_slot(1000.0, 5), 1000.0)
+        self.assertGreater(cap.next_slot(1000.0, 60), 1000.0)
+
+    def test_an_on_grid_time_moves_on_rather_than_repeating(self):
+        # Equal would fire twice at the same second, and the second frame
+        # would collide with the first.
+        self.assertEqual(cap.next_slot(1020, 60), 1080)
+
+    def test_a_cadence_change_lands_on_the_new_grid(self):
+        # 86401 is on the old 7s grid and nowhere near the new 60s one.
+        after = cap.next_slot(86401, 60)
+        self.assertEqual(after % 60, 0)
+        self.assertGreater(after, 86401)
+
+    def test_an_unchanged_cadence_still_advances_by_one_interval(self):
+        self.assertEqual(cap.next_slot(1000, 5) - 1000, 5)
+
+
+class TestBothCamerasShareTheCadenceState(unittest.TestCase):
+    """The mixin's rule depends on ten attributes it did not set.
+
+    Both classes opened with the same twelve lines, so the two copies were
+    free to drift apart and begin_day() would have read whichever it was
+    given.
+    """
+
+    SHARED = ("cam", "name_", "url", "cfg_path", "day", "interval",
+              "framerate", "base_timeout", "timeout", "root", "log",
+              "last_attempt", "last_success")
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cam = {"name": "Roof", "url": "rtsp://192.0.2.1/s1"}
+
+    def test_the_two_classes_agree_on_every_shared_attribute(self):
+        cfg = make_config(self.tmp)
+        http = cap.HttpCamera(self.cam, cfg, "/etc/timelapse/config.json")
+        rtsp = cap.RtspCamera(self.cam, cfg, "/etc/timelapse/config.json")
+        for attr in self.SHARED:
+            self.assertEqual(getattr(http, attr), getattr(rtsp, attr), attr)
+
+    def test_the_mixin_is_what_sets_them(self):
+        # A bare subclass, so nothing but the mixin has run. If an attribute
+        # moves back into the camera classes this is where it goes missing.
+        class Bare(cap.DayCadenceMixin, threading.Thread):
+            pass
+
+        bare = Bare(self.cam, make_config(self.tmp))
+        for attr in self.SHARED:
+            self.assertTrue(hasattr(bare, attr), attr)
+
+    def test_the_rule_itself_runs_on_that_state_alone(self):
+        class Bare(cap.DayCadenceMixin, threading.Thread):
+            pass
+
+        bare = Bare(self.cam, make_config(self.tmp))
+        self.assertFalse(bare.begin_day("2026-08-11"))
+        self.assertEqual(bare.day, "2026-08-11")
+
+
+class TestTheDayRollover(unittest.TestCase):
+    """The one moment a cadence change is allowed to land.
+
+    The tick loop itself is executed by no test (that is M31 of the plan), so
+    the rule lives in _roll_day() where it can be called directly. Times are
+    built from a local datetime and read back through the product's own
+    day_string(), so nothing here depends on the machine's timezone.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def camera(self, interval):
+        return cap.HttpCamera({"name": "Roof", "url": "http://192.0.2.1/snap"},
+                              make_config(self.tmp, interval))
+
+    def day_with_cadence(self, day, interval, framerate):
+        d = self.tmp / "Roof" / day
+        d.mkdir(parents=True)
+        cap.write_cadence(d, interval, framerate)
+        return d
+
+    def test_a_new_cadence_re_anchors_the_grid(self):
+        cam = self.camera(7)
+        fire_t = datetime(2026, 8, 12, 0, 0, 1).timestamp()
+        self.day_with_cadence(cap.day_string(fire_t), 60, 30)
+        after = cam._roll_day(fire_t, fire_t + 7)
+        self.assertEqual(cam.interval, 60)
+        self.assertEqual(after % 60, 0, "left on the old 7s phase")
+        self.assertGreater(after, fire_t)
+
+    def test_an_unchanged_cadence_leaves_the_schedule_alone(self):
+        cam = self.camera(5)
+        fire_t = datetime(2026, 8, 12, 0, 0, 5).timestamp()
+        self.day_with_cadence(cap.day_string(fire_t), 5, 60)
+        self.assertEqual(cam._roll_day(fire_t, fire_t + 5), fire_t + 5)
+
+    def test_a_day_already_under_way_is_not_re_read(self):
+        cam = self.camera(5)
+        fire_t = datetime(2026, 8, 12, 0, 0, 5).timestamp()
+        self.day_with_cadence(cap.day_string(fire_t), 60, 30)
+        cam._roll_day(fire_t, fire_t + 5)
+        self.assertEqual(cam.interval, 60)
+        # Same day, so nothing is read and nothing moves, whatever is on disk.
+        later = fire_t + 3600
+        self.assertEqual(cam._roll_day(later, later + 60), later + 60)
+
+    def test_an_edit_made_mid_day_does_not_land_until_midnight(self):
+        """The invariant the day check exists for.
+
+        A day with no marker reads the config, so if the rollover stopped
+        being the only moment it is read, an edit at 14:00 would change the
+        cadence under a day already half captured, and the encoder would play
+        that day back at the wrong speed. A marked day cannot show this: its
+        marker pins the answer whoever asks.
+        """
+        cfg_path = self.tmp / "config.json"
+        cfg = make_config(self.tmp, 5)
+        cfg_path.write_text(json.dumps(
+            {"capture": cfg["capture"], "paths": cfg["paths"],
+             "encode": {"framerate": 60},
+             "cameras": [{"name": "Roof", "url": "http://192.0.2.1/snap",
+                          "enabled": True}]}), encoding="utf-8")
+        cam = cap.HttpCamera({"name": "Roof", "url": "http://192.0.2.1/snap"},
+                             cfg, str(cfg_path))
+
+        fire_t = datetime(2026, 8, 12, 0, 0, 5).timestamp()
+        (self.tmp / "Roof" / cap.day_string(fire_t)).mkdir(parents=True)
+        cam._roll_day(fire_t, fire_t + 5)       # adopts the day, unmarked
+        self.assertEqual(cam.interval, 5)
+
+        cfg_path.write_text(json.dumps(
+            {"capture": dict(cfg["capture"], interval_seconds=60),
+             "paths": cfg["paths"], "encode": {"framerate": 30},
+             "cameras": [{"name": "Roof", "url": "http://192.0.2.1/snap",
+                          "enabled": True}]}), encoding="utf-8")
+        later = fire_t + 3600
+        self.assertEqual(cam._roll_day(later, later + 5), later + 5)
+        self.assertEqual(cam.interval, 5, "an edit landed before midnight")

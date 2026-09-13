@@ -204,6 +204,14 @@ Long-running daemon. `systemd` `Type=simple`, `Restart=always`.
 | `STOP` | `threading.Event`, set by SIGTERM/SIGINT. Every loop uses `STOP.wait(n)` rather than `time.sleep(n)` so shutdown is immediate. |
 | `PAUSED` | `threading.Event`, set by `DiskGuard`. Capture threads check it and skip, but keep their scheduling loop running. |
 
+**Nothing on the housekeeping tick may raise** (0.2.1). `record_cadences()`
+and `write_cadence()` both stat a path, and pathlib swallows only `ENOENT`,
+`ENOTDIR`, `EBADF` and `ELOOP`: an `EACCES` from an ACL change or an `EIO`
+from a network frames root propagates, and this runs on the main thread, so
+the daemon unwinds rather than the camera it was about. The guard is **per
+camera**, which is failure isolation met in the housekeeping rather than in a
+fetch, and the formatter redacts whatever the path turns out to carry.
+
 The same once-a-minute tick in `main()` that calls `record_cadences()` also
 calls `write_state()` (§3a). It is the main thread, so there is one writer and
 no lock: every value it reads off a camera thread is a single int or float,
@@ -223,7 +231,12 @@ stopped taking pictures, and **once more on clean shutdown** with
 - `_grab(dt, timeout=None)`: one fetch. Validates size ≥ `min_bytes` and JPEG
   SOI (`FF D8`), writes temp, `os.replace`s into place. Nothing is written until
   both checks pass, so a failed attempt leaves no partial file and no
-  `_dest_path` collision for a retry to trip over.
+  `_dest_path` collision for a retry to trip over. A `FileNotFoundError` from
+  that write clears `_last_dir` before re-raising (0.2.1): the day directory is
+  created only when the date changes, so an operator clearing today's frames
+  to start again, or a dropped mount, otherwise failed every remaining tick of
+  the day identically with nothing repairing it until midnight. The tick that
+  found it missing is still counted and logged as the failure it was.
 - `_retry_grab(dt, deadline, first_exc)` / `_retry_timeout(deadline, now)`: one
   second attempt inside the same tick, controlled by `retry_within_tick`.
   Rationale: an ONVIF snapshot endpoint on a busy camera answers `500` in
@@ -3125,6 +3138,17 @@ the config.
   it did not, and the whole path was broken. It never *creates* a directory: a
   camera offline all day would otherwise leave an empty one behind every night,
   which the encoder finds, reports as a `SKIP`, and never cleans up.
+- **A cadence that changes re-anchors the tick grid** (0.2.1). `_roll_day()`
+  owns the whole rule: the day is what decides whether the config is re-read,
+  and a change that lands returns `next_slot(fire_t, interval)` rather than
+  `fire_t + interval`. Carrying the old phase forward is not a rounding error,
+  it is permanent: a day moved from 7s to 60s would name every frame at seven
+  seconds past the minute for the rest of that day, and **filenames are the
+  sort key**. `next_slot` is strictly after the time given, or a tick that
+  happened to sit on both grids would fire twice in the same second and the
+  second frame would collide with the first. It is a method rather than four
+  lines in the loop because the tick loop is the one part of this daemon no
+  test executes, and the rule is worth executing.
 - **RTSP gets `-t seconds_to_midnight()`.** ffmpeg carries `fps=1/interval` on
   its command line, so a new cadence means a new process, and the boundary is
   the only moment that may happen. Its `rc=0` is the planned handover and is
@@ -3386,7 +3410,7 @@ take an optional path as their first positional argument. See
 | `timeout_seconds` | 4 | Must stay below `interval_seconds`, or a slow camera stalls its own next fetch. |
 | `min_bytes` | 4096 | Shared with the encoder's validity check. |
 | `min_free_gb` | 60 | `0` disables DiskGuard. |
-| `log_every_n_failures` | 60 | At 5s intervals, 60 = one log line per 5 minutes of downtime. |
+| `log_every_n_failures` | 60 | At 5s intervals, 60 = one log line per 5 minutes of downtime. Clamped to at least 1 where it is read (0.2.1): the throttle is a modulo outside the try, so `0` used to end the camera thread on its second consecutive failure, and nothing restarts a camera thread. |
 | `retry_within_tick` | true | One retry per tick when the budget allows. Set false for a camera that degrades under a second request. |
 | `notify_auth_failures` | true | Send one notification when a camera is confirmed to be refusing our credentials, and one when it recovers. Needs a configured sink; the back-off itself is unconditional. |
 
@@ -3559,7 +3583,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,194 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,216 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4334,7 +4358,7 @@ timelapse-setup.cmd              double-click shim for the above
 installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
-scripts/timelapse_capture.py     daemon, 1529 lines
+scripts/timelapse_capture.py     daemon, 1584 lines
 scripts/timelapse_encode.py      batch job, 2300 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1049 lines
 scripts/timelapse_setup.py       configuration wizard, 4814 lines
