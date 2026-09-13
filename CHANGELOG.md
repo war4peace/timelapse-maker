@@ -95,6 +95,17 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **A typo at the Auth question no longer deletes the camera's password.**
+  The wizard printed `Auth (digest/basic/none)` and then stored whatever was
+  typed, and anything that was not `digest` or `basic` meant no
+  authentication, so the username and password were removed with it.
+  Answering `digets` while editing a camera left it presenting nothing: every
+  snapshot refused with a 401 from the next restart, looking exactly like a
+  password changed at the camera, with the real one no longer in the file to
+  put back. The question now re-asks until the answer is one of the three it
+  offers. If your config already holds a mode that is not one of them, the
+  wizard says so and offers `digest` rather than looping.
+
 - **Testing a camera with no terminal no longer loops until it crashes.**
   `timelapse cameras -t:Gate` from cron or a scheduled task, and any run
   with `--defaults`, met a camera answering HTTP 401 with an offer to retry

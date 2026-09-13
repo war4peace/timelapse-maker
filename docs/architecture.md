@@ -20,6 +20,7 @@ guide.
   - [4.4 `timelapse_setup.py`](#44-timelapse_setuppy)
   - [4.4b A path with a space in it (0.2.1)](#44b-a-path-with-a-space-in-it-021)
   - [4.4c A question nobody was there to answer (0.2.1)](#44c-a-question-nobody-was-there-to-answer-021)
+  - [4.4d A prompt that lists its answers and takes any of them (0.2.1)](#44d-a-prompt-that-lists-its-answers-and-takes-any-of-them-021)
   - [4.5 `timelapse_web.py`](#45-timelapse_webpy)
   - [4.6 `timelapse_update.py`](#46-timelapse_updatepy)
   - [4.6a `timelapse_platform.py` (0.2.0)](#46a-timelapse_platformpy-020)
@@ -997,6 +998,45 @@ the window calls `grab_snapshot()` and a test pins that `test_camera()`,
 `ask_yes()` and `ask()` appear nowhere in it. What changes here is where the
 rule lives. Avoiding a function that asks questions works only for callers who
 know to; the function now knows whether anybody is listening.
+
+#### 4.4d A prompt that lists its answers and takes any of them (0.2.1)
+
+`ask()` hands back whatever was typed and `ask_yes()` loops until it hears
+yes or no. The Auth prompt sat between the two: it printed
+`Auth (digest/basic/none)` and then stored the answer whatever it was.
+
+That is worse than it sounds, because of what the caller does next. Anything
+that is not `digest` or `basic` takes the branch that **pops `username` and
+`password`**, and the daemon reads an unknown mode as none
+(`HttpCamera.__init__`). Measured on the real edit path
+(`temp/h2_probe.py`, the shipped build and the old one loaded side by side
+from source):
+
+| answered | stored |
+|---|---|
+| `digets` | `auth: "digets"`, no username, no password |
+| `digest` | `auth: "digest"`, username and password untouched |
+
+So one transposed letter leaves a camera presenting nothing, 401ing every tick
+from the next daemon restart, with the credential gone rather than merely
+unused: retyping it is the only way back. Nothing reports it either, since a
+camera that answers 401 looks exactly like a camera whose password was
+changed at the camera.
+
+`ask_choice(question, choices, default)` re-asks, shaped like `ask_yes()`, and
+both sites use it. **The default gets checked too**, which is not fussiness:
+with no terminal `ask()` returns the default unread, so a default outside the
+list would re-prompt for ever, and a fix that hangs the wizard on a config it
+merely disapproves of is a worse outage than the defect. An out of range value
+is named in a warning and replaced with the first choice, so an operator who
+hand-edited `digets` into the file is told what was wrong with it.
+
+**The graphical wizard never had this**, and why is the general point: its
+Authentication field is a readonly `Combobox`, and a picker cannot express a
+typo. Validation belongs wherever free text is possible, which on the console
+is everywhere. The two lists are one list now (`AUTH_MODES`, read by the
+window), because two spellings of the same set is the drift `tools/` was
+deleted over.
 
 ### 4.5 `timelapse_web.py`
 
@@ -3271,7 +3311,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,113 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,119 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4000,7 +4040,7 @@ installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2252 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
-scripts/timelapse_setup.py       configuration wizard, 4769 lines
+scripts/timelapse_setup.py       configuration wizard, 4799 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2344 lines

@@ -705,6 +705,116 @@ class TestCameraCounter(unittest.TestCase):
         self.assertEqual(len(cams), 1)
 
 
+class TestTheAuthPromptChecksItsAnswer(unittest.TestCase):
+    """It listed three answers and accepted anything typed at it.
+
+    Platform-independent and unprivileged; it declares its own terminal. The
+    stakes are not the typo. The branch for "neither digest nor basic"
+    *deletes* the stored username and password, and the daemon reads an
+    unknown mode as none, so `digets` left a camera with nothing to present,
+    401ing every tick from the next restart, and nothing to put back.
+
+    edit_one_camera() had no test of its own before this.
+    """
+
+    def cam(self, **over):
+        cam = {"name": "Gate", "enabled": True, "method": "http",
+               "url": "http://192.0.2.1/snap", "auth": "digest",
+               "username": "admin", "password": "hunter2"}
+        cam.update(over)
+        return cam
+
+    def edit(self, keystrokes, cam=None):
+        """Keystrokes run out, and every prompt after that takes its default,
+        which is how these stay about the Auth question alone."""
+        cam = self.cam() if cam is None else cam
+        cfg = {"paths": {"frames_root": "/nonexistent"},
+               "capture": {"interval_seconds": 5},
+               "encode": {"framerate": 60}, "cameras": [cam]}
+        prev = (setup._TTY, setup.AUTO)
+        setup._TTY, setup.AUTO = FakeTTY(keystrokes, tty=False), False
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "test_camera", return_value=True), \
+                 mock.patch.object(setup, "rename_camera_frames"):
+                setup.edit_one_camera(cfg, cfg["cameras"], cam)
+        finally:
+            setup._TTY, setup.AUTO = prev
+        return cam, buf.getvalue()
+
+    def test_a_typo_is_refused_rather_than_stored(self):
+        cam, out = self.edit("\n\ndigets\ndigest\n")
+        self.assertEqual(cam["auth"], "digest")
+        self.assertEqual(cam["password"], "hunter2")
+        self.assertEqual(cam["username"], "admin")
+        self.assertIn("Answer one of", out)
+
+    def test_enter_still_keeps_the_mode_that_is_there(self):
+        cam, _ = self.edit("\n\n\n")
+        self.assertEqual(cam["auth"], "digest")
+        self.assertEqual(cam["password"], "hunter2")
+
+    def test_none_still_clears_the_credentials(self):
+        """The control. Without it, "the password survives a typo" would be
+        satisfied by a version that had stopped clearing at all, and a camera
+        deliberately set to no auth would keep presenting one."""
+        cam, _ = self.edit("\n\nnone\n")
+        self.assertEqual(cam["auth"], "none")
+        self.assertNotIn("username", cam)
+        self.assertNotIn("password", cam)
+
+    def test_a_stored_value_the_prompt_would_refuse_does_not_loop(self):
+        """With no terminal ask() hands the default straight back, so a
+        default outside the list would re-prompt for ever: the fix causing a
+        worse outage than the defect. A config edited by hand, or written
+        before this prompt checked anything, can hold one."""
+        prev = (setup._TTY, setup.AUTO)
+        setup._TTY, setup.AUTO = None, True
+        real, asked = setup.ask, []
+
+        def counted(question, default=""):
+            # A loop would hang the run rather than fail it, and a hanging
+            # test tells nobody anything.
+            asked.append(question)
+            if len(asked) > 4:
+                raise AssertionError("%d prompts and no terminal to answer "
+                                     "them" % len(asked))
+            return real(question, default)
+
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "ask", counted):
+                answer = setup.ask_choice("Auth", setup.AUTH_MODES, "digets")
+        finally:
+            setup._TTY, setup.AUTO = prev
+        self.assertIn(answer, setup.AUTH_MODES)
+        self.assertEqual(len(asked), 1)
+        self.assertIn("digets", buf.getvalue())     # named, not silently fixed
+
+    def test_the_add_path_checks_it_too(self):
+        """Custom URL is the other site, and it is the one where the answer
+        decides whether a password is asked for at all."""
+        cfg = {"paths": {"frames_root": "/nonexistent"},
+               "capture": {"interval_seconds": 5}, "encode": {"framerate": 60},
+               "cameras": []}
+        custom = len(setup.CAMERA_PRESETS)          # "Custom URL" is the last
+        prev = (setup._TTY, setup.AUTO)
+        setup._TTY, setup.AUTO = FakeTTY(
+            "%d\nGate\nn\nhttp://192.0.2.1/s\nbasick\nbasic\n" % custom,
+            tty=False), False
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf), \
+                 mock.patch.object(setup, "test_camera", return_value=True):
+                cam = setup.add_one_camera(cfg, 1)
+        finally:
+            setup._TTY, setup.AUTO = prev
+        self.assertEqual(cam["auth"], "basic")
+        self.assertIn("Answer one of", buf.getvalue())
+
+
 class TestCameraManagement(unittest.TestCase):
     """`timelapse cameras`: add/edit/remove against a live config.
 

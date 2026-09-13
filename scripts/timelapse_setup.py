@@ -197,6 +197,30 @@ def ask_yes(question, default=True):
             return False
 
 
+def ask_choice(question, choices, default):
+    """Prompt until the answer is one of `choices`. Shaped like ask_yes().
+
+    A prompt that lists its choices and then accepts anything is a free text
+    field with a misleading label. The Auth prompt was one: its caller acts on
+    the answer, and the branch for "not digest and not basic" *deletes* the
+    stored username and password, so `digets` left a camera with no
+    credentials and an auth mode the daemon reads as none. Every fetch then
+    401s from the next restart, and the password has to be typed again.
+    """
+    if default not in choices:
+        # An out-of-range default would loop for ever with no terminal, where
+        # ask() hands it straight back. Reachable: a config edited by hand, or
+        # one written before this prompt checked anything.
+        warn(f"'{default}' is not one of {', '.join(choices)}.")
+        default = choices[0]
+    listed = "/".join(choices)
+    while True:
+        answer = ask(f"{question} ({listed})", default).strip().lower()
+        if answer in choices:
+            return answer
+        fail(f"Answer one of: {', '.join(choices)}.")
+
+
 def ask_int(question, default, lo=None, hi=None):
     while True:
         raw = ask(question, str(default))
@@ -879,6 +903,12 @@ def wsd_preset(dev):
     return ""
 
 
+# What the HTTP snapshot fetch can be asked to present. The daemon reads
+# anything else as "none" (timelapse_capture.py, HttpCamera.__init__), which is
+# why the prompts pick from this list rather than accepting what was typed.
+AUTH_MODES = ("digest", "basic", "none")
+
+
 CAMERA_PRESETS = [
     ("Dahua / Amcrest", "http", "digest",
      "http://{ip}/cgi-bin/snapshot.cgi?channel=1&subtype=0"),
@@ -1131,7 +1161,7 @@ def add_one_camera(cfg, n, found=None):
         if not url:
             fail("No URL given; skipping this camera.")
             return None
-        auth = ask("Auth (digest/basic/none)", "digest").lower()
+        auth = ask_choice("Auth", AUTH_MODES, "digest")
         user = pwd = ""
         if auth in ("digest", "basic"):
             user = ask("Username", "admin")
@@ -1432,8 +1462,8 @@ def edit_one_camera(cfg, cams, cam):
 
     cam["url"] = ask("Snapshot URL", str(cam.get("url", "")))
     if cam.get("method", "http") == "http":
-        cam["auth"] = ask("Auth (digest/basic/none)",
-                          str(cam.get("auth", "none"))).lower()
+        cam["auth"] = ask_choice("Auth", AUTH_MODES,
+                                 str(cam.get("auth", "none")).lower())
         if cam["auth"] in ("digest", "basic"):
             cam["username"] = ask("Username", str(cam.get("username", "")))
             pw = ask_secret("Password (blank keeps the current one)")

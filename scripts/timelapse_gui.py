@@ -1985,7 +1985,7 @@ def run(config_path=None, existing=None):
             auth = tk.StringVar()
             auth_row = add_row("Authentication",
                                ttk.Combobox(right, textvariable=auth,
-                                            values=["digest", "basic", "none"],
+                                            values=list(setup.AUTH_MODES),
                                             state="readonly", width=14))
             user, user_row = entry_row("Username")
             password, pw_row = entry_row("Password", secret=True)

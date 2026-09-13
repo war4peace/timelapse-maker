@@ -1743,6 +1743,18 @@ class TestSnapshotPreview(unittest.TestCase):
                              "%s prompts or prints on a console this window "
                              "does not have" % banned)
 
+    def test_the_auth_picker_offers_what_the_wizard_validates(self):
+        """Two lists of authentication modes is one that drifts. The window
+        cannot produce the typo the console prompt could, because it is a
+        readonly picker, but it could offer a mode the wizard would refuse.
+        """
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+        read = {node.attr for node in ast.walk(tree)
+                if isinstance(node, ast.Attribute)
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "setup"}
+        self.assertIn("AUTH_MODES", read)
+
 
 class TestReview(unittest.TestCase):
 
