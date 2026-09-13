@@ -3889,6 +3889,24 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
+**The suite's own fixtures live in `tests/_support.py`** (0.2.1, L47):
+`FakeTTY`, `wizard_tty()`, `TempDirCase` and `make_frame()`. `FakeTTY` lived
+in `test_setup.py`, where `test_gui.py` and `test_usage.py` drove the same
+prompts and could not reach it, and its default is now **`tty=False`**: with
+`isatty()` true, `ask_secret()` hands the question to the real `getpass`,
+which reads the console rather than the fake, and a suite that blocks on a
+password prompt is one nobody can run unattended. A test that wants a terminal
+says so.
+
+`wizard_tty()` also stands in for `offer_discovery`, and that is not
+tidiness. **Four tests were sending a real WS-Discovery multicast** and
+waiting three seconds for answers, through one shared helper: packets on the
+network of whoever was running the suite. Measured with
+`temp/l47_who_multicasts.py` before and after: five call sites reached the
+real discovery, now one, and that one patches `wsd_open_sockets` to return
+nothing, so it opens no socket at all. `test_setup.py` went from 23.9 to 14.0
+seconds and the whole suite from 68 to 57.
+
 **Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,381 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's

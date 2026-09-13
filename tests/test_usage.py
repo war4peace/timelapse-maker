@@ -23,9 +23,13 @@ import timelapse_test as tt
 
 
 def make_frames(day_dir, count, size=1024):
-    day_dir.mkdir(parents=True, exist_ok=True)
+    """`count` frames in one day directory, through the shared builder.
+
+    It used to write the bytes itself, which is one more place that has to
+    agree with what the product calls a valid frame (0.2.1, L47).
+    """
     for i in range(count):
-        (day_dir / f"{i:06d}.jpg").write_bytes(b"\xff\xd8" + b"\0" * (size - 2))
+        _support.make_frame(day_dir / ("%06d.jpg" % i), size=size)
 
 
 class TestHumanBytes(unittest.TestCase):

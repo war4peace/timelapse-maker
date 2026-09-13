@@ -604,20 +604,14 @@ class TestCredentialQuoting(unittest.TestCase):
                 self.assertEqual(q["cmd"], ["Snap"])
 
 
-class FakeTTY(io.StringIO):
-    """A terminal that supplies a fixed script of keystrokes."""
-
-    def __init__(self, text, tty=True):
-        super().__init__(text)
-        self.reads = 0
-        self._tty = tty
-
-    def isatty(self):
-        return self._tty
-
-    def readline(self):
-        self.reads += 1
-        return super().readline()
+# One definition, in _support, where test_gui.py and test_usage.py can reach
+# it too (0.2.1, L47). The name stays bound here because twenty call sites use
+# it, and moving a fake is not a reason to touch twenty tests.
+#
+# Note the default: _support.FakeTTY is tty=False, and the copy that lived
+# here was tty=True. Every site that wants a terminal says so, and the ones
+# that do not now cannot reach the real getpass by accident.
+FakeTTY = _support.FakeTTY
 
 
 class TestEnterAcceptsTheDefault(unittest.TestCase):
@@ -711,19 +705,16 @@ class TestCameraCounter(unittest.TestCase):
     """
 
     def drive(self, keystrokes, expected):
-        prev_tty, prev_auto = setup._TTY, setup.AUTO
-        prev_test = setup.test_camera
-        setup.AUTO = False
-        setup._TTY = FakeTTY(keystrokes, tty=False)
-        setup.test_camera = lambda cam, cfg: True     # no network in tests
+        # wizard_tty(), which also stands in for offer_discovery: this reaches
+        # choose_cameras(), and the real one puts a WS-Discovery multicast on
+        # the network of whoever is running the suite and waits three seconds
+        # for answers.
         cfg = setup.default_config()
         buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                setup.choose_cameras(cfg, expected)
-        finally:
-            setup._TTY, setup.AUTO = prev_tty, prev_auto
-            setup.test_camera = prev_test
+        with _support.wizard_tty(keystrokes), \
+                mock.patch.object(setup, "test_camera", return_value=True), \
+                contextlib.redirect_stdout(buf):
+            setup.choose_cameras(cfg, expected)
         return cfg["cameras"], buf.getvalue()
 
     # configure? / scan? / type / name / ip / user / pass / smooth? / test? /
@@ -783,17 +774,12 @@ class TestTheFirstRunWizardRefusesADuplicateName(unittest.TestCase):
     """
 
     def drive(self, keystrokes, expected=9):
-        prev_tty, prev_auto = setup._TTY, setup.AUTO
-        setup.AUTO = False
-        setup._TTY = FakeTTY(keystrokes, tty=False)
         cfg = setup.default_config()
         buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf), \
-                 mock.patch.object(setup, "test_camera", return_value=True):
-                setup.choose_cameras(cfg, expected)
-        finally:
-            setup._TTY, setup.AUTO = prev_tty, prev_auto
+        with _support.wizard_tty(keystrokes), \
+                mock.patch.object(setup, "test_camera", return_value=True), \
+                contextlib.redirect_stdout(buf):
+            setup.choose_cameras(cfg, expected)
         return cfg["cameras"], buf.getvalue()
 
     # configure? / scan? / type / name / ip / user / pass / smooth? / test?
@@ -1248,10 +1234,16 @@ class TestCameraActions(unittest.TestCase):
         setup._TTY, setup.AUTO = None, False
 
     def act(self, action, target=None, keys=""):
-        setup.AUTO = False
-        setup._TTY = FakeTTY(keys, tty=False)
+        """One camera action, with the terminal and discovery both stood in.
+
+        Four tests reach the real WS-Discovery multicast through this helper
+        (measured with temp/l47_who_multicasts.py), which puts packets on the
+        network of whoever is running the suite and waits three seconds for
+        answers. wizard_tty() patches offer_discovery, so it is fixed here
+        once rather than in each of them.
+        """
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        with _support.wizard_tty(keys), contextlib.redirect_stdout(buf):
             changed, okay = setup.camera_action(self.cfg, action, target)
         return changed, okay, buf.getvalue()
 
@@ -1534,9 +1526,6 @@ class TestTransferDestinationKind(unittest.TestCase):
         self.addCleanup(shutil.rmtree, str(self.tmp), True)
 
     def drive(self, keystrokes):
-        prev_tty, prev_auto = setup._TTY, setup.AUTO
-        setup.AUTO = False
-        setup._TTY = FakeTTY(keystrokes, tty=False)
         cfg = setup.default_config()
         buf = io.StringIO()
 
@@ -1545,7 +1534,7 @@ class TestTransferDestinationKind(unittest.TestCase):
                 "a test reached the CIFS mount path; it installs packages and "
                 "writes to /etc")
 
-        try:
+        with _support.wizard_tty(keystrokes):
             with contextlib.redirect_stdout(buf), \
                  mock.patch.object(setup, "IS_WINDOWS", False), \
                  mock.patch.object(setup, "is_elevated", return_value=False), \
@@ -1554,8 +1543,6 @@ class TestTransferDestinationKind(unittest.TestCase):
                  mock.patch.object(setup, "probe_rsync_flags",
                                    return_value=["-rt"]):
                 setup.choose_transfer(cfg)
-        finally:
-            setup._TTY, setup.AUTO = prev_tty, prev_auto
         return cfg["transfer"], buf.getvalue()
 
     def test_declining_leaves_transfer_disabled(self):
@@ -1756,9 +1743,6 @@ class TestChooseWeb(unittest.TestCase):
     LAN = "192.168.1.50"
 
     def drive(self, keystrokes, cfg=None, checks=None, lan=LAN):
-        prev_tty, prev_auto = setup._TTY, setup.AUTO
-        setup.AUTO = False
-        setup._TTY = FakeTTY(keystrokes, tty=False)
         cfg = cfg or setup.default_config()
         buf = io.StringIO()
         # Keyed by address, not a call sequence: suggest_bind() probes too, so
@@ -1767,15 +1751,13 @@ class TestChooseWeb(unittest.TestCase):
         def fake_check(addr, port):
             return (checks or {}).get(addr, ("ok", ""))
 
-        try:
+        with _support.wizard_tty(keystrokes):
             with contextlib.redirect_stdout(buf), \
                     mock.patch.object(setup, "check_bind", fake_check), \
                     mock.patch.object(setup, "lan_address", lambda: lan), \
                     mock.patch.object(setup, "host_addresses",
                                       lambda: [lan, "127.0.0.1"]):
                 setup.choose_web(cfg)
-        finally:
-            setup._TTY, setup.AUTO = prev_tty, prev_auto
         return cfg.get("web", {}), buf.getvalue()
 
     def test_declining_leaves_it_disabled(self):
@@ -2470,21 +2452,16 @@ class TestRestartWeb(unittest.TestCase):
     connections on an address the wizard had just called correct."""
 
     def drive(self, keystrokes, enabled=True, active=True):
-        prev_tty, prev_auto = setup._TTY, setup.AUTO
-        setup.AUTO = False
-        setup._TTY = FakeTTY(keystrokes, tty=False)
         cfg = {"web": {"enabled": enabled}}
         buf = io.StringIO()
         restarted = []
-        try:
+        with _support.wizard_tty(keystrokes):
             with contextlib.redirect_stdout(buf), \
                     mock.patch.object(setup, "unit_is_active",
                                       lambda unit: active), \
                     mock.patch.object(setup, "restart_unit",
                                       lambda unit, msg: restarted.append(unit)):
                 setup.restart_web_if_running(cfg)
-        finally:
-            setup._TTY, setup.AUTO = prev_tty, prev_auto
         return restarted, buf.getvalue()
 
     def test_a_running_service_is_restarted(self):
@@ -4863,17 +4840,12 @@ class TestWindowsWebUI(unittest.TestCase):
     """It is not ported, and the question must not pretend otherwise."""
 
     def drive(self, keystrokes, windows):
-        prev_tty, prev_auto = setup._TTY, setup.AUTO
-        setup.AUTO = False
-        setup._TTY = FakeTTY(keystrokes, tty=False)
         cfg = setup.default_config()
         buf = io.StringIO()
-        try:
+        with _support.wizard_tty(keystrokes):
             with contextlib.redirect_stdout(buf), \
                  mock.patch.object(setup, "IS_WINDOWS", windows):
                 setup.choose_web(cfg)
-        finally:
-            setup._TTY, setup.AUTO = prev_tty, prev_auto
         return cfg["web"], buf.getvalue()
 
     def test_windows_says_nothing_will_run_it(self):
@@ -4958,13 +4930,10 @@ class TestWindowsTransfer(unittest.TestCase):
         timelapse_encode because that is the module that defines them, which
         works here only because the wizard imports them inside the function.
         """
-        prev_tty, prev_auto = setup._TTY, setup.AUTO
-        setup.AUTO = False
-        setup._TTY = FakeTTY(keystrokes, tty=False)
         cfg = setup.default_config()
         buf = io.StringIO()
         mapping = mapping or {}
-        try:
+        with _support.wizard_tty(keystrokes):
             with contextlib.redirect_stdout(buf), \
                  mock.patch.object(setup, "IS_WINDOWS", True), \
                  mock.patch.object(plat, "IS_WINDOWS", True), \
@@ -4978,8 +4947,6 @@ class TestWindowsTransfer(unittest.TestCase):
                  mock.patch.object(setup, "network_path",
                                    side_effect=lambda p: mapping.get(str(p))):
                 setup.choose_transfer(cfg)
-        finally:
-            setup._TTY, setup.AUTO = prev_tty, prev_auto
         return cfg["transfer"], buf.getvalue()
 
     def test_declining_leaves_it_disabled(self):
@@ -5149,12 +5116,9 @@ class TestWindowsFfmpeg(unittest.TestCase):
 
     def drive(self, keystrokes, found="", resolve=None,
               encoders=("libx264", [], "")):
-        prev_tty, prev_auto = setup._TTY, setup.AUTO
-        setup.AUTO = False
-        setup._TTY = FakeTTY(keystrokes, tty=False)
         cfg = setup.default_config()
         buf = io.StringIO()
-        try:
+        with _support.wizard_tty(keystrokes):
             with contextlib.redirect_stdout(buf), \
                  mock.patch.object(setup, "IS_WINDOWS", True), \
                  mock.patch.object(setup, "find_tool", return_value=found), \
@@ -5164,8 +5128,6 @@ class TestWindowsFfmpeg(unittest.TestCase):
                  mock.patch.object(setup, "detect_encoders",
                                    return_value=encoders):
                 setup.choose_tools(cfg)
-        finally:
-            setup._TTY, setup.AUTO = prev_tty, prev_auto
         return cfg["paths"], buf.getvalue()
 
     def test_it_offers_no_default_when_nothing_is_installed(self):
@@ -5792,7 +5754,11 @@ class TestCtrlCAtAPasswordIsNotAnAnswer(unittest.TestCase):
         self.prev_tty, self.prev_auto = setup._TTY, setup.AUTO
         self.addCleanup(self.restore)
         setup.AUTO = False
-        setup._TTY = FakeTTY("")
+        # tty=True said out loud: ask_secret() only reaches getpass when it
+        # believes there is a terminal, and that is the branch under test. The
+        # shared FakeTTY defaults to False so that no test reaches the real
+        # console by accident.
+        setup._TTY = FakeTTY("", tty=True)
 
     def restore(self):
         setup._TTY, setup.AUTO = self.prev_tty, self.prev_auto
