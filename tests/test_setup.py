@@ -12,6 +12,7 @@ import io
 import os
 import collections
 import json
+import ntpath
 import re
 import shutil
 import socket
@@ -5948,10 +5949,16 @@ class TestAWindowsDestinationIsStoredAbsolute(unittest.TestCase):
         self.assertIn("Storing the full path", said)
 
     def test_a_drive_relative_path_is_made_absolute_too(self):
-        # ntpath.isabs("D:timelapse") is False: it means "the current
-        # directory on D:", which is not a place a service can find.
-        if not setup.IS_WINDOWS:
-            self.skipTest("drive-relative paths exist only on Windows")
+        """`D:timelapse` means "the current directory on D:", which is not a
+        place a service can find.
+
+        No skip: `ntpath.isabs()` calls it relative on either platform, which
+        is the decision under test, and what gets stored is absolute by the
+        running platform's rules, which is what the caller needs. A skip here
+        would have been a test that runs on one leg and reports nothing on the
+        other three.
+        """
+        self.assertFalse(ntpath.isabs("D:timelapse"))
         transfer, _ = self.choose("D:timelapse\n")
         self.assertTrue(os.path.isabs(transfer["destination"]))
 

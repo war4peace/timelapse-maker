@@ -2469,6 +2469,11 @@ class TestTheStopErrorIsTheOneThatFailed(unittest.TestCase):
 
     def clobbering_state(self, unit):
         # What the real one does: several calls, each setting the error.
+        #
+        # create=True on the patches below, because ctypes.get_last_error is
+        # **Windows-only**: these two passed here and errored on all three
+        # Linux legs, which is the fourth time this project has met "a local
+        # branch is a branch CI has never seen".
         plat.ctypes.get_last_error()
         return plat.SERVICE_RUNNING
 
@@ -2478,6 +2483,7 @@ class TestTheStopErrorIsTheOneThatFailed(unittest.TestCase):
             with mock.patch.object(plat, "service_state",
                                    self.clobbering_state), \
                     mock.patch.object(plat.ctypes, "get_last_error",
+                                      create=True,
                                       side_effect=[1053, 6, 6, 6]):
                 ok, detail = plat.stop_service("timelapse-capture", timeout=0)
         self.assertFalse(ok)
@@ -2492,7 +2498,7 @@ class TestTheStopErrorIsTheOneThatFailed(unittest.TestCase):
             with mock.patch.object(plat, "service_state",
                                    lambda u: plat.SERVICE_STOPPED), \
                     mock.patch.object(plat.ctypes, "get_last_error",
-                                      return_value=1062):
+                                      create=True, return_value=1062):
                 ok, detail = plat.stop_service("timelapse-capture", timeout=0)
         self.assertTrue(ok)
         self.assertEqual(detail, "")
