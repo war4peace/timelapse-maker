@@ -127,6 +127,21 @@ While the version is `0.x`, the configuration format may change in any release.
   wizard's transfer page with credentials nothing has tested, it now says so
   and lets you decide.
 
+- **An RTSP camera's ffmpeg is now stopped when capture stops.** Nothing on
+  the shutdown path ever reached it: the supervising thread waited for
+  ffmpeg to finish, and a working grabber finishes at midnight. On Linux
+  systemd stops it for us, so nothing was visibly wrong. On Windows nothing
+  does, so stopping the service left ffmpeg running and still writing frames
+  until midnight, and starting the service again put a second one on the
+  same folder. Both are ended properly now.
+
+  Two things that go with it, for RTSP cameras only. Pausing capture because
+  the disk is low now actually stops the camera, instead of leaving it
+  filling the disk it was paused for. And when ffmpeg does fail, the log
+  shows what it said just before it died rather than the first few lines it
+  printed when it connected, which for a camera that had been running all
+  day was never the useful part.
+
 - **Windows: the capture service now really does restart itself.** The
   installer has always registered it with three restart-on-failure actions,
   fifteen seconds apart, described in the guide as the equivalent of the

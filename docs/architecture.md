@@ -348,6 +348,55 @@ Two things follow, and both are the point rather than the fix:
   So a day that ends with no `.jpg` in it is removed, along with its cadence
   marker and nothing else.
 
+**Nothing on the stop path could reach ffmpeg until 0.2.1, and the whole of
+`run()` was written as though it could.** `communicate()` blocks until the
+child exits, and a healthy RTSP grabber exits at midnight, so `STOP` was
+noticed by the loop and never by the process; the `terminate()` after the loop
+was unreachable for as long as the thing it was terminating was working.
+Measured with a fake `Popen`, `STOP` set 0.2s after launch: `terminate()` was
+never called at all.
+
+**On Linux this was masked rather than absent**, which is why it survived. The
+unit runs under `KillMode=control-group`, so systemd SIGTERMs ffmpeg directly
+whatever this code does. Under the Windows SCM nothing does: each RTSP thread
+times out on its 20 second join (and two RTSP cameras therefore exceed the 30
+second stop hint this daemon gives the SCM), `run_daemon()` returns,
+SERVICE_STOPPED is reported, the process exits, and **ffmpeg is orphaned**. It
+keeps writing into today's directory until its own `-t` expires at midnight,
+and a service restart launches a second one with `-y` on the same pattern, so
+two writers race on one directory.
+
+`_supervise()` polls `proc.wait(timeout=SUPERVISE_POLL)` and ends the process
+when `STOP` or `PAUSED` is set, keeping the terminate-then-kill ladder. Three
+neighbours fall out of the same rewrite, and they were all consequences of the
+same blocking call:
+
+- **`PAUSED` now reaches the process.** The disk guard could pause capture
+  while a grabber launched at 00:00 went on filling the disk it was pausing
+  for, all day, with `capture.json` saying `paused: true` throughout.
+- **stderr is drained on a reader thread into a bounded deque**
+  (`STDERR_LINES`), rather than accumulated by `communicate()` until the
+  process exits. A grabber complaining once a second has all day to produce
+  it.
+- **The log keeps the tail, not the head.** `err[:400]` on a day of stderr is
+  the connection banner; what matters is the last thing it said before it
+  died.
+
+And **a process we ended is not a fault**: the returncode after `terminate()`
+is our own signal, so a stop or a pause is neither logged as a crash nor
+counted in `restarts`, which is published in `capture.json` and shown on the
+status page. A pause that incremented it would make a full disk look like a
+flapping camera.
+
+Verified on real Linux with a control (`temp/h10_orphan_check.sh`): the same
+harness against a copy of the daemon with the blocking call put back leaves an
+ffmpeg running after SIGTERM, and against the shipped one leaves none. WSL has
+no RTSP server (measured at 0.1.7), so ffmpeg is reached through a stub that
+takes the daemon's own output pattern and generates frames from lavfi, which
+makes the supervised process a genuine long-running ffmpeg writing real frames.
+**The Windows half is what only the operator can check**: `Get-Process ffmpeg`
+after `sc stop "TimelapseCapture"` with an RTSP camera configured.
+
 **`DiskGuard(threading.Thread)`**
 
 Polls `shutil.disk_usage(frames_root).free` every 300s. Below `min_free_gb`, sets
@@ -3510,7 +3559,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,183 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,194 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4285,7 +4334,7 @@ timelapse-setup.cmd              double-click shim for the above
 installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
-scripts/timelapse_capture.py     daemon, 1427 lines
+scripts/timelapse_capture.py     daemon, 1529 lines
 scripts/timelapse_encode.py      batch job, 2300 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1049 lines
 scripts/timelapse_setup.py       configuration wizard, 4814 lines

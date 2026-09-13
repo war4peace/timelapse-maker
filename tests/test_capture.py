@@ -1525,3 +1525,251 @@ class TestRtspWritesItsFrames(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakePipe(object):
+    """ffmpeg's stderr: a few lines, then blocking until the process ends."""
+
+    def __init__(self, lines=()):
+        self.lines = list(lines)
+        self.eof = threading.Event()
+        self.closed = False
+
+    def readline(self):
+        if self.lines:
+            return self.lines.pop(0)
+        self.eof.wait(10)
+        return b""
+
+    def close(self):
+        self.closed = True
+
+
+class FakePopen(object):
+    """A child that keeps running until something ends it.
+
+    Which is the whole subject: a real RTSP grabber runs until midnight, so
+    anything that only notices a stop after the process exits does not notice
+    it at all.
+    """
+
+    started = None               # every instance, in order, for the tests
+
+    def __init__(self, argv, stdout=None, stderr=None):
+        self.argv = argv
+        self.done = threading.Event()
+        self.returncode = None
+        self.terminated = 0
+        self.killed = 0
+        self.stderr = FakePipe(getattr(self, "_lines", ()))
+        FakePopen.started.append(self)
+
+    def wait(self, timeout=None):
+        if not self.done.wait(10 if timeout is None else timeout):
+            raise cap.subprocess.TimeoutExpired(self.argv, timeout)
+        return self.returncode
+
+    def poll(self):
+        return self.returncode if self.done.is_set() else None
+
+    def _finish(self, rc):
+        self.returncode = rc
+        self.done.set()
+        self.stderr.eof.set()
+
+    def terminate(self):
+        self.terminated += 1
+        self._finish(-15)
+
+    def kill(self):
+        self.killed += 1
+        self._finish(-9)
+
+    def exits(self, rc):
+        """The process ending on its own: a crash, or the -t deadline."""
+        self._finish(rc)
+
+
+class TestTheGrabberCanBeStopped(unittest.TestCase):
+    """Nothing on the stop path could reach ffmpeg.
+
+    `communicate()` blocks until the child exits, and a healthy RTSP grabber
+    exits at midnight, so STOP was noticed by the loop and never by the
+    process. On Linux that was masked rather than harmless, since
+    KillMode=control-group SIGTERMs ffmpeg directly; under the Windows SCM
+    nothing does, so the service stopped and ffmpeg carried on writing into
+    today's directory until its own -t expired. A restart then put a second
+    writer with -y on the same pattern.
+
+    Platform-independent and unprivileged: no process is ever started. The
+    poll interval is shortened so the class runs in about a second; what it
+    changes is how long these tests take, not what they prove, and the shipped
+    value is asserted separately.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = make_config(self.tmp / "frames")
+        FakePopen.started = []
+        self.addCleanup(cap.STOP.clear)
+        self.addCleanup(cap.PAUSED.clear)
+        cap.STOP.clear()
+        cap.PAUSED.clear()
+        # Shortened so the class runs in about a second. What this
+        # changes is how long these tests take, not what they prove;
+        # each shipped value is asserted on its own below.
+        for name, value in (("SUPERVISE_POLL", 0.02),
+                            ("RECONNECT_BACKOFF", 0.05),
+                            ("PAUSED_POLL", 0.05)):
+            p = mock.patch.object(cap, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def start(self, lines=()):
+        """Run a grabber in its own thread, with Popen faked."""
+        FakePopen._lines = list(lines)
+        cam = cap.RtspCamera({"name": "Hallway", "method": "rtsp",
+                              "url": "rtsp://192.0.2.9/s1"}, self.cfg)
+        patch = mock.patch.object(cap.subprocess, "Popen", FakePopen)
+        patch.start()
+        self.addCleanup(patch.stop)
+        thread = threading.Thread(target=cam.run, daemon=True)
+        thread.start()
+        self.addCleanup(self.finish, thread)
+        return cam, thread
+
+    def finish(self, thread):
+        cap.STOP.set()
+        thread.join(timeout=5)
+
+    def wait_for(self, predicate, timeout=5):
+        end = time.time() + timeout
+        while time.time() < end:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def first(self):
+        self.assertTrue(self.wait_for(lambda: FakePopen.started),
+                        "ffmpeg was never started")
+        return FakePopen.started[0]
+
+    def test_a_stop_reaches_ffmpeg(self):
+        _, thread = self.start()
+        proc = self.first()
+        cap.STOP.set()
+        self.assertTrue(self.wait_for(lambda: proc.terminated),
+                        "STOP never reached the process")
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive(), "the thread outlived the stop")
+
+    def test_a_stop_is_not_counted_as_a_crash(self):
+        """It used to be impossible to tell: the process only ever ended by
+        itself. Now that we end it, the returncode is our own signal and must
+        not be logged as ffmpeg falling over."""
+        cam, thread = self.start()
+        proc = self.first()
+        cap.STOP.set()
+        self.wait_for(lambda: proc.terminated)
+        thread.join(timeout=5)
+        self.assertEqual(cam.restarts, 0)
+
+    def test_a_pause_reaches_ffmpeg_too(self):
+        """The disk guard pauses capture when space runs low, and a process
+        launched at 00:00 went on filling that disk all day while
+        capture.json said paused: true."""
+        _, thread = self.start()
+        proc = self.first()
+        cap.PAUSED.set()
+        self.assertTrue(self.wait_for(lambda: proc.terminated),
+                        "PAUSED never reached the process")
+        self.assertTrue(thread.is_alive(), "a pause must not end the thread")
+
+    def test_a_pause_is_not_counted_as_a_crash_either(self):
+        """`restarts` is published in capture.json and shown on the status
+        page. A disk guard pause that incremented it would make a full disk
+        look like a flapping camera, which is a different fault wanting a
+        different remedy."""
+        cam, _thread = self.start()
+        proc = self.first()
+        with self.assertLogs(cam.log, level="INFO") as caught:
+            cap.PAUSED.set()
+            self.assertTrue(
+                self.wait_for(lambda: any("paused" in r.getMessage()
+                                          for r in caught.records), 5),
+                "the grabber never said why it stopped")
+        self.assertEqual(cam.restarts, 0)
+        self.assertEqual(proc.terminated, 1)
+
+    def test_clearing_the_pause_starts_a_new_grabber(self):
+        _, _thread = self.start()
+        proc = self.first()
+        cap.PAUSED.set()
+        self.wait_for(lambda: proc.terminated)
+        cap.PAUSED.clear()
+        self.assertTrue(self.wait_for(lambda: len(FakePopen.started) > 1, 60),
+                        "capture never resumed after the pause was cleared")
+
+    def test_a_crash_still_restarts_and_is_still_counted(self):
+        """The control. Ending the process on a stop must not have turned an
+        ordinary reconnect into one."""
+        cam, _thread = self.start()
+        proc = self.first()
+        proc.exits(1)
+        self.assertTrue(self.wait_for(lambda: len(FakePopen.started) > 1, 30),
+                        "the grabber did not reconnect")
+        self.assertEqual(cam.restarts, 1)
+        self.assertEqual(proc.terminated, 0)
+
+    def test_the_midnight_handover_is_still_not_a_crash(self):
+        cam, _thread = self.start()
+        proc = self.first()
+        proc.exits(0)
+        self.assertTrue(self.wait_for(lambda: len(FakePopen.started) > 1, 30))
+        self.assertEqual(cam.restarts, 0)
+
+    def test_the_log_keeps_the_end_of_stderr_rather_than_the_start(self):
+        """The old code logged `err[:400]`, which for a process that ran all
+        day is the connection banner. What matters is what it said just before
+        it died."""
+        lines = [b"opening rtsp://192.0.2.9/s1\n"] + \
+                [b"frame %d dropped\n" % n for n in range(200)] + \
+                [b"Connection reset by peer\n"]
+        cam, _thread = self.start(lines)
+        proc = self.first()
+        with self.assertLogs(cam.log, level="WARNING") as caught:
+            proc.exits(1)
+            self.wait_for(lambda: len(FakePopen.started) > 1, 30)
+        said = "\n".join(caught.output)
+        self.assertIn("Connection reset by peer", said)
+        self.assertNotIn("opening rtsp://", said)
+
+    def test_the_stderr_it_holds_is_bounded(self):
+        """A grabber complaining once a second has all day to produce it, and
+        communicate() held every byte of it until the process exited. Driven
+        with a small limit so the deque's own bound is what is tested, rather
+        than the 400 characters the log line is then trimmed to."""
+        with mock.patch.object(cap, "STDERR_LINES", 3):
+            lines = [b"line %d\n" % n for n in range(10)]
+            cam, _thread = self.start(lines)
+            proc = self.first()
+            with self.assertLogs(cam.log, level="WARNING") as caught:
+                proc.exits(1)
+                self.wait_for(lambda: len(FakePopen.started) > 1, 30)
+        said = "\n".join(caught.output)
+        self.assertIn("line 9", said)
+        self.assertNotIn("line 6", said)
+
+    def test_the_shipped_bound_is_a_tail_worth_reading(self):
+        """Small enough that a day of complaints costs nothing, large enough
+        that the last thing ffmpeg said is in it."""
+        self.assertTrue(5 <= cap.STDERR_LINES <= 200, cap.STDERR_LINES)
+
+    def test_the_shipped_poll_is_short_enough_to_stop_a_service(self):
+        """This class shortens it, so the value that ships needs its own
+        assertion. It is bounded by systemd's TimeoutStopSec and by the 30
+        second wait hint this daemon gives the Windows SCM, with the camera
+        threads joined one after another."""
+        self.assertLessEqual(cap.SUPERVISE_POLL, 2)

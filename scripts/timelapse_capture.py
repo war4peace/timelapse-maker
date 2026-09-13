@@ -18,6 +18,7 @@ drops below capture.min_free_gb, rather than filling the disk.
 Run under systemd. Logs to stdout (journald) and to a rotating file.
 """
 
+import collections
 import json
 import logging
 import logging.handlers
@@ -112,6 +113,21 @@ CONFIG_PATH = _LOC["config"]
 
 STOP = threading.Event()
 PAUSED = threading.Event()      # set by the disk guard when space runs low
+
+# How much of ffmpeg's stderr an RTSP grabber keeps. Lines rather than bytes,
+# and a bounded deque rather than a buffer, because the useful part is the
+# tail: the last thing it said before it died, not the connection banner it
+# opened with a day earlier.
+STDERR_LINES = 40
+
+# How often a running RTSP grabber looks up to see whether it has been asked
+# to stop or pause. It is a poll because the thing being waited on is a child
+# process and the thing being watched for is an Event, and one second is chosen
+# against the deadlines that matter: systemd's TimeoutStopSec and the 30 second
+# wait hint this daemon gives the Windows SCM.
+SUPERVISE_POLL = 1.0
+RECONNECT_BACKOFF = 10          # after ffmpeg died, before reconnecting
+PAUSED_POLL = 30                # while the disk guard has capture paused
 log = logging.getLogger("capture")
 
 # Intra-tick retry, for snapshot endpoints that refuse instantly (ONVIF answers
@@ -1052,6 +1068,86 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
             "-y", pattern,
         ]
 
+    def _drain(self, stream, tail):
+        """Read ffmpeg's stderr on its own thread, keeping only the last lines.
+
+        Two defects in one line of the old code. `communicate()` held the whole
+        day's stderr in memory until the process exited, and a grabber that is
+        complaining once a second has all day to produce it; and the 400
+        characters that then got logged were the *oldest* ones, which are the
+        connection banner rather than whatever it said just before it died.
+        """
+        try:
+            for raw in iter(stream.readline, b""):
+                line = raw.decode(errors="replace").rstrip()
+                if line:
+                    tail.append(line)
+        except (OSError, ValueError):
+            pass                    # the pipe closed under us; nothing to add
+        finally:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _end(self, proc):
+        """Terminate, then kill if it will not go. Same ladder as before."""
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+        except OSError:
+            pass                    # already gone
+
+    def _supervise(self, proc):
+        """Wait for ffmpeg, and end it when this daemon is asked to. (tail,
+        ended_here).
+
+        The old code called `communicate()` with no timeout, so **nothing on
+        the stop path could reach the process**: the thread ended only when
+        ffmpeg finished by itself, which for a healthy grabber means midnight.
+        Measured with a fake Popen, STOP set 0.2s after launch: terminate() was
+        never called.
+
+        On Linux that was masked rather than harmless, because
+        `KillMode=control-group` SIGTERMs ffmpeg directly. Under the Windows
+        SCM nothing does: each RTSP thread times out on its join, run_daemon
+        returns, SERVICE_STOPPED is reported, this process exits, and **ffmpeg
+        is orphaned**, writing into today's directory until its own `-t`
+        expires at midnight. A service restart then launches a second one with
+        `-y` on the same pattern, so two writers race on one directory.
+
+        PAUSED is honoured here too, and that is the third thing the blocking
+        call cost: the disk guard could pause capture while a process launched
+        at 00:00 carried on filling the disk it was pausing for, with
+        capture.json saying `paused: true` all the while.
+        """
+        tail = collections.deque(maxlen=STDERR_LINES)
+        reader = threading.Thread(target=self._drain, args=(proc.stderr, tail),
+                                  daemon=True, name="%s-err" % self.name_)
+        reader.start()
+        ended_here = False
+        while True:
+            try:
+                proc.wait(timeout=SUPERVISE_POLL)
+                break
+            except subprocess.TimeoutExpired:
+                if STOP.is_set() or PAUSED.is_set():
+                    self._end(proc)
+                    ended_here = True
+                    break
+        # The pipe is closed once the process is gone, so this returns at once
+        # in every ordinary case; the timeout is for the one where a child of
+        # ffmpeg is still holding it.
+        reader.join(timeout=5)
+        return "\n".join(tail), ended_here
+
     def run(self):
         self.root.mkdir(parents=True, exist_ok=True)
         self.begin_day(day_string(time.time()))
@@ -1059,7 +1155,7 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
 
         while not STOP.is_set():
             if PAUSED.is_set():
-                STOP.wait(30)
+                STOP.wait(PAUSED_POLL)
                 continue
             # Re-read at the boundary and nowhere else, the same rule the HTTP
             # path follows. A mid-day relaunch after a dropped connection
@@ -1073,8 +1169,13 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
                     self._cmd(day), stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE)
                 self.last_started = self.last_attempt = time.time()
-                _, err = self.proc.communicate()
-                if not STOP.is_set():
+                err, ended_here = self._supervise(self.proc)
+                if ended_here:
+                    # We stopped it on purpose. Neither a fault nor a restart
+                    # worth counting, and the returncode is our own signal.
+                    if not STOP.is_set():
+                        self.log.info("grabber stopped: capture is paused")
+                elif not STOP.is_set():
                     # rc=0 means it reached the -t deadline, which is the
                     # planned midnight handover rather than a fault. Logging
                     # that as a warning every night would train people to
@@ -1084,14 +1185,15 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
                         self.log.info("day rolled over; restarting the grabber")
                     else:
                         self.restarts += 1
-                        msg = (err or b"").decode(errors="replace").strip()[:400]
+                        # The tail, not the head: what it said before it died.
                         self.log.warning("ffmpeg exited (rc=%s, restart #%d): %s",
-                                         self.proc.returncode, self.restarts, msg)
+                                         self.proc.returncode, self.restarts,
+                                         err.strip()[-400:])
             except Exception as exc:
                 self.log.error("failed to start ffmpeg: %s", exc)
             self._discard_empty_day(day_dir)
             if not STOP.is_set() and not rolled:
-                STOP.wait(10)           # backoff before reconnecting
+                STOP.wait(RECONNECT_BACKOFF)
 
         if self.proc and self.proc.poll() is None:
             self.proc.terminate()
