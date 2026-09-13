@@ -2068,6 +2068,24 @@ different name:
 | which disks could hold frames | `scan_filesystems()`, `os_disk_mount()` |
 | is this path really on the network | `network_path()`, `unc_for_drive()`, `mapped_drives()` |
 | where ffmpeg might be | `find_tool()`, `resolve_tool()` |
+| what this host's addresses are | `host_addresses()` |
+| what filesystem backs a path | `mount_fstype()` |
+| put cifs-utils on this box | `install_cifs_utils()` |
+
+The last three arrived at 0.2.1 (L13), out of `timelapse_setup.py`, where each
+was an `os.name` branch in everything but spelling: `mount_fstype()` reads
+`/proc/mounts`, `install_cifs_utils()` drives five package managers, and
+`host_addresses()` ran `ip -j addr` and then `hostname -I` **on Windows too**,
+two process launches per page for a platform that has neither. The Linux
+behaviour is unchanged, which is the whole of the move; the Windows half of
+`host_addresses()` resolves the machine's own hostname instead, which is
+narrower and is display only.
+
+The move found one bug of its own, in code that had been correct where it
+lived: `mount_fstype()` compared `str(Path(path))` against a mount point, and
+`Path` is `WindowsPath` on the dev box, so a Linux path became a backslashed
+string that matches nothing. It names `posixpath` now, for the same reason
+`locations()` does.
 
 Four properties are load-bearing.
 
@@ -3661,7 +3679,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,256 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,275 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4439,10 +4457,10 @@ installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1584 lines
 scripts/timelapse_encode.py      batch job, 2382 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1049 lines
-scripts/timelapse_setup.py       configuration wizard, 4845 lines
+scripts/timelapse_setup.py       configuration wizard, 4774 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2946 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 471 lines
-scripts/timelapse_platform.py    the only platform branch, 2377 lines
+scripts/timelapse_platform.py    the only platform branch, 2505 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
 scripts/timelapse_web.py         read-only web UI, 3560 lines
 tests/_support.py                path setup and fakes

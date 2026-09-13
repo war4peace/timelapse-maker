@@ -1526,7 +1526,7 @@ class TestTransferDestinationKind(unittest.TestCase):
         try:
             with contextlib.redirect_stdout(buf), \
                  mock.patch.object(setup, "IS_WINDOWS", False), \
-                 mock.patch.object(setup, "is_root", return_value=False), \
+                 mock.patch.object(setup, "is_elevated", return_value=False), \
                  mock.patch.object(setup, "ensure_cifs_utils",
                                    side_effect=never), \
                  mock.patch.object(setup, "probe_rsync_flags",
@@ -3161,7 +3161,7 @@ class TestSyncReadWritePaths(unittest.TestCase):
         return p
 
     def sync(self, root=True):
-        with mock.patch.object(setup, "is_root", lambda: root), \
+        with mock.patch.object(setup, "is_elevated", lambda: root), \
                 contextlib.redirect_stdout(io.StringIO()):
             return setup.sync_unit_readwritepaths(self.CFG, unitdir=str(self.tmp))
 
@@ -5972,3 +5972,41 @@ class TestAWindowsDestinationIsStoredAbsolute(unittest.TestCase):
         transfer, said = self.choose("\\\\tower\\cctv\\TL\n")
         self.assertEqual(transfer["destination"], "\\\\tower\\cctv\\TL")
         self.assertNotIn("Storing the full path", said)
+
+
+class TestTheWizardDoesNotGrowSysPath(unittest.TestCase):
+    """Six copies of `sys.path.insert(0, ...)` ran on every call.
+
+    The module-level `from timelapse_platform import ...` at the top of the
+    file already proves `scripts/` is importable from here, and two functions
+    (`redact_url`, `url_host`) imported the same sibling without one, so the
+    inserts were never what made it work. Measured before removing them: 66
+    new entries on sys.path after test_setup alone.
+    """
+
+    def test_the_wizard_inserts_nothing(self):
+        # Anchored at the start of a line so the sentence above, and this
+        # comment, are not read as a breach of the rule they describe.
+        src = Path(setup.__file__).read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"^\s*sys\.path\.insert\(", src, re.M), [])
+
+    def test_the_sibling_imports_still_work(self):
+        # The control. Deleting the inserts must not have deleted the reach:
+        # this is the one that runs in every install.
+        from timelapse_encode import day_encoded
+        self.assertTrue(callable(day_encoded))
+
+    def test_the_os_probes_come_from_the_platform_module(self):
+        # Item 11e: one file carries the platform branch. Identity, not
+        # equality, so a re-added local copy fails here.
+        import timelapse_platform as plat
+        for name in ("host_addresses", "mount_fstype", "install_cifs_utils",
+                     "is_elevated"):
+            self.assertIs(getattr(setup, name), getattr(plat, name), name)
+
+    def test_there_is_one_way_to_test_a_notification(self):
+        # send_test_webhook() was a second path that bypassed notify(), which
+        # send_test_notification()'s own docstring calls the wrong way to test
+        # a sink. Nothing called it.
+        self.assertFalse(hasattr(setup, "send_test_webhook"))
+        self.assertTrue(hasattr(setup, "send_test_notification"))

@@ -40,8 +40,11 @@ from timelapse_platform import (
     SERVICE_STATES, STATE_DIR_DEFAULT, WATCH_UNIT, WEB_STATE_DIR_DEFAULT,
     allow_users_read,
     daily_trigger, drive_is_local, elevation_hint, find_tool,
-    install_service, install_task, is_elevated, is_reserved_name, is_scheduled,
-    is_unc, log_hint, native_name, network_path, no_console, os_disk_mount,
+    host_addresses, install_cifs_utils,
+    install_service, install_task, is_elevated, is_reserved_name,
+    is_scheduled,
+    is_unc, log_hint, mount_fstype, native_name, network_path,
+    no_console, os_disk_mount,
     remove_service,
     remove_task, repeating_trigger, resolve_tool, restart_hint,
     restart_service, same_file_name, scan_filesystems, secure_secret_file,
@@ -476,7 +479,6 @@ def detect_encoders(ffmpeg):
 
     Deciding, never printing: 11c.6b's rule for anything a GUI has to reuse.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
         from timelapse_encode import (driver_mismatch, encoder_hint,
                                       is_nvenc, list_encoders,
@@ -2468,25 +2470,6 @@ def probe_sample(cfg, data):
         return ""
 
 
-def mount_fstype(path):
-    """Filesystem type backing path, and its mount point. ('', None) if none."""
-    try:
-        entries = []
-        for line in Path("/proc/mounts").read_text().splitlines():
-            parts = line.split()
-            if len(parts) >= 3:
-                entries.append((parts[1].replace("\\040", " "), parts[2]))
-    except OSError:
-        return "", None
-    target = str(Path(path))
-    best = ("", None)
-    for mount, fstype in entries:
-        if target == mount or target.startswith(mount.rstrip("/") + "/"):
-            if best[1] is None or len(mount) > len(best[1]):
-                best = (fstype, mount)
-    return best
-
-
 def probe_rsync_flags(dest, svcuser=None):
     """Which rsync flags this destination accepts. See timelapse_encode.
 
@@ -2494,13 +2477,8 @@ def probe_rsync_flags(dest, svcuser=None):
     answer, and both already reach into the encoder for the things it owns.
     rsync is the encoder's business: it is the program that runs it nightly.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import probe_rsync_flags as probe
     return probe(dest, svcuser)
-
-
-def is_root():
-    return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
 def looks_like_ssh_spec(dest):
@@ -2734,26 +2712,15 @@ def choose_transfer(cfg, svcuser=None):
 # ----------------------------------------------------------------------------
 
 def ensure_cifs_utils():
+    """True when mount.cifs is available, installing it if it is not.
+
+    The package-manager table is in the platform module; the talking stays
+    here, because that half knows what the operator is in the middle of.
+    """
     if shutil.which("mount.cifs"):
         return True
     note("Installing cifs-utils...")
-    for mgr, args in (
-        ("apt-get", ["install", "-y", "-qq", "cifs-utils"]),
-        ("dnf", ["install", "-y", "-q", "cifs-utils"]),
-        ("pacman", ["-S", "--noconfirm", "--needed", "cifs-utils"]),
-        ("zypper", ["--non-interactive", "install", "cifs-utils"]),
-        ("apk", ["add", "--quiet", "cifs-utils"]),
-    ):
-        if not shutil.which(mgr):
-            continue
-        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
-        try:
-            subprocess.run([mgr] + args, capture_output=True, timeout=300,
-                           env=env, **no_console())
-        except Exception:
-            pass
-        break
-    if shutil.which("mount.cifs"):
+    if install_cifs_utils():
         good("Installed cifs-utils")
         return True
     fail("Could not install cifs-utils. Install it and re-run.")
@@ -2781,7 +2748,7 @@ def try_mount_cifs(unc, mountpoint, opts_base):
 def setup_cifs_share(cfg, svcuser=None):
     """Prompt for a share, mount it, verify it, and persist it. True on success."""
     print()
-    if not is_root():
+    if not is_elevated():
         fail("Mounting a share needs root privileges.")
         note("Re-run this as root (the installer does), or choose option 2")
         note("and give a path you have already mounted yourself.")
@@ -2900,7 +2867,7 @@ def sync_unit_readwritepaths(cfg, unitdir="/etc/systemd/system"):
         empty     the config yields no writable paths
         failed    a unit exists but could not be written
     """
-    if not is_root():
+    if not is_elevated():
         return "denied", "needs root to edit the unit files"
     # Quoted, not joined with a space: see quote_unit_path(). The detail this
     # returns is printed to the operator and is meant to be the line that went
@@ -3027,7 +2994,7 @@ def persist_cifs_mount(unc, mountpoint, opts, vers):
     line = (f"{fstab_escape(unc)}  {fstab_escape(mountpoint)}  cifs  "
             f"{full}  0  0")
     try:
-        shutil.copy2(fstab, f"/etc/fstab.bak.{int(__import__('time').time())}")
+        shutil.copy2(fstab, f"/etc/fstab.bak.{int(time.time())}")
         with open(fstab, "a", encoding="utf-8") as fh:
             fh.write(f"\n# timelapse-maker transfer destination\n{line}\n")
     except OSError as exc:
@@ -3155,42 +3122,6 @@ def lan_address():
     return "" if not addr or addr.startswith("127.") else addr
 
 
-def host_addresses():
-    """Every address configured on this host, best effort, loopback last.
-
-    Display only. Validation never depends on this list: check_bind() asks the
-    kernel, so a host where neither command exists still gets a correct answer
-    to the question that matters.
-    """
-    found = []
-    try:
-        r = subprocess.run(["ip", "-j", "addr"], stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, timeout=10,
-                           **no_console())
-        if r.returncode == 0:
-            for iface in json.loads(r.stdout.decode("utf-8", "replace") or "[]"):
-                for info in iface.get("addr_info", []):
-                    if info.get("local"):
-                        found.append(info["local"])
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
-    if not found:
-        try:
-            r = subprocess.run(["hostname", "-I"], stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, timeout=10,
-                               **no_console())
-            if r.returncode == 0:
-                found = r.stdout.decode("utf-8", "replace").split()
-        except (OSError, subprocess.SubprocessError):
-            pass
-    # IPv6 link-local is dropped: it cannot be bound without a scope id, so
-    # offering it as a choice would be offering something that does not work.
-    found = [a for a in found if not a.lower().startswith("fe80:")]
-    # Loopback is a valid answer, just never the interesting one.
-    return sorted(set(found),
-                  key=lambda a: (a.startswith("127.") or a == "::1", a))
-
-
 def check_bind(addr, port):
     """Can the service actually listen there? Returns (kind, detail).
 
@@ -3298,7 +3229,6 @@ def hash_web_password(password):
     and the failure would appear as a locked-out operator rather than as an
     error here.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_web import hash_password
     return hash_password(password)
 
@@ -3636,7 +3566,6 @@ def send_test_notification(sink, config_path=None):
     request the encoder would never make is how a check comes to pass while
     the thing it checks is broken.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import notify
 
     kind = (sink.get("type") or "discord").lower()
@@ -3658,31 +3587,6 @@ def send_test_notification(sink, config_path=None):
         note("Check the bot token, and that you have messaged the bot at")
         note("least once: a bot cannot open a conversation with you.")
     return False
-
-
-def choose_discord(cfg, config_path=None):
-    """Kept as the old name for anything that calls it."""
-    return choose_notify(cfg, config_path)
-
-
-def send_test_webhook(url, username, config_path=None):
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from timelapse_encode import post_webhook
-    payload = {"username": username,
-               "embeds": [{"title": "timelapse-maker",
-                           "description": "Setup test - the webhook works.",
-                           "color": 0x3498DB}]}
-    try:
-        post_webhook(url, payload)
-        good("Discord accepted the test message.")
-        record_webhook_verified(config_path, url)
-    except Exception as exc:
-        fail(f"Webhook failed: {exc}")
-        if "403" in str(exc):
-            note("403 usually means the webhook was deleted or regenerated.")
-            note("Re-copy it from Channel Settings -> Integrations -> Webhooks.")
-        elif "404" in str(exc):
-            note("404 means no webhook exists at that URL any more.")
 
 
 WEBHOOK_MARKER = ".webhook-verified"
@@ -3725,7 +3629,6 @@ def record_webhook_verified(config_path, url):
     """
     if not config_path:
         return
-    import time
     try:
         marker = Path(config_path).parent / WEBHOOK_MARKER
         marker.write_text(f"{webhook_fingerprint(url)} {int(time.time())}\n",
@@ -4425,7 +4328,6 @@ def create_web_state_dir(cfg, owner=None):
 
 def summarise_notify(cfg):
     """One line per sink, with nothing secret on any of them."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import notify_sinks
 
     sinks = notify_sinks(cfg)

@@ -18,6 +18,7 @@ import ast
 import contextlib
 import ctypes
 import io
+import json
 import logging
 import logging.handlers
 import os
@@ -2288,3 +2289,86 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+class TestTheOsProbesLiveHere(unittest.TestCase):
+    """Three probes moved out of the wizard at 0.2.1 (L13).
+
+    Item 11e's rule: the platform branch lives in one file. Each of these runs
+    a command or reads a file that exists on one platform and not the other,
+    and the wizard runs on both. Every test declares the platform rather than
+    inheriting it, so both halves are exercised on both CI legs.
+    """
+
+    def test_the_address_list_does_not_shell_out_on_windows(self):
+        # It ran `ip -j addr` and then `hostname -I`, on a platform that has
+        # neither: two process launches per page, for nothing.
+        def refuse(*a, **kw):
+            raise AssertionError("shelled out on Windows: %r" % (a,))
+
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+                mock.patch.object(plat.subprocess, "run", refuse), \
+                mock.patch.object(plat.socket, "getaddrinfo",
+                                  return_value=[(2, 1, 6, "", ("192.0.2.5", 0))]):
+            self.assertEqual(plat.host_addresses(), ["192.0.2.5"])
+
+    def test_the_address_list_still_reads_ip_addr_on_linux(self):
+        payload = json.dumps([
+            {"addr_info": [{"local": "192.0.2.5"}, {"local": "fe80::1"}]},
+            {"addr_info": [{"local": "127.0.0.1"}]},
+        ]).encode("utf-8")
+
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+                mock.patch.object(plat.subprocess, "run",
+                                  return_value=mock.Mock(returncode=0,
+                                                         stdout=payload)):
+            found = plat.host_addresses()
+        # Link-local dropped (it cannot be bound without a scope id), and
+        # loopback last, because it is a valid answer and never the
+        # interesting one.
+        self.assertEqual(found, ["192.0.2.5", "127.0.0.1"])
+
+    def test_a_windows_path_has_no_mount_type(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertEqual(plat.mount_fstype("C:\\videos"), ("", None))
+
+    def test_a_linux_mount_type_is_read_from_proc(self):
+        mounts = ("proc /proc proc rw 0 0\n"
+                  "//tower/cctv /mnt/nas cifs rw 0 0\n"
+                  "/dev/sda1 / ext4 rw 0 0\n")
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+                mock.patch("builtins.open",
+                           mock.mock_open(read_data=mounts)):
+            # The longest matching mount point wins, or every path under a
+            # share reports the root filesystem.
+            self.assertEqual(plat.mount_fstype("/mnt/nas/tl")[0], "cifs")
+
+    def test_installing_cifs_utils_says_nothing(self):
+        """The wizard owns the talking.
+
+        This half knows about package managers and the caller knows what the
+        operator is in the middle of. It is also imported by the daemon, which
+        has no console under the SCM.
+        """
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+                mock.patch.object(plat.shutil, "which", lambda n: None), \
+                mock.patch.object(plat.subprocess, "run",
+                                  return_value=mock.Mock(returncode=0)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            ok = plat.install_cifs_utils()
+        self.assertFalse(ok)
+        self.assertEqual(out.getvalue(), "")
+
+    def test_nothing_is_installed_on_windows(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertFalse(plat.install_cifs_utils())
+
+    def test_an_already_installed_cifs_needs_no_package_manager(self):
+        def refuse(*a, **kw):
+            raise AssertionError("ran a package manager for nothing")
+
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+                mock.patch.object(plat.shutil, "which",
+                                  lambda n: "/sbin/mount.cifs"), \
+                mock.patch.object(plat.subprocess, "run", refuse):
+            self.assertTrue(plat.install_cifs_utils())

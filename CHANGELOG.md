@@ -111,6 +111,11 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Windows: the wizard no longer runs two Linux commands on every page that
+  lists this machine's addresses.** It tried `ip -j addr` and then
+  `hostname -I`, neither of which exists here, and fell back to showing
+  nothing. It asks Windows instead.
+
 - **Windows: a transfer destination typed as a plain folder name is stored in
   full.** `videos` was stored exactly as typed and resolved, at 00:05, against
   whatever folder the nightly task happened to start in, which for a system

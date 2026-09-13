@@ -55,6 +55,7 @@ import ntpath
 import os
 import posixpath
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -926,6 +927,133 @@ CREATE_NO_WINDOW = 0x08000000
 def no_console():
     """Keyword arguments that keep a captured child off the screen."""
     return {"creationflags": CREATE_NO_WINDOW} if IS_WINDOWS else {}
+
+
+# ----------------------------------------------------------------------------
+# Asking the operating system about itself (0.2.1)
+#
+# These three lived in timelapse_setup.py, which is where item 11e says they
+# must not: each one runs a command or reads a file that exists on one platform
+# and not the other, and the wizard runs on both. The Linux behaviour is
+# unchanged, deliberately, because it is what a real deployment depends on.
+# ----------------------------------------------------------------------------
+
+
+def mount_fstype(path):
+    """Filesystem type backing `path`, and its mount point. ('', None) if none.
+
+    Linux only, by reading `/proc/mounts`; Windows has no equivalent question,
+    because a UNC path is not mounted and a drive letter's kind is what
+    `drive_kind()` answers. Absent that file, ('', None), which every caller
+    already treats as "cannot tell".
+    """
+    if IS_WINDOWS:
+        return "", None
+    try:
+        entries = []
+        for line in open("/proc/mounts", encoding="utf-8"):
+            parts = line.split()
+            if len(parts) >= 3:
+                entries.append((parts[1].replace("\\040", " "), parts[2]))
+    except OSError:
+        return "", None
+    # posixpath by name, not Path: the paths in /proc/mounts are Linux paths
+    # whoever is reading them, and Path is WindowsPath on the dev box, which
+    # turns /mnt/nas/tl into a backslashed string that matches no mount point.
+    # Caught by this function's own test, which runs on both legs.
+    target = posixpath.normpath(str(path))
+    best = ("", None)
+    for mount, fstype in entries:
+        if target == mount or target.startswith(mount.rstrip("/") + "/"):
+            if best[1] is None or len(mount) > len(best[1]):
+                best = (fstype, mount)
+    return best
+
+
+def host_addresses():
+    """Every address configured on this host, best effort, loopback last.
+
+    Display only. Validation never depends on this list: `check_bind()` asks
+    the kernel, so a host where none of this works still gets a correct answer
+    to the question that matters.
+
+    `ip -j addr` then `hostname -I` on Linux. On Windows neither exists, and
+    running them anyway is how a wizard comes to shell out twice per page for
+    nothing, so it resolves its own hostname instead. That is narrower (it
+    misses addresses DNS does not know) and it is display only.
+    """
+    found = []
+    if IS_WINDOWS:
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None):
+                addr = info[4][0]
+                if addr:
+                    found.append(addr)
+        except (OSError, IndexError):
+            pass
+    else:
+        try:
+            r = subprocess.run(["ip", "-j", "addr"], stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=10,
+                               **no_console())
+            if r.returncode == 0:
+                for iface in json.loads(
+                        r.stdout.decode("utf-8", "replace") or "[]"):
+                    for info in iface.get("addr_info", []):
+                        if info.get("local"):
+                            found.append(info["local"])
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass
+        if not found:
+            try:
+                r = subprocess.run(["hostname", "-I"], stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, timeout=10,
+                                   **no_console())
+                if r.returncode == 0:
+                    found = r.stdout.decode("utf-8", "replace").split()
+            except (OSError, subprocess.SubprocessError):
+                pass
+    # IPv6 link-local is dropped: it cannot be bound without a scope id, so
+    # offering it as a choice would be offering something that does not work.
+    found = [a for a in found if not a.lower().startswith("fe80:")]
+    # Loopback is a valid answer, just never the interesting one.
+    return sorted(set(found),
+                  key=lambda a: (a.startswith("127.") or a == "::1", a))
+
+
+# Every package manager install.sh knows about, in the order it tries them.
+CIFS_INSTALL = (
+    ("apt-get", ["install", "-y", "-qq", "cifs-utils"]),
+    ("dnf", ["install", "-y", "-q", "cifs-utils"]),
+    ("pacman", ["-S", "--noconfirm", "--needed", "cifs-utils"]),
+    ("zypper", ["--non-interactive", "install", "cifs-utils"]),
+    ("apk", ["add", "--quiet", "cifs-utils"]),
+)
+
+
+def install_cifs_utils():
+    """Try to install cifs-utils. True if `mount.cifs` is there afterwards.
+
+    Says nothing: the wizard owns the talking, because this is the half that
+    knows about package managers and the caller is the half that knows what to
+    tell the operator. Never raises, and refuses outright on Windows, where
+    there is nothing to mount.
+    """
+    if IS_WINDOWS:
+        return False
+    if shutil.which("mount.cifs"):
+        return True
+    for mgr, args in CIFS_INSTALL:
+        if not shutil.which(mgr):
+            continue
+        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+        try:
+            subprocess.run([mgr] + args, capture_output=True, timeout=300,
+                           env=env, **no_console())
+        except Exception:                                        # noqa: BLE001
+            pass
+        break
+    return bool(shutil.which("mount.cifs"))
 
 
 # ----------------------------------------------------------------------------
