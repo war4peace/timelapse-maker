@@ -111,6 +111,32 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **The installer no longer prints two errors per question when it is run
+  without a terminal.** Over `ssh host sudo bash install.sh`, or from a job
+  runner, it thought a terminal was there, failed to use it, and took every
+  default silently. It now detects that properly and says nothing.
+
+- **`timelapse status` shows the credential watch as well.** The help said it
+  covered every unit and it listed four of five.
+
+- **The installer asks for Python 3.9**, which is what the README, the Windows
+  installer and the documentation have always said. It accepted 3.8, on which
+  this program does not run.
+
+- **`--ref` now says when it is being ignored.** Installing from a checkout
+  uses that checkout, whatever ref you name, and it did so silently.
+
+- **Arch: the installer no longer refreshes the package database without
+  upgrading**, which is the partial-upgrade pattern that leaves
+  `python-requests` unable to import.
+
+- **Uninstalling says what it left behind**, and the "no cameras yet" message
+  names `timelapse cameras -a` rather than `timelapse config`, which opens an
+  editor.
+
+- **Windows: the installer accepts a machine where `py -3` is old and a newer
+  Python is on PATH.** It took the first one it found and then refused it.
+
 - **`timelapse test` says which camera name it could not find.** `--camera`
   with a name that is not in the config reported "Cameras (0 enabled)", which
   reads as something being wrong with the config rather than with what was

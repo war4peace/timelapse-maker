@@ -6084,3 +6084,97 @@ class TestTheExampleAndTheDefaultsAgree(unittest.TestCase):
         # Without this, a keys() that returned nothing would make both
         # assertions above pass for ever.
         self.assertGreater(len(self.keys(self.defaults)), 30)
+
+
+class TestTheShellInstallerAgreesWithItself(unittest.TestCase):
+    """Four small claims install.sh made and did not keep (L33 to L37, L40).
+
+    A source scan is what a unit test can do here; the end to end half is a
+    real install in WSL, which the batch ends with.
+    """
+
+    def setUp(self):
+        self.source = (_support.REPO / "install.sh").read_text(
+            encoding="utf-8")
+        # Prose that describes a constraint is not a breach of it. The comment
+        # explaining why `pacman -Sy` is gone contains the words `pacman -Sy`,
+        # and the first version of this class failed on exactly that: the
+        # fifth time this project has caught a source scan reading its own
+        # explanation. Lines that are wholly a comment are dropped for the
+        # assertions that say something is absent.
+        self.code = "\n".join(
+            line for line in self.source.splitlines()
+            if not line.lstrip().startswith("#"))
+
+    def test_the_python_floor_is_the_projects_floor(self):
+        # 3.8 here and 3.9 in README, install.ps1 and prepare.ps1. RHEL 9 and
+        # Debian 11 ship 3.9, and this project states 3.9 as a property it
+        # holds rather than as momentum.
+        self.assertIn("sys.version_info >= (3, 9)", self.source)
+        self.assertNotIn("(3, 8)", self.code)
+
+    def test_every_front_door_names_the_same_floor(self):
+        for name in ("install.ps1", "README.md"):
+            text = (_support.REPO / name).read_text(encoding="utf-8")
+            self.assertIn("3.9", text, name)
+
+    def test_the_terminal_is_probed_by_opening_it(self):
+        # `test -r /dev/tty` is true under setsid, with no controlling
+        # terminal, and then every read fails: two bash errors per question
+        # and every default taken.
+        self.assertIn("! { : < /dev/tty; } 2>/dev/null", self.source)
+        self.assertNotIn("[ ! -r /dev/tty ]", self.code)
+
+    def test_pacman_does_not_refresh_without_upgrading(self):
+        # -Sy then -S is the partial-upgrade pattern Arch does not support.
+        self.assertNotIn("pacman -Sy", self.code)
+        self.assertIn("pacman -S --noconfirm --needed", self.source)
+
+    def test_an_ignored_ref_is_said_out_loud(self):
+        self.assertIn("REF_GIVEN=1", self.source)
+        self.assertIn("ignored: this checkout is what gets installed",
+                      self.source)
+
+    def test_the_status_command_covers_every_managed_unit(self):
+        """The help said "all four units" and the command listed four, while
+        MANAGED_UNITS has five and the docs describe the watch timer as one
+        of the things `timelapse status` shows."""
+        block = self.source.split("MANAGED_UNITS=(", 1)[1].split(")", 1)[0]
+        managed = block.split()
+        self.assertIn("timelapse-watch.timer", managed)
+        status = self.source.split("status)    exec systemctl status", 1)[1]
+        status = status.split(";;", 1)[0]
+        for unit in managed:
+            self.assertIn(unit, status, "%s is managed and not shown" % unit)
+
+    def test_the_help_no_longer_counts_them_wrong(self):
+        self.assertNotIn("status for all four units", self.code)
+
+    def test_adding_a_camera_names_the_command_that_adds_one(self):
+        # `timelapse config` opens the file in an editor; the command that
+        # adds a camera is `timelapse cameras -a`.
+        self.assertNotIn('Add them with:  timelapse config', self.code)
+        self.assertIn("timelapse cameras -a", self.source)
+
+    def test_uninstall_says_what_it_left_behind(self):
+        tail = self.source.split("do_uninstall()", 1)[1]
+        self.assertIn("Kept $CONFDIR (the example config", tail)
+        self.assertIn("Kept /var/lib/timelapse", tail)
+
+
+class TestThePowerShellInstallerDeclaresItsArguments(unittest.TestCase):
+    """Test-PythonVersion had no param block.
+
+    It resolved `$Python` from the caller's scope by dynamic scoping, which
+    happened to hold one. Its two neighbours, Test-Requests and
+    Install-Requests, both declare it.
+    """
+
+    def test_every_function_that_takes_a_python_declares_it(self):
+        text = (_support.REPO / "install.ps1").read_text(encoding="utf-8")
+        for name in ("Test-PythonVersion", "Test-Requests",
+                     "Install-Requests"):
+            body = text.split("function %s {" % name, 1)[1]
+            body = body.split("\nfunction ", 1)[0]
+            self.assertIn("param(", body,
+                          "%s reads its argument by dynamic scope" % name)

@@ -3259,6 +3259,48 @@ owns, and `web.auth`, because the login is keyed on **absence** and
 
 ### 4.7 `install.sh`
 
+**Six small corrections** (0.2.1, L33 to L37, L40), each of which made the
+installer say something that was not so.
+
+- **A readable `/dev/tty` is not an openable one.** Measured in WSL under
+  `setsid`: `test -r /dev/tty` is true with no controlling terminal, and then
+  `printf` and `read` both fail with "No such device or address". Under
+  `ssh host sudo bash install.sh` without `-t`, or from a job runner, that is
+  two bash errors per question and every default taken silently, which reads
+  as a broken installer. It is probed by opening it now
+  (`! { : < /dev/tty; } 2>/dev/null`), which answers `no-tty` under setsid and
+  `have-tty` with a real terminal, both measured.
+- **`pacman -Sy` then `pacman -S` is the partial-upgrade pattern Arch does not
+  support**: a `python-requests` built against a newer `python` than the
+  installed one will not import. The refresh is gone; `pkg_install()` already
+  used `--needed`, so an already-current package costs nothing.
+- **The Python floor said 3.8** here and 3.9 in README, `install.ps1` and
+  `prepare.ps1`. A test now holds all three together.
+- **`--ref` is silently ignored when a checkout wins**, which is how an
+  upgrade rehearsal installs the tree it was run from while believing it
+  installed the tag. It warns, and only when `--ref` was actually given:
+  `TIMELAPSE_REF=main` and the default are indistinguishable by value, so the
+  parser records that it was named.
+- **`status` listed four units and the help called them "all four"**, while
+  `MANAGED_UNITS` has five and the docs describe the watch timer as one of the
+  things `timelapse status` shows. The test reads `MANAGED_UNITS` and requires
+  each entry to appear in the `status)` case, so the next unit cannot be
+  forgotten here.
+- **Two messages named the wrong thing**: `timelapse config` opens an editor,
+  where the command that adds a camera is `timelapse cameras -a`; and an
+  uninstall that keeps `/etc/timelapse` and `/var/lib/timelapse` now says so,
+  because leaving them is right and leaving them silently is how an operator
+  finds them a year later and cannot tell what put them there.
+
+`install.ps1`'s `Find-Python` had the matching defect: it returned the first
+candidate without applying the floor, so `py -3` resolving to a 3.8 on a
+machine that also had 3.12 on PATH was returned and then refused, while
+`prepare.ps1` applied the floor per candidate and would have found the 3.12.
+It checks each one now and keeps a too-old candidate as a fallback, so the
+refusal can still name the version it found rather than reporting no Python at
+all. `Test-PythonVersion` also gained the `param()` block its two neighbours
+have; it had been resolving `$Python` from the caller's scope.
+
 Bootstrap. Detects the package manager (apt/dnf/yum/pacman/zypper/apk), installs
 dependencies, creates the `timelapse` system account, places scripts, units and
 a `timelapse` command wrapper, then calls the wizard and offers to enable.
@@ -3813,7 +3855,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,355 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,369 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4587,8 +4629,8 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 1014 lines
-install.ps1                      the Windows one, 578 lines
+install.sh                       bootstrap installer, 1047 lines
+install.ps1                      the Windows one, 601 lines
 setup-gui.ps1                    launcher for the graphical wizard, 111 lines
 timelapse-setup.cmd              double-click shim for the above
 installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines

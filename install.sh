@@ -20,6 +20,9 @@ set -euo pipefail
 
 REPO="war4peace/timelapse-maker"
 REF="${TIMELAPSE_REF:-main}"
+# Whether the operator named one, which is a different question from what it
+# is set to: TIMELAPSE_REF=main and the default are indistinguishable by value.
+REF_GIVEN=0
 PREFIX="${TIMELAPSE_PREFIX:-/opt/timelapse}"
 CONFDIR="${TIMELAPSE_CONFDIR:-/etc/timelapse}"
 SVCUSER="${TIMELAPSE_USER:-timelapse}"
@@ -59,7 +62,13 @@ die()   { err "$*"; exit 1; }
 ask_yn() {
     local q="$1" def="${2:-y}" ans prompt
     [ "$def" = "y" ] && prompt="Y/n" || prompt="y/N"
-    if [ "$UNATTENDED" = "1" ] || [ ! -r /dev/tty ]; then
+    # Probed by opening it, not by asking whether it is readable. Measured in
+    # WSL under setsid: `test -r /dev/tty` is true with no controlling
+    # terminal, and then printf and read both fail with "No such device or
+    # address". Under `ssh host sudo bash install.sh` without -t, or from a
+    # job runner, that is two bash errors per question and every default
+    # taken, which reads as a broken installer.
+    if [ "$UNATTENDED" = "1" ] || ! { : < /dev/tty; } 2>/dev/null; then
         [ "$def" = "y" ]
         return
     fi
@@ -124,7 +133,12 @@ install_deps() {
         dnf|yum)
             pyreq="python3 python3-requests rsync curl"; ffm="ffmpeg" ;;
         pacman)
-            pacman -Sy --noconfirm >/dev/null 2>&1 || true
+            # No `pacman -Sy` here. Refreshing the database and then installing
+            # without upgrading is the partial-upgrade pattern Arch does not
+            # support: python-requests built against a newer python than the
+            # one installed will not import. pkg_install() uses --needed, so an
+            # already-current package costs nothing, and a stale database is a
+            # missing package rather than a broken one.
             pyreq="python python-requests rsync curl"; ffm="ffmpeg" ;;
         zypper)
             pyreq="python3 python3-requests rsync curl"; ffm="ffmpeg" ;;
@@ -145,8 +159,8 @@ install_deps() {
     fi
 
     command -v python3 >/dev/null 2>&1 || die "python3 is required but missing."
-    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 8) else 1)' \
-        || die "Python 3.8+ is required (found $(python3 -V 2>&1))."
+    python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
+        || die "Python 3.9+ is required (found $(python3 -V 2>&1))."
 
     if ! python3 -c 'import requests' >/dev/null 2>&1; then
         warn "The 'requests' module is missing."
@@ -187,6 +201,13 @@ obtain_source() {
     if [ -n "$self_dir" ] && [ -f "$self_dir/scripts/timelapse_capture.py" ]; then
         SRC="$self_dir"
         ok "Using local checkout: $SRC"
+        # Said out loud, because a silently ignored --ref is how an upgrade
+        # rehearsal installs the tree it was run from while believing it
+        # installed the tag. That cost a release rehearsal once.
+        if [ "$REF_GIVEN" = "1" ]; then
+            warn "--ref $REF ignored: this checkout is what gets installed."
+            note "Run it from an empty directory to install that ref instead."
+        fi
         return
     fi
 
@@ -338,11 +359,12 @@ CHECKING
                        plus totals, videos and free space. Also names frame
                        folders that no enabled camera will ever encode, which
                        is how stranded frames get found.
-  status               systemctl status for all four units at once: capture,
-                       the encode timer and the encode service, and the web
-                       UI. The encode service is listed separately from its
-                       timer on purpose, because a failed run leaves the
-                       service failed while the timer still looks healthy.
+  status               systemctl status for every unit at once: capture, the
+                       encode timer and service, the credential watch timer
+                       and service, and the web UI. Each oneshot is listed
+                       separately from its timer on purpose, because a failed
+                       run leaves the service failed while the timer still
+                       looks healthy.
   logs                 Follow the capture journal live. Ctrl-C to stop.
   version              The installed version of each script, and a warning
                        if the running daemon started before they were
@@ -449,6 +471,7 @@ case "\${1:-}" in
     status)    exec systemctl status --lines=5 \\
                     timelapse-capture.service \\
                     timelapse-encode.timer timelapse-encode.service \\
+                    timelapse-watch.timer timelapse-watch.service \\
                     timelapse-web.service ;;
     version)
         for f in capture encode test setup update platform web cli gui; do
@@ -832,7 +855,7 @@ offer_enable() {
     cams="$(python3 -c "import json;print(len(json.load(open('$CONFIG'))['cameras']))" 2>/dev/null || echo 0)"
     if [ "$cams" = "0" ]; then
         warn "No cameras configured yet."
-        say "Add them with:  timelapse config     (then: timelapse test)"
+        say "Add them with:  timelapse cameras -a   (then: timelapse test)"
         return
     fi
 
@@ -940,6 +963,16 @@ do_uninstall() {
         fi
     fi
     note "Captured frames and videos were left untouched."
+    if [ ! -f "$CONFIG" ] && [ -d "$CONFDIR" ]; then
+        # Said rather than removed: it holds config.example.json and, on a
+        # machine that has ever been configured, the backups. Leaving it is
+        # right; leaving it without a word is how an operator finds it a year
+        # later and cannot tell what put it there.
+        note "Kept $CONFDIR (the example config and any backups)."
+    fi
+    [ -d /var/lib/timelapse ] && \
+        note "Kept /var/lib/timelapse (runtime state and the web index)." \
+        || true
     if id "$SVCUSER" >/dev/null 2>&1 && ask_yn "Delete the '$SVCUSER' account?" n; then
         userdel "$SVCUSER" 2>/dev/null && ok "Deleted '$SVCUSER'" || true
     fi
@@ -970,7 +1003,7 @@ main() {
             --unattended) UNATTENDED=1 ;;
             --no-wizard)  RUN_WIZARD=0 ;;
             --uninstall)  DO_UNINSTALL=1 ;;
-            --ref)        REF="$2"; shift ;;
+            --ref)        REF="$2"; REF_GIVEN=1; shift ;;
             --prefix)     PREFIX="$2"; shift ;;
             -h|--help)    usage ;;
             *)            die "Unknown option: $1  (try --help)" ;;

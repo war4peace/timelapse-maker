@@ -871,5 +871,40 @@ class TestTheEditorIsResolvedBeforeItIsRun(unittest.TestCase):
         self.assertIn("myeditor", calls[-1])
 
 
+
+class TestFindPythonAppliesTheFloor(unittest.TestCase):
+    """It returned the first candidate and the caller then refused it.
+
+    `py -3` resolving to a 3.8 on a machine that also has 3.12 on PATH was
+    returned, refused at the version check, and the install stopped: an
+    install that could have worked did not. prepare.ps1 applies the floor per
+    candidate and would have found the 3.12, so the two halves of the same
+    installer disagreed.
+    """
+
+    def setUp(self):
+        self.source = (ROOT / "install.ps1").read_text(encoding="utf-8")
+        self.body = self.source.split("function Find-Python {", 1)[1]
+        self.body = self.body.split("\nfunction ", 1)[0]
+
+    def test_the_candidates_are_asked_their_version(self):
+        self.assertIn("Test-PythonVersion $path", self.body)
+
+    def test_the_floor_is_named_once_and_used(self):
+        self.assertIn("$PYTHON_MIN_MINOR = 9", self.source)
+        self.assertIn("$PYTHON_MIN_MINOR", self.body)
+
+    def test_a_candidate_that_is_too_old_is_still_reported(self):
+        """Returning $null for "every Python here is 3.8" would be false, and
+        would send the operator looking for the one they have."""
+        self.assertIn("$fallback", self.body)
+        self.assertIn("return $fallback", self.body)
+
+    def test_the_store_stub_is_still_excluded(self):
+        # The control: it is on PATH by default, is not an interpreter, and as
+        # a service means a service that starts and does nothing.
+        self.assertIn("WindowsApps", self.body)
+
+
 if __name__ == "__main__":
     unittest.main()

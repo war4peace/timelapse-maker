@@ -139,6 +139,10 @@ function Test-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# The floor, in one place: install.ps1 states it four times otherwise, and a
+# version that lives in several places drifts in one of them.
+$PYTHON_MIN_MINOR = 9
+
 function Find-Python {
     <#
       An absolute path, because it is baked into the service's command line and
@@ -149,6 +153,15 @@ function Find-Python {
       Then PATH itself. The Microsoft Store stub is excluded explicitly, since
       it is on PATH by default, is not an interpreter, and opens the Store when
       run, which as a service means a service that starts and does nothing.
+
+      The floor is applied per candidate, as prepare.ps1 already did: `py -3`
+      resolving to a 3.8 on a machine that also has 3.12 on PATH used to be
+      returned and then refused, so an install that could have worked did not.
+      A candidate that cannot be asked its version is skipped rather than
+      trusted. If every candidate is too old the newest of them is returned
+      anyway, so the caller can say which version it found rather than "no
+      Python found", which would be false and would send the operator looking
+      for the one they have.
     #>
     $found = @()
     $launcher = Get-Command 'py' -ErrorAction SilentlyContinue
@@ -162,11 +175,20 @@ function Find-Python {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
         if ($cmd -and $cmd.Source) { $found += $cmd.Source }
     }
+    $fallback = $null
     foreach ($path in $found) {
         if ($path -like '*\WindowsApps\*') { continue }
-        if (Test-Path $path) { return $path }
+        if (-not (Test-Path $path)) { continue }
+        $version = Test-PythonVersion $path
+        if (-not $version) { continue }
+        $parts = $version -split '\.'
+        if ([int]$parts[0] -gt 3 -or
+            ([int]$parts[0] -eq 3 -and [int]$parts[1] -ge $PYTHON_MIN_MINOR)) {
+            return $path
+        }
+        if (-not $fallback) { $fallback = $path }
     }
-    return $null
+    return $fallback
 }
 
 function Test-PythonVersion {
@@ -184,6 +206,7 @@ function Test-PythonVersion {
       So: no quotes in anything passed after -c, and the formatting is done on
       this side where the quoting rules are known.
     #>
+    param($Python)
     # The preference is relaxed for the same reason Invoke-Tool exists: an
     # interpreter that prints a deprecation warning at startup writes to stderr,
     # and under Stop that would end the install instead of answering a question
