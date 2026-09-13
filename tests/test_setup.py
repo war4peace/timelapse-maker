@@ -4869,10 +4869,8 @@ class TestWindowsTransfer(unittest.TestCase):
                                    plat.DRIVE_FIXED if root[0] in fixed else 1), \
                  mock.patch.object(enc, "try_destination",
                                    return_value=(probe_ok, probe_why)), \
-                 mock.patch.object(enc, "reach_destination",
+                 mock.patch.object(enc, "verify_share_credentials",
                                    return_value=(probe_ok, probe_why)), \
-                 mock.patch.object(setup, "disconnect_share",
-                                   return_value=(True, "")), \
                  mock.patch.object(setup, "network_path",
                                    side_effect=lambda p: mapping.get(str(p))):
                 setup.choose_transfer(cfg)
@@ -4953,19 +4951,23 @@ class TestWindowsTransfer(unittest.TestCase):
         self.assertIn("1326", out)
         self.assertIn("will fail until this passes", out)
 
-    def test_the_existing_connection_is_dropped_before_probing(self):
-        """Or the probe cannot fail.
+    def test_the_credentials_are_what_gets_tested_not_the_current_token(self):
+        """reach_destination() tries the current token first, deliberately,
+        because a share that already accepts this machine needs no password
+        stored anywhere. On the machine a wizard runs on that token is the
+        operator's own, so the probe file gets written by *them* and a
+        password that was never presented to anything is reported as good.
 
-        Windows permits one identity per server per session, so a connection
-        made earlier by Explorer or by a previous run makes the new credentials
-        answer ERROR_SESSION_CREDENTIAL_CONFLICT, and the write then succeeds
-        over *that* connection and reports the new password as good.
+        So the wizard calls verify_share_credentials(), which presents them
+        and nothing else. The ordering inside it (drop whatever this session
+        already holds, or the check cannot fail) is pinned one layer down, in
+        test_encode.py, where that rule lives.
         """
         prev_tty, prev_auto = setup._TTY, setup.AUTO
         setup.AUTO = False
         setup._TTY = FakeTTY("y\n\\\\tower\\cctv\\TL\ny\nwar\npw\n", tty=False)
         cfg = setup.default_config()
-        order = []
+        called = []
         try:
             with contextlib.redirect_stdout(io.StringIO()), \
                  mock.patch.object(setup, "IS_WINDOWS", True), \
@@ -4974,15 +4976,17 @@ class TestWindowsTransfer(unittest.TestCase):
                                    return_value=(False, "denied")), \
                  mock.patch.object(
                      enc, "reach_destination",
-                     side_effect=lambda *a: (order.append("probe"), (True, ""))[1]), \
+                     side_effect=lambda *a: (called.append("token"),
+                                             (True, ""))[1]), \
                  mock.patch.object(
-                     setup, "disconnect_share",
-                     side_effect=lambda *a: (order.append("drop"), (True, ""))[1]), \
+                     enc, "verify_share_credentials",
+                     side_effect=lambda *a: (called.append("credentials"),
+                                             (True, ""))[1]), \
                  mock.patch.object(setup, "network_path", return_value=None):
                 setup.choose_transfer(cfg)
         finally:
             setup._TTY, setup.AUTO = prev_tty, prev_auto
-        self.assertEqual(order, ["drop", "probe"])
+        self.assertEqual(called, ["credentials"])
 
     def test_a_drive_it_cannot_resolve_is_refused_not_stored(self):
         """The backstop for a mapping made without /persistent, and for a typo.

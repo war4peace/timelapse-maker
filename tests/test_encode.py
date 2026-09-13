@@ -3094,6 +3094,123 @@ class TestCredentialWatch(unittest.TestCase):
         self.assertNotIn("hunter2", json.dumps(fields))
 
 
+class TestVerifyShareCredentials(unittest.TestCase):
+    """Proving a password, as opposed to proving a folder is writable.
+
+    Platform-independent: IS_WINDOWS is declared rather than inherited, and
+    is_unc()/share_root() are pure string work on both. The distinction this
+    class exists for is that reach_destination() answers "can anything here
+    write to that share", which on a wizard's own machine is usually yes
+    because the operator is signed in to it, while the job that matters runs
+    as LocalSystem at 00:05 and presents the machine account.
+    """
+
+    DEST = "\\\\tower\\cctv\\TL"
+    CREDS = {"username": "war", "password": "hunter2"}
+
+    def run_it(self, connect=(True, ""), write=(True, ""), dest=None,
+               creds=None, windows=True):
+        self.order = []
+
+        def note(label, answer):
+            def fn(*_args, **_kw):
+                self.order.append(label)
+                return answer
+            return fn
+
+        with mock.patch.object(enc, "IS_WINDOWS", windows), \
+                mock.patch.object(enc, "disconnect_share",
+                                  side_effect=note("drop", (True, ""))), \
+                mock.patch.object(enc, "connect_share",
+                                  side_effect=note("connect", connect)), \
+                mock.patch.object(enc, "try_destination",
+                                  side_effect=note("write", write)):
+            return enc.verify_share_credentials(
+                dict(self.CREDS if creds is None else creds),
+                self.DEST if dest is None else dest)
+
+    def test_the_credentials_are_presented_before_anything_is_written(self):
+        ok, detail = self.run_it()
+        self.assertTrue(ok, detail)
+        self.assertEqual(self.order, ["drop", "connect", "write", "drop"])
+
+    def test_a_write_the_current_token_can_do_is_not_a_pass(self):
+        """The whole finding. The operator can write to their own NAS, so a
+        check that reaches the share by any means reports a rejected password
+        as good and the nightly encode discovers otherwise."""
+        ok, detail = self.run_it(
+            connect=(False, "the password was rejected (error 1326)"),
+            write=(True, ""))
+        self.assertFalse(ok)
+        self.assertIn("1326", detail)
+        self.assertIn("war", detail)
+        self.assertNotIn("write", self.order)
+
+    def test_an_existing_connection_is_dropped_first(self):
+        """Windows permits one identity per server per logon session, so a
+        connection Explorer or an earlier run already made would absorb this
+        one and the write would succeed over it. Dropping it is what makes
+        this check able to fail at all."""
+        self.run_it()
+        self.assertEqual(self.order[0], "drop")
+
+    def test_a_credential_conflict_is_a_failure_here(self):
+        """connect_share() answers None for ERROR_SESSION_CREDENTIAL_CONFLICT
+        and that is right for the nightly run, where somebody else's
+        connection may be the one that works. For a verification it is a
+        failure: passing over that connection would be measuring it rather
+        than these credentials."""
+        ok, detail = self.run_it(connect=(None, "already connected as "
+                                                "somebody else (error 1219)"))
+        self.assertFalse(ok)
+        self.assertIn("1219", detail)
+
+    def test_a_share_that_signs_us_in_and_then_refuses_the_write_fails(self):
+        ok, detail = self.run_it(write=(False, "access is denied"))
+        self.assertFalse(ok)
+        self.assertIn("denied", detail)
+        self.assertEqual(self.order, ["drop", "connect", "write", "drop"])
+
+    def test_nothing_is_left_connected_afterwards(self):
+        """A connection left up would make the next probe pass over it, which
+        is the same defect one step later."""
+        self.run_it()
+        self.assertEqual(self.order[-1], "drop")
+        self.run_it(write=(False, "access is denied"))
+        self.assertEqual(self.order[-1], "drop")
+
+    def test_a_local_folder_is_not_asked_about(self):
+        """None, not False. There are no credentials involved in writing to
+        D:\\videos, so there is nothing here to report as wrong."""
+        ok, detail = self.run_it(dest="D:\\videos")
+        self.assertIsNone(ok)
+        self.assertEqual(self.order, [])
+        self.assertTrue(detail)
+
+    def test_no_username_is_not_asked_about_either(self):
+        ok, _ = self.run_it(creds={})
+        self.assertIsNone(ok)
+        self.assertEqual(self.order, [])
+
+    def test_linux_is_not_asked_about_either(self):
+        """Declared, not inherited: this must answer the same on both CI
+        legs."""
+        ok, _ = self.run_it(windows=False)
+        self.assertIsNone(ok)
+        self.assertEqual(self.order, [])
+
+    def test_the_nightly_run_still_tries_the_token_first(self):
+        """The control. reach_destination() is deliberately the other way
+        round, because a share that already accepts this machine needs no
+        password stored anywhere, and this fix must not have changed it."""
+        with mock.patch.object(enc, "try_destination",
+                               return_value=(True, "")), \
+                mock.patch.object(enc, "connect_share") as connect:
+            ok, _ = enc.reach_destination(dict(self.CREDS), self.DEST)
+        self.assertTrue(ok)
+        connect.assert_not_called()
+
+
 class TestOnlyOneRunAtATime(unittest.TestCase):
     """Two encodes on the same night destroy the day, in both directions.
 

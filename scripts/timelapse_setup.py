@@ -38,7 +38,7 @@ from timelapse_platform import (
     FFMPEG_URL, IS_WINDOWS, LINUX_STATE_DIR, LINUX_WEB_STATE_DIR,
     SERVICE_STATES, STATE_DIR_DEFAULT, WATCH_UNIT, WEB_STATE_DIR_DEFAULT,
     allow_users_read,
-    daily_trigger, disconnect_share, drive_is_local, elevation_hint, find_tool,
+    daily_trigger, drive_is_local, elevation_hint, find_tool,
     install_service, install_task, is_elevated, is_reserved_name, is_scheduled,
     is_unc, log_hint, native_name, network_path, no_console, os_disk_mount,
     remove_service,
@@ -2558,7 +2558,7 @@ def check_windows_destination(cfg, dest):
     the encoder make the same WNetAddConnection2W call with the same secret,
     and the probe becomes authoritative for both.
     """
-    from timelapse_encode import reach_destination, try_destination
+    from timelapse_encode import try_destination, verify_share_credentials
 
     print()
     ok, why = try_destination(dest)
@@ -2605,17 +2605,14 @@ def check_windows_destination(cfg, dest):
     cfg["transfer"]["username"] = user
     cfg["transfer"]["password"] = password
 
-    # Drop any existing connection to this server first, or the probe below
-    # cannot fail. Windows permits one identity per server per session, so a
-    # connection made earlier (by Explorer, or by a previous run of this
-    # wizard under a different username) makes WNetAddConnection2W answer
-    # ERROR_SESSION_CREDENTIAL_CONFLICT, and the write that follows then
-    # succeeds over *that* connection and reports the new credentials as good.
-    # Explorer re-establishes its own on next use, so the cost is nil.
-    disconnect_share(dest)
-
+    # verify_share_credentials(), not reach_destination(). The latter tries
+    # the current token first, which is right for the nightly run and wrong
+    # here: on this machine that token is usually the operator's own, and a
+    # write it does alone would report a password that was never presented to
+    # anything as good. Dropping the session's existing connection first is
+    # part of the same rule and lives in there too.
     print()
-    ok, why = reach_destination(cfg["transfer"], dest)
+    ok, why = verify_share_credentials(cfg["transfer"], dest)
     if ok:
         good(f"Connected to {share_root(dest)} as {user} and wrote a file.")
         note("That is the same connection the nightly encode makes, so this")

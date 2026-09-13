@@ -1126,6 +1126,56 @@ def destination_needs_credentials(dest):
     return bool(is_unc(dest))
 
 
+def check_share_access(dest, user, password):
+    """(level, message) for the transfer page's Test. The verdict, not the
+    widget.
+
+    Which of three questions gets asked depends on whether credentials were
+    given, and the distinction is the whole point of this function existing.
+    With a username, the credentials themselves are put to the share, because
+    reach_destination() tries the current token first and on this machine that
+    token is the operator's own: it would write the probe file itself and
+    report a password it never sent as good. Without one, the old answer
+    stands and says exactly what it proved, which is that *you* can write
+    there and not that the nightly encode can.
+    """
+    from timelapse_encode import reach_destination, verify_share_credentials
+
+    probe = {"destination": dest, "username": user, "password": password}
+    if (user or "").strip():
+        ok, why = verify_share_credentials(probe, dest)
+        if ok:
+            return OK, ("Signed in to %s as %s and wrote a file. That is the "
+                        "connection the nightly encode makes, so this is the "
+                        "result that counts." % (share_root(dest), user))
+        if ok is False:
+            return FAIL, "Test failed: %s" % why
+        # None: not a share, so there are no credentials to put to anything.
+
+    ok, why = reach_destination(probe, dest)
+    if not ok:
+        return FAIL, "Test failed: %s" % why
+    if is_unc(dest):
+        return WARN, ("Test successful as your account, which does not prove "
+                      "the nightly encode can write there. Give a username "
+                      "and password to be sure.")
+    return OK, "Test successful."
+
+
+def unverified_credentials_warning(dest):
+    """What to say on the way off the page when nothing tested what is stored.
+
+    A warning and not a refusal. The share may be switched off while somebody
+    configures this, and refusing a configuration that would work is the
+    mistake try_rsync_args() exists because of.
+    """
+    return ("The username and password for %s have not been tested.\n\n"
+            "The nightly encode signs in with them itself, so if they are "
+            "wrong the first you will hear of it is a failed transfer at "
+            "00:05. Test them on this page, or run 'timelapse test' "
+            "later.\n\nStore them anyway?" % (share_root(dest) or "the share"))
+
+
 def credentials_advice(dest):
     """Why a share is likely to need a sign-in even though you can write to it."""
     return ("The nightly encode runs as the system account, which introduces "
@@ -2553,32 +2603,26 @@ def run(config_path=None, existing=None):
                 else:
                     creds.pack_forget()
 
+            # What the last passing Test actually put to the share. commit()
+            # compares against it rather than against "was Test pressed",
+            # because editing the password after a green tick leaves the tick
+            # on screen describing the previous one.
+            proved = {"key": None}
+
             def test():
                 level, _message, stored = check_destination(dest.get())
                 if level == FAIL:
                     return self.say(result, FAIL, _message)
-                from timelapse_encode import reach_destination
                 self.config(cursor="watch")
                 self.update_idletasks()
                 try:
-                    probe = {"destination": stored, "username": user.get(),
-                             "password": password.get()}
-                    good, why = reach_destination(probe, stored)
+                    level, message = check_share_access(
+                        stored, user.get(), password.get())
                 finally:
                     self.config(cursor="")
-                if not good:
-                    return self.say(result, FAIL, f"Test failed: {why}")
-                if is_unc(stored) and not user.get().strip():
-                    # The one case where the detail is the point rather than
-                    # noise: it passed as *you*, and the nightly encode is
-                    # somebody else. Saying only "Test successful" here would
-                    # be the check lying by omission.
-                    return self.say(
-                        result, WARN,
-                        "Test successful as your account, which does not prove "
-                        "the nightly encode can write there. Give a username "
-                        "and password to be sure.")
-                self.say(result, OK, "Test successful.")
+                if level == OK and user.get().strip():
+                    proved["key"] = (stored, user.get(), password.get())
+                self.say(result, level, message)
 
             tester.config(command=test)
             dest.trace_add("write", refresh)
@@ -2593,6 +2637,20 @@ def run(config_path=None, existing=None):
                 if level == FAIL:
                     messagebox.showerror("Destination", message)
                     return False
+                if (user.get().strip()
+                        and proved["key"] != (stored, user.get(),
+                                              password.get())
+                        and destination_needs_credentials(stored)):
+                    # Warned, never refused: the share may simply be switched
+                    # off while somebody sets this up, and refusing a
+                    # configuration that would work is the try_rsync_args
+                    # mistake. Saying nothing is the other one, since these
+                    # credentials are about to be trusted by a job that runs
+                    # at 00:05 as a different account.
+                    if not messagebox.askyesno(
+                            "Transfer",
+                            unverified_credentials_warning(stored)):
+                        return False
                 t.update({"enabled": True, "destination": stored,
                           "require_mountpoint": False})
                 # Absent rather than empty, because "" is a real answer to

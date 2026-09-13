@@ -2284,12 +2284,39 @@ runs rsync: three opinions about one share is two too many.
 
 **What the wizard can and cannot prove is stated to the operator.** Run without
 credentials, its probe tests the operator's own account and says so; with
-credentials it makes the identical call the encoder will make, and says that
-instead. It also disconnects the share first, because Windows permits one
-identity per server per session, so an existing connection (Explorer's, or a
-previous run's) would make new credentials answer
-`ERROR_SESSION_CREDENTIAL_CONFLICT` and the write then succeed over the *old*
-connection, reporting an untested password as good.
+credentials it puts those credentials, and only those, to the share.
+
+**That second half was not true until 0.2.1, and the way it was false is the
+lesson.** Both wizards called `reach_destination()`, which is the function
+above: it tries the current token first *on purpose*. That order is right for
+the nightly run and exactly wrong for a check, because of where a wizard runs.
+On the operator's own machine the current token is the operator, who can write
+to their own NAS, so the probe file went in, "Test successful" appeared, and
+the password they had just typed was never presented to anything. The
+disconnect the console path already did was not enough: Windows re-establishes
+a connection to a server from Credential Manager, which holds the operator's
+own credentials in their own hive. The graphical wizard warned only when the
+username box was *empty*, which is precisely the case that needed no warning.
+
+`verify_share_credentials()` is the check that can fail. It drops whatever this
+session holds to that server, signs in with the stored username and password,
+writes the probe, and disconnects again so nothing it made can be passed over
+later. It is **stricter about one answer than its neighbour**:
+`ERROR_SESSION_CREDENTIAL_CONFLICT` is "not attempted" for the nightly run and
+a *failure* here, because succeeding over somebody else's connection would be
+measuring that connection rather than these credentials. It answers `None` for
+"the question does not arise" (not Windows, not a UNC path, no username), which
+is the three-way shape again. `reach_destination()` is untouched: the nightly
+run still tries the token first, and a test pins that it does.
+
+The graphical wizard's Next warns, and does not refuse, when credentials are
+stored that nothing verified, and it compares against **what the last passing
+Test actually sent** rather than against whether Test was pressed: editing the
+password after a green tick leaves the tick on screen describing the previous
+one. Warning rather than refusing was the user's call and the consistent one,
+since the share may simply be switched off while somebody configures this, and
+refusing a configuration that would work is the mistake `try_rsync_args()`
+exists because of.
 
 `ERROR_SESSION_CREDENTIAL_CONFLICT` is also why `connect_share()` returns
 `None` rather than `False` for it. Somebody else's connection may be the one
@@ -3391,7 +3418,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,133 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,149 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -3784,6 +3811,16 @@ how `WINDOW` came to be 660 rather than a guess.
     **Then press Network:** every drive the operator has mapped is listed with
     where it really points, and picking one puts the UNC in the box and carries
     on into the folder dialog there.
+10a. **Type a username and a deliberately wrong password for the share, and
+    press Test.** It must fail, naming the refusal, on a machine where you can
+    write to that share yourself: that is the whole of H5, and it is the one
+    step no test can take, because the decide layer is proven against a
+    stubbed `connect_share()` and what this measures is the real one. Then
+    press Next without pressing Test at all: a warning names the share and
+    asks whether to store them anyway, No stays on the page and Yes goes
+    through. Press Test with the right password, then change the password, and
+    press Next: the warning must appear again, because the green tick above it
+    describes the previous password.
 11. Notifications: fill in one service and press its Send a test message. The
     message arrives. Leaving all three empty is allowed and says so. **All
     three services must be visible without resizing the window**, along with
@@ -4118,10 +4155,10 @@ installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
-scripts/timelapse_encode.py      batch job, 2252 lines
+scripts/timelapse_encode.py      batch job, 2300 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
-scripts/timelapse_setup.py       configuration wizard, 4817 lines
-scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
+scripts/timelapse_setup.py       configuration wizard, 4814 lines
+scripts/timelapse_gui.py         the same wizard in a window, 2946 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2377 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines

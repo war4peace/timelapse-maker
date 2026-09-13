@@ -95,6 +95,22 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Windows: testing a network share now tests the password you typed.** Both
+  wizards reported a share as reachable as soon as anything could write to
+  it, and on the machine you run the wizard on that is usually you: your own
+  sign-in already reaches your NAS. So the test passed, the graphical wizard
+  said "Test successful", and the username and password you had just entered
+  were never sent to the server at all. The nightly encode signs in with them
+  as the system account, so a wrong password went unnoticed until a transfer
+  failed at 00:05.
+
+  Testing a share with credentials now signs in with exactly those
+  credentials and nothing else, and says so. The nightly run is unchanged: it
+  still writes as itself first, because a share that already accepts this
+  machine needs no password stored anywhere. If you leave the graphical
+  wizard's transfer page with credentials nothing has tested, it now says so
+  and lets you decide.
+
 - **Windows: the capture service now really does restart itself.** The
   installer has always registered it with three restart-on-failure actions,
   fifteen seconds apart, described in the guide as the equivalent of the

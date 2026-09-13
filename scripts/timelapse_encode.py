@@ -37,9 +37,10 @@ from urllib import request as urlrequest
 # Names, not the module: `platform` above is the stdlib one, and two things
 # called platform in one file is a trap waiting for a reader in a hurry.
 from timelapse_platform import (CONFIG_PATH, IS_WINDOWS, NET_ERRORS,
-                                STATE_DIR_DEFAULT, connect_share, is_unc,
-                                log_handler, net_error, no_console,
-                                release_lock, share_root, take_lock)
+                                STATE_DIR_DEFAULT, connect_share,
+                                disconnect_share, is_unc, log_handler,
+                                net_error, no_console, release_lock,
+                                share_root, take_lock)
 
 __version__ = "0.2.0"
 
@@ -1357,6 +1358,53 @@ def reach_destination(t, dest):
         log.info("  %s", detail)
 
     ok, why = try_destination(dest)
+    return (True, "") if ok else (False, why)
+
+
+def verify_share_credentials(t, dest):
+    """Prove that these credentials are what reaches the share. (ok, detail).
+
+    None means the question does not arise here, never that the answer is no:
+    not Windows, not a UNC path, or no username to check.
+
+    A different job from reach_destination(), which tries the current token
+    first on purpose, because a share that already accepts this machine needs
+    no password stored anywhere. That is right for the nightly run and wrong
+    for a check, and on the machine a wizard runs on it is wrong in the
+    direction that hurts: the operator's own token can usually write to their
+    own NAS, so the probe passes, "Test successful" is printed, and the
+    password they typed was never sent to anything. LocalSystem finds out at
+    00:05.
+
+    So this presents the credentials and nothing else, and it is deliberately
+    stricter about one answer than its neighbour. ERROR_SESSION_CREDENTIAL_
+    CONFLICT is "not attempted" for the nightly run, because somebody else's
+    connection to that server may well be the one that works; for a
+    verification it is a failure, because succeeding over that connection
+    would be measuring it rather than these credentials.
+    """
+    user = (t.get("username") or "").strip()
+    if not IS_WINDOWS or not is_unc(dest):
+        return None, "share credentials are a Windows network mechanism"
+    if not user:
+        return None, "no username to check"
+
+    # Drop whatever this session already holds to that server, or the check
+    # cannot fail: Windows permits one identity per server per logon session,
+    # so an existing connection (Explorer's, or an earlier run of this wizard
+    # under another name) makes the connect below a no-op and the write
+    # succeed over it. Explorer re-establishes its own on next use.
+    disconnect_share(dest)
+    made, detail = connect_share(dest, user, t.get("password") or "")
+    if made is not True:
+        disconnect_share(dest)
+        return False, "%s refused %s: %s" % (share_root(dest), user,
+                                             detail or "no detail given")
+    try:
+        ok, why = try_destination(dest)
+    finally:
+        # Leave nothing behind that a later probe could pass over.
+        disconnect_share(dest)
     return (True, "") if ok else (False, why)
 
 

@@ -19,6 +19,7 @@ from unittest import mock
 
 import _support
 
+import timelapse_encode as enc
 import timelapse_gui as gui
 import timelapse_setup as setup
 
@@ -2069,6 +2070,87 @@ class TestItRefusesOffWindows(unittest.TestCase):
             code = gui.main([])
         self.assertEqual(code, 2)
         self.assertIn("timelapse setup", buf.getvalue())
+
+
+class TestTheTransferTestPresentsWhatItStores(unittest.TestCase):
+    """The Test button's verdict, decided above the widget.
+
+    Platform-independent: everything that could read the running machine is
+    stubbed at the module that defines it, so the same three answers are
+    asserted on both CI legs. The defect this is about is specific and
+    unpleasant: reach_destination() tries the current token first, so on the
+    machine the wizard runs on the operator's own account writes the probe
+    file, the page says "Test successful", and the password they typed was
+    never sent anywhere. LocalSystem finds out at 00:05.
+
+    No test exercised the transfer Test path at all before this.
+    """
+
+    DEST = "\\\\tower\\cctv\\TL"
+
+    def test_credentials_the_share_refuses_are_a_failure(self):
+        """Even though the operator can write there, which is what makes the
+        old answer wrong rather than merely incomplete."""
+        with mock.patch.object(enc, "IS_WINDOWS", True), \
+                mock.patch.object(enc, "disconnect_share",
+                                  return_value=(True, "")), \
+                mock.patch.object(
+                    enc, "connect_share",
+                    return_value=(False,
+                                  "the password was rejected (error 1326)")), \
+                mock.patch.object(enc, "try_destination",
+                                  return_value=(True, "")):
+            level, message = gui.check_share_access(self.DEST, "war", "wrong")
+        self.assertEqual(level, gui.FAIL)
+        self.assertIn("1326", message)
+
+    def test_credentials_the_share_accepts_are_the_answer_that_counts(self):
+        with mock.patch.object(enc, "IS_WINDOWS", True), \
+                mock.patch.object(enc, "disconnect_share",
+                                  return_value=(True, "")), \
+                mock.patch.object(enc, "connect_share",
+                                  return_value=(True, "")), \
+                mock.patch.object(enc, "try_destination",
+                                  return_value=(True, "")):
+            level, message = gui.check_share_access(self.DEST, "war", "right")
+        self.assertEqual(level, gui.OK)
+        self.assertIn("war", message)
+
+    def test_a_share_with_no_credentials_still_warns_about_the_account(self):
+        """Unchanged, and it is the reason the warning was not enough on its
+        own: it only ever fired when the username box was empty."""
+        with mock.patch.object(enc, "IS_WINDOWS", True), \
+                mock.patch.object(enc, "try_destination",
+                                  return_value=(True, "")):
+            level, message = gui.check_share_access(self.DEST, "", "")
+        self.assertEqual(level, gui.WARN)
+        self.assertIn("your account", message)
+
+    def test_a_local_folder_that_is_writable_is_simply_successful(self):
+        """LocalSystem is the most privileged account on this machine, so
+        there is no second principal to warn about."""
+        with mock.patch.object(enc, "IS_WINDOWS", True), \
+                mock.patch.object(enc, "try_destination",
+                                  return_value=(True, "")):
+            level, message = gui.check_share_access("D:\\videos", "", "")
+        self.assertEqual(level, gui.OK)
+        self.assertNotIn("account", message)
+
+    def test_an_unwritable_destination_fails_whoever_asked(self):
+        with mock.patch.object(enc, "IS_WINDOWS", True), \
+                mock.patch.object(enc, "try_destination",
+                                  return_value=(False, "access is denied")):
+            level, message = gui.check_share_access("D:\\videos", "", "")
+        self.assertEqual(level, gui.FAIL)
+        self.assertIn("denied", message)
+
+    def test_the_warning_on_the_way_off_the_page_names_the_share(self):
+        """It is a warning and not a refusal, because the share may simply be
+        switched off while somebody configures this, and refusing a
+        configuration that would work is the try_rsync_args mistake."""
+        text = gui.unverified_credentials_warning(self.DEST)
+        self.assertIn("\\\\tower\\cctv", text)
+        self.assertIn("00:05", text)
 
 
 class TestNoEmDashes(unittest.TestCase):
