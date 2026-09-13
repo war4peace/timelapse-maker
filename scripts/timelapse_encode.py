@@ -1275,7 +1275,11 @@ def try_rsync_args(dest, args, svcuser=None):
     try:
         tmpdir = tempfile.mkdtemp(prefix="tl-xfer-")
         os.chmod(tmpdir, 0o755)
-        probe = Path(tmpdir) / ".tl-transfer-probe"
+        # Unique for the reason try_destination()'s is: this file lands
+        # in the operator's destination, where whichever account rsync
+        # presented owns it, and the pre-flight runs as root or as the
+        # service user depending on who started it.
+        probe = Path(tmpdir) / probe_name(".tl-transfer-probe")
         probe.write_bytes(b"\0" * 4096)
         if svcuser:
             try:
@@ -1300,8 +1304,9 @@ def try_rsync_args(dest, args, svcuser=None):
         return False, f"exit {r.returncode}{': ' + detail if detail else ''}"
     finally:
         # The configured args may include --remove-source-files, which takes
-        # the probe with it; missing_ok covers both outcomes.
-        landed.unlink(missing_ok=True)
+        # the probe with it, and a destination that refuses the delete must not
+        # turn a verdict into a traceback out of a `finally`.
+        forget_probe(landed)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -1331,8 +1336,9 @@ def probe_rsync_flags(dest, svcuser=None):
 # ----------------------------------------------------------------------------
 
 # Named so it cannot collide with a video, and dotted so it does not show up
-# in the operator's file browser next to five years of timelapses.
-PROBE_NAME = ".timelapse-write-probe"
+# in the operator's file browser next to five years of timelapses. A prefix
+# rather than the whole name since 0.2.1; see probe_name().
+PROBE_PREFIX = ".timelapse-write-probe"
 PART_SUFFIX = ".part"
 
 
@@ -1349,6 +1355,47 @@ def path_problem(exc):
     return " ".join(str(exc).split())[:200]
 
 
+def probe_name(prefix=PROBE_PREFIX):
+    """A probe file name no other run can already be holding.
+
+    It was one fixed name until 0.2.1, which made it a shared mutable resource
+    across identities: the wizard probes as the operator, the pre-flight as
+    whoever typed it, and the nightly encode as the account in
+    `transfer.username`. On a share the file belongs to whichever of them wrote
+    it, so one left behind refuses every later caller with EACCES on a
+    directory they can otherwise write to perfectly well, and `path_problem()`
+    reports that as the share denying access.
+
+    Reported from the real deployment 2026-09-13: the graphical wizard passed
+    its destination test and then failed its final check, on a share that had
+    delivered every night since August. The operator could not clear the file
+    either, since reading, overwriting and deleting it over the share were all
+    access denied, so the check had broken itself and kept the means of
+    repair. Same family as `try_rsync_args()` and the nested `runuser`: a
+    checker's own limitations are never a finding about what it checks.
+
+    Random rather than a timestamp: `time.time_ns()` moves in about 15ms steps
+    on Windows, and 64 calls in a loop return one value, so a clock would have
+    reintroduced a shared name in the one place two checks can overlap. The pid
+    stays because it says which run left a file that could not be removed.
+    """
+    return "%s.%d.%s" % (prefix, os.getpid(), os.urandom(4).hex())
+
+
+def forget_probe(path):
+    """Remove a probe file, and never fail the check on account of it.
+
+    The old code unlinked on the success path only, so a run that had already
+    gone wrong left its file behind, which is how a fixed name came to block
+    anything at all. What the caller asked is whether the write succeeded; a
+    file that cannot be removed afterwards does not change that answer.
+    """
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
 def try_destination(dest):
     """(ok, why): can this account create a file in dest right now?
 
@@ -1362,14 +1409,20 @@ def try_destination(dest):
     the same reason: the wizard and the pre-flight import it, so none of the
     three can hold a different opinion about the same share.
     """
+    d = Path(dest)
     try:
-        d = Path(dest)
         d.mkdir(parents=True, exist_ok=True)
-        probe = d / PROBE_NAME
-        probe.write_bytes(b"timelapse")
-        probe.unlink()
+        probe = d / probe_name()
+        try:
+            probe.write_bytes(b"timelapse")
+        finally:
+            forget_probe(probe)
     except OSError as exc:
         return False, path_problem(exc)
+    # An install before 0.2.1 may have left the old fixed-name probe here.
+    # Only its owner can remove it, and the nightly encode is usually exactly
+    # that account, so upgrading clears most of them without anybody being asked.
+    forget_probe(d / PROBE_PREFIX)
     return True, ""
 
 

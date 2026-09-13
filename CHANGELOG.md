@@ -111,6 +111,17 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **A leftover check file could make the wizard and `timelapse test` report a
+  working network destination as unwritable, and keep doing so.** Both write a
+  small file to the destination to find out whether they can, and both used the
+  same name for it. On a network share that file belongs to whoever wrote it,
+  so once one was left behind by the account the nightly encode uses, running
+  the wizard as yourself was refused with "permission denied" for a folder you
+  can write to by hand, and the file could not be deleted over the share
+  either. The name is now unique to each check, and is removed even when the
+  check fails; a successful check also clears an old one where it is allowed
+  to, which the nightly encode usually is.
+
 - **Linux: the capture, encode and watch services are sandboxed like the web
   UI already was.** The daemon that holds your camera passwords could reach
   kernel tunables, control groups, devices and any kind of socket; the page

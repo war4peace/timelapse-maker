@@ -2620,12 +2620,29 @@ any file, and asking for one to solve a problem the operator does not have is
 how a tool teaches people to store secrets for no reason.
 
 **Everything probes by writing.** `try_destination()` mkdirs the destination,
-writes `.timelapse-write-probe` and deletes it. Existence is not the question
+writes a probe file and deletes it. Existence is not the question
 and neither is reachability: a share can be listable by an account and still
 refuse it a write, and `Path.is_dir()` *raises* on Windows for a directory the
 caller may not read. The wizard, the pre-flight and the encoder all call this
 one function, for the same reason `try_rsync_args()` lives beside the code that
 runs rsync: three opinions about one share is two too many.
+
+**The probe name is unique to the attempt** (0.2.1), and it is removed in a
+`finally`. It was the flat `.timelapse-write-probe` before, which made it a
+shared mutable resource across identities: the wizard probes as the operator,
+the pre-flight as whoever typed it, and the nightly encode as the account in
+`transfer.username`, so on a share the file belongs to whichever of them wrote
+it and one left behind refuses every later caller with EACCES on a directory
+they can otherwise write. Reported from the deployment 2026-09-13, where the
+graphical wizard passed its destination test and then failed its final check on
+a share that had delivered every night since August, and the operator could not
+clear the file either: reading, overwriting and deleting it over the share were
+all access denied, so the check had broken itself and kept the means of repair.
+The name is random rather than timestamped, because `time.time_ns()` moves in
+about 15ms steps on Windows and 64 calls in a loop return one value; the pid
+stays in it so a file that could not be removed says which run left it. A
+successful probe also clears the old fixed-name file where it is allowed to,
+which is usually the nightly encode tidying up after the wizard.
 
 **What the wizard can and cannot prove is stated to the operator.** Run without
 credentials, its probe tests the operator's own account and says so; with
@@ -4689,7 +4706,7 @@ installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1584 lines
-scripts/timelapse_encode.py      batch job, 2394 lines
+scripts/timelapse_encode.py      batch job, 2447 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1092 lines
 scripts/timelapse_setup.py       configuration wizard, 4928 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2990 lines

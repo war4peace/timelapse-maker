@@ -1328,6 +1328,73 @@ class TestPreflightWindowsTransfer(unittest.TestCase):
         self.assertIn("disabled", buf.getvalue())
 
 
+class TestTheWriteProbeIsNotOneSharedName(_support.TempDirCase):
+    """`try_destination()` writes a real file, and every other test here
+    patches it, so the function itself had never been executed by the suite.
+
+    That is how a fixed probe name reached production. The wizard probes as the
+    operator, the pre-flight as whoever typed it, and the nightly encode as the
+    account in `transfer.username`, and on a share the file belongs to
+    whichever of them wrote it.
+    """
+
+    def test_it_leaves_nothing_behind(self):
+        ok, why = enc.try_destination(str(self.tmp))
+        self.assertTrue(ok, why)
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_no_two_probes_share_a_name(self):
+        names = {enc.probe_name() for _ in range(64)}
+        self.assertEqual(len(names), 64)
+
+    def test_the_name_is_never_the_one_older_installs_left_behind(self):
+        with mock.patch.object(enc, "forget_probe"):
+            ok, why = enc.try_destination(str(self.tmp))
+        self.assertTrue(ok, why)
+        left = os.listdir(self.tmp)
+        self.assertEqual(len(left), 1)
+        self.assertTrue(left[0].startswith(enc.PROBE_PREFIX))
+        self.assertNotEqual(left[0], enc.PROBE_PREFIX)
+
+    def test_a_probe_it_cannot_delete_is_still_a_successful_write(self):
+        with mock.patch.object(Path, "unlink",
+                               side_effect=PermissionError(13, "denied")):
+            ok, why = enc.try_destination(str(self.tmp))
+        self.assertTrue(ok, why)
+
+    def test_a_refused_write_is_still_a_refusal_and_leaves_nothing(self):
+        with mock.patch.object(Path, "write_bytes",
+                               side_effect=PermissionError(13, "denied")):
+            ok, why = enc.try_destination(str(self.tmp))
+        self.assertFalse(ok)
+        self.assertIn("denied", why)
+        self.assertEqual(os.listdir(self.tmp), [])
+
+    def test_a_stale_probe_from_an_older_install_is_cleared(self):
+        stale = self.tmp / enc.PROBE_PREFIX
+        stale.write_bytes(b"timelapse")
+        ok, why = enc.try_destination(str(self.tmp))
+        self.assertTrue(ok, why)
+        self.assertFalse(stale.exists())
+
+    def test_clearing_a_stale_probe_is_best_effort(self):
+        """One owned by another account cannot be removed, and that must not
+        turn a working share into a failed check: the write succeeded."""
+        stale = self.tmp / enc.PROBE_PREFIX
+        stale.write_bytes(b"timelapse")
+        real = Path.unlink
+
+        def refuse(path, *a, **kw):
+            if path.name == enc.PROBE_PREFIX:
+                raise PermissionError(13, "denied")
+            return real(path, *a, **kw)
+
+        with mock.patch.object(Path, "unlink", refuse):
+            ok, why = enc.try_destination(str(self.tmp))
+        self.assertTrue(ok, why)
+        self.assertTrue(stale.exists())
+
+
 class TestReachDestination(unittest.TestCase):
     """Try this account first; only then spend a stored credential.
 
@@ -1530,6 +1597,28 @@ class TestRsyncProbe(unittest.TestCase):
     def fake_run(self, rc, stderr=""):
         return mock.MagicMock(return_value=mock.Mock(returncode=rc,
                                                      stderr=stderr))
+
+    def test_the_probe_it_sends_has_a_name_of_its_own(self):
+        """The same reason try_destination()'s does: this file lands in the
+        operator's destination, and there it belongs to whoever wrote it."""
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(0)) as run:
+            enc.try_rsync_args(self.tmp, ["-a"])
+        sent = Path(run.call_args[0][0][-2]).name
+        self.assertTrue(sent.startswith(".tl-transfer-probe"))
+        self.assertNotEqual(sent, ".tl-transfer-probe")
+
+    def test_a_cleanup_it_is_refused_is_not_a_traceback(self):
+        """The unlink sits in a `finally`, so an exception there escapes the
+        function and reaches the operator as a crash instead of an answer."""
+        real = Path.unlink
+
+        def refuse(path, *a, **kw):
+            if path.name.startswith(".tl-transfer-probe"):
+                raise PermissionError(13, "denied")
+            return real(path, *a, **kw)
+
+        with mock.patch.object(enc.subprocess, "run", self.fake_run(0)),                 mock.patch.object(Path, "unlink", refuse):
+            self.assertEqual(enc.try_rsync_args(self.tmp, ["-a"]), (True, ""))
 
     def test_success_is_reported_as_working(self):
         with mock.patch.object(enc.subprocess, "run", self.fake_run(0)):
