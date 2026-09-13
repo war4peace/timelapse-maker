@@ -6,6 +6,7 @@ that would reach GitHub patches fetch_json or fetch_text, and one of them
 exists specifically to prove that.
 """
 
+import builtins
 import io
 import os
 import shutil
@@ -13,7 +14,8 @@ import sys
 import tempfile
 import unittest
 import urllib.error
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import (contextmanager, redirect_stdout,
+                        redirect_stderr)
 from pathlib import Path
 from unittest import mock
 
@@ -437,3 +439,140 @@ class TestNoAccidentalNetwork(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@contextmanager
+def tty(raw=None, open_error=None, read_error=None):
+    """Stand in for /dev/tty, and only for /dev/tty.
+
+    ask_yes() opens it by name rather than reading stdin, because under
+    `curl | bash` stdin is the script itself. Everything else that opens a
+    file during the call goes through to the real one, so a blanket patch
+    cannot quietly change what the rest of main() is doing.
+    """
+    real_open = builtins.open
+
+    class FakeTTY(object):
+        def readline(self):
+            if read_error is not None:
+                raise read_error
+            return raw
+
+        def close(self):
+            pass
+
+    def fake_open(path, *args, **kw):
+        if str(path) == "/dev/tty":
+            if open_error is not None:
+                raise open_error
+            return FakeTTY()
+        return real_open(path, *args, **kw)
+
+    with mock.patch.object(builtins, "open", fake_open):
+        yield
+
+
+class TestNotAnsweringMeansNo(UpdateCLICase):
+    """Every way of not answering used to mean yes, and the question is
+    "shall I download an installer and run it as root".
+
+    Three of them. With no terminal ask_yes() returned its default, which is
+    True at the only call site, so an unattended `timelapse update` upgraded
+    without being told to, and `--yes` exists to say exactly that on purpose.
+    A Ctrl-C at the prompt was caught and turned into the default, so changing
+    your mind started the installer. And an EOF read the same as pressing
+    Enter.
+
+    Platform-independent and unprivileged: geteuid is declared below, and
+    /dev/tty is never really opened.
+    """
+
+    def setUp(self):
+        # main() refuses to install as a normal user, and this class is about
+        # what happens after that check rather than at it.
+        p = mock.patch.object(os, "geteuid", lambda: 0, create=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def ask(self, **how):
+        out = io.StringIO()
+        with tty(**how), redirect_stdout(out):
+            answer = upd.ask_yes("Install v9.9.9 now?", True)
+        return answer, out.getvalue()
+
+    def test_enter_still_accepts_the_default(self):
+        """The control, and it is the promise every prompt in this project
+        makes: Enter takes what is in the brackets."""
+        answer, _ = self.ask(raw="\n")
+        self.assertTrue(answer)
+
+    def test_yes_is_still_yes_and_no_is_still_no(self):
+        self.assertTrue(self.ask(raw="y\n")[0])
+        self.assertFalse(self.ask(raw="n\n")[0])
+
+    def test_no_terminal_means_no(self):
+        answer, text = self.ask(open_error=OSError(6, "no such device"))
+        self.assertFalse(answer)
+        self.assertIn("no terminal", text)
+        self.assertIn("--yes", text)     # and how to mean yes on purpose
+
+    def test_an_end_of_input_means_no(self):
+        """Ctrl-D, or a terminal that went away mid-question. It reads the
+        same as Enter after strip(), which is why the raw line is checked
+        before it is stripped."""
+        answer, text = self.ask(raw="")
+        self.assertFalse(answer)
+        self.assertIn("no", text.lower())
+
+    def test_an_unreadable_terminal_means_no(self):
+        answer, text = self.ask(read_error=OSError(5, "I/O error"))
+        self.assertFalse(answer)
+        self.assertIn("as no", text)
+
+    def test_a_ctrl_c_exits_rather_than_answering(self):
+        """An interrupt is not an answer, and a caller reading a bool cannot
+        tell the two apart. 130 is the conventional status for it."""
+        out = io.StringIO()
+        with tty(read_error=KeyboardInterrupt()), redirect_stdout(out):
+            with self.assertRaises(SystemExit) as caught:
+                upd.ask_yes("Install v9.9.9 now?", True)
+        self.assertEqual(caught.exception.code, 130)
+        self.assertIn("Nothing was changed", out.getvalue())
+
+    # -- and the same three through main(), which is what actually installs --
+
+    def install_args(self, run):
+        return dict(latest_release=self.release("v9.9.9"),
+                    release_notes=mock.MagicMock(return_value=""),
+                    fetch_installer=mock.MagicMock(
+                        return_value="/tmp/x/install.sh"),
+                    check_syntax=lambda p: True, run_installer=run)
+
+    def test_an_unattended_run_without_yes_installs_nothing(self):
+        run = mock.MagicMock()
+        with tty(open_error=OSError(6, "no such device")):
+            rc, text = self.run_main(["--current", "0.1.1"],
+                                     **self.install_args(run))
+        self.assertEqual(rc, 0)
+        run.assert_not_called()
+        self.assertIn("--yes", text)
+
+    def test_a_ctrl_c_at_the_prompt_installs_nothing(self):
+        run = mock.MagicMock()
+        with tty(read_error=KeyboardInterrupt()):
+            with self.assertRaises(SystemExit) as caught:
+                self.run_main(["--current", "0.1.1"], **self.install_args(run))
+        self.assertEqual(caught.exception.code, 130)
+        run.assert_not_called()
+
+    def test_yes_never_asks_at_all(self):
+        """The other half of the contract. --yes is how an unattended run says
+        it meant to upgrade, so it must not be affected by any of the above."""
+        run = mock.MagicMock(return_value=0)
+        def never(*_a, **_kw):
+            raise AssertionError("--yes must not reach the question")
+
+        rc, _ = self.run_main(["--yes", "--current", "0.1.1"],
+                              ask_yes=never, **self.install_args(run))
+        self.assertEqual(rc, 0)
+        run.assert_called_once()

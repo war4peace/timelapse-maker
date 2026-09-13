@@ -240,6 +240,11 @@ That asks GitHub for the newest release, shows you what changed, and installs
 it after one confirmation. `timelapse update --check` reports without
 installing and is the one command here that needs no root at all.
 
+**Not answering that confirmation means no.** Ctrl-C at the prompt changes
+nothing and exits 130, and running it where there is no terminal (from cron,
+or a script) declines rather than upgrading. If you want it to upgrade without
+asking, say so with `--yes`.
+
 Under the covers it is the same thing the documentation has always said:
 re-run the installer. It downloads `install.sh` **from the tag it is about to
 install**, so the installer and the tree it unpacks are the same version, and

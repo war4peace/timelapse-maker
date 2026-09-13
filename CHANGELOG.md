@@ -158,6 +158,15 @@ While the version is `0.x`, the configuration format may change in any release.
   every answer and dropped the camera from the discovered list. It now asks
   for a different name and keeps the rest.
 
+- **`sudo timelapse update` no longer upgrades when you did not answer it.**
+  Pressing Ctrl-C at `Install v0.2.1 now? (Y/n)` was caught and read as yes,
+  so changing your mind started the installer; and running it with no
+  terminal (from cron, or a script) upgraded without asking, which is what
+  `--yes` is for. Not answering now means no, whichever way you did not
+  answer it. Ctrl-C exits 130 and says nothing was changed; with no terminal
+  it says so and points at `--yes`. Answering, and `--yes`, work exactly as
+  before.
+
 - **`timelapse test` now exits non-zero when it found something wrong.** It
   printed FAIL lines and then reported success to whatever ran it, which
   means a script could not act on it and the installer did not: it ran the

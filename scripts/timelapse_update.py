@@ -252,23 +252,48 @@ def ask_yes(question, default=True):
     """Yes/no from the terminal, never from stdin.
 
     Same reason the wizard and the installer do it: under `curl | bash` stdin
-    is the script itself. Without a terminal, take the default rather than
-    block forever.
+    is the script itself.
+
+    **No answer is not the default here, and that is the difference between
+    this and the wizard's `ask()`.** The one question this asks is "shall I
+    download an installer and run it as root", so every way of not answering
+    it has to mean no. It used to mean yes three times over: with no terminal
+    the default came back, a Ctrl-C at the prompt was caught and turned into
+    the default, and an EOF read the same as pressing Enter. So an unattended
+    `timelapse update` upgraded without being told to, which is what `--yes`
+    exists to say on purpose, and an operator who changed their mind at the
+    prompt watched the installer start.
+
+    Ctrl-C exits 130 rather than returning False, because an interrupt is not
+    an answer to the question and a caller reading a bool cannot tell the two
+    apart. (The wizard exits 1 for the same gesture; it is not writing
+    /opt/timelapse when it does.)
     """
     prompt = "Y/n" if default else "y/N"
     try:
         tty = open("/dev/tty")
     except OSError:
-        note(f"{question} ({prompt}) -> {'yes' if default else 'no'} "
-             f"(no terminal)")
-        return default
+        note(f"{question} ({prompt}) -> no, because there is no terminal to "
+             f"ask on.")
+        note("Pass --yes to answer it in advance.")
+        return False
     try:
         print(f"  {question} ({prompt}): ", end="", flush=True)
-        answer = tty.readline().strip().lower()
-    except (OSError, KeyboardInterrupt):
-        return default
+        raw = tty.readline()
+    except KeyboardInterrupt:
+        print()
+        note("Nothing was changed.")
+        raise SystemExit(130)
+    except OSError as exc:
+        note(f"Could not read an answer ({exc}); taking that as no.")
+        return False
     finally:
         tty.close()
+    if raw == "":                   # EOF: the terminal went away mid-question
+        print()
+        note("No answer (end of input); taking that as no.")
+        return False
+    answer = raw.strip().lower()
     if not answer:
         return default
     return answer in ("y", "yes")

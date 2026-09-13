@@ -1877,6 +1877,29 @@ Upgrading is re-running the installer, so that is what this does:
 6. Hand over, into a directory holding nothing but `install.sh`, so the
    installer's `obtain_source()` does not mistake it for a checkout.
 
+**Step 3 fails closed, and until 0.2.1 it failed open three ways** (0.2.1).
+`ask_yes()` returned its default when there was no terminal, caught a
+`KeyboardInterrupt` and returned the default, and read an EOF the same as
+pressing Enter. The default at the only call site is **yes**, and the question
+is "shall I download an installer and run it as root". So an unattended
+`timelapse update` upgraded without being asked to, which is exactly what
+`--yes` exists to say on purpose; and an operator who changed their mind at the
+prompt and pressed Ctrl-C watched the installer start.
+
+Every way of not answering means no now. No terminal says so and names `--yes`
+as the way to mean yes in advance. An EOF is distinguished from Enter by
+checking the raw line before it is stripped, since both are `""` afterwards.
+And a **Ctrl-C exits 130** rather than returning False: an interrupt is not an
+answer, and a caller reading a bool cannot tell the two apart. The wizard exits
+1 for the same gesture and that difference is deliberate rather than
+overlooked; the wizard is not writing `/opt/timelapse` when it happens.
+
+This is the opposite rule from `ask()` in the wizard, where a missing answer
+takes the default, and both are right for what they do. The question to ask of
+a prompt is not "what is the default" but **"what does this do if nobody
+answers"**, and the answer has to be safe for the specific thing that happens
+next.
+
 The privilege check sits between steps 3 and 4, not at the top of `main()`:
 `--check` answers the question without root, and only acting on the answer
 needs it. `--check` exits **10** when an update is available, so a cron job
@@ -3487,7 +3510,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,174 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,183 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4267,7 +4290,7 @@ scripts/timelapse_encode.py      batch job, 2300 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1049 lines
 scripts/timelapse_setup.py       configuration wizard, 4814 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2946 lines
-scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
+scripts/timelapse_update.py      release query + `timelapse update`, 471 lines
 scripts/timelapse_platform.py    the only platform branch, 2377 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
 scripts/timelapse_web.py         read-only web UI, 3560 lines
