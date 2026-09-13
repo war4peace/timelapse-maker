@@ -15,7 +15,11 @@ logs, which is exactly how it came to be missed.
 import ast
 import contextlib
 import io
+import json
+import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -259,3 +263,156 @@ class TestTheExitCodeSaysWhatItFound(unittest.TestCase):
                 spelled.add(call.func.id)
         self.assertIn("exit", spelled)
         self.assertIn("main", spelled)
+
+
+class TestAnEmptyFfmpegPathIsNamed(unittest.TestCase):
+    """`Path("").exists()` is True, because it is ".".
+
+    So `ffmpeg: ""` slipped past the "not found" check and produced four "not
+    available" lines, one per candidate encoder, instead of one sentence
+    naming the setting. The wizard can write it: ffmpeg_defaults() answers ""
+    on Windows under --defaults or with no terminal.
+    """
+
+    def run_check(self, ffmpeg):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            tt.test_encoders({"paths": {"ffmpeg": ffmpeg}, "encode": {}})
+        return out.getvalue()
+
+    def test_an_empty_path_is_one_finding_naming_the_setting(self):
+        said = self.run_check("")
+        self.assertIn("paths.ffmpeg is empty", said)
+        self.assertNotIn("not available", said)
+
+    def test_a_wrong_path_still_says_where_it_looked(self):
+        # The control: the empty case must not have swallowed the ordinary one.
+        said = self.run_check("/no/such/ffmpeg")
+        self.assertIn("/no/such/ffmpeg", said)
+
+
+class TestTheAccountIsNamedOnEveryPlatform(unittest.TestCase):
+    """"... is not writable by : [WinError 5]" was the whole message.
+
+    pwd is Linux-only, and the empty string landed on the one platform where
+    the account is the likeliest cause of the failure being reported.
+    """
+
+    def test_it_answers_something_without_pwd(self):
+        import builtins
+        real = builtins.__import__
+
+        def refuse(name, *a, **kw):
+            if name == "pwd":
+                raise ImportError("no pwd here")
+            return real(name, *a, **kw)
+
+        with mock.patch.object(builtins, "__import__", refuse):
+            self.assertTrue(enc.whoami())
+
+    def test_it_still_prefers_the_real_account_where_there_is_one(self):
+        # The control: getpass.getuser() reads the environment, which is good
+        # enough for a message and not as good as the password database.
+        if not hasattr(os, "geteuid"):
+            self.assertTrue(enc.whoami())
+            return
+        import pwd
+        self.assertEqual(enc.whoami(), pwd.getpwuid(os.geteuid()).pw_name)
+
+
+class TestAnUnknownCameraNameIsRefused(unittest.TestCase):
+    """`--camera Typo` silently reported "Cameras (0 enabled)".
+
+    Which reads as a configuration problem, so the operator goes looking for
+    one. A name this config has never heard of is a typo, and the fix is the
+    list of names it does know.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.config = self.tmp / "config.json"
+        self.config.write_text(json.dumps({
+            "paths": {"frames_root": str(self.tmp / "frames"),
+                      "video_output": str(self.tmp / "videos"),
+                      "log_dir": str(self.tmp / "logs"),
+                      "state_dir": str(self.tmp / "state"),
+                      "ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+            "capture": {"interval_seconds": 5, "timeout_seconds": 4,
+                        "min_bytes": 4096},
+            "encode": {"framerate": 60, "min_frames": 100},
+            "transfer": {"enabled": False},
+            "cameras": [{"name": "Gate", "enabled": True,
+                         "url": "http://192.0.2.1/s", "method": "http"}],
+        }), encoding="utf-8")
+
+    def run_main(self, camera):
+        argv = ["timelapse_test.py", str(self.config), "--camera", camera,
+                "--no-notify"]
+        # test_http is stubbed: a unit test must not open a socket, and
+        # 192.0.2.1 is TEST-NET, so the real one sits out its whole timeout
+        # before failing. Four seconds of that was the first version of this
+        # class.
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(tt, "test_http", lambda cam, cfg: None), \
+                mock.patch.object(tt, "test_rtsp", lambda cam, cfg: None), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            code = tt.main()
+        return code, out.getvalue()
+
+    def test_a_name_that_is_not_there_is_a_failure_naming_itself(self):
+        code, said = self.run_main("Typo")
+        self.assertEqual(code, 1)
+        self.assertIn("Typo", said)
+
+    def test_it_lists_the_names_it_does_know(self):
+        _, said = self.run_main("Typo")
+        self.assertIn("Gate", said)
+
+    def test_a_name_it_knows_is_not_refused(self):
+        # The control, and case-insensitively, as the option always was.
+        _, said = self.run_main("gate")
+        self.assertNotIn("No enabled camera", said)
+
+
+class TestAStatCanBeRefusedRatherThanMissing(unittest.TestCase):
+    """Path.is_dir() raises on Windows for a directory this account may not
+    read, where on Linux it answers False.
+
+    test_state_dir() learned that at 0.2.0, when install.ps1 started
+    restricting %ProgramData%\\timelapse for real; three of its neighbours
+    were left doing it the old way, and a traceback out of a pre-flight reads
+    as the tool being broken rather than as the answer.
+
+    The refusal is injected, not arranged: arranging one needs a real ACL
+    change, and the test would then run on one platform and be a skip on the
+    other.
+    """
+
+    def test_the_helper_tells_a_refusal_from_an_absence(self):
+        missing = tt.can_read(Path("/no/such/place/at/all"))
+        self.assertEqual(missing, (False, None))
+
+    def test_a_refusal_comes_back_with_its_reason(self):
+        class Refusing(object):
+            def is_dir(self):
+                raise PermissionError(13, "Permission denied")
+
+        answer, why = tt.can_read(Refusing())
+        self.assertFalse(answer)
+        self.assertIsInstance(why, OSError)
+
+    def test_the_frames_check_says_which_it_was(self):
+        cfg = {"paths": {"frames_root": "X:\\frames",
+                         "video_output": "X:\\videos"},
+               "cameras": []}
+
+        def refuse(_self):
+            raise PermissionError(13, "Permission denied")
+
+        with mock.patch.object(tt.Path, "is_dir", refuse), \
+                mock.patch.object(tt.Path, "exists", refuse), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            tt.report_usage(cfg)
+        said = out.getvalue()
+        self.assertIn("Cannot tell whether", said)
+        self.assertNotIn("does not exist yet", said)

@@ -757,6 +757,22 @@ logic cannot drift between the two).
 | `test_transfer` | unmounted CIFS path, missing SSH key |
 | `test_notify` | a bad webhook URL, a wrong ntfy topic, a Telegram bot nobody has messaged. It sends through the encoder's own `notify()`, so what is proven is the request the nightly run will make; a pre-flight that builds its own payload is how a check passes while the thing it checks is broken |
 
+**Four more things it could not say** (0.2.1, L27, L28, L32). An empty
+`paths.ffmpeg` produced four "not available" lines, one per candidate encoder,
+because `Path("").exists()` is True (it is `.`) and the "not found" check
+walked past it; it is one sentence naming the setting now, and the wizard can
+write that value, since `ffmpeg_defaults()` answers `""` on Windows with no
+terminal. `whoami()` returned `""` where there is no `pwd` module, so the
+message read "... is not writable by : [WinError 5]" on the one platform where
+the account is the likeliest cause; `getpass.getuser()` is the fallback.
+`--camera Typo` printed "Cameras (0 enabled)", which reads as a configuration
+problem, so it is a refusal naming the cameras it does know. And three
+`is_dir()`/`exists()` calls were unguarded next door to the one fixed at
+0.2.0: `Path.is_dir()` **raises** on Windows for a directory this account may
+not read, where on Linux it answers False, so a permission problem came out as
+a traceback and a traceback out of a pre-flight reads as the tool being
+broken. `can_read()` answers `(bool, error)` and the callers say which it was.
+
 **The status is part of the answer** (0.2.1). `bad()` only printed, `main()`
 returned nothing, and a run with two FAIL lines exited 0 like any other. So
 `install.sh`'s
@@ -3210,6 +3226,37 @@ ordering rule as the restart), and `next_steps()` takes the outcome as an
 argument so the dialog cannot assert something nobody checked. The two
 scheduled tasks never had this gap: Task Scheduler fires them on its own.
 
+**What "verified" has to mean before running something as root** (0.2.1,
+L29, L30). The installer is downloaded and run as root, and three things in
+that path were weaker than they read. `fetch_text()` used `r.read(limit)`,
+which cuts at a byte boundary and says nothing: a cut landing on a line
+boundary passes both the installer-marker check and `bash -n`, so a script
+missing its second half would have been verified and then run. It reads
+`limit + 1` and refuses when more than `limit` comes back, which is what the
+extra byte is for. `check_syntax()` returned True on a `bash -n` timeout,
+meaning "could not check" was reported as "checked"; a timeout is a refusal
+now, while a machine with no bash at all still carries on, because refusing
+there would refuse every upgrade on it. And `VERSION_RE` had no end anchor, so
+`v0.2.1-rc1`, `v0.2.1rc1`, `0.2.0-experimental` and `v1.2.3.4` all parsed to
+the bare tuple: a future `v0.3.0-beta` tag would have been offered to a 0.2.x
+install as the release, and the checker would then have called that install up
+to date against the real `v0.3.0`. Only the `/tags` fallback is exposed, since
+`/releases/latest` excludes pre-releases, and this repo lives on that
+fallback, which now also asks for `per_page=100`: the default page is 30 and
+there are 20 tags, so the 31st would have started hiding the newest release
+silently.
+
+**The example config and `default_config()` are one document written twice**
+(0.2.1, L31), and a test holds them together. The example is the only place an
+operator ever sees a new key, because an upgrade keeps the existing config and
+refreshes the example beside it; `default_config()` is the only place a fresh
+install gets one. Nothing breaks when they disagree, which is exactly why they
+had: 0.2.0's Windows share credentials are read by `reach_destination()` and
+appeared in neither. Two keys are deliberately example-only and named in the
+test: `cameras`, because a fresh config must not start with a camera nobody
+owns, and `web.auth`, because the login is keyed on **absence** and
+`choose_web_login()` removes it rather than emptying it.
+
 ### 4.7 `install.sh`
 
 Bootstrap. Detects the package manager (apt/dnf/yum/pacman/zypper/apk), installs
@@ -3766,7 +3813,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,329 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,355 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4548,11 +4595,11 @@ installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1584 lines
-scripts/timelapse_encode.py      batch job, 2382 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 1049 lines
-scripts/timelapse_setup.py       configuration wizard, 4774 lines
+scripts/timelapse_encode.py      batch job, 2394 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 1092 lines
+scripts/timelapse_setup.py       configuration wizard, 4787 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2990 lines
-scripts/timelapse_update.py      release query + `timelapse update`, 471 lines
+scripts/timelapse_update.py      release query + `timelapse update`, 509 lines
 scripts/timelapse_platform.py    the only platform branch, 2583 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 438 lines
 scripts/timelapse_web.py         read-only web UI, 3596 lines

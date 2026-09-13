@@ -6010,3 +6010,77 @@ class TestTheWizardDoesNotGrowSysPath(unittest.TestCase):
         # a sink. Nothing called it.
         self.assertFalse(hasattr(setup, "send_test_webhook"))
         self.assertTrue(hasattr(setup, "send_test_notification"))
+
+
+class TestTheExampleAndTheDefaultsAgree(unittest.TestCase):
+    """Two documents describing one config, written in two places.
+
+    `config/config.example.json` is the only place an operator ever sees a new
+    key, because an upgrade keeps the existing config and refreshes the
+    example beside it. `default_config()` is the only place a fresh install
+    gets one. Nothing breaks when they disagree, which is exactly why they
+    drifted: 0.2.0's Windows share credentials reached `reach_destination()`
+    without ever appearing in either.
+    """
+
+    # Deliberate, each with its reason. Anything not listed here is drift.
+    ONLY_IN_EXAMPLE = {
+        # An example of a configured camera is worth more than an empty list,
+        # and the wizard clears it: a fresh config must not start with a
+        # camera nobody owns.
+        ("cameras",),
+        # The login is keyed on absence, which is the same rule the per-camera
+        # overrides are under: no `auth` means the pages are open, and
+        # choose_web_login() *removes* the key rather than emptying it. The
+        # example shows the shape it takes when set; a fresh config writing an
+        # empty one would be storing "no login" twice over.
+        ("web", "auth"),
+    }
+    ONLY_IN_DEFAULTS = set()
+
+    def setUp(self):
+        self.example = json.loads(
+            (_support.REPO / "config" / "config.example.json").read_text(
+                encoding="utf-8"))
+        prev_tty, prev_auto = setup._TTY, setup.AUTO
+        setup.AUTO = True
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.defaults = setup.default_config()
+        finally:
+            setup._TTY, setup.AUTO = prev_tty, prev_auto
+
+    def keys(self, cfg):
+        """Every (section,) and (section, key) in a config, comments aside."""
+        out = set()
+        for name, block in cfg.items():
+            if name.startswith("_"):
+                continue
+            out.add((name,))
+            if isinstance(block, dict):
+                out.update((name, k) for k in block if not k.startswith("_"))
+        return out
+
+    def test_the_example_carries_nothing_new_installs_lack(self):
+        missing = self.keys(self.example) - self.keys(self.defaults) \
+            - self.ONLY_IN_EXAMPLE
+        self.assertEqual(missing, set(),
+                         "in the example and not in default_config()")
+
+    def test_new_installs_carry_nothing_the_example_hides(self):
+        extra = self.keys(self.defaults) - self.keys(self.example) \
+            - self.ONLY_IN_DEFAULTS
+        self.assertEqual(extra, set(),
+                         "written by default_config() and undocumented")
+
+    def test_the_windows_share_credentials_are_in_both(self):
+        # The pair that went missing, named rather than left to the sets
+        # above: they are read by the nightly encode and were invisible.
+        for cfg in (self.example, self.defaults):
+            self.assertIn("username", cfg["transfer"])
+            self.assertIn("password", cfg["transfer"])
+
+    def test_the_comparison_is_looking_at_something(self):
+        # Without this, a keys() that returned nothing would make both
+        # assertions above pass for ever.
+        self.assertGreater(len(self.keys(self.defaults)), 30)

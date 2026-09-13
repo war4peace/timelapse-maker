@@ -253,11 +253,18 @@ def probe_profiles(cam, cfg):
 
 
 def test_encoders(cfg):
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import (build_candidates, driver_mismatch,
                                   encoder_hint, is_nvenc, list_encoders,
                                   probe_encoder_detail)
     ffmpeg = cfg["paths"]["ffmpeg"]
+    if not ffmpeg:
+        # Path("").exists() is True, because it is ".", so an empty setting
+        # sailed past the check below and produced four "not available" lines
+        # instead of one sentence naming the actual problem. The wizard can
+        # write "" on Windows: ffmpeg_defaults() answers that under --defaults
+        # or with no terminal, where there is nobody to ask.
+        bad("paths.ffmpeg is empty; run the wizard and give it the path.")
+        return
     if not shutil.which(ffmpeg) and not Path(ffmpeg).exists():
         bad(f"ffmpeg not found at {ffmpeg}")
         return
@@ -293,7 +300,6 @@ def diagnose_encoders(cfg):
     log, its build flags, and nvidia-smi - and the one line ffmpeg prints by
     default ("No capable devices found") is the least useful of all.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import (PROBE_SIZE, driver_mismatch, encoder_hint,
                                   list_encoders, probe_encoder_detail,
                                   probe_encoder_verbose)
@@ -442,12 +448,37 @@ def test_cadence(cfg, cams):
             ok(line)
 
 
+def can_read(path, kind="is_dir"):
+    """(answer, error). `Path.is_dir()` raises on Windows for a directory this
+    account may not read, where on Linux it answers False.
+
+    So `if not d.is_dir(): bad(...)` turns a permission problem into a
+    traceback, and a traceback out of a pre-flight reads as the tool being
+    broken rather than as the answer. `test_state_dir()` learned this at 0.2.0
+    when install.ps1 started restricting %ProgramData%\timelapse for real, and
+    three of its neighbours were left doing it the old way.
+    """
+    try:
+        return bool(getattr(path, kind)()), None
+    except OSError as exc:
+        return False, exc
+
+
 def test_disk(cfg, avg_bytes, n_cameras):
     root = Path(cfg["paths"]["frames_root"])
-    probe = root if root.exists() else root.parent
-    while not probe.exists() and probe != probe.parent:
+    here, why = can_read(root, "exists")
+    if why is not None:
+        bad(f"Cannot tell whether {root} exists: {why}")
+        info("That is a permission problem, not a missing directory.")
+        return
+    probe = root if here else root.parent
+    while not can_read(probe, "exists")[0] and probe != probe.parent:
         probe = probe.parent
-    free = shutil.disk_usage(probe).free
+    try:
+        free = shutil.disk_usage(probe).free
+    except OSError as exc:
+        bad(f"Cannot read the free space at {probe}: {exc}")
+        return
 
     # Summed per camera rather than multiplied, because they no longer share a
     # cadence. One camera at 60s and five at 5s is not six times any single
@@ -646,7 +677,11 @@ def report_usage(cfg):
     known = {c["name"] for c in cfg["cameras"]}
 
     print(f"\n=== Frames: {root} ===")
-    if not root.is_dir():
+    present, why = can_read(root)
+    if why is not None:
+        bad(f"Cannot tell whether {root} exists: {why}")
+        return
+    if not present:
         bad(f"{root} does not exist yet.")
         return
     try:
@@ -703,7 +738,10 @@ def report_usage(cfg):
         info("Harmless, and not counted above; they are overwritten in place.")
 
     print(f"\n=== Videos: {videos} ===")
-    if not videos.is_dir():
+    present, why = can_read(videos)
+    if why is not None:
+        info(f"cannot read {videos}: {why}")
+    elif not present:
         info("no video directory yet")
     else:
         vids = [p for p in videos.rglob("*") if p.is_file()]
@@ -736,7 +774,10 @@ def test_transfer(cfg):
     if not t.get("enabled"):
         info("transfer disabled in config")
         return
-    dest = t["destination"]
+    dest = t.get("destination", "")
+    if not dest:
+        bad("transfer is enabled and transfer.destination is empty.")
+        return
     if IS_WINDOWS:
         # Before the SSH branch, and that ordering is load-bearing: "D:\\out"
         # contains a colon and does not start with "/", so the remote-spec test
@@ -769,7 +810,6 @@ def test_transfer(cfg):
     # A destination that is a plain local directory rather than a mount is the
     # dangerous case: rsync succeeds, fills the local disk, and
     # --remove-source-files then deletes the originals.
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import nearest_mountpoint
     mp = nearest_mountpoint(dest)
     if str(mp) == "/":
@@ -800,7 +840,6 @@ def check_windows_transfer(t, dest):
     then make the same connection with the same secret, so the check says
     which of the two it just did.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import reach_destination
 
     user = (t.get("username") or "").strip()
@@ -843,7 +882,6 @@ def check_rsync_args(cfg, dest):
     if not args:
         info("no rsync_args configured; the encoder's defaults apply")
         return
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import probe_rsync_flags, try_rsync_args
 
     # As the account that runs the encode, because a share can accept root and
@@ -921,7 +959,6 @@ def test_notify(cfg, config_path=None, force=False):
     the nightly run will actually make. A pre-flight that proves a different
     request is how a check comes to pass while the thing it checks is broken.
     """
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
     from timelapse_encode import notify, notify_sinks
     from timelapse_setup import sink_identity
 
@@ -957,11 +994,6 @@ def test_notify(cfg, config_path=None, force=False):
             info("the bot at least once: a bot cannot start the conversation.")
 
 
-def test_discord(cfg, config_path=None, force=False):
-    """Kept as the old name for anything that calls it."""
-    return test_notify(cfg, config_path, force)
-
-
 def main():
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
     ap.add_argument("config", nargs="?", default=CONFIG_PATH)
@@ -991,7 +1023,18 @@ def main():
 
     cams = [c for c in cfg["cameras"] if c.get("enabled", True)]
     if args.camera:
-        cams = [c for c in cams if c["name"].lower() == args.camera.lower()]
+        wanted = args.camera.lower()
+        named = [c for c in cams if str(c.get("name", "")).lower() == wanted]
+        if not named:
+            # "Cameras (0 enabled)" reads as a configuration problem, and the
+            # operator goes looking for one. A name this config has never
+            # heard of is a typo, and the fix is the list of names.
+            bad(f"No enabled camera called '{args.camera}'.")
+            known = ", ".join(str(c.get("name", "")) for c in cams)
+            info(f"Enabled cameras: {known}" if known
+                 else "No cameras are enabled in this config.")
+            return 1
+        cams = named
 
     # The three report modes stay at 0 whatever they print. They answer a
     # question rather than passing a verdict, and `timelapse usage` in a

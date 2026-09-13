@@ -36,6 +36,12 @@ import tempfile
 import urllib.error
 import urllib.request
 
+# No sys.path.insert: this file is installed beside the platform module and is
+# run as a script, so its own directory is sys.path[0]. Every other script here
+# imports it the same way, and L13 removed the twelve inserts that pretended
+# otherwise.
+from timelapse_platform import use_colour
+
 __version__ = "0.2.0"
 
 GITHUB_REPO = "war4peace/timelapse-maker"
@@ -52,7 +58,13 @@ UPDATE_TIMEOUT = 10
 # A release body is somebody's prose and goes on a page; cap what is rendered.
 NOTES_LIMIT = 4000
 
-VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)")
+# Anchored at both ends, and that is the whole of L29. Without the tail,
+# v0.2.1-rc1, v0.2.1rc1, 0.2.0-experimental and v1.2.3.4 all parsed to the bare
+# tuple: a future v0.3.0-beta tag would have been offered to a 0.2.x install as
+# the release, and the checker would then have called that install up to date
+# against the real v0.3.0. Only the /tags fallback is exposed, since
+# /releases/latest excludes pre-releases, and this repo lives on that fallback.
+VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 # socket.timeout is a deprecated alias for TimeoutError from 3.10, but on the
 # 3.9 floor it is a separate OSError subclass, so neither name alone covers
@@ -88,9 +100,21 @@ def fetch_json(url, timeout=UPDATE_TIMEOUT):
 
 
 def fetch_text(url, limit, timeout=UPDATE_TIMEOUT):
+    """At most `limit` bytes, and a refusal rather than a silent truncation.
+
+    `r.read(limit)` cuts at a byte boundary and says nothing, and a cut that
+    lands on a line boundary passes both the installer marker check and
+    `bash -n`: a script that is missing its second half, verified and then run
+    as root. Not live today at 44 KB against a 512 KiB cap, but a cap with no
+    teeth is not a check.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": UPDATE_UA})
     with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read(limit).decode("utf-8", "replace")
+        body = r.read(limit + 1)
+    if len(body) > limit:
+        raise ValueError("the download is larger than %d bytes, which this is "
+                         "not" % limit)
+    return body.decode("utf-8", "replace")
 
 
 def friendly_error(exc):
@@ -191,7 +215,10 @@ def latest_release():
             raise
 
     best = None
-    for item in fetch_json(GITHUB_API + "/tags"):
+    # per_page, because the default page is 30 and this repo has 20 tags. The
+    # fallback would start missing the newest release on the 31st tag, silently
+    # and for ever, and the failure would read as "no update available".
+    for item in fetch_json(GITHUB_API + "/tags?per_page=100"):
         tag = item.get("name") or ""
         ver = parse_version(tag)
         # Highest version, not first in the list: the API's order is its own
@@ -221,7 +248,13 @@ def release_notes(ver, notes):
 # The command
 # ----------------------------------------------------------------------------
 
-if sys.stdout.isatty() and not os.environ.get("NO_COLOR"):
+# use_colour(), not a fourth copy of the rule. isatty() is necessary and not
+# sufficient on Windows, where a console prints escapes literally until
+# ENABLE_VIRTUAL_TERMINAL_PROCESSING is set, and that bit is what
+# use_colour() sets on the way to answering. This file had its own two-line
+# version, which is how `timelapse update` would have printed <-[32m at an
+# operator exactly as the wizard did before 0.2.0.
+if use_colour():
     B, DIM, R, G, Y, N = ("\033[1m", "\033[2m", "\033[31m", "\033[32m",
                           "\033[33m", "\033[0m")
 else:
@@ -346,8 +379,13 @@ def check_syntax(path):
         r = subprocess.run(["bash", "-n", path],
                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                            timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return True
+    except subprocess.TimeoutExpired:
+        # A refusal, not a pass. "bash -n did not finish" is not evidence that
+        # the file is sane, and what happens next is running it as root.
+        fail("Checking the downloaded installer timed out, so it was not run.")
+        return False
+    except OSError:
+        return True                 # No bash after all; the run will say.
     if r.returncode == 0:
         return True
     fail("The downloaded installer is not valid bash, so it was not run.")

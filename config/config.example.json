@@ -45,7 +45,10 @@
       "--remove-source-files"
     ],
     "delete_local_after_transfer": true,
-    "require_mountpoint": false
+    "require_mountpoint": false,
+    "_comment_windows": "username and password are Windows only, and optional: the nightly encode signs in to a UNC destination with them. Leave both empty to present the machine account, which is enough for a share that accepts it. They are masked by 'timelapse config --redacted'.",
+    "username": "",
+    "password": ""
   },
   "_comment_notify": "Optional nightly summary, to any number of sinks. Configure with 'sudo timelapse notify'. Types: discord (webhook_url), ntfy (server, topic, optional token), telegram (token, chat_id). The older top-level 'discord' block still works and is used when this list is absent, so configs written before 0.1.6 need no edit; when this list exists, that block is ignored.",
   "notify": [

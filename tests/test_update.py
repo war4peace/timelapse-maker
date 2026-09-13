@@ -437,6 +437,131 @@ class TestNoAccidentalNetwork(unittest.TestCase):
         self.assertIn("timelapse-maker", upd.UPDATE_UA)
 
 
+
+class TestAPreReleaseIsNotTheRelease(unittest.TestCase):
+    """VERSION_RE had no end anchor.
+
+    Measured: v0.2.1-rc1, v0.2.1rc1, 0.2.0-experimental and v1.2.3.4 all
+    parsed to the bare tuple. A future v0.3.0-beta tag would then be offered
+    to a 0.2.x install as the release, and after installing it the checker
+    would call that install up to date against the real v0.3.0. Only the tags
+    fallback is exposed, since /releases/latest excludes pre-releases, and
+    this repo lives on that fallback.
+    """
+
+    def test_a_release_tag_still_parses(self):
+        self.assertEqual(upd.parse_version("v0.2.1"), (0, 2, 1))
+        self.assertEqual(upd.parse_version("0.2.1"), (0, 2, 1))
+
+    def test_a_release_candidate_does_not(self):
+        for tag in ("v0.3.0-beta", "v0.2.1-rc1", "v0.2.1rc1",
+                    "0.2.0-experimental"):
+            self.assertIsNone(upd.parse_version(tag), tag)
+
+    def test_a_fourth_component_does_not(self):
+        self.assertIsNone(upd.parse_version("v1.2.3.4"))
+
+    def test_the_tags_fallback_skips_them(self):
+        tags = [{"name": "v0.2.0"}, {"name": "v0.3.0-beta"},
+                {"name": "v0.2.1"}]
+        with mock.patch.object(upd, "fetch_json", side_effect=[
+                upd.urllib.error.HTTPError("u", 404, "nf", None, None), tags]):
+            ver, tag, _url, _notes = upd.latest_release()
+        self.assertEqual((ver, tag), ((0, 2, 1), "v0.2.1"))
+
+
+class TestTheInstallerIsCheckedAsMuchAsClaimed(unittest.TestCase):
+    """What is downloaded here is run as root.
+
+    `r.read(limit)` cuts at a byte boundary and says nothing, and a cut that
+    lands on a line boundary passes both the marker check and `bash -n`: a
+    script missing its second half, verified and then run. Not live today at
+    44 KB against a 512 KiB cap, but a cap with no teeth is not a check.
+    """
+
+    def fetch(self, body, limit=100):
+        class Reader(object):
+            def read(self, n):
+                return body[:n]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with mock.patch.object(upd.urllib.request, "urlopen",
+                               lambda *a, **k: Reader()):
+            return upd.fetch_text("https://example.invalid/x", limit)
+
+    def test_a_body_under_the_limit_comes_back(self):
+        self.assertEqual(self.fetch(b"#!/bin/bash\n"), "#!/bin/bash\n")
+
+    def test_a_body_of_exactly_the_limit_is_whole_and_kept(self):
+        # read(limit + 1) coming back with exactly limit bytes is the proof
+        # that nothing was cut: that is what the extra byte is for, and it is
+        # why this case is a pass rather than a refusal.
+        self.assertEqual(self.fetch(b"x" * 100), "x" * 100)
+
+    def test_a_body_over_the_limit_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.fetch(b"x" * 5000)
+
+    def test_a_syntax_check_that_times_out_is_a_refusal(self):
+        """"bash -n did not finish" is not evidence that the file is sane,
+        and what happens next is running it as root."""
+        with mock.patch.object(upd.shutil, "which", lambda n: "/bin/bash"), \
+                mock.patch.object(upd.subprocess, "run",
+                                  side_effect=upd.subprocess.TimeoutExpired(
+                                      "bash", 30)), \
+                redirect_stderr(io.StringIO()) as out:
+            self.assertFalse(upd.check_syntax("/tmp/install.sh"))
+        # fail() writes to stderr, which is where a refusal belongs.
+        self.assertIn("timed out", out.getvalue())
+
+    def test_no_bash_at_all_still_carries_on(self):
+        # The control, and the reason the two are told apart: a machine with
+        # no bash cannot check, and refusing there would refuse every upgrade
+        # on it. The run itself will say.
+        with mock.patch.object(upd.shutil, "which", lambda n: None):
+            self.assertTrue(upd.check_syntax("/tmp/install.sh"))
+
+    def test_the_tags_request_asks_for_more_than_one_page(self):
+        # The default page is 30 and this repo has 20 tags. On the 31st, the
+        # fallback would start missing the newest release, silently and for
+        # ever, and it would read as "no update available".
+        seen = []
+
+        def fake(url, timeout=None):
+            seen.append(url)
+            if url.endswith("/releases/latest"):
+                raise upd.urllib.error.HTTPError("u", 404, "nf", None, None)
+            return [{"name": "v0.2.1"}]
+
+        with mock.patch.object(upd, "fetch_json", fake):
+            upd.latest_release()
+        self.assertTrue(any("per_page=100" in u for u in seen), seen)
+
+
+class TestTheUpdaterUsesTheSharedColourRule(unittest.TestCase):
+    """It had its own two-line version.
+
+    isatty() is necessary and not sufficient on Windows, where a console
+    prints escapes literally until ENABLE_VIRTUAL_TERMINAL_PROCESSING is set,
+    and use_colour() is what sets it. This file would have printed <-[32m at
+    an operator exactly as the wizard did before 0.2.0.
+    """
+
+    def test_it_asks_the_platform_module(self):
+        src = Path(upd.__file__).read_text(encoding="utf-8")
+        self.assertIn("if use_colour():", src)
+        self.assertNotIn("sys.stdout.isatty() and not os.environ", src)
+
+    def test_the_import_is_the_one_the_rest_of_the_project_uses(self):
+        import timelapse_platform as plat
+        self.assertIs(upd.use_colour, plat.use_colour)
+
+
 if __name__ == "__main__":
     unittest.main()
 

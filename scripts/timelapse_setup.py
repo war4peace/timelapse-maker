@@ -3765,11 +3765,24 @@ def default_config(template_path=None):
                    "av1_preset": "p6", "av1_cq": 26, "hevc_cq": 24,
                    "x264_crf": 20, "min_frames": 100,
                    "delete_frames_on_success": True, "max_backlog_days": 7},
+        # Every key config.example.json carries, and no more: the two are one
+        # document written twice, and a test holds them together. The example
+        # is the only place an operator ever sees a new key, and this is the
+        # only place a fresh install gets one.
         "transfer": {"enabled": False, "destination": "",
                      "rsync_args": ["-a", "--partial", "--remove-source-files"],
-                     "delete_local_after_transfer": True},
+                     "delete_local_after_transfer": True,
+                     "require_mountpoint": False,
+                     # Windows only, and optional: empty means present the
+                     # machine account, which is enough for a share that
+                     # accepts it.
+                     "username": "", "password": ""},
         "discord": {"enabled": False, "webhook_url": "",
                     "username": "Timelapse Bot"},
+        "notify": [],
+        "web": {"enabled": False, "bind": "127.0.0.1", "port": 8787,
+                "library_root": "", "state_dir": WEB_STATE_DIR_DEFAULT,
+                "update_check": True},
         "cameras": [],
     })
 

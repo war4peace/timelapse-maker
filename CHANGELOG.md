@@ -111,6 +111,35 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **`timelapse test` says which camera name it could not find.** `--camera`
+  with a name that is not in the config reported "Cameras (0 enabled)", which
+  reads as something being wrong with the config rather than with what was
+  typed. It now names the cameras it does know.
+
+- **`timelapse test` with no ffmpeg path set says so once.** An empty
+  `paths.ffmpeg` produced four "not available" lines, one per encoder, and
+  never mentioned the setting.
+
+- **`timelapse test` reports a folder it is not allowed to read as exactly
+  that**, rather than as a missing folder or, in three places, a Python
+  traceback.
+
+- **"is not writable by" now names the account on Windows.** The message had
+  an empty space where the user should be.
+
+- **`timelapse update` will not offer a pre-release as the latest version.** A
+  tag like `v0.3.0-beta` was read as `0.3.0`, so it would have been offered as
+  a release and then reported as up to date afterwards.
+
+- **`timelapse update` refuses an installer download it could not verify.** A
+  file larger than the size limit was silently cut short instead, and a cut
+  that happened to land on a line ending passed the checks and would have been
+  run. A syntax check that times out is now a refusal rather than a pass.
+
+- **A new config carries every setting the example shows**, including the
+  Windows share username and password, which the nightly encode reads and
+  which appeared in neither file.
+
 - **Windows: the graphical wizard keeps a videos folder you placed yourself.**
   It derived frames, videos and logs from the data folder every time you
   pressed Next, so a library kept on a second disk was moved back under the

@@ -1209,10 +1209,22 @@ RSYNC_CANDIDATES = (
 
 
 def whoami():
-    """The current account's name, or "" where that cannot be told."""
+    """The current account's name, or "" where that cannot be told.
+
+    `pwd` is Linux-only, and returning "" there produced the pre-flight's
+    worst line: "... is not writable by : [WinError 5]", with nothing at all
+    where the account should be, on the one platform where the account is the
+    likeliest cause. getpass.getuser() reads the environment, which is
+    good enough for a message and is what every platform has.
+    """
     try:
         import pwd
         return pwd.getpwuid(os.geteuid()).pw_name
+    except Exception:                           # noqa: BLE001
+        pass
+    try:
+        import getpass
+        return getpass.getuser()
     except Exception:                           # noqa: BLE001
         return ""
 
