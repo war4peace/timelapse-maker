@@ -163,6 +163,15 @@ It places the scripts, restricts `%ProgramData%\timelapse` so that only the
 system and administrators can read the camera passwords in it, adds `timelapse`
 to the system PATH, and registers three things:
 
+**The finished videos are the one exception to that restriction.** They are
+inside the same folder by default, and a timelapse you cannot double-click is
+not much of a timelapse, so the videos folder is granted read and execute to
+ordinary accounts: open and copy, but not alter or delete. If you pointed
+`video_output` at another drive, nothing there is touched. One wrinkle:
+*browsing* down to it from `%ProgramData%\timelapse` will not work, because the
+folder above it is closed. Open `%ProgramData%\timelapse\videos` directly, or
+keep a shortcut to it; saved playlists and file associations are unaffected.
+
 | Component | Windows | Linux equivalent |
 |---|---|---|
 | `TimelapseCapture` | a service, automatic (delayed) start | `timelapse-capture.service` |

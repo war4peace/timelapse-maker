@@ -1379,6 +1379,66 @@ def secure_secret_file(path, group=None):
             pass
 
 
+# Well-known SIDs, spelled as numbers because the names are localised. On a
+# German Windows the Administrators group is `Administratoren`, and icacls
+# answers "No mapping between account names and security IDs was done" for the
+# English spelling, which would leave the directory holding the camera
+# passwords with the permissive ACL it inherited from %ProgramData%. These
+# three numbers are identical on every installation in every language.
+SID_SYSTEM = "*S-1-5-18"
+SID_ADMINISTRATORS = "*S-1-5-32-544"
+SID_USERS = "*S-1-5-32-545"
+
+
+def allow_users_read(path):
+    """Let the people who use this machine open what is inside `path`.
+
+    The Windows counterpart of the fact that on Linux a finished video is a
+    plain file under /var/lib/timelapse that anybody can read. Here the data
+    directory defaults to %ProgramData%\\timelapse, which the installer closes
+    to everyone but SYSTEM and Administrators so that `config.json` beside it
+    is not readable by every account on the machine; the videos are collateral,
+    and a timelapse the operator cannot double-click is not a delivered
+    product.
+
+    Read and execute, never write: a surveillance archive that any account can
+    quietly alter is worth less than one it cannot open. Measured unelevated
+    (temp/c3b_users_grant_probe.ps1), with a video written *after* the grant, so
+    what is confirmed is the nightly case and not just the setup case:
+
+        open a video by its full path      OK
+        list the videos folder             OK
+        browse the data root above it      DENIED
+        read config.json / a log / a frame DENIED
+        write or delete inside videos      DENIED
+
+    The third line is the one to tell an operator about, and it is not a bug in
+    the grant: browsing means listing every directory on the way, and the data
+    root above this one is closed. Opening the folder by its path, from a
+    shortcut or from a playlist works, because "bypass traverse checking" is
+    granted to Everyone by default and skips exactly that check.
+
+    Returns (ok, detail). None for "this platform does not need it", which is
+    not False: a caller reporting a failure on Linux would be inventing one.
+    """
+    if not IS_WINDOWS:
+        # Nothing to undo. The restriction this reverses is an ACL that only
+        # the Windows installer applies; the POSIX modes on these directories
+        # already let the operator read them.
+        return None, "not needed on this platform"
+    try:
+        r = subprocess.run(
+            ["icacls", str(path), "/grant", SID_USERS + ":(OI)(CI)RX"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=60, **no_console())
+    except OSError as exc:
+        return False, "could not run icacls: %s" % exc
+    if r.returncode != 0:
+        out = (r.stdout or b"").decode("utf-8", "replace").strip()
+        return False, " ".join(out.split())[:200]
+    return True, ""
+
+
 # ----------------------------------------------------------------------------
 # Names that are not filenames
 #

@@ -37,6 +37,7 @@ from timelapse_platform import (
     CAPTURE_UNIT, CONFIG_DIR, CONFIG_PATH, DATA_ROOT_DEFAULT, ENCODE_UNIT,
     FFMPEG_URL, IS_WINDOWS, LINUX_STATE_DIR, LINUX_WEB_STATE_DIR,
     SERVICE_STATES, STATE_DIR_DEFAULT, WATCH_UNIT, WEB_STATE_DIR_DEFAULT,
+    allow_users_read,
     daily_trigger, disconnect_share, drive_is_local, elevation_hint, find_tool,
     install_service, install_task, is_elevated, is_reserved_name, is_scheduled,
     is_unc, log_hint, native_name, network_path, no_console, os_disk_mount,
@@ -4167,6 +4168,69 @@ def restore_config(out_path, owner=None):
     return 0
 
 
+def inside_config_dir(path):
+    """Is `path` a directory this program's own ACL has closed off?
+
+    The question `open_video_dir()` needs, and the two ways of getting it wrong
+    are both dangerous. A `video_output` *equal* to the config directory would
+    have the restriction lifted off `config.json` and every camera password in
+    it, by a function whose whole job is to be safe. And `/srv/tl-old` must not
+    count as inside `/srv/tl`, which is the same shape `writable_paths()`
+    already had to get right.
+
+    Asking `parents` answers both, and that is why it is written this way
+    rather than with the `startswith` anybody reaches for first: a path is
+    never its own parent, and a prefix is not a parent. There is deliberately
+    no explicit equality check in front of this; one was written, and the
+    revert check then showed it could not fail, because it was restating what
+    the line below already guarantees. Two tests pin the property instead, and
+    both of them do fail against the `startswith` version.
+
+    Case-insensitively on Windows, via normcase, because the filesystem is:
+    `%ProgramData%\\Timelapse\\videos` and `%programdata%\\timelapse\\videos`
+    are one directory and a test comparing them as text would say otherwise.
+    Same reasoning as check_camera_names().
+    """
+    try:
+        here = Path(path).resolve()
+        base = Path(CONFIG_DIR).resolve()
+    except OSError:
+        return False
+    return os.path.normcase(str(base)) in (
+        os.path.normcase(str(parent)) for parent in here.parents)
+
+
+def open_video_dir(cfg):
+    """Make the finished videos openable by whoever uses this machine.
+
+    Windows only in effect, and only when the videos are inside the directory
+    the installer restricts. Those two conditions are the whole rule: a
+    video_output on another drive was chosen by the operator and is already
+    readable, and changing permissions there would be this program tidying up
+    somewhere it was not asked to. **Only undo the restriction this program
+    applied.**
+
+    Called from create_directories() so that it follows the videos wherever the
+    wizard puts them, and from --grant-video-access so that an upgrade, which
+    never runs the wizard, is covered too. One implementation, two doors.
+    """
+    dest = cfg.get("paths", {}).get("video_output")
+    if not dest or not inside_config_dir(dest):
+        return None
+    ok, detail = allow_users_read(dest)
+    if ok is None:
+        return None
+    if ok:
+        good(f"Videos in {dest} can be opened without administrator rights")
+        return True
+    # A warning and not a failure: the videos exist and are correct, and an
+    # administrator can still open them. Saying nothing would be worse, since
+    # the symptom is an access denial on the operator's own recordings.
+    warn(f"Could not open up {dest} for ordinary accounts: {detail}")
+    note("Opening a finished video will ask for administrator rights.")
+    return False
+
+
 def create_directories(cfg, owner=None):
     for key in ("frames_root", "video_output", "log_dir"):
         p = Path(cfg["paths"][key])
@@ -4180,6 +4244,12 @@ def create_directories(cfg, owner=None):
                 shutil.chown(p, user=owner, group=owner)
             except (OSError, LookupError):
                 pass
+    # After the mkdir, and only for the videos. Frames and logs stay closed:
+    # frames are transient and nobody browses a hundred thousand of them, and
+    # a log is the one place in this project a camera password has ever
+    # actually turned up, so widening it would widen the blast radius of the
+    # next leak. The videos are what the operator came for.
+    open_video_dir(cfg)
     create_state_dir(cfg, owner)
     create_web_state_dir(cfg, owner)
 
@@ -4382,6 +4452,8 @@ def main():
                     help="print the directory the daemons publish state into")
     ap.add_argument("--quote-unit-path", metavar="PATH",
                     help="quote one path for a systemd unit file")
+    ap.add_argument("--grant-video-access", metavar="CONFIG",
+                    help="let ordinary accounts open the finished videos")
     units = ap.add_argument_group(
         "service registration (Windows)",
         "What install.sh does with unit files, for the platform that has none. "
@@ -4459,6 +4531,18 @@ def main():
     # nothing and reads no config, so it costs a process and nothing else.
     if args.quote_unit_path is not None:
         print(quote_unit_path(args.quote_unit_path))
+        return 0
+
+    # For the upgrade, which never runs the wizard and so never reaches
+    # create_directories(). Exits 0 with no config: on a first install this
+    # runs before there is one, and the wizard covers that case minutes later.
+    if args.grant_video_access:
+        try:
+            with open(args.grant_video_access, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError):
+            return 0
+        open_video_dir(cfg)
         return 0
 
     if args.print_state_path:

@@ -478,6 +478,27 @@ class TestInstallerText(unittest.TestCase):
         on_disk = {p.name for p in (ROOT / "scripts").glob("timelapse_*.py")}
         self.assertEqual(listed, on_disk)
 
+    def test_every_icacls_principal_is_a_sid(self):
+        """icacls resolves a name through the local SAM, and the names are
+
+        localised: Administratoren on a German Windows, Administrateurs on a
+        French one. The English spelling comes back as "No mapping between
+        account names and security IDs was done", and this script used to warn
+        and carry on, which leaves the directory holding every camera password
+        with the permissive ACL it inherited from %ProgramData% - readable by
+        every account on the machine, on exactly the installs least able to
+        notice. The numbers are the same in every language.
+
+        Scanned on the /grant arguments rather than on the whole file, so the
+        paragraph above explaining the rule is not itself a breach of it.
+        """
+        text = self.SOURCE.decode("ascii")
+        principals = re.findall(r"'([^']+:\(OI\)\(CI\)[A-Z]+)'", text)
+        self.assertTrue(principals, "found no icacls grant at all")
+        for principal in principals:
+            self.assertTrue(principal.startswith("*S-1-"),
+                            "a localised account name: " + principal)
+
     def test_it_calls_the_wizard_rather_than_registering_anything_itself(self):
         """The rule tools/ was deleted over. Two installers that both know how
 

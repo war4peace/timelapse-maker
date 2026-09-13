@@ -1095,6 +1095,91 @@ class TestSecureSecretFile(unittest.TestCase):
         chown.assert_not_called()
 
 
+class TestAllowUsersRead(unittest.TestCase):
+    """The other direction: opening one directory back up, on purpose.
+
+    The installer closes the whole data tree so that config.json beside it is
+    not readable by every account, and by default the finished videos are
+    inside it, so a timelapse the operator cannot double-click is the cost.
+    This grants Users read and execute on that one directory.
+
+    What the ACL then does was measured unelevated rather than reasoned about
+    (temp/c3b_users_grant_probe.ps1 and temp/c3b_check.py, 21 checks): a video
+    written after the grant opens, the folder lists, the data root above it
+    does not, config.json and the logs and the frames stay closed, and an
+    ordinary account can neither add nor delete a file there.
+    """
+
+    def run_it(self, windows=True, rc=0, out=b"", raises=None):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            if raises:
+                raise raises
+            return mock.Mock(returncode=rc, stdout=out)
+
+        with mock.patch.object(plat, "IS_WINDOWS", windows), \
+             mock.patch.object(plat.subprocess, "run", fake_run):
+            result = plat.allow_users_read("C:\\ProgramData\\timelapse\\videos")
+        return result, calls
+
+    def test_linux_answers_none_rather_than_false(self):
+        """Not the same answer as a failure.
+
+        There is nothing to undo: the restriction this reverses is an ACL only
+        the Windows installer writes. A caller reading False would report a
+        failure on a platform where none happened, which is the falsy-return
+        shape this project has paid for five times.
+        """
+        (ok, detail), calls = self.run_it(windows=False)
+        self.assertIsNone(ok)
+        self.assertTrue(detail)
+        self.assertEqual(calls, [])
+
+    def test_it_grants_the_users_sid_read_and_execute(self):
+        (ok, _detail), calls = self.run_it()
+        self.assertIs(ok, True)
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[0], "icacls")
+        self.assertIn("/grant", argv)
+        self.assertIn(plat.SID_USERS + ":(OI)(CI)RX", argv)
+
+    def test_it_never_asks_for_write(self):
+        """A surveillance archive any account can quietly alter is worth less
+
+        than one it cannot open. RX, and the harness confirms an ordinary
+        account can neither create nor delete there.
+        """
+        argv = self.run_it()[1][0]
+        joined = " ".join(argv)
+        for permission in (":(OI)(CI)F", ":(OI)(CI)M", ":(OI)(CI)W"):
+            self.assertNotIn(permission, joined)
+
+    def test_the_sids_are_numbers_and_not_names(self):
+        """icacls resolves a name through the local SAM, and the group is
+
+        Administratoren on a German Windows and Administrateurs on a French
+        one. A name would fail on exactly the installs least able to debug it.
+        """
+        for sid in (plat.SID_SYSTEM, plat.SID_ADMINISTRATORS, plat.SID_USERS):
+            self.assertTrue(sid.startswith("*S-1-"), sid)
+
+    def test_a_refusal_comes_back_with_what_icacls_said(self):
+        (ok, detail), _calls = self.run_it(rc=1, out=b"videos: Access is denied.")
+        self.assertIs(ok, False)
+        self.assertIn("Access is denied", detail)
+
+    def test_icacls_missing_is_reported_rather_than_raised(self):
+        # This runs after the videos already exist and are correct. Raising
+        # here would turn "your videos need administrator rights to open" into
+        # a failed install.
+        (ok, detail), _calls = self.run_it(raises=OSError("no icacls"))
+        self.assertIs(ok, False)
+        self.assertIn("icacls", detail)
+
+
 class TestReservedNames(unittest.TestCase):
     """Refused on both platforms, which is the deliberate part."""
 

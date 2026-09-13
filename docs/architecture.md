@@ -1898,15 +1898,63 @@ compared against a developer's own box has to be compared against a clean ACL
 too**, which is the permission-model cousin of "a local branch is a branch CI
 has never seen".
 
-**Still open, and not a CLI question.** `DATA_ROOT_DEFAULT` is that same
-directory, so an operator who accepts the default on a single-disk box gets
-`frames`, `videos` and `logs` inside the restricted tree, and opening one of
-their own timelapses in Explorer or VLC meets the same refusal, with Explorer
-offering the "click Continue" that writes the third entry above. Documenting
-the CLI does not answer that: it is the product's output rather than its
-administration. The two candidate answers are to default the data root to a
-sibling of the config directory rather than a child, or to grant Users read
-and execute on the videos subtree; neither has been chosen.
+**The videos are the exception, and are opened back up** (0.2.1).
+`DATA_ROOT_DEFAULT` is that same directory, so an operator who accepts the
+default on a single-disk box would have `frames`, `videos` and `logs` inside
+the restricted tree, and a timelapse the operator cannot double-click is not a
+delivered product: that is the product's output rather than its administration,
+and an elevated prompt is no answer to it. `allow_users_read()` grants
+`*S-1-5-32-545` read and execute on `video_output`, and
+`open_video_dir()` decides when.
+
+**Two conditions, and each one is the rule.** *Inside the config directory*,
+because a `video_output` on another drive was chosen by the operator, is
+already readable, and is not ours to change permissions on: **only undo the
+restriction this program applied**. And *videos only*: frames are transient and
+nobody browses a hundred thousand of them, while a log is the one place in this
+project a camera password has ever actually turned up (§4.9), so opening the
+logs would widen the blast radius of the next leak.
+
+`inside_config_dir()` asks `Path.parents` rather than `startswith`, and that is
+load-bearing twice: a path is never its own parent, so a `video_output` set to
+the data root cannot lift the restriction off `config.json`, and a prefix is
+not a parent, so `...timelapse-other` is not inside `...timelapse`. An explicit
+equality guard was written in front of it and then **removed, because the
+revert check showed it could not fail**: it restated what `parents` already
+guarantees. Two tests pin the property instead and both fail against the
+`startswith` version.
+
+**Read and execute, never write**: a surveillance archive any account can
+quietly alter is worth less than one it cannot open. Measured unelevated, first
+against a hand-built ACL (`temp/c3b_users_grant_probe.ps1`) and then through
+the shipped functions (`temp/c3b_check.py`, 21 checks): a video written *after*
+the grant opens, the folder lists, the data root above it does not,
+`config.json` and the logs and the frames stay closed, and an ordinary account
+can neither add nor delete a file there.
+
+**What to tell an operator**: opening the folder by its path, from a shortcut
+or from a saved playlist works, but *browsing* down to it from
+`%ProgramData%\timelapse` does not, because browsing means listing every
+directory on the way and the one above is closed. The path works only because
+"bypass traverse checking" is granted to Everyone by default and skips exactly
+that check.
+
+**Two doors, one implementation.** `create_directories()` calls it, so it
+follows the videos wherever the wizard puts them and covers any later change of
+`video_output`; `--grant-video-access` is the same function for `install.ps1`,
+because an upgrade never runs the wizard and an install made before this
+release would otherwise stay closed for ever. On a first install the flag runs
+before there is a config and exits 0; the wizard does it minutes later.
+
+**The grants are SIDs, not names** (M22). `icacls` resolves a name through the
+local SAM, and the group is `Administratoren` on a German Windows and
+`Administrateurs` on a French one; the English spelling comes back as "No
+mapping between account names and security IDs was done". `Protect-ConfigDir`
+used to warn and carry on, which would leave the directory holding every camera
+password with the permissive ACL it inherited from `%ProgramData%`: readable by
+every account on the machine, on exactly the installs least able to notice.
+`*S-1-5-18`, `*S-1-5-32-544` and `*S-1-5-32-545` are identical in every
+language, and a test scans the installer's grant arguments for anything else.
 
 **The name an administrator finds a service by is its display name.**
 `services.msc` sorts by it, and `CreateServiceW`'s third argument is
@@ -3128,7 +3176,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,069 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,087 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -3831,7 +3879,7 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 
 ```
 install.sh                       bootstrap installer, 1002 lines
-install.ps1                      the Windows one, 483 lines
+install.ps1                      the Windows one, 578 lines
 setup-gui.ps1                    launcher for the graphical wizard, 111 lines
 timelapse-setup.cmd              double-click shim for the above
 installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
@@ -3840,10 +3888,10 @@ installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2210 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
-scripts/timelapse_setup.py       configuration wizard, 4671 lines
+scripts/timelapse_setup.py       configuration wizard, 4755 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_platform.py    the only platform branch, 2149 lines
+scripts/timelapse_platform.py    the only platform branch, 2235 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes

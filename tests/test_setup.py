@@ -9,6 +9,7 @@ what the wizard does with the answer, which is the same on either platform.
 import contextlib
 import inspect
 import io
+import os
 import collections
 import json
 import re
@@ -300,6 +301,144 @@ class TestTheInstallerUsesTheEmitter(unittest.TestCase):
             rc = setup.main()
         self.assertEqual(rc, 0)
         self.assertEqual(out.getvalue().strip(), '"/media/x/My Disk/f"')
+
+
+class TestOpeningTheVideosBackUp(unittest.TestCase):
+    """Only undo the restriction this program applied, and only for videos.
+
+    install.ps1 closes the whole data tree so that `config.json` beside it is
+    not readable by every account on the machine. By default the finished
+    videos are inside that tree, so the operator cannot double-click their own
+    timelapse: the product's output, not its administration, and an elevated
+    prompt is no answer to it.
+
+    Two conditions and both are the rule. Inside the config directory, because
+    a video_output on another drive was chosen by the operator, is already
+    readable, and is not ours to change permissions on. And videos only:
+    frames are transient and nobody browses a hundred thousand of them, while
+    a log is the one place in this project a camera password has ever actually
+    turned up, so opening the logs would widen the blast radius of the next
+    leak.
+    """
+
+    def cfg(self, dest):
+        return {"paths": {"frames_root": "/f", "video_output": dest,
+                          "log_dir": "/l"}}
+
+    def granted(self, dest, windows=True):
+        """What open_video_dir() asks the platform to do, if anything."""
+        asked = []
+        with mock.patch.object(setup, "IS_WINDOWS", windows), \
+             mock.patch.object(setup, "allow_users_read",
+                               lambda p: (asked.append(p), (True, ""))[1]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            setup.open_video_dir(self.cfg(dest))
+        return asked
+
+    def test_a_child_of_the_config_directory_is_opened(self):
+        dest = str(Path(setup.CONFIG_DIR) / "videos")
+        self.assertEqual(self.granted(dest), [dest])
+
+    def test_a_path_elsewhere_is_left_alone(self):
+        # Chosen by the operator, already readable, and not ours to touch.
+        for dest in ("/srv/tl/videos", "D:\\timelapse\\videos"):
+            self.assertEqual(self.granted(dest), [], dest)
+
+    def test_the_config_directory_itself_is_refused(self):
+        """The trap. video_output set to the data root would have this lift
+
+        the restriction off config.json and every camera password in it, by a
+        function whose whole job is to be safe. Strictly inside, never equal.
+        """
+        self.assertEqual(self.granted(str(setup.CONFIG_DIR)), [])
+        self.assertEqual(self.granted(str(setup.CONFIG_DIR) + os.sep), [])
+
+    def test_a_sibling_with_a_longer_name_is_not_inside(self):
+        # The `/srv/tl` versus `/srv/tl-old` shape, which writable_paths()
+        # already had to get right. A prefix is not a parent.
+        self.assertEqual(self.granted(str(setup.CONFIG_DIR) + "-other"), [])
+
+    def test_an_empty_destination_asks_for_nothing(self):
+        self.assertEqual(self.granted(""), [])
+
+    def test_case_variants_follow_the_platform(self):
+        """Keyed on os.path.normcase, so the filesystem answers rather than a
+
+        branch of ours: on Windows the two spellings are one directory, on
+        Linux they genuinely are two and calling them one would be the error.
+        Asserting the platform's own answer rather than a fixed one is the
+        point of using normcase at all, and the same shape as
+        TestSameFileName.test_case_variants_follow_the_platform.
+
+        The first version of this test asserted the Windows answer and
+        inherited its platform, so it passed here and failed on all three
+        Linux legs: the rule this project already had for euid and privilege,
+        met once more.
+        """
+        dest = str(Path(setup.CONFIG_DIR) / "videos")
+        self.assertTrue(setup.inside_config_dir(dest))
+        expected = os.path.normcase("A") == os.path.normcase("a")
+        self.assertIs(setup.inside_config_dir(dest.upper()), expected)
+
+    def test_create_directories_opens_the_videos_and_nothing_else(self):
+        """The wiring, which is the part a pure test of the rule would miss.
+
+        It has to be create_directories() and not some other place, because
+        that is what follows the videos wherever the wizard puts them.
+        """
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        cfg = {"paths": {"frames_root": str(tmp / "frames"),
+                         "video_output": str(tmp / "videos"),
+                         "log_dir": str(tmp / "logs"),
+                         "state_dir": str(tmp / "state")},
+               "web": {"state_dir": str(tmp / "web")}}
+        asked = []
+        with mock.patch.object(setup, "inside_config_dir", lambda p: True), \
+             mock.patch.object(setup, "allow_users_read",
+                               lambda p: (asked.append(p), (True, ""))[1]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            setup.create_directories(cfg)
+        self.assertEqual(asked, [str(tmp / "videos")])
+
+    def test_a_failure_warns_and_does_not_stop_the_install(self):
+        # The videos exist and are correct; an administrator can still open
+        # them. Failing the install over a permission nicety would be worse,
+        # and saying nothing would be worse still.
+        out = io.StringIO()
+        with mock.patch.object(setup, "inside_config_dir", lambda p: True), \
+             mock.patch.object(setup, "allow_users_read",
+                               lambda p: (False, "Access is denied.")), \
+             contextlib.redirect_stdout(out):
+            result = setup.open_video_dir(self.cfg("/anything"))
+        self.assertIs(result, False)
+        self.assertIn("administrator", out.getvalue().lower())
+
+    def test_the_installer_asks_for_it_on_an_upgrade(self):
+        """An upgrade never runs the wizard, so create_directories() is never
+
+        reached and the videos of an install made before this release would
+        stay closed for ever. One implementation, two doors.
+        """
+        source = (_support.REPO / "install.ps1").read_text(encoding="utf-8")
+        self.assertIn("--grant-video-access", source)
+        body = "\n".join(line for line in source.splitlines()
+                         if not line.lstrip().startswith("#"))
+        self.assertIn("--grant-video-access", body)
+
+    def test_the_flag_is_silent_when_there_is_no_config_yet(self):
+        # install.ps1 calls it on a first install too, before the wizard has
+        # written anything. An error there would be a failed install for a
+        # file that is about to exist.
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        argv = ["timelapse_setup.py", "--grant-video-access",
+                str(tmp / "nothing.json")]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(setup, "init_tty", mock.Mock(
+                    side_effect=AssertionError("asked for a terminal"))), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(setup.main(), 0)
 
 
 class TestFstabEscaping(unittest.TestCase):

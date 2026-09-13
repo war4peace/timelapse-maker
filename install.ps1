@@ -237,14 +237,25 @@ function Protect-ConfigDir {
       directory once protects everything created in it afterwards, including an
       editor's temporary copies. Inheritance is broken first, or the permissive
       ACL from %ProgramData% comes along with it.
+
+      By SID and not by name. icacls resolves a name through the local SAM, and
+      on a German Windows the group is Administratoren, on a French one
+      Administrateurs; the English spelling comes back as "No mapping between
+      account names and security IDs was done". This used to warn and carry on,
+      which would leave the directory holding every camera password with the
+      permissive ACL it inherited from %ProgramData%: readable by every account
+      on the machine, on exactly the installs least able to notice. The numbers
+      are the same in every language.
     #>
     $code = Invoke-Tool 'icacls' @($CONFDIR, '/inheritance:r', '/grant',
-                                   'SYSTEM:(OI)(CI)F',
-                                   'Administrators:(OI)(CI)F') -Quiet
+                                   '*S-1-5-18:(OI)(CI)F',
+                                   '*S-1-5-32-544:(OI)(CI)F') -Quiet
     if ($code -eq 0) {
         Ok "Restricted $CONFDIR to SYSTEM and Administrators"
     } else {
         Warn "Could not restrict $CONFDIR; it holds your camera passwords."
+        Warn 'Check it by hand before configuring any camera:'
+        Warn "  icacls `"$CONFDIR`""
     }
 }
 
@@ -513,6 +524,16 @@ if (Test-Path $CONFIG) {
     # error preference is relaxed, and that by Invoke-Tool rather than here.
     [void](Invoke-Tool $python (@((Join-Path $Prefix 'timelapse_setup.py')) + $wizard))
 }
+
+# Protect-ConfigDir closed this whole tree, and by default the finished videos
+# are inside it, so without this the operator cannot double-click their own
+# timelapse. The rule for which directory and when lives in Python beside the
+# wizard that creates it, not here: the wizard reaches the same function when
+# it makes the directories, and this covers the upgrade, which never runs the
+# wizard at all. A first install has no config yet and this exits 0; the wizard
+# a few lines above has already done it by then.
+[void](Invoke-Tool $python @((Join-Path $Prefix 'timelapse_setup.py'),
+                             '--grant-video-access', $CONFIG))
 
 # After the wizard, never during registration. Registering replaces the files
 # on disk and leaves the running process alone; the wizard then rewrites the

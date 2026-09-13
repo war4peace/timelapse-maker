@@ -54,6 +54,30 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Changed
 
+- **Windows: your finished videos open without administrator rights.** The
+  installer closes `%ProgramData%\timelapse` so that the camera passwords in
+  `config.json` are not readable by every account on the machine, and by
+  default the videos are inside it, so double-clicking your own timelapse
+  asked for administrator. The videos folder is now granted read and execute
+  to ordinary accounts. Read and execute only: an account that is not an
+  administrator can open and copy a video but cannot alter or delete one.
+  Nothing else opens up, and the frames, the logs and `config.json` stay
+  exactly as restricted as before. Applied on upgrade as well as on a fresh
+  install, and only when the videos are in the folder this program restricted:
+  a `video_output` you put on another drive is left alone.
+
+  One wrinkle worth knowing: *browsing* to the folder from
+  `%ProgramData%\timelapse` still will not work, because the folder above it
+  is closed. Open `%ProgramData%\timelapse\videos` directly, or make a
+  shortcut to it. Saved playlists and file associations work as they are.
+
+- **The installer's permissions no longer depend on the language Windows is
+  installed in.** It granted access to accounts named "SYSTEM" and
+  "Administrators", which on a German or French Windows resolve to nothing at
+  all; it then warned and carried on, leaving the folder holding your camera
+  passwords readable by every account on the machine. It uses the numeric
+  identifiers now, which are the same everywhere.
+
 - **Windows: `timelapse` needs an Administrator prompt, whichever command it
   is, and the documentation now says so.** It used to name `timelapse status`
   and `timelapse version` as needing nothing, "from any window". They do:
