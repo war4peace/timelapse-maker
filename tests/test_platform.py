@@ -2059,6 +2059,231 @@ class TestNoPlatformBranchesElsewhere(unittest.TestCase):
                          "platform branch outside timelapse_platform.py")
 
 
+class FakeTable(ctypes.Structure):
+    """A real structure, because the product builds a (TABLE * 2) array of it.
+
+    `lpServiceProc` is a py_object rather than a function pointer so a plain
+    Python callable survives the round trip: ctypes.WINFUNCTYPE does not exist
+    off Windows at all, which is why the whole SCM half of this module had no
+    test on either leg.
+    """
+    _fields_ = [("lpServiceName", ctypes.c_wchar_p),
+                ("lpServiceProc", ctypes.py_object)]
+
+
+def deref(arg):
+    """The structure behind a byref() or a pointer."""
+    obj = getattr(arg, "_obj", None)
+    return obj if obj is not None else arg.contents
+
+
+class FakeAdvapi(object):
+    """Enough advapi32 to run the service paths on a runner that has none.
+
+    Every call is recorded with the arguments that matter, and the structures
+    handed to SetServiceStatus are copied out rather than referenced, because
+    the product reuses one SERVICE_STATUS per report and the interesting thing
+    is the sequence.
+    """
+
+    def __init__(self, refuse=()):
+        self.calls = []
+        self.reported = []
+        self.config2 = []               # (info level, structure)
+        self.refuse = set(refuse)       # calls that answer NULL / FALSE
+        self.handler = None
+        self.service_main = None
+
+    def _ok(self, name):
+        self.calls.append(name)
+        return 0 if name in self.refuse else 1
+
+    # Registration ---------------------------------------------------------
+    def OpenSCManagerW(self, machine, database, access):
+        return 11 * self._ok("OpenSCManagerW")
+
+    def OpenServiceW(self, scm, name, access):
+        return 12 * self._ok("OpenServiceW")
+
+    def CreateServiceW(self, *args):
+        self.created = args
+        return 13 * self._ok("CreateServiceW")
+
+    def ChangeServiceConfigW(self, *args):
+        return self._ok("ChangeServiceConfigW")
+
+    def ChangeServiceConfig2W(self, svc, level, info):
+        ok = self._ok("ChangeServiceConfig2W")
+        self.config2.append((level, deref(info)))
+        return ok
+
+    def CloseServiceHandle(self, handle):
+        return self._ok("CloseServiceHandle")
+
+    # Hosting --------------------------------------------------------------
+    def RegisterServiceCtrlHandlerExW(self, name, handler, context):
+        self.handler = handler
+        return 14 * self._ok("RegisterServiceCtrlHandlerExW")
+
+    def SetServiceStatus(self, handle, status):
+        ok = self._ok("SetServiceStatus")
+        s = deref(status)
+        self.reported.append((s.dwCurrentState, s.dwWin32ExitCode,
+                              s.dwServiceSpecificExitCode))
+        return ok
+
+    def StartServiceCtrlDispatcherW(self, table):
+        self._ok("StartServiceCtrlDispatcherW")
+        self.service_main = table[0].lpServiceProc
+        self.service_main(0, None)
+        return 1
+
+
+class FakeWinApi(object):
+    """What _win() returns. MAIN and HANDLER hand the callable straight back."""
+
+    def __init__(self, advapi=None):
+        self.advapi32 = advapi or FakeAdvapi()
+        self.shell32 = None
+        self.kernel32 = None
+        self.mpr = None
+        # Plain lambdas, not staticmethod(): a staticmethod object is
+        # not callable on 3.9, and 3.9 is this project's floor.
+        self.MAIN = lambda fn=None: fn
+        self.HANDLER = lambda fn=None: fn
+        self.TABLE = FakeTable
+
+
+@contextlib.contextmanager
+def fake_windows(advapi=None):
+    """Run a Windows-only path on whichever platform this is.
+
+    IS_WINDOWS is patched on the module that reads it, which is this one:
+    `from timelapse_platform import IS_WINDOWS` elsewhere makes a second
+    binding, and patching one does not move the other.
+    """
+    api = FakeWinApi(advapi)
+    with mock.patch.object(plat, "IS_WINDOWS", True), \
+            mock.patch.object(plat, "_win", lambda: api):
+        yield api.advapi32
+
+
+class TestAFailedServiceIsReportedAsOne(unittest.TestCase):
+    """A stop the SCM should act on has to look different from one it should
+    not.
+
+    Runs on both CI legs: nothing here touches a DLL. The SCM runs the
+    failure actions only for a service that either died without reporting
+    SERVICE_STOPPED or reported one with a non-zero exit code, so the daemon
+    catching its own exception and reporting a tidy STOPPED meant the three
+    SC_ACTION_RESTART entries, documented as the equivalent of Restart=always,
+    never ran at all. One exception out of write_state() left capture down
+    until the next reboot; on Linux the same exception restarts in 15 seconds.
+    """
+
+    def host(self, body):
+        advapi = FakeAdvapi()
+        with fake_windows(advapi):
+            rc = plat.run_as_service(plat.CAPTURE_UNIT, body, lambda: None)
+        return rc, advapi
+
+    def test_a_clean_return_reports_a_clean_stop(self):
+        """The control, and it is the half that must not change: stopping a
+        service on purpose must not queue a restart."""
+        _, advapi = self.host(lambda ready: ready())
+        self.assertEqual(advapi.reported[-1][0], plat.SERVICE_STOPPED)
+        self.assertEqual(advapi.reported[-1][1:], (plat.NO_ERROR, 0))
+
+    def test_an_exception_reports_a_failure(self):
+        def explode(ready):
+            ready()
+            raise OSError(13, "capture.json is held open by something")
+
+        _, advapi = self.host(explode)
+        state, win32, specific = advapi.reported[-1]
+        self.assertEqual(state, plat.SERVICE_STOPPED)
+        self.assertEqual(win32, plat.ERROR_SERVICE_SPECIFIC_ERROR)
+        self.assertNotEqual(specific, 0)
+
+    def test_the_running_report_is_still_a_clean_one(self):
+        """Only the last report carries the verdict. A RUNNING with an exit
+        code in it would be a service reporting its own death while alive."""
+        _, advapi = self.host(lambda ready: ready())
+        running = [r for r in advapi.reported
+                   if r[0] == plat.SERVICE_RUNNING]
+        self.assertEqual(running, [(plat.SERVICE_RUNNING, plat.NO_ERROR, 0)])
+
+    def test_the_failure_is_witnessed_as_well_as_reported(self):
+        """The exit code tells Windows to restart; it tells the operator
+        nothing. service-error.log is the only witness a failure has before
+        logging is up."""
+        seen = []
+
+        def explode(ready):
+            raise ValueError("config.json: Expecting value: line 1 column 1")
+
+        advapi = FakeAdvapi()
+        with fake_windows(advapi):
+            plat.run_as_service(plat.CAPTURE_UNIT, explode,
+                                lambda: None, on_error=seen.append)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("ValueError", seen[0])
+
+
+class TestTheRestartActionsAreArmed(unittest.TestCase):
+    """Registering the service has to opt in to acting on a reported failure.
+
+    fFailureActionsOnNonCrashFailures is FALSE by default, and with it FALSE
+    the exit code above changes nothing: the SCM runs failure actions only for
+    a process that died without reporting SERVICE_STOPPED. The two halves are
+    one fix and neither works alone.
+    """
+
+    def install(self, refuse=()):
+        advapi = FakeAdvapi(refuse)
+        with fake_windows(advapi):
+            ok, detail = plat.install_service(
+                plat.CAPTURE_UNIT, "Camera snapshot capture",
+                ["C:\\Python\\python.exe", "C:\\tl\\timelapse_capture.py"])
+        return ok, detail, advapi
+
+    def levels(self, advapi):
+        return [level for level, _info in advapi.config2]
+
+    def test_the_flag_is_set_alongside_the_actions(self):
+        ok, detail, advapi = self.install()
+        self.assertTrue(ok, detail)
+        self.assertIn(plat.SERVICE_CONFIG_FAILURE_ACTIONS,
+                      self.levels(advapi))
+        self.assertIn(plat.SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+                      self.levels(advapi))
+
+    def test_the_flag_is_true(self):
+        """A structure of the right shape carrying zero would register, report
+        success and do nothing, which is the state this fix found."""
+        _, _, advapi = self.install()
+        flag = [info for level, info in advapi.config2
+                if level == plat.SERVICE_CONFIG_FAILURE_ACTIONS_FLAG]
+        self.assertEqual(len(flag), 1)
+        self.assertEqual(flag[0].fFailureActionsOnNonCrashFailures, 1)
+
+    def test_the_actions_are_still_three_restarts(self):
+        _, _, advapi = self.install()
+        actions = [info for level, info in advapi.config2
+                   if level == plat.SERVICE_CONFIG_FAILURE_ACTIONS]
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].cActions, 3)
+        for i in range(3):
+            self.assertEqual(actions[0].lpsaActions[i].Type,
+                             plat.SC_ACTION_RESTART)
+
+    def test_a_refused_flag_is_reported_and_does_not_undo_the_install(self):
+        """A service that runs without automatic restart is worth more than no
+        service and a rollback, which is what the other two already do."""
+        ok, detail, _ = self.install(refuse=("ChangeServiceConfig2W",))
+        self.assertTrue(ok)
+        self.assertIn("restart-on-reported-failure", detail)
+
 if __name__ == "__main__":
     unittest.main()
 

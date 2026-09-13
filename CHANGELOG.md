@@ -95,6 +95,23 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Windows: the capture service now really does restart itself.** The
+  installer has always registered it with three restart-on-failure actions,
+  fifteen seconds apart, described in the guide as the equivalent of the
+  Linux `Restart=always`. They never ran. Windows treats a service that
+  reports a stop as having stopped on purpose, whatever the reason, and this
+  program catches its own errors and reports them tidily, so an error while
+  running left capture stopped until the next reboot with one line in
+  `service-error.log`. It reports a failure as a failure now, and the
+  restart actions are armed to act on one.
+
+  The consequence to know about: a fault that cannot clear by itself, a
+  `config.json` that will not parse being the usual one, retries every
+  fifteen seconds and writes a line to `service-error.log` each time. That
+  is what the Linux side has always done. Read that file, fix what it names,
+  and the next attempt succeeds without you starting anything. A deliberate
+  `sc stop` still stops it.
+
 - **The first-run wizard no longer accepts two cameras with the same name.**
   A camera's name is the folder its frames go in, so two cameras sharing one
   meant two cameras writing into one folder: on Windows, where `Gate` and

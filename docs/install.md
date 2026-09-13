@@ -182,6 +182,14 @@ The service runs as LocalSystem and restarts itself if it stops unexpectedly,
 which is the equivalent of `Restart=always RestartSec=15`. Start it the first
 time with `sc start "TimelapseCapture"`; after a reboot it starts itself.
 
+That covers a crash and an unhandled error alike: whatever the reason, it is
+started again fifteen seconds later, and each attempt appends a line to
+`%ProgramData%\timelapse\service-error.log` saying what happened. **A fault
+it cannot recover from, a configuration file it cannot read being the usual
+one, therefore retries every fifteen seconds indefinitely**, which is the same
+behaviour as on Linux and is deliberate: read that log, fix what it names, and
+the next attempt succeeds on its own.
+
 **Open a new terminal, as administrator, before using `timelapse`.** New,
 because a PATH change only reaches processes started after it. Administrator
 for every command and not only the ones that change something: the wrapper

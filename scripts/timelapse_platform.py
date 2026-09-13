@@ -283,11 +283,18 @@ SC_STATUS_PROCESS_INFO = 0
 SERVICE_CONFIG_DESCRIPTION = 1
 SERVICE_CONFIG_FAILURE_ACTIONS = 2
 SERVICE_CONFIG_DELAYED_AUTO_START_INFO = 3
+SERVICE_CONFIG_FAILURE_ACTIONS_FLAG = 4
 SC_ACTION_RESTART = 1
 
 ERROR_SERVICE_EXISTS = 1073
 ERROR_SERVICE_DOES_NOT_EXIST = 1060
 ERROR_FAILED_SERVICE_CONTROLLER_CONNECT = 1063
+# What a service reports when the failure is its own rather than Windows'.
+# dwWin32ExitCode carries this and dwServiceSpecificExitCode carries the
+# meaning, which is the only way to report a stop the SCM should act on.
+ERROR_SERVICE_SPECIFIC_ERROR = 1066
+NO_ERROR = 0
+EXIT_SERVICE_FAILED = 1
 
 # Network errors from WNetAddConnection2W. Each one needs a different thing
 # doing about it, which is the whole reason they are named rather than
@@ -379,6 +386,10 @@ class SERVICE_DESCRIPTIONW(ctypes.Structure):
 
 class SERVICE_DELAYED_AUTO_START_INFO(ctypes.Structure):
     _fields_ = [("fDelayedAutostart", _BOOL)]
+
+
+class SERVICE_FAILURE_ACTIONS_FLAG(ctypes.Structure):
+    _fields_ = [("fFailureActionsOnNonCrashFailures", _BOOL)]
 
 
 class _WinApi(object):
@@ -650,6 +661,19 @@ def install_service(unit, description, argv, account=None, password=None,
                     svc, SERVICE_CONFIG_FAILURE_ACTIONS, ctypes.byref(failure)):
                 problems.append("restart-on-failure")
 
+            # Without this flag the actions above run only when the process
+            # dies without reporting SERVICE_STOPPED, so every failure that is
+            # a Python exception rather than a process kill is a clean stop to
+            # Windows and nothing restarts. That is most of them: the daemon
+            # catches what it can and reports the rest through the entry
+            # point's guard. Set, a STOPPED with a non-zero exit code queues
+            # the restart, and a `sc stop` still reports zero and does not.
+            flag = SERVICE_FAILURE_ACTIONS_FLAG(1)
+            if not api.advapi32.ChangeServiceConfig2W(
+                    svc, SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+                    ctypes.byref(flag)):
+                problems.append("restart-on-reported-failure")
+
             if delayed:
                 start = SERVICE_DELAYED_AUTO_START_INFO(1)
                 if not api.advapi32.ChangeServiceConfig2W(
@@ -782,7 +806,7 @@ def run_as_service(unit, body, request_stop, on_error=None,
     name = native_name(unit)
     live = {"handle": None, "state": SERVICE_STOPPED}
 
-    def report(code, wait_hint=0, checkpoint=0):
+    def report(code, wait_hint=0, checkpoint=0, exit_code=0):
         if not live["handle"]:
             return False
         status = SERVICE_STATUS()
@@ -791,8 +815,14 @@ def run_as_service(unit, body, request_stop, on_error=None,
         status.dwControlsAccepted = (
             SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN
             if code == SERVICE_RUNNING else 0)
-        status.dwWin32ExitCode = 0
-        status.dwServiceSpecificExitCode = 0
+        # A STOPPED reported with exit code zero is a clean stop, whatever
+        # went wrong to cause it, and the SCM runs no failure action for one.
+        # So the exit code is the entire difference between "the operator
+        # stopped it" and "it fell over", and it is what makes the three
+        # SC_ACTION_RESTART entries mean anything.
+        status.dwWin32ExitCode = (ERROR_SERVICE_SPECIFIC_ERROR if exit_code
+                                  else NO_ERROR)
+        status.dwServiceSpecificExitCode = exit_code
         status.dwCheckPoint = checkpoint
         status.dwWaitHint = wait_hint
         live["state"] = code
@@ -819,21 +849,24 @@ def run_as_service(unit, body, request_stop, on_error=None,
         # Every line is inside the guard. An exception escaping a ctypes
         # callback goes to stderr, and stderr under the SCM is nowhere, so the
         # service would simply appear to hang.
+        failed = 0
         try:
             live["handle"] = api.advapi32.RegisterServiceCtrlHandlerExW(
                 name, handler, None)
             if not live["handle"]:
+                failed = EXIT_SERVICE_FAILED
                 _report_error(on_error,
                               _last_error("RegisterServiceCtrlHandlerExW"))
                 return
             report(SERVICE_START_PENDING, wait_hint=stop_wait_ms, checkpoint=1)
             body(lambda: report(SERVICE_RUNNING))
         except BaseException as exc:                             # noqa: BLE001
+            failed = EXIT_SERVICE_FAILED
             _report_error(on_error, "service_main raised %s: %s"
                           % (type(exc).__name__, exc))
         finally:
             try:
-                report(SERVICE_STOPPED)
+                report(SERVICE_STOPPED, exit_code=failed)
             except BaseException:                                # noqa: BLE001
                 pass
 

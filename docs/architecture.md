@@ -1948,6 +1948,53 @@ return immediately. Four rules are load-bearing and each was a bug first:
   work.** Capture has a camera thread per camera to join, each possibly holding
   a fetch open, and an SCM that has not been told to wait calls the stop hung.
 
+**A stop the SCM should act on has to look different from one it should not**
+(0.2.1). The four rules above were all about surviving; this is about dying
+properly. `report()` set `dwWin32ExitCode = 0` on every status it ever sent,
+including the `SERVICE_STOPPED` in `on_main`'s `finally`, which runs whether
+`body` returned or raised. To Windows that is a clean stop, and **the SCM runs
+a failure action only for a service that either died without reporting
+`SERVICE_STOPPED` or reported one with a non-zero exit code**. So the three
+`SC_ACTION_RESTART` entries, described above as the equivalent of
+`Restart=always, RestartSec=15`, were inert for every failure that is an
+exception rather than a process kill, which is nearly all of them: this code
+catches what escapes and reports it tidily.
+
+The concrete case: `write_state()` raises once because something held
+`capture.json` open past `replace_atomic()`'s retry window. On Linux capture is
+back in fifteen seconds. On Windows it stopped, wrote one line to
+`service-error.log`, and stayed stopped until somebody rebooted.
+
+Two halves, and neither works alone. `report()` takes an `exit_code`, and a
+failure reports `ERROR_SERVICE_SPECIFIC_ERROR` (1066) in `dwWin32ExitCode` with
+the meaning in `dwServiceSpecificExitCode`, which is the only way a service can
+report a failure of its own. And `install_service()` sets
+`SERVICE_CONFIG_FAILURE_ACTIONS_FLAG`, because
+`fFailureActionsOnNonCrashFailures` is FALSE by default and with it FALSE the
+exit code changes nothing. A deliberate `sc stop` still reports zero and still
+queues nothing.
+
+**The parity is exact, including the part nobody enjoys.** A `config.json` that
+will never parse now fails, restarts fifteen seconds later, fails again, for
+ever, appending a line to `service-error.log` each time: about 5,700 lines a
+day. That is precisely what `Restart=always` does on Linux, where `RestartSec=15`
+keeps the unit under systemd's default start-limit rate, so it is never given
+up on either. The choice was put to the user in those terms and parity was
+chosen: a daemon that stays down after one transient fault is the worse
+failure, and a broken config is visible in a way a stopped service is not.
+
+**What the unit tests can and cannot say.** `test_platform.py` drives
+`run_as_service()` and `install_service()` against a fake `advapi32` on both CI
+legs, which is the first test coverage the SCM half of this module has ever
+had; `FakeTable` declares `lpServiceProc` as a `py_object` because
+`ctypes.WINFUNCTYPE` does not exist off Windows, which is why there was none.
+They prove this program tells Windows the right thing. They cannot prove
+Windows acts on it, and that is the whole claim, so `temp/h4_check.py`
+registers a throwaway `timelapse-h4probe` service with a five second restart
+delay, makes it fall over on purpose, and reads back whether the SCM started it
+again, whether each start is a new process, and whether a deliberate stop still
+stops. It needs an elevated prompt and never touches the installed services.
+
 The batch jobs are **scheduled tasks**, not services, mirroring the
 `.service`/`.timer` split exactly: a service that exits within seconds is a
 service in a permanent restart loop. Their definitions are generated as XML
@@ -3344,7 +3391,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,125 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,133 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4076,7 +4123,7 @@ scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
 scripts/timelapse_setup.py       configuration wizard, 4817 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_platform.py    the only platform branch, 2344 lines
+scripts/timelapse_platform.py    the only platform branch, 2377 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes
