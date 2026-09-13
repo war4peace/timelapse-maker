@@ -673,6 +673,37 @@ class TestVersions(unittest.TestCase):
         self.assertIn("## [%s]" % version, changelog, "no section")
         self.assertIn("[%s]: https://" % version, changelog, "no link ref")
 
+
+    def test_every_changelog_section_has_a_link_reference(self):
+        """The existing test pins the version being shipped, and only that.
+
+        Eight sections had no reference at all, including `[Unreleased]`,
+        which Keep a Changelog expects to be a compare link: the heading
+        renders as literal brackets, and nothing here could see it.
+        """
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        sections = re.findall(r"^## \[([^\]]+)\]", changelog, re.M)
+        refs = set(re.findall(r"^\[([^\]]+)\]: ", changelog, re.M))
+        self.assertGreater(len(sections), 10, "found no sections to check")
+        self.assertEqual([s for s in sections if s not in refs], [],
+                         "sections whose heading renders as plain brackets")
+
+    def test_the_unreleased_reference_is_a_comparison(self):
+        # Against the newest released section, so it shows what is on main and
+        # not yet in a release. A tag URL there would point at a tag that does
+        # not exist.
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        newest = re.findall(r"^## \[(\d[^\]]*)\]", changelog, re.M)[0]
+        self.assertIn("[Unreleased]: https://github.com/war4peace/"
+                      "timelapse-maker/compare/v%s...HEAD" % newest,
+                      changelog)
+
+    def test_no_reference_points_at_a_section_that_is_gone(self):
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        sections = set(re.findall(r"^## \[([^\]]+)\]", changelog, re.M))
+        refs = re.findall(r"^\[([^\]]+)\]: ", changelog, re.M)
+        self.assertEqual([r for r in refs if r not in sections], [])
+
     def test_install_sh_reports_the_same_scripts_as_the_dispatcher(self):
         """Found by a real upgrade rehearsal, not by this suite.
 

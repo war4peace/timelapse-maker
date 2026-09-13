@@ -3855,7 +3855,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,369 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,377 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4631,7 +4631,7 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ```
 install.sh                       bootstrap installer, 1047 lines
 install.ps1                      the Windows one, 601 lines
-setup-gui.ps1                    launcher for the graphical wizard, 111 lines
+setup-gui.ps1                    launcher for the graphical wizard, 142 lines
 timelapse-setup.cmd              double-click shim for the above
 installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
@@ -4641,8 +4641,8 @@ scripts/timelapse_encode.py      batch job, 2394 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1092 lines
 scripts/timelapse_setup.py       configuration wizard, 4787 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2990 lines
-scripts/timelapse_update.py      release query + `timelapse update`, 509 lines
-scripts/timelapse_platform.py    the only platform branch, 2583 lines
+scripts/timelapse_update.py      release query + `timelapse update`, 510 lines
+scripts/timelapse_platform.py    the only platform branch, 2597 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 438 lines
 scripts/timelapse_web.py         read-only web UI, 3596 lines
 tests/_support.py                path setup and fakes

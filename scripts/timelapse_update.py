@@ -20,8 +20,9 @@ mandatory User-Agent and of this repo's tags-without-Releases history.
 Upgrading is re-running the installer, which is what the documentation has
 always said. This command downloads that installer from the tag it is about to
 install and runs it, so the installer and the tree it unpacks are the same
-version. It keeps the config: install.sh asks "Reconfigure it?" and defaults
-to no.
+version. It keeps the config: since 0.1.7 install.sh does not ask at all, and
+an upgrade that walked the whole wizard was a strange thing to be offered by
+something run to get a bug fix.
 """
 
 import argparse

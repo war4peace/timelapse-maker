@@ -48,10 +48,21 @@ the arguments for them are recorded rather than left to be re-made.
 
 ## Item 11: a Windows variant, sharing the Python
 
-**Status: research only.** Nothing is designed and nothing is committed. This
-entry exists to record what was measured on 2026-08-15, so the decision to
-build it or refuse it is made against facts rather than against an impression
-of how hard Windows is.
+**Status: BUILT and shipped at v0.2.0** (2026-08-18). The sub-items below say
+BUILT where they were built, and this line said "research only" for three
+months after they were, which is the sort of thing a reader believes because
+it is at the top.
+
+What remains open is in **11c.6b**: a compiled `.exe` of the graphical wizard
+for the release page, which brings a code-signing question with it, and an
+installer front end over `install.ps1`. Two things are **deferred on scope**
+rather than unfinished, both with their reasoning in `decided-against.md`: the
+web UI and a monitoring client, neither of which is wanted on Windows until
+somebody wants to check the cameras from a phone.
+
+The text below is kept as it was written, on 2026-08-15, because it is the
+record of what was *measured* before any of it was built, and several of the
+measurements are the reason the design looks as it does.
 
 **Constraint from the outset:** the Python must stay common. Two forks of
 `timelapse_capture.py` is the outcome this entry exists to avoid, and the

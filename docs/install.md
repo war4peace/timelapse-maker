@@ -71,7 +71,10 @@ rm install_timelapse.sh
 creates a `timelapse` system account, puts the scripts in `/opt/timelapse`, the
 units in `/etc/systemd/system`, a `timelapse` wrapper in `/usr/local/bin`, and
 then runs the setup wizard described in §3. Re-running it upgrades the scripts
-and offers to keep your existing config.
+and **keeps your existing config without asking**: reconfiguring is a separate
+job with its own commands, and being walked through the whole wizard is a
+strange offer from something you ran to get a bug fix. New settings arrive with
+defaults, so an untouched config keeps working.
 
 | Flag | Effect |
 |---|---|
@@ -355,9 +358,15 @@ sudo cp config/config.example.json /etc/timelapse/config.json
 sudo chown root:timelapse /etc/timelapse/config.json
 sudo chmod 640 /etc/timelapse/config.json        # it holds camera passwords
 
-sudo mkdir -p /var/lib/timelapse/{frames,videos,logs,state}
+sudo mkdir -p /var/lib/timelapse/{frames,videos,logs,state,web}
 sudo chown -R timelapse:timelapse /var/lib/timelapse
 ```
+
+`web` is for the optional web UI's index (§11). It costs nothing if you never
+turn that on, and creating it later is easy to forget: the unit names it in
+`ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths`
+points at a directory that is not there, with an error about mount namespaces
+that mentions neither.
 
 Then edit `/etc/timelapse/config.json`: camera URLs, credentials, and, if you
 put frames anywhere other than `/var/lib/timelapse`, the `paths` block.
@@ -555,7 +564,8 @@ sudo cp service/timelapse-capture.service \
         service/timelapse-encode.service \
         service/timelapse-encode.timer \
         service/timelapse-watch.service \
-        service/timelapse-watch.timer /etc/systemd/system/
+        service/timelapse-watch.timer \
+        service/timelapse-web.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now timelapse-capture.service
 sudo systemctl enable --now timelapse-encode.timer
@@ -563,6 +573,10 @@ sudo systemctl enable --now timelapse-watch.timer
 
 journalctl -u timelapse-capture -f
 ```
+
+The web unit is copied and not enabled: it is off unless you ask for it (§11),
+and `timelapse web` is what turns it on. Copying it now means the file is
+there when you do.
 
 Check after an hour: at a 5s interval this should be ≈ 720 × cameras:
 
