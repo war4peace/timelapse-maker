@@ -5860,3 +5860,115 @@ class TestTheCameraTestReadsTheCameraItWasGiven(unittest.TestCase):
         _, said = self.run_test(cam, {"capture": {"interval_seconds": 5}},
                                 seconds=3.1)
         self.assertIn("slow", said)
+
+
+class TestTheStrandedWarningCountsWhatIsLeft(unittest.TestCase):
+    """With delete_frames_on_success off, every encoded day is still on disk.
+
+    So counting day directories told the operator that disabling a camera
+    would strand N days, and sent them to `timelapse encode --date` for days
+    that carry a marker and are skipped. The encoder decides with
+    find_pending(); this agrees with it rather than restating it.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cfg = {"paths": {"frames_root": str(self.tmp)},
+                    "cameras": [{"name": "Gate", "enabled": True}]}
+
+    def day(self, name, encoded=False):
+        d = self.tmp / "Gate" / name
+        d.mkdir(parents=True)
+        if encoded:
+            (d / ".encoded.json").write_text(
+                '{"video": "Gate.%s.mkv"}' % name.replace("-", ""),
+                encoding="utf-8")
+        return d
+
+    def test_an_encoded_day_is_not_pending(self):
+        self.day("2020-01-01", encoded=True)
+        self.assertEqual(setup.pending_days(self.cfg, "Gate"), [])
+
+    def test_an_unencoded_day_still_is(self):
+        # The control: the warning has to survive for what it is about.
+        self.day("2020-01-02")
+        self.assertEqual([p.name for p in setup.pending_days(self.cfg, "Gate")],
+                         ["2020-01-02"])
+
+    def test_a_marker_that_will_not_parse_counts_as_unencoded(self):
+        # day_encoded()'s rule, inherited rather than re-decided: the wasteful
+        # answer costs one re-encode and is self-correcting.
+        d = self.day("2020-01-03")
+        (d / ".encoded.json").write_text("{ this is not json", encoding="utf-8")
+        self.assertEqual([p.name for p in setup.pending_days(self.cfg, "Gate")],
+                         ["2020-01-03"])
+
+    def test_the_encoder_and_the_wizard_agree(self):
+        # Both keyed on the same function, so a day the encoder would skip is
+        # a day the wizard does not warn about.
+        import timelapse_encode as enc
+        self.day("2020-01-04", encoded=True)
+        self.day("2020-01-05")
+        jobs, done = enc.find_pending(self.tmp, ["Gate"], None, 0)
+        self.assertEqual([d.name for _, d in jobs], ["2020-01-05"])
+        self.assertEqual(done, 1)
+        self.assertEqual([p.name for p in setup.pending_days(self.cfg, "Gate")],
+                         ["2020-01-05"])
+
+
+class TestAWindowsDestinationIsStoredAbsolute(unittest.TestCase):
+    """A relative path is resolved at 00:05 against the task's directory.
+
+    Which for a LocalSystem task is System32. The wizard's own write probe
+    resolved it against this process's directory instead, so the check agreed
+    with a setting that cannot work.
+
+    Declares its platform: the wizard branch is Windows-only, and os.path is
+    the right module here because the running machine is the subject.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.prev_tty, self.prev_auto = setup._TTY, setup.AUTO
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        setup._TTY, setup.AUTO = self.prev_tty, self.prev_auto
+
+    def choose(self, typed):
+        cfg = {"transfer": {}, "paths": {}}
+        setup.AUTO = False
+        setup._TTY = FakeTTY(typed, tty=False)
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                mock.patch.object(setup, "network_path", lambda d: None), \
+                mock.patch.object(setup, "drive_is_local", lambda d: True), \
+                mock.patch.object(setup, "check_windows_destination",
+                                  lambda cfg, dest: None):
+            setup.choose_windows_destination(cfg)
+        return cfg["transfer"], out.getvalue()
+
+    def test_a_bare_folder_name_is_made_absolute(self):
+        transfer, said = self.choose("videos\n")
+        self.assertTrue(os.path.isabs(transfer["destination"]))
+        self.assertIn("Storing the full path", said)
+
+    def test_a_drive_relative_path_is_made_absolute_too(self):
+        # ntpath.isabs("D:timelapse") is False: it means "the current
+        # directory on D:", which is not a place a service can find.
+        if not setup.IS_WINDOWS:
+            self.skipTest("drive-relative paths exist only on Windows")
+        transfer, _ = self.choose("D:timelapse\n")
+        self.assertTrue(os.path.isabs(transfer["destination"]))
+
+    def test_an_absolute_path_is_left_exactly_as_typed(self):
+        want = str(self.tmp / "library")
+        transfer, said = self.choose(want + "\n")
+        self.assertEqual(transfer["destination"], want)
+        self.assertNotIn("Storing the full path", said)
+
+    def test_a_unc_path_is_left_alone(self):
+        transfer, said = self.choose("\\\\tower\\cctv\\TL\n")
+        self.assertEqual(transfer["destination"], "\\\\tower\\cctv\\TL")
+        self.assertNotIn("Storing the full path", said)

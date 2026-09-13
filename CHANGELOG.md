@@ -111,6 +111,18 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Windows: a transfer destination typed as a plain folder name is stored in
+  full.** `videos` was stored exactly as typed and resolved, at 00:05, against
+  whatever folder the nightly task happened to start in, which for a system
+  task is `C:\Windows\System32`. The wizard's own write test passed, because
+  it resolved the same name against its own folder, so the setting looked
+  checked and could not work.
+
+- **Removing or disabling a camera no longer counts days it has already
+  encoded.** If you keep your frames (`delete_frames_on_success: false`), the
+  warning counted every day the camera had ever captured and offered to
+  re-encode days that were finished months ago.
+
 - **Ctrl-C at a camera's password prompt now leaves the wizard.** It returned
   an empty password instead, and the wizard carried on and stored the camera
   with it, so the interruption looked like it had worked and produced a camera

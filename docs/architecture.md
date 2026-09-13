@@ -1017,7 +1017,13 @@ install never means reinstalling or re-answering everything:
    captured, and permanently, since nothing else will ever encode it.
    `warn_stranded()` counts the un-encoded day directories and names the
    `timelapse encode --date` that would rescue them; `rename_camera_frames()`
-   offers to move the directory instead. Disabling being just as destructive as
+   offers to move the directory instead. **Un-encoded means what the encoder
+   means by it** (0.2.1): `pending_days()` calls `day_encoded()` rather than
+   counting directories, because with `delete_frames_on_success` off every day
+   this camera ever encoded is still there, and the warning was naming them
+   all and sending the operator to re-encode days the encoder would skip. The
+   wizard agreeing with the encoder, rather than restating it, is the same
+   rule `try_rsync_args()` is under. Disabling being just as destructive as
    removing is the non-obvious half, and is why `x` warns as loudly as `r`.
 
 `redact_url()` masks credentials in the listing (§4.9 has the rule and why it
@@ -2415,6 +2421,18 @@ split token is still the same user and so the same hive. It covers persistent
 mappings; for a letter neither source resolves, the wizard refuses and asks for
 the UNC, since from there a non-persistent mapping and a typo are
 indistinguishable and want the same answer.
+
+**And a relative destination is the same trap without the letter** (0.2.1).
+`videos` and `D:timelapse` were stored exactly as typed, and both are resolved
+at 00:05 against the *task's* working directory, which for a LocalSystem task
+is System32. The wizard's own write probe passed, because it resolved them
+against the wizard's directory instead: a check agreeing with a setting that
+cannot work. `ntpath.isabs()` decides, **by name rather than through
+`os.path`**, because the path being judged belongs to Windows whoever is
+asking and `os.path` is posixpath on the Linux CI legs, where it calls
+`C:\videos` relative. Writing that line with `os.path` first broke five
+existing tests on Linux and none on Windows, which is the trap describing
+itself.
 
 **Colour is a platform question, not just an `isatty()` one.** A Windows
 console understands ANSI escapes only once `ENABLE_VIRTUAL_TERMINAL_PROCESSING`

@@ -16,6 +16,7 @@ Every question has a default in [brackets]; pressing Enter accepts it.
 import argparse
 import errno
 import json
+import ntpath
 import os
 import re
 import select
@@ -1299,14 +1300,25 @@ def camera_frames_dir(cfg, name):
 
 
 def pending_days(cfg, name):
-    """Completed day directories this camera has captured but not yet encoded."""
+    """Completed day directories this camera has captured but not yet encoded.
+
+    `day_encoded()` rather than a second opinion about it: with
+    `delete_frames_on_success` off, every day this camera ever encoded is still
+    on disk, so counting directories told the operator that removing a camera
+    would strand N days and sent them to `timelapse encode --date` for days
+    that carry a marker and would be skipped. `find_pending()` is the function
+    the encoder decides with, and this is the wizard agreeing with it rather
+    than restating it.
+    """
+    from timelapse_encode import day_encoded
     d = camera_frames_dir(cfg, name)
     if not d.is_dir():
         return []
     today = date.today().isoformat()
     try:
         return sorted(p for p in d.iterdir()
-                      if p.is_dir() and DAY_DIR_RE.match(p.name) and p.name < today)
+                      if p.is_dir() and DAY_DIR_RE.match(p.name)
+                      and p.name < today and not day_encoded(p))
     except OSError:
         return []
 
@@ -2533,6 +2545,21 @@ def choose_windows_destination(cfg):
         note("or a network path instead.")
         cfg["transfer"]["enabled"] = False
         return
+
+    # `videos` and `D:timelapse` were stored exactly as typed, and both are
+    # resolved at 00:05 against the *task's* working directory, which for a
+    # LocalSystem task is System32. The wizard's own write probe passed,
+    # because it resolves against this process's directory instead, so the
+    # check agreed with a setting that cannot work: the drive-letter trap in a
+    # third disguise. A UNC path is already absolute and survives untouched.
+    # ntpath.isabs by name, never os.path.isabs: the path being judged belongs
+    # to Windows whoever is asking, and os.path is posixpath on the Linux CI
+    # legs, where it calls a drive-lettered path and a UNC path relative and
+    # would "fix" both into the runner's working directory. The resolution
+    # below is os.path, because that question is about the running machine.
+    if not ntpath.isabs(dest):
+        dest = os.path.abspath(dest)
+        note(f"Storing the full path: {dest}")
 
     # The single most likely way a Windows install fails, and it fails in a
     # way that reads as this tool being broken: drive mappings are per logon
