@@ -1007,8 +1007,15 @@ def console_codec():
 # ----------------------------------------------------------------------------
 
 
-def mount_fstype(path):
+def mount_fstype(path, mounts_path="/proc/mounts"):
     """Filesystem type backing `path`, and its mount point. ('', None) if none.
+
+    The file is a parameter for the reason `scan_mounts()`'s is: a synthetic
+    one is how both branches get tested on both CI legs. It is read whole
+    rather than iterated, which also closes it; `for line in open(...)` leaked
+    the handle, and a ResourceWarning is invisible here (this returns before
+    the open on Windows) and intermittent there (it depends on when the object
+    is finalised).
 
     Linux only, by reading `/proc/mounts`; Windows has no equivalent question,
     because a UNC path is not mounted and a drive letter's kind is what
@@ -1019,7 +1026,8 @@ def mount_fstype(path):
         return "", None
     try:
         entries = []
-        for line in open("/proc/mounts", encoding="utf-8"):
+        raw = Path(mounts_path).read_text(encoding="utf-8").splitlines()
+        for line in raw:
             parts = line.split()
             if len(parts) >= 3:
                 entries.append((parts[1].replace("\\040", " "), parts[2]))

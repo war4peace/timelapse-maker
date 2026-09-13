@@ -22,11 +22,13 @@ import json
 import logging
 import logging.handlers
 import os
+import gc
 import re
 import shutil
 import subprocess
 import tempfile
 import unittest
+import warnings
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
@@ -2415,16 +2417,33 @@ class TestTheOsProbesLiveHere(unittest.TestCase):
         with mock.patch.object(plat, "IS_WINDOWS", True):
             self.assertEqual(plat.mount_fstype("C:\\videos"), ("", None))
 
+    def mounts_file(self):
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return write_mounts(tmp, ["proc /proc proc rw 0 0",
+                                  "//tower/cctv /mnt/nas cifs rw 0 0",
+                                  "/dev/sda1 / ext4 rw 0 0"])
+
     def test_a_linux_mount_type_is_read_from_proc(self):
-        mounts = ("proc /proc proc rw 0 0\n"
-                  "//tower/cctv /mnt/nas cifs rw 0 0\n"
-                  "/dev/sda1 / ext4 rw 0 0\n")
-        with mock.patch.object(plat, "IS_WINDOWS", False), \
-                mock.patch("builtins.open",
-                           mock.mock_open(read_data=mounts)):
+        with mock.patch.object(plat, "IS_WINDOWS", False):
             # The longest matching mount point wins, or every path under a
             # share reports the root filesystem.
-            self.assertEqual(plat.mount_fstype("/mnt/nas/tl")[0], "cifs")
+            self.assertEqual(
+                plat.mount_fstype("/mnt/nas/tl", self.mounts_file())[0], "cifs")
+
+    def test_it_closes_the_file_it_reads(self):
+        """A suite that prints a ResourceWarning is one line away from printing
+        a real one nobody reads. This one reached a WSL run of 2,390 tests and
+        not the run before it, which is what an unclosed handle looks like:
+        reported whenever the object happens to be finalised."""
+        with mock.patch.object(plat, "IS_WINDOWS", False), \
+                warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            plat.mount_fstype("/mnt/nas/tl", self.mounts_file())
+            gc.collect()
+        leaked = [str(w.message) for w in caught
+                  if issubclass(w.category, ResourceWarning)]
+        self.assertEqual(leaked, [])
 
     def test_installing_cifs_utils_says_nothing(self):
         """The wizard owns the talking.

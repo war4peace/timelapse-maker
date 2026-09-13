@@ -4711,7 +4711,7 @@ scripts/timelapse_test.py        pre-flight checks + usage report, 1092 lines
 scripts/timelapse_setup.py       configuration wizard, 4928 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2990 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 510 lines
-scripts/timelapse_platform.py    the only platform branch, 2597 lines
+scripts/timelapse_platform.py    the only platform branch, 2605 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 438 lines
 scripts/timelapse_web.py         read-only web UI, 3596 lines
 tests/_support.py                path setup and fakes
