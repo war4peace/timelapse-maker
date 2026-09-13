@@ -24,7 +24,20 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+# No PrivateDevices here, deliberately: it hides /dev/nvidia*, and an encode
+# that cannot see the GPU falls back to libx264 and succeeds, taking hours
+# instead of minutes, with nothing to say why.
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# AF_UNIX is not optional: it is how a child reaches systemd, journald and
+# the resolver. The three together are what this program can possibly need,
+# and everything else (netlink route dumps, packet sockets, bluetooth) is
+# refused. Verified on real systemd, because a missing family here presents
+# as a name that will not resolve rather than as an error about sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadWritePaths=/var/lib/timelapse
 
-[Install]
-WantedBy=multi-user.target
+# No [Install] section. This is started by timelapse-encode.timer and by nothing
+# else, and `systemctl enable` on a timer-fired oneshot means "also run it at
+# every boot", which for the encode is a full backlog pass at the worst
+# possible moment. Enable the timer instead; the installer does.

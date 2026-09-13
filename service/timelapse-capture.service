@@ -24,6 +24,15 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+# AF_UNIX is not optional: it is how a child reaches systemd, journald and
+# the resolver. The three together are what this program can possibly need,
+# and everything else (netlink route dumps, packet sockets, bluetooth) is
+# refused. Verified on real systemd, because a missing family here presents
+# as a name that will not resolve rather than as an error about sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 ReadWritePaths=/var/lib/timelapse
 
 [Install]

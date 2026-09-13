@@ -111,6 +111,19 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Linux: the capture, encode and watch services are sandboxed like the web
+  UI already was.** The daemon that holds your camera passwords could reach
+  kernel tunables, control groups, devices and any kind of socket; the page
+  that lists video files could not. `systemd-analyze security` rates capture
+  8.4 before and 7.0 after. The nightly encode keeps its access to the GPU, or
+  it would quietly fall back to software encoding and take hours.
+
+- **Linux: `systemctl enable timelapse-encode.service` no longer runs an
+  encode at every boot.** That unit is started by its timer; enabling it
+  directly also wired it into startup, which is a full backlog pass at the
+  worst possible moment. The timer is what to enable, and what the installer
+  has always enabled.
+
 - **The installer no longer prints two errors per question when it is run
   without a terminal.** Over `ssh host sudo bash install.sh`, or from a job
   runner, it thought a terminal was there, failed to use it, and took every

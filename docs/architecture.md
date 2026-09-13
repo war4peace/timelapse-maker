@@ -4691,6 +4691,40 @@ Dependencies: Python 3.9+ stdlib, `requests`, `ffmpeg`/`ffprobe` (NVENC for
 AV1/HEVC), `rsync`. No virtualenv required, one pip package, no database. The
 web UI adds nothing: it is `http.server` and the stdlib.
 
+**The daemons are hardened like the page that lists files** (0.2.1, L38).
+They were not: `timelapse-web.service` carried `RestrictAddressFamilies`,
+`ProtectKernelTunables`, `ProtectControlGroups` and `PrivateDevices`, and the
+capture daemon, which holds every camera password and talks to the LAN, had
+none of the four. Capture and watch now have all four; encode has three,
+because **`PrivateDevices=true` hides `/dev/nvidia*`** and an encode that
+cannot see the GPU falls back to libx264 and *succeeds*, taking hours instead
+of minutes with nothing to say why. Measured on systemd 255:
+`systemd-analyze security` moves the daemon from **8.4 EXPOSED to 7.0
+MEDIUM**, the same score the web unit has.
+
+The two timer-fired oneshots also lost their `[Install]` sections. They
+carried `WantedBy=multi-user.target`, so `systemctl enable
+timelapse-encode.service` ran a full backlog pass at every boot, which is the
+worst possible moment for one; neither is ever enabled directly, because the
+installer enables the timers. They report `static` now, and `systemctl enable`
+on them explains itself and exits 0 rather than failing, so the check for this
+reads `is-enabled`, not the exit code.
+
+**Verified by running it, not by reading it** (`temp/l38_wsl.sh`): a real
+install on systemd 255, a camera served on 127.0.0.1, the daemon started under
+the new set, four frames captured through a resolved hostname, and nothing in
+the journal about sockets or name resolution. That last one is the point of
+doing it live: a missing address family presents as a name that will not
+resolve, not as an error about sockets.
+
+**The first run of that harness failed, and the reason is the older trap.**
+The daemon exited `226/NAMESPACE`, which reads as the new sandboxing breaking
+it. It was the harness: systemd refuses to start a unit whose
+`ReadWritePaths` names a directory that does not exist, and the config had
+been pointed at `/srv/tl/frames` without creating it. Bisecting the four
+directives one at a time (`temp/l38_bisect.sh`) showed every one of them
+starting cleanly, which is what sent the search back to the paths.
+
 All three systemd units use `ProtectSystem=strict` with an explicit
 `ReadWritePaths`. **Any new write path (a different frames root, a CIFS
 mountpoint for transfer) must be added there**, or writes fail with a
