@@ -1365,6 +1365,36 @@ dropped NAS mount is a *correct* empty library, not a fault.
   `Host` is validated against `HOST_RE` before it goes into the file, and
   `X-Forwarded-Proto` is honoured only for the literal values `http`/`https`,
   so a reverse proxy terminating TLS produces working links.
+- **One file is one row, and containment was not enough to make that true**
+  (0.2.1). `abs_path()` proved the *resolved* path was inside the library and
+  the caller then stored `rel`, the request's own spelling, as the primary key
+  of the files table. `Path.resolve()` accepts `.`, `..`, `//` and components
+  that do not exist, so `./Gate.mkv`, `nope/../Gate.mkv` and `2024-01//Roof.mkv`
+  all landed on the right file, passed the containment check, and each inserted
+  a row that nothing ever prunes. Measured (`temp/h6_probe.py`, the shipped
+  build and the old one loaded side by side from source): two files, six
+  spellings, **seven rows**. On a live server with a login configured, 200 HEAD
+  requests carrying a 58 KB `./` prefix took the index from 0.21 MB to 46.78 MB
+  at 21.5 MB/s, and needed no password, because `/video/` sits outside the
+  login by design so VLC can follow an `.m3u` without a cookie jar. The index
+  normally shares a filesystem with the frames, which makes that free space,
+  and free space below `capture.min_free_gb` pauses capture: a LAN client with
+  no credentials could stop the recording. The gated side had the same hole
+  through `?folder=`, where attacker-chosen text such as `nope/..` then
+  persisted in the Folders table until a restart. Escaping held throughout, so
+  there was no XSS.
+  The rule now is **refuse any spelling this index would not have generated
+  itself**: `posixpath.normpath(rel) == rel`, not absolute by either
+  platform's reckoning, not `..` or below it, and the resolved path equal *as
+  text* to the plain join. That last one earns its place twice over. It refuses
+  a symlinked component, which the scan already skips (`follow_symlinks=False`)
+  and `reconcile_file()` did not. And it is compared as text rather than as
+  `Path`, because `Path` equality on Windows is case-insensitive while
+  `resolve()` hands back the spelling on disk, so `gate.mkv` and `Gate.mkv`,
+  one file on NTFS, would otherwise be two rows on the platform the Windows
+  port runs on. What that does not reach is a case-insensitive share mounted on
+  Linux, where `resolve()` normalises no case and the second spelling stats
+  fine; the same limit `same_file_name()` states, and the same reason.
 - **The extension allow-list is enforced in `reconcile_file()`, not only in the
   scan.** `/video/<path>` resolves through it, and without the check a request
   could name any file the user keeps beside their videos; `abs_path()` stops
@@ -3418,7 +3448,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,149 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,163 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4162,7 +4192,7 @@ scripts/timelapse_gui.py         the same wizard in a window, 2946 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2377 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
-scripts/timelapse_web.py         read-only web UI, 3521 lines
+scripts/timelapse_web.py         read-only web UI, 3560 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_cli.py                unit tests

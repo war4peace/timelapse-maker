@@ -35,6 +35,22 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Security
 
+- **The web UI's video index can no longer be made to grow without limit by
+  anyone who can reach it.** A file could be asked for under many spellings
+  of the same path (`./name.mkv`, `folder/../name.mkv`, `folder//name.mkv`),
+  and each one was recorded as a separate entry in the index, for the same
+  one video. Video requests are deliberately outside the optional login, so
+  VLC can follow a playlist without signing in, which meant no password was
+  needed: a few hundred requests from anything on the network took the index
+  from a fifth of a megabyte to forty-seven. The index normally sits on the
+  same disk as the frames, and this program pauses capture when that disk
+  runs low on space, so this could stop the recording.
+
+  Only spellings the program itself produces are accepted now. Every link on
+  every page and every playlist it has ever written uses one, so nothing you
+  can click changes. Nothing was ever served from outside the library folder,
+  and nothing entered the page as text.
+
 - **`timelapse test` no longer prints the camera password when a snapshot
   fetch fails.** The pre-flight reported `request failed - <exception>`, and
   the exception `requests` raises carries the URL it was fetching: for a

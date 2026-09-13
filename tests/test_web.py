@@ -1339,6 +1339,152 @@ class TestIndexReconcile(IndexCase):
         self.assertIsNone(self.index.get("Gate.20260707.mkv"))
 
 
+class TestOneFileIsOneRow(IndexCase):
+    """Containment keeps a request inside the library; this keeps it to one
+    spelling.
+
+    `rel` is the primary key of the files table and it is stored as the
+    request spelled it, while Path.resolve() accepts `.`, `..`, `//` and
+    components that do not exist. So every spelling of one file resolved to
+    the same contained path and inserted a different row, and nothing prunes
+    by spelling. `/video/` is outside the login by design, so no password was
+    needed: measured on a live server, 200 HEAD requests with a 58 KB `./`
+    prefix took the index from 0.21 MB to 46.78 MB. The index normally shares
+    a filesystem with the frames, and free space under capture.min_free_gb
+    pauses capture.
+
+    Platform-independent: the spellings are `/`-separated, which is what the
+    index stores on both.
+    """
+
+    ONE = "Gate.20260707.mkv"
+
+    def setUp(self):
+        super().setUp()
+        self.scan()
+        self.before = self.index.totals()["n"]
+
+    def unchanged(self):
+        self.assertEqual(self.index.totals()["n"], self.before)
+
+    def test_the_spelling_the_index_generated_still_works(self):
+        """The control, and it has to come first: refusing everything would
+        pass every other test in this class and serve no videos."""
+        self.assertIsNotNone(self.index.reconcile_file(self.ONE))
+        self.unchanged()
+
+    def test_a_leading_dot_slash_is_not_a_second_file(self):
+        self.assertIsNone(self.index.reconcile_file("./" + self.ONE))
+        self.unchanged()
+
+    def test_a_dot_dot_that_comes_back_is_not_a_second_file(self):
+        """It lands inside the library, which is why containment says yes."""
+        self.assertIsNone(self.index.reconcile_file("2024-01/../" + self.ONE))
+        self.unchanged()
+
+    def test_a_doubled_separator_is_not_a_second_file(self):
+        self.assertIsNone(
+            self.index.reconcile_file("2024-01//2024-01-01_Workshop.mp4"))
+        self.unchanged()
+
+    def test_a_repeated_prefix_is_not_a_thousand_files(self):
+        """The cheap form of the attack: one file, as many rows as the client
+        cares to spell."""
+        for n in (1, 2, 40):
+            self.assertIsNone(self.index.reconcile_file("./" * n + self.ONE))
+        self.unchanged()
+
+    def test_an_absolute_path_inside_the_root_is_refused(self):
+        """Containment cannot see this one at all: the file really is in the
+        library, so commonpath agrees, and the row would be keyed on an
+        absolute path that no link on any page could produce."""
+        self.assertIsNone(self.index.reconcile_file(str(self.root / self.ONE)))
+        self.unchanged()
+
+    def test_a_trailing_separator_is_refused(self):
+        self.assertIsNone(self.index.abs_path("2024-01/"))
+
+    def test_a_folder_view_cannot_invent_folders_either(self):
+        """The same hole on the gated side, through ?folder=. It listed `.`
+        and `nope/..` in the Folders table, which is attacker-chosen text
+        persisting until a restart."""
+        self.assertFalse(self.index.reconcile_dir("./2024-01"))
+        self.assertFalse(self.index.reconcile_dir("2024-01/../2024-01"))
+        self.assertIsNotNone(self.index.abs_path("2024-01"))
+
+    def test_traversal_out_of_the_library_is_still_refused(self):
+        """Unchanged, and worth keeping here: the new rules must not have
+        replaced the containment check, only added to it."""
+        for rel in ("../etc/passwd", "..", "../../etc",
+                    "2024-01/../../outside"):
+            self.assertIsNone(self.index.abs_path(rel), rel)
+
+    def test_a_case_variant_is_not_a_second_row(self):
+        """On NTFS `Gate.mkv` and `gate.mkv` are one file, so a second
+        spelling is a second row for one video, which is this finding on the
+        platform the Windows port runs on. On ext4 they are two files and the
+        second simply is not there.
+
+        Which mechanism refuses it follows the *filesystem*, so that is what
+        the test declares, the way same_file_name() does. Neither may add a
+        row.
+        """
+        folds = os.path.normcase("A") == os.path.normcase("a")
+        self.assertIsNone(self.index.reconcile_file("gate.20260707.mkv"))
+        self.unchanged()
+        if folds:
+            # resolve() hands back the spelling on disk, so the comparison
+            # with what was asked for is what refuses this.
+            self.assertIsNone(self.index.abs_path("gate.20260707.mkv"))
+        else:
+            # Nothing to refuse: the path is fine and there is no file at it.
+            self.assertIsNotNone(self.index.abs_path("gate.20260707.mkv"))
+
+    def test_a_file_named_with_two_dots_is_not_traversal(self):
+        """`..mkv` starts with two dots and is an ordinary name. Refusing it
+        would be the check being broader than the rule it enforces."""
+        (self.root / "..Gate.mkv").write_bytes(b"\0" * 4096)
+        self.assertIsNotNone(self.index.abs_path("..Gate.mkv"))
+
+
+class TestServingRefusesASecondSpelling(IndexCase):
+    """Through the real handler, which is where it matters: /video/ is
+    deliberately outside the login so VLC can follow an .m3u without a cookie
+    jar, so these requests need no password at all.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.config = cfg(self.tmp, transfer={"enabled": True,
+                                              "destination": str(self.root)})
+        self.scan()
+
+    def get(self, path, **kw):
+        return request(path, self.config, self.index,
+                       auth=web.Auth("x" * 60), **kw)
+
+    def test_the_real_path_is_served(self):
+        """The control. With a login configured, because that is the
+        configuration the finding is about."""
+        status, _, _ = self.get("/video/Gate.20260707.mkv")
+        self.assertEqual(status, 200)
+
+    def test_a_dot_slash_spelling_is_a_404(self):
+        before = self.index.totals()["n"]
+        status, _, _ = self.get("/video/./Gate.20260707.mkv")
+        self.assertEqual(status, 404)
+        self.assertEqual(self.index.totals()["n"], before)
+
+    def test_a_head_request_adds_nothing_either(self):
+        """The measured attack was HEAD, because the response body is the
+        video and the row is written before a byte of it is sent."""
+        before = self.index.totals()["n"]
+        for n in (1, 5, 20):
+            self.get("/video/" + "./" * n + "Gate.20260707.mkv",
+                     method="HEAD")
+        self.assertEqual(self.index.totals()["n"], before)
+
+
 class TestIndexSafety(IndexCase):
 
     def test_traversal_is_refused(self):

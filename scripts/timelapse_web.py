@@ -33,6 +33,7 @@ import hmac
 import json
 import logging
 import os
+import posixpath
 import re
 import secrets
 import signal
@@ -635,15 +636,53 @@ class Index:
         Nothing from a request should reach the filesystem unchecked, even
         while this phase only stats. commonpath rather than startswith: the
         latter accepts /library-old for a root of /library.
+
+        **Containment was necessary and not sufficient**, because `rel` is
+        also the primary key of the files table and it is stored as the
+        request spelled it. `Path.resolve()` accepts `.`, `..`, `//` and
+        components that do not exist, so every spelling of one file resolved
+        to the same contained path and inserted a *different* row:
+        `./Gate.mkv`, `nope/../Gate.mkv`, `2024-01//Roof.mkv`. Measured
+        against a live server with a login configured, 200 HEAD requests
+        carrying a 58 KB `./` prefix took the index from 0.21 MB to 46.78 MB,
+        and `/video/` is outside the login by design, so no password was
+        needed. The index normally shares a filesystem with the frames, which
+        makes that free space, and free space under `capture.min_free_gb`
+        pauses capture.
+
+        So the rule is: refuse any spelling this index would not have
+        generated itself. One path, one row. `posixpath` because the stored
+        spelling is always `/`-separated whatever the platform, but
+        `os.path.isabs` as well, because what happens next is a real
+        filesystem call and the running machine is the subject of that one.
         """
         if self.root is None:
             return None
-        candidate = (self.root / rel).resolve() if rel else self.root.resolve()
         try:
             root = self.root.resolve()
+        except OSError:
+            return None
+        rel = str(rel)
+        if not rel:
+            return root                  # normpath("") is ".", so say it here
+        if (posixpath.normpath(rel) != rel
+                or posixpath.isabs(rel) or os.path.isabs(rel)
+                or rel == ".." or rel.startswith("../")):
+            return None
+        candidate = (root / rel).resolve()
+        try:
             if os.path.commonpath([str(root), str(candidate)]) != str(root):
                 return None
         except (OSError, ValueError):
+            return None
+        # The last word, and the one that makes the row unique: resolving may
+        # still have landed somewhere other than where it was asked to, through
+        # a symlink or through a case this filesystem folds together. The index
+        # generates neither. Compared as *text*, because Path equality on
+        # Windows is case-insensitive and case is half of what this catches:
+        # `gate.mkv` and `Gate.mkv` are one file on NTFS, and resolve() hands
+        # back the spelling on disk.
+        if str(candidate) != str(root / rel):
             return None
         return candidate
 
