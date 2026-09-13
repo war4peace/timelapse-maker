@@ -178,8 +178,10 @@ def test_rtsp(cam, cfg):
     name = cam["name"]
     OUT.mkdir(parents=True, exist_ok=True)
     sample = OUT / f"{name}.jpg"
+    # `warning` rather than `error`, for the reason grab_snapshot_rtsp()
+    # gives: at error level every RTSP failure reads the same.
     cmd = [cfg["paths"]["ffmpeg"], "-y", "-nostdin", "-hide_banner",
-           "-loglevel", "error", "-rtsp_transport", "tcp",
+           "-loglevel", "warning", "-rtsp_transport", "tcp",
            "-i", cam["url"], "-frames:v", "1", "-q:v", "2", str(sample)]
     t0 = time.time()
     try:
@@ -194,9 +196,12 @@ def test_rtsp(cam, cfg):
         # password in its userinfo. This runs under sudo, so unredacted it
         # would land in root's scroll-back and in whatever the operator pastes
         # into a bug report.
-        from timelapse_encode import redact
+        from timelapse_encode import rtsp_reason
+        said, evidence = rtsp_reason(p.stderr)
         bad(f"{name}: RTSP grab failed - "
-            f"{redact((p.stderr or '').strip())[:200]}")
+            f"{said or evidence or 'no output from ffmpeg'}")
+        if said and evidence:
+            info(f"ffmpeg said: {evidence}")
         return None
     size = sample.stat().st_size
     dims = dimensions(cfg["paths"].get("ffprobe", "ffprobe"), sample)

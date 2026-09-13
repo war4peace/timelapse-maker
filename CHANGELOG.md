@@ -111,6 +111,17 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Testing an RTSP camera now says what went wrong instead of "Operation not
+  permitted".** ffmpeg uses that one phrase for several unrelated problems, and
+  the setup window repeated it, so a camera that was refusing the connection
+  because it already had as many viewers as it allows looked exactly like a
+  wrong password. The test now names the likely cause (the camera closed the
+  connection, the credentials were refused, there is no stream at that path,
+  nothing answered) and shows ffmpeg's own line underneath it, no longer cut
+  off in the middle of a word. Worth knowing for the commonest case: capture
+  holds one connection to the camera whenever it is running, and some cameras
+  allow only two.
+
 - **A leftover check file could make the wizard and `timelapse test` report a
   working network destination as unwritable, and keep doing so.** Both write a
   small file to the destination to find out whether they can, and both used the

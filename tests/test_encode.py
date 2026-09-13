@@ -4197,3 +4197,59 @@ class TestTheIdleRunAnswersTheDateItWasGiven(unittest.TestCase):
         self.assertIn("still being captured", said)
         self.assertNotIn("No day folder named", said)
         self.assertIn("No completed day folders", notified[0][2])
+
+
+BUSY_CAMERA = """[in#0 @ 000001e7a2bb4140] Failed reading RTSP data: End of file
+[in#0 @ 000001e7a2bb3e80] Error opening input: Operation not permitted
+Error opening input file rtsp://war4peace:hunter2@192.168.2.209:554/stream1.
+Error opening input files: Operation not permitted
+"""
+
+WRONG_PASSWORD = """[in#0 @ 0000012810c44140] method DESCRIBE failed: 401 (Unauthorized)
+[in#0 @ 0000012810c43e80] Error opening input: Server returned 401 Unauthorized (authorization failed)
+Error opening input file rtsp://war4peace:hunter2@192.168.2.209:554/stream1.
+Error opening input files: Server returned 401 Unauthorized (authorization failed)
+"""
+
+
+class TestExplainingAnRtspFailure(unittest.TestCase):
+    """The operator reported "I cannot connect to my RTSP camera, the
+    credentials are correct". They were: the daemon was pulling frames from it
+    at that moment. The camera was full, and ffmpeg calls that "Operation not
+    permitted", which is also what it calls several other things.
+    """
+
+    def test_a_full_camera_is_not_reported_as_a_credentials_problem(self):
+        said = enc.explain_rtsp(BUSY_CAMERA)
+        self.assertIn("closed it", said)
+        self.assertIn("free client slot", said)
+        self.assertNotIn("credential", said)
+
+    def test_a_refused_password_says_that_instead(self):
+        self.assertIn("refused the credentials", enc.explain_rtsp(WRONG_PASSWORD))
+
+    def test_the_two_do_not_read_the_same(self):
+        self.assertNotEqual(enc.explain_rtsp(BUSY_CAMERA),
+                            enc.explain_rtsp(WRONG_PASSWORD))
+
+    def test_nothing_is_invented_for_an_unfamiliar_failure(self):
+        self.assertEqual(enc.explain_rtsp("something else entirely"), "")
+        self.assertEqual(enc.explain_rtsp(""), "")
+        self.assertEqual(enc.explain_rtsp(None), "")
+
+    def test_the_evidence_is_the_telling_line_not_the_last_one(self):
+        self.assertEqual(enc.rtsp_reason(BUSY_CAMERA)[1],
+                         "Failed reading RTSP data: End of file")
+        self.assertEqual(enc.rtsp_reason(WRONG_PASSWORD)[1],
+                         "method DESCRIBE failed: 401 (Unauthorized)")
+
+    def test_ffmpegs_address_prefix_is_dropped(self):
+        self.assertNotIn("in#0", enc.rtsp_reason(BUSY_CAMERA)[1])
+
+    def test_the_password_never_survives(self):
+        text = "Error opening input file rtsp://war4peace:hunter2@h/stream1."
+        self.assertNotIn("hunter2", enc.rtsp_reason(text)[1])
+
+    def test_it_cuts_on_a_line_and_never_mid_word(self):
+        """The screenshot of the old version ends "Error opening in"."""
+        self.assertTrue(enc.rtsp_reason(BUSY_CAMERA)[1].endswith("End of file"))

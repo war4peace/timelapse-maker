@@ -545,6 +545,59 @@ def driver_mismatch(message="", runner=None):
     return True if any(k in text for k in MISMATCH_MARKERS) else False
 
 
+def explain_rtsp(stderr):
+    """What an RTSP failure actually was, in one sentence. "" if unrecognised.
+
+    ffmpeg's summary is the same sentence for several different problems, and
+    the one met in production 2026-09-13 is the worst of them: a camera with no
+    free client slot accepts the connection and then closes it, which arrives
+    as `Operation not permitted`. The operator reads that as a password
+    problem, and the password is correct.
+
+    Keyed on the reason, never on the call, which is the rule `encoder_hint()`
+    was rewritten to follow. Both shapes measured against a real TP-Link camera
+    at `-loglevel warning`: the lowest level that carries the hang-up line, and
+    the highest that prints no Authorization header.
+    """
+    text = stderr or ""
+    if "401" in text and "nauthorized" in text:
+        return ("the camera refused the credentials. On several makes the RTSP "
+                "user is a separate camera account, not the login for the "
+                "vendor's app.")
+    if "Failed reading RTSP data" in text or "End of file" in text:
+        return ("the camera accepted the connection and then closed it, which "
+                "usually means it has no free client slot. Capture holds one "
+                "whenever it is running, and some cameras allow only two.")
+    if "404" in text and "ot Found" in text:
+        return "the camera has no stream at that path."
+    if "Connection refused" in text or "No route to host" in text:
+        return "nothing answered at that address and port."
+    return ""
+
+
+def rtsp_reason(stderr):
+    """(explanation, evidence): what happened, and ffmpeg's own words for it.
+
+    Cut on a line, never mid-word. The old callers took the first 160 or 200
+    characters of everything ffmpeg had said, and the operator's screenshot of
+    that ends "Error opening in", which reads as this program having crashed.
+    """
+    lines = []
+    for raw in (stderr or "").splitlines():
+        line = raw.strip()
+        # Drop ffmpeg's "[in#0 @ 000001f7d2453fc0] " prefix: an address is
+        # noise in a message an operator is meant to act on.
+        if line.startswith("[") and "] " in line:
+            line = line.split("] ", 1)[1]
+        if line:
+            lines.append(line)
+    telling = [l for l in lines
+               if l.startswith(("Failed reading RTSP data", "method ",
+                                "Error opening input:"))]
+    evidence = telling[0] if telling else (lines[-1] if lines else "")
+    return explain_rtsp(stderr), redact(evidence)[:200]
+
+
 def encoder_hint(codec, message, built_in=None, mismatch=None):
     """Plain-language cause for a failed probe, or '' if there is nothing useful.
 

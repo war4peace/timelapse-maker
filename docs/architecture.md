@@ -355,6 +355,21 @@ Two things follow, and both are the point rather than the fix:
   probe: **a probe must produce what the pipeline produces.**
   `smoke_test.py`'s `rtsp_writer_check()` now takes the argv from
   `RtspCamera._cmd()` itself and swaps only the input, so it cannot drift.
+- **Both probes ask ffmpeg for `warning`, not `error`** (0.2.1). At `error` the
+  whole of an RTSP failure is `Operation not permitted`, and that one sentence
+  covers a wrong stream path, a refused connection and the case met in
+  production: a camera with no free client slot, which accepts the connection
+  and then closes it. One level up carries the line that separates them,
+  `Failed reading RTSP data: End of file`, and stays below the level that
+  prints an `Authorization` header, so the only secret in the output is the URL
+  `redact()` already masks. Measured both ways against a real TP-Link camera,
+  with the busy case reproduced by holding its one spare slot open.
+  `explain_rtsp()` names the cause and `rtsp_reason()` keeps ffmpeg's telling
+  line as evidence, cut on a line rather than at 160 characters, which used to
+  end an operator's report mid-word. **The report that found it was "I cannot
+  connect to my RTSP camera, the credentials are correct", and they were**: the
+  daemon was pulling frames from that camera while the wizard said it could
+  not reach it.
 - **`_discard_empty_day()` is the other half.** Creating the directory
   ourselves means an unreachable camera would leave one empty directory per
   day for ever, since the encoder `SKIP`s a short day and does not clean up.
@@ -378,6 +393,16 @@ SERVICE_STOPPED is reported, the process exits, and **ffmpeg is orphaned**. It
 keeps writing into today's directory until its own `-t` expires at midnight,
 and a service restart launches a second one with `-y` on the same pattern, so
 two writers race on one directory.
+
+**Measured on the operator's machine 2026-09-13, where the cost turned out to
+be worse than two writers.** An orphan also holds the camera's RTSP session.
+That camera permits two clients, capture holds one, the orphan held the other,
+and the wizard's camera test was then refused by the camera and reported as
+`Operation not permitted`, which reads as a wrong password. The frames of that
+day arrived in pairs four seconds apart on a fifteen second cycle, which is the
+123 seconds between the two service starts modulo the cadence. Two restarts in
+one day would therefore leave capture itself unable to connect until midnight,
+when the orphans' own `-t` expires.
 
 `_supervise()` polls `proc.wait(timeout=SUPERVISE_POLL)` and ends the process
 when `STOP` or `PAUSED` is set, keeping the terminate-then-kill ladder. Three
@@ -407,8 +432,14 @@ ffmpeg running after SIGTERM, and against the shipped one leaves none. WSL has
 no RTSP server (measured at 0.1.7), so ffmpeg is reached through a stub that
 takes the daemon's own output pattern and generates frames from lavfi, which
 makes the supervised process a genuine long-running ffmpeg writing real frames.
-**The Windows half is what only the operator can check**: `Get-Process ffmpeg`
-after `sc stop "TimelapseCapture"` with an RTSP camera configured.
+**The Windows half is confirmed**, 2026-09-13, though not by the harness
+written for it. The operator restarted capture from the wizard while enabling
+an RTSP camera, and `capture-20260913.log` recorded both HTTP threads stopping
+in one second, **no `rtsp grabber stopped` line at all**, and `exited cleanly`
+twenty seconds later on the join timeout, while the process table showed the
+previous instance's ffmpeg still running with its parent gone. So the defect is
+measured on Windows; the fix is not, and `temp/h10_win_check.ps1` is waiting
+for a machine with 0.2.1 installed.
 
 **`DiskGuard(threading.Thread)`**
 
@@ -4706,9 +4737,9 @@ installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1584 lines
-scripts/timelapse_encode.py      batch job, 2447 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 1092 lines
-scripts/timelapse_setup.py       configuration wizard, 4928 lines
+scripts/timelapse_encode.py      batch job, 2500 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 1097 lines
+scripts/timelapse_setup.py       configuration wizard, 4936 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2990 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 510 lines
 scripts/timelapse_platform.py    the only platform branch, 2605 lines

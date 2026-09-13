@@ -416,3 +416,41 @@ class TestAStatCanBeRefusedRatherThanMissing(unittest.TestCase):
         said = out.getvalue()
         self.assertIn("Cannot tell whether", said)
         self.assertNotIn("does not exist yet", said)
+
+
+class TestThePreflightsRtspProbeKeepsTheDiagnosis(unittest.TestCase):
+    """The same fix as the wizard's, in the copy next door. Both hand-roll the
+    argv the daemon builds in RtspCamera._cmd(), which is its own finding."""
+
+    BUSY = """[in#0 @ 1] Failed reading RTSP data: End of file
+[in#0 @ 2] Error opening input: Operation not permitted
+"""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        # OUT defaults to the system temp directory, and a test writes inside
+        # its own or nowhere.
+        p = mock.patch.object(tt, "OUT", self.tmp / "samples")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def probe(self):
+        cfg = {"paths": {"ffmpeg": "ffmpeg"}}
+        cam = {"name": "Hallway", "url": "rtsp://war4peace:hunter2@h/stream1"}
+        result = mock.Mock(returncode=1, stderr=self.BUSY)
+        with mock.patch.object(tt.subprocess, "run", return_value=result) as run,                 contextlib.redirect_stdout(io.StringIO()) as out:
+            size = tt.test_rtsp(cam, cfg)
+        return run.call_args[0][0], size, out.getvalue()
+
+    def test_it_asks_ffmpeg_for_warnings_not_only_errors(self):
+        argv, _size, _said = self.probe()
+        self.assertIn("warning", argv)
+        self.assertNotIn("error", argv)
+
+    def test_it_says_what_the_failure_was(self):
+        _argv, size, said = self.probe()
+        self.assertIsNone(size)
+        self.assertIn("free client slot", said)
+        self.assertIn("End of file", said)
+        self.assertNotIn("hunter2", said)

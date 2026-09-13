@@ -2388,8 +2388,11 @@ def grab_snapshot_rtsp(cam, cfg):
     t0 = time.time()
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "frame.jpg"
+        # `warning`, not `error`: at error level every RTSP failure is
+        # "Operation not permitted", and the line that separates a full camera
+        # from a wrong path is one level above it.
         cmd = [cfg["paths"]["ffmpeg"], "-y", "-nostdin", "-hide_banner",
-               "-loglevel", "error", "-rtsp_transport", "tcp",
+               "-loglevel", "warning", "-rtsp_transport", "tcp",
                "-i", cam["url"], "-frames:v", "1", "-q:v", "2", str(out)]
         try:
             p = subprocess.run(cmd, capture_output=True, text=True,
@@ -2403,9 +2406,14 @@ def grab_snapshot_rtsp(cam, cfg):
             # ffmpeg quotes the URL it was handed, password and all. The
             # wizard asks for that password with ask_secret() precisely to
             # keep it out of the scroll-back; reporting ffmpeg's complaint
-            # verbatim would hand it straight back.
+            # verbatim would hand it straight back. rtsp_reason() redacts, and
+            # says what the failure was rather than what ffmpeg called it.
+            from timelapse_encode import rtsp_reason
+            said, evidence = rtsp_reason(p.stderr)
             detail["reason"] = ("RTSP grab failed: %s"
-                                % redact_url((p.stderr or "").strip())[:160])
+                                % (said or evidence or "no output from ffmpeg"))
+            if said and evidence:
+                detail["notes"].append("ffmpeg said: %s" % evidence)
             return None, detail
         data = out.read_bytes()
     detail["bytes"] = len(data)

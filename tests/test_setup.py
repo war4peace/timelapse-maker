@@ -6178,3 +6178,42 @@ class TestThePowerShellInstallerDeclaresItsArguments(unittest.TestCase):
             body = body.split("\nfunction ", 1)[0]
             self.assertIn("param(", body,
                           "%s reads its argument by dynamic scope" % name)
+
+
+class TestTheWizardsRtspProbeKeepsTheDiagnosis(unittest.TestCase):
+    """At -loglevel error every RTSP failure is "Operation not permitted", so
+    the wizard told an operator with correct credentials to check them."""
+
+    BUSY = """[in#0 @ 1] Failed reading RTSP data: End of file
+[in#0 @ 2] Error opening input: Operation not permitted
+Error opening input file rtsp://war4peace:hunter2@h:554/stream1.
+"""
+
+    def probe(self):
+        cfg = {"paths": {"ffmpeg": "ffmpeg"}}
+        cam = {"name": "Hallway", "url": "rtsp://war4peace:hunter2@h/stream1"}
+        result = mock.Mock(returncode=1, stderr=self.BUSY)
+        with mock.patch.object(setup.subprocess, "run",
+                               return_value=result) as run:
+            data, detail = setup.grab_snapshot_rtsp(cam, cfg)
+        return run.call_args[0][0], data, detail
+
+    def test_it_asks_ffmpeg_for_warnings_not_only_errors(self):
+        argv, _data, _detail = self.probe()
+        self.assertIn("warning", argv)
+        self.assertNotIn("error", argv)
+
+    def test_the_reason_names_the_cause_rather_than_ffmpegs_word_for_it(self):
+        _argv, data, detail = self.probe()
+        self.assertIsNone(data)
+        self.assertIn("free client slot", detail["reason"])
+        self.assertNotIn("Operation not permitted", detail["reason"])
+
+    def test_ffmpegs_own_line_is_kept_as_a_note(self):
+        _argv, _data, detail = self.probe()
+        self.assertTrue(any("End of file" in n for n in detail["notes"]))
+
+    def test_the_password_reaches_neither(self):
+        _argv, _data, detail = self.probe()
+        self.assertNotIn("hunter2", detail["reason"])
+        self.assertNotIn("hunter2", " ".join(detail["notes"]))
