@@ -95,6 +95,17 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Testing a camera with no terminal no longer loops until it crashes.**
+  `timelapse cameras -t:Gate` from cron or a scheduled task, and any run
+  with `--defaults`, met a camera answering HTTP 401 with an offer to retry
+  under the other authentication scheme. With nobody there, that question
+  answered itself yes every time: digest, basic, digest, about a thousand
+  requests at the camera in a few seconds, and then a Python traceback
+  instead of an answer. The offer is made only where somebody can answer it
+  now; otherwise the check reports the 401 and names the other scheme as the
+  thing to try. Run by hand it still works, and is offered once rather than
+  after every yes.
+
 - **Two encode runs at once no longer destroy the day.** Running `timelapse
   encode` by hand while the nightly one was still going, the natural thing to
   do while clearing a backlog, gave two processes writing the same

@@ -2241,7 +2241,7 @@ def grab_snapshot(cam, cfg, timeout=None):
     return r.content, detail
 
 
-def test_camera(cam, cfg):
+def test_camera(cam, cfg, retried=False):
     if cam["method"] == "rtsp":
         return test_camera_rtsp(cam, cfg)
     data, detail = grab_snapshot(cam, cfg)
@@ -2253,9 +2253,23 @@ def test_camera(cam, cfg):
         if detail["status"] == 401:
             other = "basic" if (cam.get("auth") or "").lower() == "digest" \
                 else "digest"
+            if retried:
+                return False                # one flip, not a pendulum
+            # Offer that flip only where somebody is there to answer it.
+            # ask_yes() hands back its default with no terminal and under
+            # --defaults, and this default is yes, so headless the function
+            # answered itself: digest to basic to digest until the stack ran
+            # out. `timelapse cameras -t:Gate` from cron or a scheduled task
+            # ended in a RecursionError, which reads as this tool being broken
+            # rather than as a wrong password. run_camera_action() refuses the
+            # writing actions headless and lets "test" through, so the path is
+            # reachable by design.
+            if AUTO or _TTY is None:
+                note(f"Try auth '{other}' if the credentials are right.")
+                return False
             if ask_yes(f"Retry with auth '{other}'?", True):
                 cam["auth"] = other
-                return test_camera(cam, cfg)
+                return test_camera(cam, cfg, retried=True)
             return False
         if detail["said"]:
             fail(f"The camera said: {detail['said']}")

@@ -19,6 +19,7 @@ guide.
   - [4.3 `timelapse_test.py`](#43-timelapse_testpy)
   - [4.4 `timelapse_setup.py`](#44-timelapse_setuppy)
   - [4.4b A path with a space in it (0.2.1)](#44b-a-path-with-a-space-in-it-021)
+  - [4.4c A question nobody was there to answer (0.2.1)](#44c-a-question-nobody-was-there-to-answer-021)
   - [4.5 `timelapse_web.py`](#45-timelapse_webpy)
   - [4.6 `timelapse_update.py`](#46-timelapse_updatepy)
   - [4.6a `timelapse_platform.py` (0.2.0)](#46a-timelapse_platformpy-020)
@@ -959,6 +960,43 @@ are already quoted, and shellcheck agrees. Nothing refuses a space at the
 prompt, deliberately: with these two fixed a spaced path works end to end, and
 refusing a working configuration is the mistake `try_rsync_args()` exists
 because of.
+
+#### 4.4c A question nobody was there to answer (0.2.1)
+
+`test_camera()` answers a 401 by offering the other authentication scheme,
+because a Hikvision configured for digest and answering basic is the single
+commonest camera misconfiguration this project meets. It offered it by calling
+`ask_yes("Retry with auth 'basic'?", True)` and then **calling itself**.
+
+`ask()` returns its default under `--defaults` and whenever `init_tty()` found
+no terminal, which is the whole of its headless contract, and this default is
+yes. So with nobody there the function answered its own question: digest to
+basic to digest, with no base case. Measured (`temp/h1_probe.py`, the shipped
+build and the old one loaded side by side from source): **995 requests to the
+camera and then a `RecursionError`**. The traceback is the small half. A
+thousand presentations of a rejected credential in a few seconds is exactly
+what the item 8 back-off ladder exists to stop the daemon doing, arriving from
+the one tool an operator runs *because* a camera is refusing them.
+
+It is reachable by design rather than by accident: `run_camera_action()`
+refuses the writing actions with no terminal and lets `test` through, so
+`timelapse cameras -t:Gate` from cron or a scheduled task reaches it, as does
+any `--defaults` run.
+
+Two guards, because they answer two different questions. The offer is made
+only when `not (AUTO or _TTY is None)`, and headless the useful half of the
+question is **printed** instead: `Try auth 'basic' if the credentials are
+right.` A question with nobody to answer it is not a question, it is an
+assignment, and the fact it carried is worth keeping either way. Then
+`retried` bounds the interactive path too, where a camera that refuses both
+schemes would otherwise ask the same question after every yes; one flip, and
+the second failure reports rather than re-offers.
+
+§4.6d closed the graphical half of this in 0.2.0 by structure, and that stays:
+the window calls `grab_snapshot()` and a test pins that `test_camera()`,
+`ask_yes()` and `ask()` appear nowhere in it. What changes here is where the
+rule lives. Avoiding a function that asks questions works only for callers who
+know to; the function now knows whether anybody is listening.
 
 ### 4.5 `timelapse_web.py`
 
@@ -3233,7 +3271,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,108 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,113 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -3962,7 +4000,7 @@ installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2252 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
-scripts/timelapse_setup.py       configuration wizard, 4755 lines
+scripts/timelapse_setup.py       configuration wizard, 4769 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
 scripts/timelapse_platform.py    the only platform branch, 2344 lines

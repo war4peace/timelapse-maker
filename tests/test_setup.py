@@ -4048,14 +4048,102 @@ class TestGrabSnapshot(unittest.TestCase):
 
     def test_the_console_wizard_still_offers_the_other_auth_scheme(self):
         """A 401 under digest is often basic, and the console has a terminal
-        to ask on. Answering no must not then retry anyway."""
+        to ask on. Answering no must not then retry anyway.
+
+        The terminal is declared rather than inherited: without that this
+        test passes on the headless path, which never asks at all, so it
+        would agree with a version that had stopped offering the retry.
+        """
         out = io.StringIO()
-        with fake_requests(FakeResponse(401, b"")) as session, \
-             contextlib.redirect_stdout(out), \
-             mock.patch.object(setup, "ask_yes", return_value=False):
-            self.assertFalse(setup.test_camera(dict(self.cam), self.cfg))
+        prev = (setup._TTY, setup.AUTO)
+        setup._TTY, setup.AUTO = FakeTTY(""), False
+        try:
+            with fake_requests(FakeResponse(401, b"")) as session, \
+                 contextlib.redirect_stdout(out), \
+                 mock.patch.object(setup, "ask_yes", return_value=False):
+                self.assertFalse(setup.test_camera(dict(self.cam), self.cfg))
+        finally:
+            setup._TTY, setup.AUTO = prev
         self.assertEqual(len(session.asked), 1)
         self.assertIn("401", out.getvalue())
+
+
+class TestTheAuthRetryIsBounded(unittest.TestCase):
+    """A 401 offers the other auth scheme once, and only where it can be
+    answered.
+
+    Platform-independent, unprivileged, and it declares its own terminal
+    rather than inheriting the runner's, since whether there is one is the
+    whole subject.
+    """
+
+    def setUp(self):
+        self.cfg = {"capture": {"timeout_seconds": 6, "interval_seconds": 5}}
+        self.cam = {"method": "http", "url": "http://10.0.0.5/snap.jpg",
+                    "auth": "digest", "username": "u", "password": "p"}
+        prev = (setup._TTY, setup.AUTO)
+        self.addCleanup(lambda: setattr(setup, "_TTY", prev[0]))
+        self.addCleanup(lambda: setattr(setup, "AUTO", prev[1]))
+
+    def drive(self, reply, tty=None, auto=False):
+        setup._TTY, setup.AUTO = tty, auto
+        out = io.StringIO()
+        with fake_requests(reply) as session, contextlib.redirect_stdout(out):
+            result = setup.test_camera(self.cam, self.cfg)
+        return result, session, out.getvalue()
+
+    def test_under_defaults_the_camera_is_asked_exactly_once(self):
+        """AUTO answers every question with its default and this default is
+        yes, so the unguarded version asked itself to flip digest to basic to
+        digest until the stack ran out. run_camera_action() refuses the
+        writing actions headless and lets "test" through, so
+        `timelapse cameras -t:Gate` from cron reaches it.
+        """
+        result, session, _ = self.drive(FakeResponse(401, b""), auto=True)
+        self.assertFalse(result)
+        self.assertEqual(len(session.asked), 1)
+
+    def test_with_no_terminal_the_camera_is_asked_exactly_once(self):
+        """The other half of the same condition. A scheduled task has no
+        terminal even when nobody passed --defaults."""
+        result, session, _ = self.drive(FakeResponse(401, b""), tty=None)
+        self.assertFalse(result)
+        self.assertEqual(len(session.asked), 1)
+
+    def test_it_names_the_other_scheme_instead_of_asking_about_it(self):
+        """The question carried the one useful fact in it. Printing it keeps
+        that where nobody can answer."""
+        _, _, printed = self.drive(FakeResponse(401, b""), auto=True)
+        self.assertIn("basic", printed)
+        self.assertNotIn("Retry with auth", printed)
+
+    def test_a_camera_that_refuses_both_schemes_asks_once_not_for_ever(self):
+        """Interactively, with somebody answering yes every time. Offering
+        the flip is worth doing; offering it again after it has been made is
+        the same loop with a person inside it."""
+        asked = []
+
+        def yes(question, default=True):
+            asked.append(question)
+            return True
+
+        with mock.patch.object(setup, "ask_yes", side_effect=yes):
+            result, session, _ = self.drive(FakeResponse(401, b""),
+                                            tty=FakeTTY(""))
+        self.assertFalse(result)
+        self.assertEqual(len(session.asked), 2)
+        self.assertEqual(len(asked), 1)
+
+    def test_the_flip_still_happens_and_still_works(self):
+        """The control. Without it, "asked once" would be satisfied by a
+        version that had simply stopped retrying."""
+        replies = [FakeResponse(401, b""), FakeResponse(200, jpeg(1920, 1080))]
+        with mock.patch.object(setup, "ask_yes", return_value=True):
+            result, session, _ = self.drive(lambda url: replies.pop(0),
+                                            tty=FakeTTY(""))
+        self.assertTrue(result)
+        self.assertEqual(self.cam["auth"], "basic")
+        self.assertEqual(len(session.asked), 2)
 
 
 class TestRenderPng(unittest.TestCase):
