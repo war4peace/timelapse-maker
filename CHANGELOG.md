@@ -111,6 +111,27 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Ctrl-C at a camera's password prompt now leaves the wizard.** It returned
+  an empty password instead, and the wizard carried on and stored the camera
+  with it, so the interruption looked like it had worked and produced a camera
+  that could never sign in.
+
+- **A wizard whose input runs out now finishes on defaults instead of
+  spinning.** Reaching the end of a scripted run (`--stdin`) left it believing
+  a terminal was still there, so any question that re-asks until the answer is
+  usable, the web port and the listen address among them, asked the same dead
+  terminal over and over. A camera name that is already taken has no sensible
+  default at all, so that one now skips the camera and says why.
+
+- **`timelapse cameras -t` works on a hand-written config.** A camera entry
+  without a `method` key, or a config without `capture.timeout_seconds`, made
+  it fail with a Python error rather than test the camera. Both now fall back
+  to what the capture daemon itself uses.
+
+- **A camera with its own interval is no longer called slow against the global
+  one.** A camera set to one frame a minute was warned that 3.1 seconds is
+  slow for a 5 second interval, which is not the interval it runs at.
+
 - **A successful encode is no longer reported as a failure because of one odd
   byte.** Every program this one runs has its output decoded, and a single
   byte the system's text encoding cannot read raised an error *inside* that

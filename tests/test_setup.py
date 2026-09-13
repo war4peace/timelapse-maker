@@ -5638,3 +5638,225 @@ class TestPreflightSeesTheGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpinGuardTTY(FakeTTY):
+    """A terminal that refuses to feed a runaway loop for ever.
+
+    These tests are about loops that did not terminate, so without a bound the
+    reverted build hangs the suite rather than failing it, and a revert check
+    that hangs proves nothing at all. Worse, it leaves the source file
+    reverted, because the harness's restore never runs.
+
+    `tty=False` for the second half of that: with isatty() true, ask_secret()
+    hands the question to the real getpass, which reads the **console** rather
+    than this object, and a suite that blocks on a password prompt is the same
+    hang by another road. Not hypothetical; that is how it presented.
+    """
+
+    LIMIT = 40
+
+    def __init__(self, text, tty=False):
+        super().__init__(text, tty=tty)
+
+    def readline(self):
+        if self.reads >= self.LIMIT:
+            raise RuntimeError("the prompt loop did not terminate")
+        return super().readline()
+
+
+class TestEndOfInputStopsAsking(unittest.TestCase):
+    """EOF returned the default and left the wizard believing it had a tty.
+
+    Several prompts sit inside a loop that re-asks until the answer is usable,
+    and their escape hatch is `AUTO or _TTY is None`. EOF set neither, so the
+    loop asked a terminal that was not there, got the same unusable default
+    back, and asked again. Measured with --stdin exhausted and `web.port`
+    already 80: the Port prompt was read more than thirty times in a second
+    before the probe's own guard tripped.
+
+    Platform-independent and unprivileged: the terminal is a StringIO and
+    nothing binds a socket, because check_bind is patched below the seam.
+    """
+
+    def setUp(self):
+        self.prev_tty, self.prev_auto = setup._TTY, setup.AUTO
+        self.addCleanup(self.restore)
+        setup.AUTO = False
+
+    def restore(self):
+        setup._TTY, setup.AUTO = self.prev_tty, self.prev_auto
+
+    def drive(self, keystrokes, fn, tty=SpinGuardTTY):
+        setup._TTY = tty(keystrokes)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            result = fn()
+        return result, setup._TTY.reads, buf.getvalue()
+
+    def test_the_first_eof_switches_to_defaults(self):
+        self.drive("", lambda: setup.ask("Anything", "x"))
+        self.assertTrue(setup.AUTO, "EOF must stop the wizard asking")
+
+    def test_the_answer_at_eof_is_still_the_default(self):
+        answer, _, _ = self.drive("", lambda: setup.ask("Anything", "x"))
+        self.assertEqual(answer, "x")
+
+    def test_a_real_answer_does_not_switch_to_defaults(self):
+        # The control. Without it, "AUTO gets set" would be satisfied by a
+        # wizard that never asks anybody anything.
+        answer, _, _ = self.drive("yes\n", lambda: setup.ask("Anything", "x"))
+        self.assertEqual(answer, "yes")
+        self.assertFalse(setup.AUTO)
+
+    def test_the_port_loop_terminates(self):
+        """The loop the finding was measured on.
+
+        A port under 1024 is refused without probing, because the wizard runs
+        as root and the service does not, so it is a rejected answer that can
+        never become acceptable by being asked for again.
+        """
+        cfg = setup.default_config()
+        cfg.setdefault("web", {})["port"] = 80
+        setup._TTY = SpinGuardTTY("y\n")
+        with contextlib.redirect_stdout(io.StringIO()), \
+                mock.patch.object(setup, "check_bind",
+                                  lambda addr, port: ("ok", "")), \
+                mock.patch.object(setup, "lan_address", lambda: "192.0.2.5"), \
+                mock.patch.object(setup, "host_addresses",
+                                  lambda: ["192.0.2.5"]):
+            setup.choose_web(cfg)
+        self.assertEqual(cfg["web"]["port"], 80)
+
+    def test_the_camera_name_loop_terminates_too(self):
+        """And skips the camera, which is the only honest answer here.
+
+        The port and bind loops have an acceptable value to keep; a name that
+        is already taken has none, and re-asking a terminal that is not there
+        is handed the same refused name for ever.
+        """
+        cfg = {"cameras": [], "capture": {"interval_seconds": 5}}
+        setup._TTY = SpinGuardTTY("")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            cam = setup.add_one_camera(cfg, 1, taken=[{"name": "Camera1"}])
+        self.assertIsNone(cam)
+        self.assertIn("skipping this camera", out.getvalue())
+
+    def test_a_free_name_is_still_accepted_without_a_terminal(self):
+        # The control for the one above: the guard must not refuse every
+        # unattended camera, only the one it cannot name.
+        cfg = {"cameras": [], "capture": {"interval_seconds": 5}}
+        setup._TTY = SpinGuardTTY("")
+        with contextlib.redirect_stdout(io.StringIO()):
+            cam = setup.add_one_camera(cfg, 1, taken=[{"name": "Gate"}])
+        self.assertIsNotNone(cam)
+        self.assertEqual(cam["name"], "Camera1")
+
+
+class TestCtrlCAtAPasswordIsNotAnAnswer(unittest.TestCase):
+    """ask() exits 1 on Ctrl-C; ask_secret() returned "".
+
+    So interrupting at "Password" did not leave the wizard, it added the
+    camera with an empty password and carried on, and every fetch from then
+    on is refused by the camera.
+    """
+
+    def setUp(self):
+        self.prev_tty, self.prev_auto = setup._TTY, setup.AUTO
+        self.addCleanup(self.restore)
+        setup.AUTO = False
+        setup._TTY = FakeTTY("")
+
+    def restore(self):
+        setup._TTY, setup.AUTO = self.prev_tty, self.prev_auto
+
+    def secret(self, raising):
+        import getpass
+        with mock.patch.object(getpass, "getpass", side_effect=raising), \
+                contextlib.redirect_stdout(io.StringIO()):
+            return setup.ask_secret("Password")
+
+    def test_ctrl_c_leaves_the_wizard(self):
+        with self.assertRaises(SystemExit) as caught:
+            self.secret(KeyboardInterrupt)
+        self.assertEqual(caught.exception.code, 1)
+
+    def test_end_of_input_gives_nothing_and_stops_asking(self):
+        # A different cause wants a different answer: the terminal went away
+        # rather than the operator changing their mind, so it matches ask().
+        self.assertEqual(self.secret(EOFError), "")
+        self.assertTrue(setup.AUTO)
+
+    def test_an_ordinary_password_still_comes_back(self):
+        import getpass
+        with mock.patch.object(getpass, "getpass", return_value="hunter2"):
+            self.assertEqual(setup.ask_secret("Password"), "hunter2")
+
+
+class TestTheCameraTestReadsTheCameraItWasGiven(unittest.TestCase):
+    """A hand-edited config has no "method" key, and the daemon defaults it.
+
+    The wizard did not, so `timelapse cameras -t` on such a config raised
+    KeyError rather than testing anything.
+    """
+
+    def setUp(self):
+        self.prev_tty, self.prev_auto = setup._TTY, setup.AUTO
+        self.addCleanup(self.restore)
+        setup.AUTO = True
+
+    def restore(self):
+        setup._TTY, setup.AUTO = self.prev_tty, self.prev_auto
+
+    def run_test(self, cam, cfg, seconds=0.1):
+        detail = {"skipped": False, "reason": "", "notes": [], "status": 200,
+                  "bytes": 1024, "seconds": seconds, "size": (1920, 1080)}
+        with mock.patch.object(setup, "grab_snapshot",
+                               return_value=(b"\xff\xd8" + b"x" * 1024,
+                                             detail)), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            ok = setup.test_camera(cam, cfg)
+        return ok, out.getvalue()
+
+    def test_a_camera_without_a_method_is_tested_as_http(self):
+        ok, _ = self.run_test({"name": "Gate", "url": "http://192.0.2.1/s"},
+                              {"capture": {"interval_seconds": 5}})
+        self.assertTrue(ok)
+
+    def test_a_config_without_a_timeout_still_fetches(self):
+        """grab_snapshot() builds its own timeout from capture.timeout_seconds.
+
+        Patched at requests.Session, which is below the seam under test: the
+        argument has to reach the real code to prove anything.
+        """
+        import requests
+        seen = {}
+
+        class FakeSession:
+            auth = None
+
+            def get(self, url, timeout=None):
+                seen["timeout"] = timeout
+                raise RuntimeError("far enough")
+
+        with mock.patch.object(requests, "Session", FakeSession):
+            data, detail = setup.grab_snapshot(
+                {"name": "Gate", "url": "http://192.0.2.1/s"}, {"capture": {}})
+        self.assertIsNone(data)
+        self.assertEqual(seen["timeout"], 8)
+
+    def test_slowness_is_judged_against_this_cameras_interval(self):
+        # A camera on a 60s override was called slow at 3.1s, against an
+        # interval it does not run at.
+        cam = {"name": "Roof", "url": "http://192.0.2.1/s", "method": "http",
+               "interval_seconds": 60}
+        _, said = self.run_test(cam, {"capture": {"interval_seconds": 5}},
+                                seconds=3.1)
+        self.assertNotIn("slow", said)
+
+    def test_a_camera_on_the_global_interval_is_still_warned(self):
+        # The control: the warning has to survive for the cameras it is about.
+        cam = {"name": "Gate", "url": "http://192.0.2.1/s", "method": "http"}
+        _, said = self.run_test(cam, {"capture": {"interval_seconds": 5}},
+                                seconds=3.1)
+        self.assertIn("slow", said)

@@ -1045,6 +1045,26 @@ piped stdin: under `curl … | bash` that pipe is the installer script itself.
 `--stdin` opts in explicitly for scripted runs. Passwords go through
 `getpass` when a real terminal is present, so they stay out of scroll-back.
 
+**End of input sets `AUTO`, and Ctrl-C leaves** (0.2.1). Both are about the
+difference between one answer and every answer after it. EOF used to return
+the default and change nothing else, which is correct for a prompt asked once
+and wrong for the several that sit in a loop re-asking until the answer is
+usable: their escape hatch is `AUTO or _TTY is None`, and EOF set neither, so
+the loop asked a terminal that was no longer there and was handed the same
+unusable default for ever. Measured with `--stdin` exhausted and `web.port`
+already 80: the Port prompt was read more than thirty times in a second. The
+bind loop and the camera-name loop have the same shape, and setting `AUTO` at
+the EOF fixes all three in one place, because two of them already knew how to
+give up. The **camera-name loop did not**, and could not: a taken name has no
+acceptable fallback to keep, the way an unverified bind address does. It skips
+the camera and says so.
+
+`ask()` exits 1 on Ctrl-C and `ask_secret()` returned `""`, so interrupting at
+"Password" was not a way out of the wizard: it added the camera with an empty
+password and carried on, and every fetch from then on is refused by the
+camera. EOF there is a different cause and keeps the different answer, `""`
+plus `AUTO`, matching `ask()`.
+
 #### 4.4b A path with a space in it (0.2.1)
 
 The wizard writes paths into two files whose fields are separated by
@@ -3623,7 +3643,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,243 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,256 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4401,7 +4421,7 @@ installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1584 lines
 scripts/timelapse_encode.py      batch job, 2382 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1049 lines
-scripts/timelapse_setup.py       configuration wizard, 4814 lines
+scripts/timelapse_setup.py       configuration wizard, 4845 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2946 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 471 lines
 scripts/timelapse_platform.py    the only platform branch, 2377 lines

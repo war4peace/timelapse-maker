@@ -146,6 +146,7 @@ def ask(question, default=""):
     empty default - re-prompted forever. That contradicted the one promise the
     wizard makes, that Enter accepts what is in brackets.
     """
+    global AUTO
     suffix = f" [{default}]" if default != "" else ""
     if AUTO or _TTY is None:
         print(f"  {question}{suffix}: {dim('(default)')}")
@@ -158,6 +159,14 @@ def ask(question, default=""):
         print("\nAborted.")
         sys.exit(1)
     if line == "":                          # EOF
+        # And from here on, defaults for everything. Returning the default
+        # once is not enough: several prompts sit inside a loop that re-asks
+        # until the answer is usable, and their escape hatch is `AUTO or _TTY
+        # is None`, neither of which EOF used to set. Measured with --stdin
+        # exhausted and web.port already 80: the Port prompt was read more
+        # than thirty times before the probe's own guard tripped. The bind
+        # loop and the camera-name loop are the same shape.
+        AUTO = True
         print()
         return default
     if not _TTY.isatty():
@@ -171,6 +180,7 @@ def ask_secret(question):
     Camera passwords end up in scroll-back and in any transcript of the
     install otherwise.
     """
+    global AUTO
     if AUTO or _TTY is None:
         return ""
     if not _TTY.isatty():
@@ -178,7 +188,16 @@ def ask_secret(question):
     import getpass
     try:
         return getpass.getpass(f"  {question}: ")
-    except (EOFError, KeyboardInterrupt):
+    except KeyboardInterrupt:
+        # Exactly what ask() does. Returning "" here added the camera with an
+        # empty password and carried on, so Ctrl-C at "Password" was not a way
+        # out of the wizard, it was a way of storing a camera that can never
+        # authenticate.
+        print("\nAborted.")
+        sys.exit(1)
+    except EOFError:
+        # The terminal went away mid-question, same as ask()'s EOF.
+        AUTO = True
         print()
         return ""
     except Exception:
@@ -1158,19 +1177,26 @@ def add_one_camera(cfg, n, found=None, taken=()):
     while True:
         name = sanitise_name(ask("Name (used as the folder name)", f"Camera{n}"),
                              f"Camera{n}")
-        if reject_reserved(name):
-            continue
+        reserved = reject_reserved(name)
         # Here rather than after the camera is built, which is where the two
         # management paths checked and where the first-run wizard did not check
         # at all. Asking the address, the credentials and the smoothing, then
         # testing the camera, and only then saying the name is taken, throws
         # away every answer and marks the discovered device used on the way
         # past. A name is refused at the prompt that asked for it.
-        if name_taken(taken, name):
+        clash = not reserved and name_taken(taken, name)
+        if clash:
             fail(f"A camera called '{name}' already exists; "
                  "two cameras cannot share a frames directory.")
-            continue
-        break
+        if not (reserved or clash):
+            break
+        # Unlike the port and bind loops, this one has no acceptable answer to
+        # fall back on, so with nothing to type into it re-asks and is handed
+        # the same refused name for ever. Skip the camera and say so.
+        if AUTO or _TTY is None:
+            note("There is no terminal to type another name into; "
+                 "skipping this camera.")
+            return None
 
     if template is None:                       # custom
         method = "rtsp" if ask_yes("Is this an RTSP stream?", False) else "http"
@@ -2248,7 +2274,7 @@ def grab_snapshot(cam, cfg, timeout=None):
         sess.auth = HTTPBasicAuth(cam.get("username"), cam.get("password"))
 
     if timeout is None:
-        timeout = cfg["capture"]["timeout_seconds"] + 4
+        timeout = cfg.get("capture", {}).get("timeout_seconds", 4) + 4
     t0 = time.time()
     try:
         r = sess.get(cam["url"], timeout=timeout)
@@ -2290,7 +2316,10 @@ def grab_snapshot(cam, cfg, timeout=None):
 
 
 def test_camera(cam, cfg, retried=False):
-    if cam["method"] == "rtsp":
+    # .get, as the daemon and list_cameras both do: a hand-edited config, or
+    # one written by an older wizard, has no "method" key and this used to
+    # KeyError out of the wizard rather than test the camera.
+    if cam.get("method", "http") == "rtsp":
         return test_camera_rtsp(cam, cfg)
     data, detail = grab_snapshot(cam, cfg)
     if detail["skipped"]:
@@ -2329,9 +2358,11 @@ def test_camera(cam, cfg, retried=False):
     dims = (", %dx%d" % detail["size"] if detail["size"]
             else probe_sample(cfg, data))
     good(f"{len(data)/1024:.0f} KB{dims}, {dt:.2f}s")
-    if dt > cfg["capture"]["interval_seconds"] * 0.6:
-        warn(f"{dt:.2f}s is slow for a "
-             f"{cfg['capture']['interval_seconds']}s interval.")
+    # This camera's interval, not the global one. A camera on a 60s override
+    # was being called slow at 3.1s, against an interval it does not run at.
+    interval = camera_interval(cfg, cam)
+    if dt > interval * 0.6:
+        warn(f"{dt:.2f}s is slow for a {interval}s interval.")
     return True
 
 
