@@ -3456,6 +3456,45 @@ filtering and deduplication, `_base_device` partition stripping, `recommend`,
 collision suffixes, and the web UI's library resolution and routing. Anything
 needing a camera, a GPU or systemd is out of scope here by design.
 
+**A test that inherits its privilege runs a different program as root, and one
+of these mounted a filesystem** (0.2.1). `TestTransferDestinationKind` drove
+the transfer menu with `"y\n1\n..."` believing option 1 was the local path. It
+is "SMB/CIFS, set it up for me". Unprivileged that branch prints
+`Mounting a share needs root privileges.` and returns, which is the only
+reason this went unnoticed: the assertion underneath it
+(`assertNotIn("SSH key", ...)`) passed against a refusal message, so the
+regression that test exists for was unguarded as well.
+
+As root it is a different program. `setup_cifs_share()` passes the privilege
+check, `ensure_cifs_utils()` runs the first package manager it finds with no
+prompt, and the remaining keystrokes, meant for a completely different
+question, become a NAS address of `/tmp/nonexistent-dest/` and a share named
+`n`: a 0600 credentials file in `/etc/timelapse`, a `mkdir /mnt/n`, and a
+`mount -t cifs`. The Linux test bed this project uses is
+`wsl -d Ubuntu -u root`, so that is not a hypothetical configuration. It is
+the usual one, and **`/mnt/n` was sitting on this developer's WSL, empty and
+root-owned, dated 2026-08-06**: the defect had already fired, months before
+anybody looked for it.
+
+Three changes, and the order of importance is the reverse of the order of
+size. `drive()` patches `is_root` to False, so the class *declares*
+unprivileged rather than inheriting whatever ran it, and the `skipTest` that
+used to hide the root case is gone: a test that skips itself exactly when its
+subject would do something is not a test. `ensure_cifs_utils` and
+`probe_rsync_flags` are stubbed as **tripwires**, not conveniences: with
+`is_root()` False neither is reachable, so either one firing means a keystroke
+change has walked back into the branch. And the local-path test answers `2`
+and asserts the `Destination path` prompt was reached, so a future menu
+reordering fails here rather than quietly testing the wrong branch again.
+
+`temp/h7_root_check.sh` is the proof, and it has both halves. It replays the
+old keystrokes as root and shows the package manager call being reached (with
+the installer itself stubbed, so nothing is installed on anybody's machine),
+then runs the whole suite as root and confirms `/etc/timelapse`, `/mnt`, the
+package database and the mount table are all exactly as they were. The revert
+that removes the declaration is **caught only when the suite runs as root**,
+which is the finding restated: unprivileged, everything agrees.
+
 **The pre-flight's camera checks had no test until 0.2.1**, which is how
 `test_http()` came to print the camera password on every failed fetch for the
 life of the project. The daemon's redaction is tested thoroughly, but the

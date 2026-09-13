@@ -1454,7 +1454,23 @@ class TestTransferDestinationKind(unittest.TestCase):
     Linux is forced, on both legs. This whole menu is Linux-only: mounting a
     CIFS share and an rsync remote spec are mechanisms Windows does not have,
     and the Windows branch is a different set of questions tested below.
+
+    **Privilege is declared here, not inherited**, and that is not tidiness.
+    Option 1 is the SMB/CIFS branch, and as root it runs the first package
+    manager it finds, writes a 0600 credentials file into /etc/timelapse,
+    mkdirs a mountpoint and attempts a mount, all from keystrokes meant for a
+    different question. Nobody noticed because unprivileged it refuses
+    politely, and the project's own note says the Linux test bed is
+    `wsl -d Ubuntu -u root`. The two stubs below are tripwires rather than
+    conveniences: with is_root() False neither can be reached, so either one
+    firing means a keystroke change has walked into the branch again.
     """
+
+    def setUp(self):
+        # A real directory, so the local branch runs past its "does not exist"
+        # early return and the rsync probe is genuinely reached and stubbed.
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
 
     def drive(self, keystrokes):
         prev_tty, prev_auto = setup._TTY, setup.AUTO
@@ -1462,9 +1478,20 @@ class TestTransferDestinationKind(unittest.TestCase):
         setup._TTY = FakeTTY(keystrokes, tty=False)
         cfg = setup.default_config()
         buf = io.StringIO()
+
+        def never(*_args, **_kw):
+            raise AssertionError(
+                "a test reached the CIFS mount path; it installs packages and "
+                "writes to /etc")
+
         try:
             with contextlib.redirect_stdout(buf), \
-                 mock.patch.object(setup, "IS_WINDOWS", False):
+                 mock.patch.object(setup, "IS_WINDOWS", False), \
+                 mock.patch.object(setup, "is_root", return_value=False), \
+                 mock.patch.object(setup, "ensure_cifs_utils",
+                                   side_effect=never), \
+                 mock.patch.object(setup, "probe_rsync_flags",
+                                   return_value=["-rt"]):
                 setup.choose_transfer(cfg)
         finally:
             setup._TTY, setup.AUTO = prev_tty, prev_auto
@@ -1493,10 +1520,14 @@ class TestTransferDestinationKind(unittest.TestCase):
         self.assertIn("SMB/CIFS", menu)
 
     def test_cifs_option_refuses_politely_without_root(self):
-        # Mounting needs root; without it, say so and offer the alternative
-        # rather than failing obscurely.
-        if setup.is_root():
-            self.skipTest("running as root")
+        """Mounting needs root; without it, say so and offer the alternative
+        rather than failing obscurely.
+
+        This used to skip itself when the suite happened to be running as
+        root, which is inheriting privilege rather than declaring it: the one
+        run where the branch does something is the one where nothing checked
+        it. drive() forces unprivileged now and the skip is gone.
+        """
         transfer, out = self.drive("y\n1\n")
         self.assertIn("root", out)
         self.assertFalse(transfer["enabled"],
@@ -1513,10 +1544,21 @@ class TestTransferDestinationKind(unittest.TestCase):
         return out.split(marker, 1)[-1]
 
     def test_local_option_does_not_mention_ssh_keys(self):
-        # The bug this class exists for: the old prompt talked about SSH keys
-        # whichever transport you picked.
-        _, out = self.drive("y\n1\n/tmp/nonexistent-dest/\nn\n")
-        self.assertNotIn("SSH key", self._after_the_choice(out))
+        """The bug this class exists for: the old prompt talked about SSH keys
+        whichever transport you picked.
+
+        It answered `1`, which is the SMB/CIFS option, so what it was reading
+        was a root refusal with no SSH in it: the assertion passed and the
+        regression it exists for was unguarded. Answering `2` is the local
+        path, and the Destination prompt is asserted so that a future menu
+        reordering fails here rather than silently testing the wrong branch
+        again.
+        """
+        transfer, out = self.drive("y\n2\n%s\n" % self.tmp)
+        after = self._after_the_choice(out)
+        self.assertIn("Destination path", after)
+        self.assertNotIn("SSH key", after)
+        self.assertEqual(transfer["destination"], str(self.tmp))
 
     def test_the_menu_describes_every_transport(self):
         _, out = self.drive("y\n2\n/tmp/nonexistent-dest/\nn\n")
