@@ -23,6 +23,7 @@ import _support
 from _support import make_frame
 
 import timelapse_encode as enc
+import timelapse_platform as plat
 
 
 class TestHumanFormatting(unittest.TestCase):
@@ -3091,6 +3092,193 @@ class TestCredentialWatch(unittest.TestCase):
         self.assertEqual(level, "error")
         self.assertIn(("Camera", "Roof"), fields)
         self.assertNotIn("hunter2", json.dumps(fields))
+
+
+class TestOnlyOneRunAtATime(unittest.TestCase):
+    """Two encodes on the same night destroy the day, in both directions.
+
+    Nothing prevented it: the systemd timer guards only timer against timer,
+    Task Scheduler's IgnoreNew only task against task, and `timelapse encode`
+    is the obvious thing to type during a long backlog. Both write the same
+    Camera.YYYYMMDD.mkv at independent offsets. The first to finish marks the
+    day and deletes the frames; the second then either fails and unlinks the
+    file the first just declared finished, or reads the truncated concat as an
+    EOF, exits 0 and reports OK over a corrupt video. The frames are gone
+    either way and both runs report success.
+
+    These are also the first tests in this project to execute the encoder's
+    main() at all. It was a wiring function nothing had ever called, which is
+    the GUI entry-point lesson sitting in the largest script here.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.cfg = {
+            "paths": {"frames_root": str(self.tmp / "frames"),
+                      "video_output": str(self.tmp / "videos"),
+                      "log_dir": str(self.tmp / "logs"),
+                      "state_dir": str(self.state),
+                      "ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+            "capture": {"interval_seconds": 5, "min_bytes": 4096},
+            "encode": {"framerate": 60, "min_frames": 1, "container": "mkv",
+                       "delete_frames_on_success": True, "max_backlog_days": 7},
+            "transfer": {"enabled": False},
+            "cameras": [{"name": "Gate", "enabled": True}],
+        }
+        self.config_path = self.tmp / "config.json"
+        self.config_path.write_text(json.dumps(self.cfg), encoding="utf-8")
+        self.day = self.tmp / "frames" / "Gate" / "2026-09-12"
+        make_frame(self.day / "000001.jpg")
+        self.held = []
+        self.addCleanup(lambda: [plat.release_lock(h) for h in self.held])
+
+    def hold_the_lock(self):
+        """Stand in for the other encode, from this process.
+
+        The same process is enough: both primitives refuse a second exclusive
+        claim on the same file whoever asks, which temp/c4_lock_probe.py
+        confirms across two real processes on both platforms.
+        """
+        status, handle, _detail = plat.take_lock(self.state / enc.ENCODE_LOCK)
+        self.assertEqual(status, "taken", "the harness could not take it")
+        self.held.append(handle)
+
+    def run_main(self, extra=()):
+        """main() with every irreversible step recorded rather than done."""
+        did = {"encoded": [], "removed": [], "notified": [], "state": []}
+
+        def fake_encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
+            did["encoded"].append((camera, day_dir.name))
+            return {"status": "OK", "camera": camera, "date": day_dir.name,
+                    "frames": 1, "bad": 0, "size": 1, "seconds": 0.1,
+                    "note": "", "encoder": "libx264"}
+
+        argv = ["timelapse_encode.py", str(self.config_path)] + list(extra)
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(enc, "setup_logging", lambda *a, **k: None), \
+             mock.patch.object(enc, "select_encoder",
+                               lambda *a: {"name": "libx264", "args": []}), \
+             mock.patch.object(enc, "encode_day", fake_encode_day), \
+             mock.patch.object(enc.shutil, "rmtree",
+                               lambda p, **k: did["removed"].append(str(p))), \
+             mock.patch.object(enc, "transfer",
+                               lambda *a, **k: {"ok": True, "moved": 0,
+                                                "detail": ""}), \
+             mock.patch.object(enc, "notify",
+                               lambda *a, **k: did["notified"].append(a[1])), \
+             mock.patch.object(enc, "write_run_state",
+                               lambda *a: did["state"].append(a)):
+            code = enc.main()
+        return code, did
+
+    def test_it_encodes_when_the_lock_is_free(self):
+        """The control, and the reason the refusal below means anything.
+
+        Without it, "no encode_day call" would be satisfied by a main() that
+        never worked in the first place.
+        """
+        code, did = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(did["encoded"], [("Gate", "2026-09-12")])
+        self.assertEqual(did["removed"], [str(self.day)])
+
+    def test_a_second_run_encodes_nothing_and_deletes_nothing(self):
+        self.hold_the_lock()
+        code, did = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertEqual(did["encoded"], [])
+        self.assertEqual(did["removed"], [])
+
+    def test_it_sends_no_notification_and_writes_no_run_record(self):
+        """Neither is true of a run that never started, and one message per
+
+        contention would be noise from the thing that prevented the harm.
+        """
+        self.hold_the_lock()
+        _code, did = self.run_main()
+        self.assertEqual(did["notified"], [])
+        self.assertEqual(did["state"], [])
+
+    def test_the_refusal_names_the_holder_and_says_nothing_is_lost(self):
+        self.hold_the_lock()
+        with self.assertLogs(enc.log, level="ERROR") as caught:
+            self.run_main()
+        said = "\n".join(caught.output)
+        self.assertIn("in progress", said)
+        self.assertIn(str(os.getpid()), said)
+        # The alternative reading of "not starting" is alarming and wrong:
+        # find_pending works from the day directories on disk, so the next run
+        # picks the day up, up to max_backlog_days.
+        self.assertIn("not lost", said)
+
+    def test_the_lock_is_free_again_afterwards(self):
+        self.run_main()
+        status, handle, _detail = plat.take_lock(self.state / enc.ENCODE_LOCK)
+        if handle is not None:
+            self.held.append(handle)
+        self.assertEqual(status, "taken")
+
+    def test_it_is_released_on_the_critical_failure_path(self):
+        """The path that would otherwise lock the encoder out until reboot.
+
+        A run that aborts is exactly the run somebody re-runs by hand a minute
+        later, so the finally clause is the difference between one bad night
+        and every night after it.
+        """
+        argv = ["timelapse_encode.py", str(self.config_path)]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(enc, "setup_logging", lambda *a, **k: None), \
+             mock.patch.object(enc, "select_encoder",
+                               side_effect=RuntimeError("ffmpeg exploded")), \
+             mock.patch.object(enc, "notify", lambda *a, **k: None), \
+             mock.patch.object(enc, "write_run_state", lambda *a: None), \
+             self.assertLogs(enc.log, level="ERROR"):
+            code = enc.main()
+        self.assertEqual(code, 2)
+        status, handle, _detail = plat.take_lock(self.state / enc.ENCODE_LOCK)
+        if handle is not None:
+            self.held.append(handle)
+        self.assertEqual(status, "taken")
+
+    def test_watch_mode_does_not_take_it(self):
+        """It runs every five minutes from its own timer, reads the capture
+
+        heartbeat and touches no video. Taking this would mean a watch tick
+        could refuse the nightly encode, which is the opposite of the point.
+        """
+        self.hold_the_lock()
+        argv = ["timelapse_encode.py", str(self.config_path), "--watch"]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(enc, "setup_logging", lambda *a, **k: None), \
+             mock.patch.object(enc, "watch_credentials", lambda cfg: 0):
+            self.assertEqual(enc.main(), 0)
+
+    def test_a_lock_that_cannot_be_taken_at_all_does_not_stop_the_run(self):
+        """Three answers and not two. A lock file that cannot be created is an
+
+        environment problem, and turning it into "no videos tonight" would be
+        the check causing the outage it exists to prevent. Only a real other
+        process refuses a run.
+        """
+        with mock.patch.object(plat, "take_lock",
+                               return_value=("unavailable", None, "read-only")):
+            code, did = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(did["encoded"], [("Gate", "2026-09-12")])
+
+    def test_the_lock_lives_in_the_state_directory(self):
+        """Which is the one directory every unit may already write.
+
+        Anywhere else means a ReadWritePaths change, and a ReadWritePaths entry
+        that does not exist stops the unit with a mount namespace error.
+        """
+        self.run_main()
+        self.assertTrue((self.state / enc.ENCODE_LOCK).exists())
+        self.assertTrue(enc.ENCODE_LOCK.startswith("."),
+                        "it sits beside two files an operator is meant to read")
 
 
 class TestWatchUnitWiring(unittest.TestCase):

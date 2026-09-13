@@ -1379,6 +1379,115 @@ def secure_secret_file(path, group=None):
             pass
 
 
+# ----------------------------------------------------------------------------
+# One run at a time
+#
+# The one genuine `os.name` branch outside `locations()`, and it is here for the
+# reason this module exists: fcntl is absent on Windows and msvcrt is absent on
+# Linux, so there is no feature detection to do and nothing to retry. Both are
+# stdlib.
+#
+# An OS lock and not a pid file, because the case that matters is the encode
+# that was *killed*: a pid file would outlive it and refuse every run afterwards
+# until somebody found the file. Measured on both platforms
+# (temp/c4_lock_probe.py): refused while the holder lives, free the moment it is
+# killed, free after a clean exit, takeable again by the same process, and a
+# leftover file naming a dead pid is not a lock.
+#
+# Byte 0 is the lock byte and is never written; the pid goes after it. That is
+# not tidiness: msvcrt's lock is *mandatory*, so a contender reading from byte 0
+# is refused and the pid would never reach the message it exists for. Measured
+# both ways.
+# ----------------------------------------------------------------------------
+
+LOCK_BYTE = 1                       # the pid starts here, past the locked byte
+
+
+def take_lock(path):
+    """Claim the right to run, without waiting. (status, handle, detail).
+
+        taken        the caller may proceed; release_lock(handle) when done
+        held         somebody else is running; detail names them
+        unavailable  the lock could not be attempted at all; detail says why
+
+    Three answers and not two, on the rule this project has paid for five
+    times. "Another encode is running" must stop the caller; "this directory is
+    read only" must not, because refusing to encode over a lock file that could
+    not be created would turn a working install into a broken one for a problem
+    the lock exists only to guard against a human causing.
+    """
+    path = Path(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        return "unavailable", None, "%s: %s" % (path, exc)
+
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        holder = lock_holder(path)
+        os.close(fd)
+        return "held", None, holder
+    except ImportError as exc:                  # pragma: no cover
+        os.close(fd)
+        return "unavailable", None, str(exc)
+
+    mine = ("%d\n" % os.getpid()).encode("ascii")
+    try:
+        os.lseek(fd, LOCK_BYTE, os.SEEK_SET)
+        os.write(fd, mine)
+        os.ftruncate(fd, LOCK_BYTE + len(mine))
+    except OSError:
+        # The lock is held either way; only the courtesy of naming ourselves
+        # to the next process failed, and that must not fail the run.
+        pass
+    return "taken", fd, ""
+
+
+def lock_holder(path):
+    """Who holds `path`, as text for a message. Never raises.
+
+    Best effort by design: on Windows the locked byte cannot be read at all, so
+    this reads from past it, and any failure here is worth strictly less than
+    the refusal it decorates.
+    """
+    try:
+        with open(str(path), "rb") as fh:
+            fh.seek(LOCK_BYTE)
+            pid = fh.read(32).decode("ascii", "replace").strip()
+    except OSError:
+        return "another process"
+    return ("pid %s" % pid) if pid.isdigit() else "another process"
+
+
+def release_lock(handle):
+    """Give it up. Safe with None, and safe to call twice."""
+    if handle is None:
+        return
+    try:
+        if IS_WINDOWS:
+            import msvcrt
+            os.lseek(handle, 0, os.SEEK_SET)
+            msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_UN)
+    except (OSError, ImportError):
+        # Closing the descriptor releases it on both platforms regardless.
+        pass
+    try:
+        os.close(handle)
+    except OSError:
+        pass
+
+
 # Well-known SIDs, spelled as numbers because the names are localised. On a
 # German Windows the Administrators group is `Administratoren`, and icacls
 # answers "No mapping between account names and security IDs was done" for the

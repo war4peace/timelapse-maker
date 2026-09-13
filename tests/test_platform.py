@@ -1095,6 +1095,129 @@ class TestSecureSecretFile(unittest.TestCase):
         chown.assert_not_called()
 
 
+class TestTakeLock(unittest.TestCase):
+    """One encode run at a time, on both platforms, with one implementation.
+
+    An OS lock and not a pid file, and the case that decides it is the encode
+    that was *killed*: a pid file would outlive it and refuse every run
+    afterwards until somebody found and deleted it. Measured on both platforms
+    in temp/c4_lock_probe.py, which is where the cross-process half lives;
+    these are the answers and the edges.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = self.tmp / "state" / ".encode.lock"
+        self.held = []
+        self.addCleanup(lambda: [plat.release_lock(h) for h in self.held])
+
+    def take(self, path=None):
+        status, handle, detail = plat.take_lock(path or self.path)
+        if handle is not None:
+            self.held.append(handle)
+        return status, handle, detail
+
+    def test_a_free_lock_is_taken(self):
+        status, handle, detail = self.take()
+        self.assertEqual(status, "taken")
+        self.assertIsNotNone(handle)
+        self.assertEqual(detail, "")
+
+    def test_it_creates_the_directory_it_needs(self):
+        # state_dir exists on every real install, because ReadWritePaths names
+        # it and a unit whose ReadWritePaths points at nothing does not start.
+        # A manual run as root on a box that never ran the wizard is the case.
+        self.assertFalse(self.path.parent.exists())
+        self.take()
+        self.assertTrue(self.path.parent.exists())
+
+    def test_a_second_take_in_the_same_process_is_held(self):
+        self.take()
+        status, handle, detail = self.take()
+        self.assertEqual(status, "held")
+        self.assertIsNone(handle)
+        self.assertIn(str(os.getpid()), detail)
+
+    def test_the_holder_is_named_as_a_pid(self):
+        self.take()
+        self.assertEqual(plat.lock_holder(self.path), "pid %d" % os.getpid())
+
+    def test_releasing_lets_the_next_caller_have_it(self):
+        _status, handle, _detail = self.take()
+        self.held.remove(handle)
+        plat.release_lock(handle)
+        self.assertEqual(self.take()[0], "taken")
+
+    def test_releasing_twice_is_harmless(self):
+        _status, handle, _detail = self.take()
+        self.held.remove(handle)
+        plat.release_lock(handle)
+        plat.release_lock(handle)
+
+    def test_releasing_nothing_is_harmless(self):
+        plat.release_lock(None)
+
+    def test_a_leftover_file_naming_a_dead_pid_is_not_a_lock(self):
+        """The whole argument for an OS lock over a pid file.
+
+        A killed encode leaves this file behind with its pid in it, and the
+        next run has to be able to take it. Measured for real against a killed
+        child in temp/c4_lock_probe.py; here it is the file alone.
+        """
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_bytes(b"\x00999999\n")
+        self.assertEqual(self.take()[0], "taken")
+
+    def test_an_unusable_path_is_unavailable_and_not_held(self):
+        """Three answers, not two, and this is the one that must not stop a
+
+        run. A lock file that cannot be created is an environment problem;
+        refusing to encode over it would be the check causing the outage it
+        exists to prevent. "Held" must mean a real other process and nothing
+        else.
+        """
+        with mock.patch.object(plat.os, "open",
+                               side_effect=OSError(13, "read-only")):
+            status, handle, detail = plat.take_lock(self.path)
+        self.assertEqual(status, "unavailable")
+        self.assertIsNone(handle)
+        self.assertIn("read-only", detail)
+
+    def test_the_holder_reader_never_raises(self):
+        # It decorates a refusal; a failure here is worth strictly less than
+        # the refusal itself, and on Windows the locked byte cannot be read at
+        # all, which is why it reads from past it.
+        self.assertEqual(plat.lock_holder(self.tmp / "nothing" / "here.lock"),
+                         "another process")
+
+    def test_the_pid_is_written_past_the_locked_byte(self):
+        """Not tidiness. msvcrt's lock is mandatory, so a contender reading
+
+        from byte 0 is refused outright and the pid would never reach the
+        message it exists for. Byte 0 is the lock byte and is never written.
+
+        Written this way because the first version read the whole file and
+        raised PermissionError on Windows, which is the behaviour being
+        described happening to the test describing it.
+        """
+        self.take()
+        self.assertEqual(plat.LOCK_BYTE, 1)
+        with open(str(self.path), "rb") as fh:
+            fh.seek(plat.LOCK_BYTE)
+            self.assertEqual(fh.read(32).strip(),
+                             str(os.getpid()).encode("ascii"))
+
+    def test_a_failure_to_write_the_pid_still_leaves_the_lock_held(self):
+        # The courtesy of naming ourselves is worth less than the lock.
+        with mock.patch.object(plat.os, "write",
+                               side_effect=OSError(28, "no space")):
+            status, handle, _detail = plat.take_lock(self.path)
+        if handle is not None:
+            self.held.append(handle)
+        self.assertEqual(status, "taken")
+
+
 class TestAllowUsersRead(unittest.TestCase):
     """The other direction: opening one directory back up, on purpose.
 

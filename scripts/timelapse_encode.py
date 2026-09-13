@@ -39,7 +39,7 @@ from urllib import request as urlrequest
 from timelapse_platform import (CONFIG_PATH, IS_WINDOWS, NET_ERRORS,
                                 STATE_DIR_DEFAULT, connect_share, is_unc,
                                 log_handler, net_error, no_console,
-                                share_root)
+                                release_lock, share_root, take_lock)
 
 __version__ = "0.2.0"
 
@@ -781,6 +781,10 @@ def mark_encoded(day_dir, out_file, result, encoder_name):
 
 CAPTURE_STATE = "capture.json"
 ENCODE_STATE = "encode.json"
+# Beside them, in the one directory both units may write. Dotted so it does not
+# sit in the operator's file browser next to the two files they are meant to
+# read; it holds nothing but the running pid.
+ENCODE_LOCK = ".encode.lock"
 STATE_VERSION = 1
 
 # Runs kept in encode.json. Two weeks is enough to see a pattern and small
@@ -2064,6 +2068,37 @@ def main():
                      changed)
         return 0
 
+    # One run at a time, and this is not a nicety. Two encodes writing the same
+    # Camera.YYYYMMDD.mkv is data loss in both directions: the first to finish
+    # marks the day and deletes the frames, and the second then either fails
+    # and unlinks the file the first just declared finished, or takes the
+    # truncated concat for an EOF, exits 0 and reports OK over a corrupt video.
+    # The frames are gone either way. Nothing else prevents it: the systemd
+    # timer only guards timer against timer and Task Scheduler's IgnoreNew only
+    # guards task against task, while `timelapse encode` is the obvious thing
+    # to type during a long backlog.
+    #
+    # Not for --watch, which returns above: it reads the capture heartbeat,
+    # writes one small record and touches no video.
+    status, lock, detail = take_lock(state_dir(cfg) / ENCODE_LOCK)
+    if status == "held":
+        log.error("Another encode run is in progress (%s); not starting.",
+                  detail)
+        # Said out loud because the alternative reading is alarming and wrong.
+        # A skipped night is picked up by the next run: find_pending() works
+        # from the day directories on disk, up to encode.max_backlog_days.
+        log.error("Tonight's work is not lost; the next run picks the day up.")
+        # No notification, and no run record. Neither a message nor a failed
+        # run on the status page is true of a run that never started, and one
+        # per contention would be noise from the thing that prevented harm.
+        return 1
+    if status == "unavailable":
+        # Not a reason to refuse. A lock file that cannot be created is an
+        # environment problem, and turning that into "no videos tonight" would
+        # be the check causing the outage it exists to prevent.
+        log.warning("Could not take the run lock (%s); continuing anyway.",
+                    detail)
+
     run_start = time.time()
     frames_root = Path(cfg["paths"]["frames_root"])
     out_dir = Path(cfg["paths"]["video_output"])
@@ -2204,6 +2239,13 @@ def main():
                      [("Host", platform.node()),
                       ("Run time", human_duration(time.time() - run_start))])
         return 2
+
+    finally:
+        # Every path, the critical failure included. Killing the process would
+        # release it too, since it is an OS lock; this is for the ordinary
+        # exits and for the tests, which call main() in a process that carries
+        # on afterwards.
+        release_lock(lock)
 
 
 if __name__ == "__main__":

@@ -356,6 +356,63 @@ resume on-boundary. Disabled by setting `min_free_gb: 0`.
 
 Batch job. `systemd` `Type=oneshot` + timer at 00:05, `Persistent=true`.
 
+**One run at a time, and the lock comes before everything else** (0.2.1).
+`take_lock(state_dir(cfg) / ".encode.lock")` is the first thing `main()` does
+after the `--watch` branch returns. Two encodes on the same night are data loss
+in both directions, because the output name is fixed per camera per day and
+both processes write it at independent offsets: whichever finishes first marks
+the day and deletes the frames, and the second then either fails and
+**unlinks the file the first just declared finished**, or reads the truncated
+concat as an EOF, exits 0 and reports OK over a corrupt video. The frames are
+gone either way and both runs report success.
+
+Nothing prevented it. The systemd timer guards only timer against timer and
+Task Scheduler's `IgnoreNew` only task against task, while `timelapse encode`
+is precisely what an operator types during a multi-hour libx264 backlog after
+downtime, which is also when a nightly run is most likely to still be going.
+
+Three answers rather than two, on the rule this project has paid for five
+times. **held** refuses, names the holder's pid, exits 1, and sends no
+notification and writes no run record, because neither is true of a run that
+never started. **unavailable**, meaning the lock file could not be created at
+all, logs a warning and proceeds: turning an environment problem into "no
+videos tonight" would be the check causing the outage it exists to prevent.
+**taken** carries on, and `release_lock()` sits in a `finally` so that the
+critical-failure path gives it up too, which matters because an aborted run is
+exactly the one somebody re-runs by hand a minute later.
+
+The refusal says the work is not lost, and that is load-bearing rather than
+reassurance: `find_pending()` works from the day directories on disk, so a
+skipped night is picked up by the next run, up to `max_backlog_days`.
+
+`--watch` does not take it. It runs every five minutes from its own timer,
+reads the capture heartbeat and touches no video, and a watch tick able to
+refuse the nightly encode would be the opposite of the point.
+
+The primitive is in `timelapse_platform.py` and is the one genuine `os.name`
+branch outside `locations()`: `fcntl` is absent on Windows and `msvcrt` is
+absent on Linux, so there is no feature detection to do. An **OS lock and not a
+pid file**, because the case that decides it is the encode that was *killed*: a
+pid file would outlive it and refuse every run afterwards until somebody found
+and deleted it. Measured on both platforms (`temp/c4_lock_probe.py`): refused
+while the holder lives, free the moment it is killed, free after a clean exit,
+takeable again by the same process, and a leftover file naming a dead pid is
+not a lock. **Byte 0 is the lock byte and is never written**; the pid goes
+after it, because msvcrt's lock is *mandatory* and a contender reading from
+byte 0 is refused outright, so the pid would never reach the message it exists
+for. The test that asserts this raised `PermissionError` on Windows when it
+first read the file whole, which is the behaviour happening to the test
+describing it.
+
+The lock lives in `state_dir`, which is the one directory every unit already
+has in `ReadWritePaths`; anywhere else means a unit change, and a
+`ReadWritePaths` entry that does not exist stops the unit with a mount
+namespace error. Verified with two real processes on systemd 255
+(`temp/c4_wsl_serialise.sh`, 15 checks): the timer-started unit takes it, the
+lock names that unit's exact pid, a manual `timelapse encode` during it is
+refused with that pid and deletes nothing, the unit then finishes with one
+video, and a run afterwards is not blocked.
+
 Pipeline, in `main()`:
 
 1. `select_encoder()` → probes `av1_nvenc`, `hevc_nvenc`, `libx264` in order by
@@ -3176,7 +3233,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,087 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,108 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -3674,6 +3731,23 @@ changes:
   `state_dir` key publishes to the default location. That is the hazard worth
   re-testing on any future change here: a `ReadWritePaths` entry that does not
   exist stops **both** daemons, with an error about mount namespaces.
+- **Two encode runs at once** (0.2.1, §4.2): Ubuntu 24.04 under real systemd,
+  `temp/c4_wsl_serialise.sh`, 15 checks with two genuine processes. A stub
+  ffmpeg makes the overlap deterministic rather than a race the test would
+  sometimes lose. What only this can answer is whether the lock works *inside
+  the sandbox*: the timer-started unit takes it under `ProtectSystem=strict`,
+  the file lands in the state directory the unit may write, it names that
+  unit's exact pid, a manual `timelapse encode` during the run is refused with
+  that pid and deletes nothing, the unit finishes with one video, and a run
+  afterwards is not blocked. The primitive itself is measured separately and on
+  both platforms in `temp/c4_lock_probe.py`, including the case that decides
+  the design: a *killed* holder frees the lock, which a pid file would not.
+  **The stub was wrong twice**, both times in the direction of testing nothing:
+  it keyed on `lavfi` to tell the encoder probe from the real encode, but
+  `list_encoders()` runs ffmpeg once before any probe and carries neither, so
+  the 25 second delay landed nowhere near the encode; and its ffprobe printed
+  commas where `-of csv=p=0:s=x` means `WIDTHxHEIGHT`, so every day failed
+  before ffmpeg was reached. Match the thing you mean.
 - **A path with a space in it** (0.2.1, §4.4b): Ubuntu 24.04 under real
   systemd, `temp/c2_wsl_e2e.sh`, a full install with a frames root of
   `/srv/c2e2e/My Passport/frames`. Eleven checks: the emitter quotes it,
@@ -3886,12 +3960,12 @@ installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
-scripts/timelapse_encode.py      batch job, 2210 lines
+scripts/timelapse_encode.py      batch job, 2252 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
 scripts/timelapse_setup.py       configuration wizard, 4755 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2888 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
-scripts/timelapse_platform.py    the only platform branch, 2235 lines
+scripts/timelapse_platform.py    the only platform branch, 2344 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
 scripts/timelapse_web.py         read-only web UI, 3521 lines
 tests/_support.py                path setup and fakes

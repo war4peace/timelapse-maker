@@ -95,6 +95,20 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Two encode runs at once no longer destroy the day.** Running `timelapse
+  encode` by hand while the nightly one was still going, the natural thing to
+  do while clearing a backlog, gave two processes writing the same
+  `Camera.YYYYMMDD.mkv`. Whichever finished first deleted the frames, and the
+  second then either deleted the finished video or wrote a corrupt one and
+  reported success; the frames were gone either way. Only one encode runs at a
+  time now. A second one says which process is already running and stops
+  without touching anything, and nothing is lost: the next run picks the day
+  up, as it always has for a night the machine was off.
+
+  The nightly encode and the credential watch are unaffected, and a run that
+  crashes or is killed does not leave anything stuck: the next run starts
+  normally.
+
 - **A storage path with a space in it no longer stops both daemons.** A
   systemd unit reads `ReadWritePaths=` as a whitespace-separated list, so
   `/media/war/My Passport/frames` arrived as two entries, `/media/war/My` and
