@@ -297,6 +297,11 @@ ERROR_SERVICE_SPECIFIC_ERROR = 1066
 NO_ERROR = 0
 EXIT_SERVICE_FAILED = 1
 
+# What a control handler answers for a control it does not implement. Saying
+# NO_ERROR to everything is how a pause request comes to look accepted and do
+# nothing at all.
+ERROR_CALL_NOT_IMPLEMENTED = 120
+
 # Network errors from WNetAddConnection2W. Each one needs a different thing
 # doing about it, which is the whole reason they are named rather than
 # printed: a wrong password, a share that is not there and a server that is
@@ -519,9 +524,19 @@ def is_elevated():
     return hasattr(os, "geteuid") and os.geteuid() == 0
 
 
-def _last_error(call):
-    err = ctypes.get_last_error()
+def _error_text(call, err):
     return "%s failed (Windows error %d)" % (call, err)
+
+
+def _last_error(call):
+    """The error the call that just failed left behind.
+
+    "Just" is load-bearing: GetLastError is per thread and is overwritten by
+    the next API call of any kind, so anything between the failure and this
+    line takes the number with it. Where something has to happen in between,
+    read it with ctypes.get_last_error() first and use _error_text().
+    """
+    return _error_text(call, ctypes.get_last_error())
 
 
 def _scm(access):
@@ -762,9 +777,16 @@ def stop_service(unit, timeout=30):
             status = SERVICE_STATUS()
             if not api.advapi32.ControlService(svc, SERVICE_CONTROL_STOP,
                                                ctypes.byref(status)):
+                # Read first. service_state() below makes several API calls of
+                # its own, and the last of them (CloseServiceHandle) leaves
+                # its own result in GetLastError, so the number reported to
+                # the operator was whichever call finished last rather than
+                # 1061 (still starting) or 1053 (the stop is hung), which are
+                # the two that mean something here.
+                err = ctypes.get_last_error()
                 if service_state(unit) == SERVICE_STOPPED:
                     return True, ""
-                return False, _last_error("ControlService")
+                return False, _error_text("ControlService", err)
         finally:
             api.advapi32.CloseServiceHandle(svc)
     finally:
@@ -776,11 +798,30 @@ def stop_service(unit, timeout=30):
         state, state)
 
 
-def _await_state(unit, wanted, timeout):
-    """Poll until the service reaches `wanted`, or the patience runs out."""
+def _await_state(unit, wanted, timeout, settle=2.0):
+    """Poll until the service reaches `wanted`, or the patience runs out.
+
+    Gives up early on a state `wanted` can no longer be reached from. A daemon
+    that exits at once, which is what `run_daemon()` does with no enabled
+    cameras, goes START_PENDING and then STOPPED within a second; waiting the
+    remaining 29 seconds for RUNNING is a busy cursor in the GUI and a pause
+    in the installer, for an answer already given.
+
+    `settle` is the grace before a STOPPED reading is believed while waiting
+    for RUNNING: StartServiceW can return before the SCM has moved the service
+    off STOPPED, so the first reading is not evidence of anything. Waiting for
+    STOPPED has no equivalent, because RUNNING on the way down is the ordinary
+    case, not a contradiction.
+    """
     deadline = time.time() + timeout
+    began = time.time()
     state = service_state(unit)
     while state != wanted and time.time() < deadline:
+        if state == SERVICE_ABSENT:
+            break                       # nothing to wait for, either way
+        if (wanted == SERVICE_RUNNING and state == SERVICE_STOPPED
+                and time.time() - began >= settle):
+            break
         time.sleep(0.5)
         state = service_state(unit)
     return state
@@ -841,10 +882,21 @@ def run_as_service(unit, body, request_stop, on_error=None,
                        checkpoint=1)
                 request_stop()
             elif control == SERVICE_CONTROL_INTERROGATE:
-                report(live["state"])
+                # With the wait hint, if one is in force. An interrogate
+                # during a slow stop that answered with no hint would tell the
+                # SCM the wait it was already granted is over.
+                report(live["state"],
+                       wait_hint=(stop_wait_ms
+                                  if live["state"] == SERVICE_STOP_PENDING
+                                  else 0))
+            else:
+                # The documented answer for a control this service does not
+                # implement. Returning NO_ERROR says it was handled, which is
+                # how a pause request comes to look accepted and do nothing.
+                return ERROR_CALL_NOT_IMPLEMENTED
         except BaseException:                                    # noqa: BLE001
             pass
-        return 0
+        return NO_ERROR
 
     def on_main(argc, argv):
         # Every line is inside the guard. An exception escaping a ctypes
@@ -927,6 +979,22 @@ CREATE_NO_WINDOW = 0x08000000
 def no_console():
     """Keyword arguments that keep a captured child off the screen."""
     return {"creationflags": CREATE_NO_WINDOW} if IS_WINDOWS else {}
+
+
+def console_codec():
+    """What a Windows console program writes its output in.
+
+    `oem` is the console codepage: 437 or 850 on an English install and
+    something else again elsewhere, and **not** UTF-8, which is what schtasks
+    output was being decoded as. Nothing here parses that output, only shows
+    it, so the cost of getting this wrong is mojibake in front of an operator
+    on exactly the installs least able to work out why.
+
+    A function rather than a constant because the codec itself exists only on
+    Windows, so naming it unconditionally would break the import on the Linux
+    legs, and because it gives the decode a seam a test can stand in.
+    """
+    return "oem" if IS_WINDOWS else "utf-8"
 
 
 # ----------------------------------------------------------------------------
@@ -1186,7 +1254,8 @@ def _schtasks(args):
                            **no_console())
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)
-    text = r.stdout.decode("utf-8", "replace").strip() if r.stdout else ""
+    text = r.stdout.decode(console_codec(), "replace").strip() if r.stdout \
+        else ""
     return r.returncode == 0, text
 
 
@@ -1473,7 +1542,12 @@ def enable_ansi():
     try:
         api = _win()
         handle = api.kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-        if handle is None or handle == -1:
+        # INVALID_HANDLE_VALUE compared as what ctypes actually hands back: a
+        # c_void_p restype comes through as an unsigned integer, so `== -1` is
+        # never true (measured: 18446744073709551615). The check was doing
+        # nothing, and GetConsoleMode below would have failed anyway, which is
+        # why it never showed.
+        if handle is None or handle == ctypes.c_void_p(-1).value:
             return False
         mode = _DWORD(0)
         if not api.kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
@@ -2124,8 +2198,6 @@ def os_disk_mount(env=None):
 # install fails. The wizard therefore stores the UNC target and says it did.
 # ----------------------------------------------------------------------------
 
-ERROR_NOT_CONNECTED = 2250
-
 
 def unc_for_drive(letter):
     """Where a mapped drive letter really points, or None if it is not mapped.
@@ -2151,9 +2223,15 @@ def unc_for_drive(letter):
         return None
     size = _DWORD(1024)
     buf = ctypes.create_unicode_buffer(size.value)
-    if _win().mpr.WNetGetConnectionW(local, buf, ctypes.byref(size)) == 0:
+    if _win().mpr.WNetGetConnectionW(local, buf, ctypes.byref(size)) == NO_ERROR:
         if buf.value:
             return buf.value
+    # Every failure takes the same road, deliberately. ERROR_NOT_CONNECTED
+    # (2250) is the ordinary answer for a letter that is not mapped *in this
+    # logon session*, which is exactly the case the registry fallback exists
+    # for, so telling it apart from any other refusal would change nothing
+    # about what happens next. The named constant was carried here unused
+    # until 0.2.1 and is gone; this comment is what it was worth.
     return _mapped_in_registry(local[0])
 
 

@@ -2091,6 +2091,7 @@ class FakeAdvapi(object):
         self.calls = []
         self.reported = []
         self.config2 = []               # (info level, structure)
+        self.hints = []                 # dwWaitHint per report, in order
         self.refuse = set(refuse)       # calls that answer NULL / FALSE
         self.handler = None
         self.service_main = None
@@ -2121,6 +2122,9 @@ class FakeAdvapi(object):
     def CloseServiceHandle(self, handle):
         return self._ok("CloseServiceHandle")
 
+    def ControlService(self, svc, control, status):
+        return self._ok("ControlService")
+
     # Hosting --------------------------------------------------------------
     def RegisterServiceCtrlHandlerExW(self, name, handler, context):
         self.handler = handler
@@ -2131,6 +2135,7 @@ class FakeAdvapi(object):
         s = deref(status)
         self.reported.append((s.dwCurrentState, s.dwWin32ExitCode,
                               s.dwServiceSpecificExitCode))
+        self.hints.append(s.dwWaitHint)
         return ok
 
     def StartServiceCtrlDispatcherW(self, table):
@@ -2143,10 +2148,10 @@ class FakeAdvapi(object):
 class FakeWinApi(object):
     """What _win() returns. MAIN and HANDLER hand the callable straight back."""
 
-    def __init__(self, advapi=None):
+    def __init__(self, advapi=None, kernel32=None):
         self.advapi32 = advapi or FakeAdvapi()
         self.shell32 = None
-        self.kernel32 = None
+        self.kernel32 = kernel32
         self.mpr = None
         # Plain lambdas, not staticmethod(): a staticmethod object is
         # not callable on 3.9, and 3.9 is this project's floor.
@@ -2155,15 +2160,41 @@ class FakeWinApi(object):
         self.TABLE = FakeTable
 
 
+class FakeKernel32(object):
+    """Enough kernel32 for the console-mode path.
+
+    `handle` is what GetStdHandle answers: a c_void_p restype comes back as an
+    unsigned integer, so INVALID_HANDLE_VALUE arrives as 18446744073709551615
+    and not as -1. That is the whole of L22's fourth part.
+    """
+
+    def __init__(self, handle=7, mode=0, set_ok=True):
+        self.handle = handle
+        self.mode = mode
+        self.set_ok = set_ok
+        self.set_to = None
+
+    def GetStdHandle(self, which):
+        return self.handle
+
+    def GetConsoleMode(self, handle, out):
+        out._obj.value = self.mode
+        return 1
+
+    def SetConsoleMode(self, handle, mode):
+        self.set_to = mode
+        return 1 if self.set_ok else 0
+
+
 @contextlib.contextmanager
-def fake_windows(advapi=None):
+def fake_windows(advapi=None, kernel32=None):
     """Run a Windows-only path on whichever platform this is.
 
     IS_WINDOWS is patched on the module that reads it, which is this one:
     `from timelapse_platform import IS_WINDOWS` elsewhere makes a second
     binding, and patching one does not move the other.
     """
-    api = FakeWinApi(advapi)
+    api = FakeWinApi(advapi, kernel32)
     with mock.patch.object(plat, "IS_WINDOWS", True), \
             mock.patch.object(plat, "_win", lambda: api):
         yield api.advapi32
@@ -2372,3 +2403,277 @@ class TestTheOsProbesLiveHere(unittest.TestCase):
                                   lambda n: "/sbin/mount.cifs"), \
                 mock.patch.object(plat.subprocess, "run", refuse):
             self.assertTrue(plat.install_cifs_utils())
+
+
+class TestTheStopErrorIsTheOneThatFailed(unittest.TestCase):
+    """GetLastError is per thread and the next API call overwrites it.
+
+    `stop_service()` called `service_state()` in between, which makes several
+    calls of its own and finishes with CloseServiceHandle, so the number shown
+    to the operator was whatever that left. 1061 (still starting) and 1053
+    (the stop is hung) are the two that mean something here, and neither could
+    survive the trip.
+    """
+
+    def clobbering_state(self, unit):
+        # What the real one does: several calls, each setting the error.
+        plat.ctypes.get_last_error()
+        return plat.SERVICE_RUNNING
+
+    def test_the_detail_names_control_services_own_error(self):
+        with fake_windows() as advapi:
+            advapi.refuse.add("ControlService")
+            with mock.patch.object(plat, "service_state",
+                                   self.clobbering_state), \
+                    mock.patch.object(plat.ctypes, "get_last_error",
+                                      side_effect=[1053, 6, 6, 6]):
+                ok, detail = plat.stop_service("timelapse-capture", timeout=0)
+        self.assertFalse(ok)
+        self.assertIn("1053", detail)
+        self.assertNotIn("(Windows error 6)", detail)
+
+    def test_a_service_already_stopped_is_still_a_success(self):
+        # The control: ControlService refusing because the service is already
+        # stopped is the ordinary case and must not become an error.
+        with fake_windows() as advapi:
+            advapi.refuse.add("ControlService")
+            with mock.patch.object(plat, "service_state",
+                                   lambda u: plat.SERVICE_STOPPED), \
+                    mock.patch.object(plat.ctypes, "get_last_error",
+                                      return_value=1062):
+                ok, detail = plat.stop_service("timelapse-capture", timeout=0)
+        self.assertTrue(ok)
+        self.assertEqual(detail, "")
+
+
+class TestWaitingStopsWhenTheAnswerIsIn(unittest.TestCase):
+    """A service that exits at once answered in a second and was waited on
+    for thirty.
+
+    `run_daemon()` raises SystemExit with no enabled cameras, so the service
+    goes START_PENDING then STOPPED, and the GUI sat with a busy cursor for
+    the rest of the timeout before saying "started, but reported stopped".
+    """
+
+    def setUp(self):
+        """A fake clock, because the point of this item is elapsed time.
+
+        With the real one, a test that only reads the returned state passes
+        whether or not the wait gave up early: it simply takes thirty seconds
+        to say so. Both of these tests were written that way first and both
+        were NOT CAUGHT by the revert check. So sleep() advances the clock,
+        nothing waits, and the assertion is on how many times the service was
+        asked.
+        """
+        self.now = 1000.0
+        self.polls = 0
+
+        def clock():
+            return self.now
+
+        def sleep(seconds):
+            self.now += seconds
+
+        for name, fn in (("time", clock), ("sleep", sleep)):
+            p = mock.patch.object(plat.time, name, fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def states(self, sequence):
+        """A service_state() that walks a list and then repeats the last."""
+        seq = list(sequence)
+
+        def answer(_unit):
+            self.polls += 1
+            return seq.pop(0) if len(seq) > 1 else seq[0]
+
+        return answer
+
+    def test_it_gives_up_when_the_service_has_stopped(self):
+        answer = self.states([plat.SERVICE_START_PENDING, plat.SERVICE_STOPPED])
+        with mock.patch.object(plat, "service_state", answer), \
+                mock.patch.object(plat.time, "sleep", lambda s: None):
+            state = plat._await_state("x", plat.SERVICE_RUNNING, 30, settle=0)
+        self.assertEqual(state, plat.SERVICE_STOPPED)
+        # Two polls: pending, then stopped. Without the early exit it polls
+        # for the whole thirty seconds to reach the same answer.
+        self.assertLessEqual(self.polls, 3, "it kept waiting anyway")
+
+    def test_it_gives_up_when_the_service_is_not_there(self):
+        with mock.patch.object(plat, "service_state",
+                               lambda u: plat.SERVICE_ABSENT), \
+                mock.patch.object(plat.time, "sleep", lambda s: None):
+            state = plat._await_state("x", plat.SERVICE_STOPPED, 30)
+        self.assertEqual(state, plat.SERVICE_ABSENT)
+        self.assertLessEqual(self.polls, 3, "it waited for a service that is "
+                                            "not installed")
+
+    def test_a_stopped_reading_before_the_grace_is_not_believed(self):
+        """StartServiceW can return before the SCM has moved it off STOPPED.
+
+        So the first reading is not evidence of anything, and giving up on it
+        would turn a service that started perfectly into a reported failure.
+        """
+        answer = self.states([plat.SERVICE_STOPPED, plat.SERVICE_STOPPED,
+                              plat.SERVICE_RUNNING])
+        with mock.patch.object(plat, "service_state", answer), \
+                mock.patch.object(plat.time, "sleep", lambda s: None):
+            state = plat._await_state("x", plat.SERVICE_RUNNING, 30, settle=30)
+        self.assertEqual(state, plat.SERVICE_RUNNING)
+
+    def test_it_still_waits_through_a_pending_start(self):
+        # The control: pending is exactly what the wait is for.
+        answer = self.states([plat.SERVICE_START_PENDING,
+                              plat.SERVICE_START_PENDING,
+                              plat.SERVICE_RUNNING])
+        with mock.patch.object(plat, "service_state", answer), \
+                mock.patch.object(plat.time, "sleep", lambda s: None):
+            state = plat._await_state("x", plat.SERVICE_RUNNING, 30, settle=0)
+        self.assertEqual(state, plat.SERVICE_RUNNING)
+
+    def test_running_on_the_way_down_is_not_a_contradiction(self):
+        answer = self.states([plat.SERVICE_RUNNING, plat.SERVICE_STOP_PENDING,
+                              plat.SERVICE_STOPPED])
+        with mock.patch.object(plat, "service_state", answer), \
+                mock.patch.object(plat.time, "sleep", lambda s: None):
+            state = plat._await_state("x", plat.SERVICE_STOPPED, 30)
+        self.assertEqual(state, plat.SERVICE_STOPPED)
+
+
+class TestTheControlHandlerAnswersProperly(unittest.TestCase):
+    """It returned NO_ERROR for every control there is.
+
+    Which says "handled" to the SCM, so a pause request looked accepted and
+    did nothing at all.
+    """
+
+    def handler(self, advapi):
+        self.assertIsNotNone(advapi.handler, "the handler was never registered")
+        return advapi.handler
+
+    def run_service(self, advapi):
+        stopped = []
+        plat.run_as_service("timelapse-capture",
+                            lambda ready: (ready(), stopped.append(True)),
+                            lambda: None)
+        return stopped
+
+    def test_an_unknown_control_is_refused_rather_than_swallowed(self):
+        with fake_windows() as advapi:
+            self.run_service(advapi)
+            answer = self.handler(advapi)(32, 0, None, None)
+        self.assertEqual(answer, plat.ERROR_CALL_NOT_IMPLEMENTED)
+
+    def test_a_stop_is_still_accepted(self):
+        # The control: refusing the unknown ones must not refuse the known.
+        with fake_windows() as advapi:
+            self.run_service(advapi)
+            answer = self.handler(advapi)(plat.SERVICE_CONTROL_STOP, 0, None,
+                                          None)
+        self.assertEqual(answer, plat.NO_ERROR)
+
+    def test_an_interrogate_during_a_stop_carries_the_wait_hint(self):
+        """Answering with no hint would tell the SCM the wait it granted is
+        over, which is how a slow stop comes to be called hung."""
+        with fake_windows() as advapi:
+            self.run_service(advapi)
+            handler = self.handler(advapi)
+            handler(plat.SERVICE_CONTROL_STOP, 0, None, None)
+            before = len(advapi.hints)
+            handler(plat.SERVICE_CONTROL_INTERROGATE, 0, None, None)
+        self.assertGreater(advapi.hints[before], 0,
+                           "the interrogate answered with no wait hint")
+
+    def test_an_interrogate_while_running_carries_none(self):
+        with fake_windows() as advapi:
+            self.run_service(advapi)
+            handler = self.handler(advapi)
+            before = len(advapi.hints)
+            handler(plat.SERVICE_CONTROL_INTERROGATE, 0, None, None)
+        self.assertEqual(advapi.hints[before], 0)
+
+
+class TestTheConsoleHandleIsCompared(unittest.TestCase):
+    """`handle == -1` is never true.
+
+    GetStdHandle's restype is a void pointer, so ctypes hands back an unsigned
+    integer: INVALID_HANDLE_VALUE arrives as 18446744073709551615. The guard
+    was doing nothing, and it never showed because GetConsoleMode fails on
+    that handle anyway.
+    """
+
+    def test_an_invalid_handle_is_recognised(self):
+        bad = FakeKernel32(handle=ctypes.c_void_p(-1).value)
+        with fake_windows(kernel32=bad):
+            self.assertFalse(plat.enable_ansi())
+        self.assertIsNone(bad.set_to, "it tried to set the mode anyway")
+
+    def test_a_real_handle_gets_the_bit_set(self):
+        good = FakeKernel32(handle=7, mode=0)
+        with fake_windows(kernel32=good):
+            self.assertTrue(plat.enable_ansi())
+        self.assertEqual(good.set_to, plat.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+
+    def test_a_console_that_already_has_it_is_left_alone(self):
+        already = FakeKernel32(
+            handle=7, mode=plat.ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        with fake_windows(kernel32=already):
+            self.assertTrue(plat.enable_ansi())
+        self.assertIsNone(already.set_to)
+
+
+class TestSchtasksOutputIsDecodedAsTheConsoleWrote(unittest.TestCase):
+    """schtasks writes the console codepage, not UTF-8.
+
+    Its output is never parsed, only shown, so the cost of getting this wrong
+    is mojibake in front of an operator rather than a wrong decision. The
+    `oem` codec is Windows-only, which is why the product names the platform
+    here and this test declares it.
+    """
+
+    def run_it(self, stdout, codec=None):
+        patches = [mock.patch.object(plat.subprocess, "run",
+                                     return_value=mock.Mock(returncode=0,
+                                                            stdout=stdout))]
+        if codec:
+            patches.append(mock.patch.object(plat, "console_codec",
+                                             lambda: codec))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        return plat._schtasks(["/query"])
+
+    def test_the_codec_is_the_console_one_on_windows(self):
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            self.assertEqual(plat.console_codec(), "oem")
+
+    def test_it_is_utf_8_where_there_is_no_such_thing(self):
+        # The codec itself is Windows-only, so naming it on Linux would be an
+        # import-time LookupError rather than mojibake.
+        with mock.patch.object(plat, "IS_WINDOWS", False):
+            self.assertEqual(plat.console_codec(), "utf-8")
+
+    def test_the_output_is_decoded_with_it(self):
+        # cp850 stands in for the real console codepage: it is a stdlib codec
+        # on every platform, so this runs on both legs and still measures the
+        # thing that matters, which is that the bytes are decoded as the
+        # console wrote them rather than as UTF-8. Under UTF-8 these two bytes
+        # are a replacement character apiece.
+        ok, text = self.run_it(b"Dur\xe9e\n", codec="cp850")
+        self.assertTrue(ok)
+        self.assertEqual(text, b"Dur\xe9e".decode("cp850"))
+        # The control, and the whole finding: under UTF-8 that byte is a
+        # replacement character. Asserting against the codec rather than
+        # against a character I typed, because cp850 is a console codepage and
+        # 0xE9 is not what latin-1 would make of it.
+        self.assertNotEqual(text, b"Dur\xe9e".decode("utf-8", "replace"))
+
+    def test_high_bytes_never_raise(self):
+        ok, text = self.run_it(b"SUCCESS: \xe9\xe8\n")
+        self.assertTrue(ok)
+        self.assertIn("SUCCESS", text)
+
+    def test_plain_output_is_unchanged(self):
+        ok, text = self.run_it(b"SUCCESS: the task was created\n")
+        self.assertTrue(ok)
+        self.assertEqual(text, "SUCCESS: the task was created")

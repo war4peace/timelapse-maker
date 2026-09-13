@@ -111,6 +111,20 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Windows: a service that will not stop now reports the right error.** The
+  number printed was whichever Windows call happened to run last, not the one
+  that failed, so "the service is still starting" and "the stop is hung"
+  both came out as something unrelated.
+
+- **Windows: starting a service that fails immediately no longer takes thirty
+  seconds to say so.** A service that exits at once, which is what capture
+  does when no cameras are enabled, was waited on for the full timeout with
+  the wizard frozen, before reporting that it had stopped.
+
+- **Windows: the scheduled-task output is shown in the console's own
+  encoding.** Accented characters in it came out as replacement characters on
+  a non-English install.
+
 - **A folder in your library named like a video is no longer listed as one.**
   A folder called `Gate.20260811.mkv` was indexed with a size of zero and its
   Play link handed VLC a playlist for it. Only real files are indexed now.
