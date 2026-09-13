@@ -2738,6 +2738,14 @@ enable switch, smoothing, Test and Save. Four things about it are deliberate:
   that Add created and nobody named removes it, rather than leaving the page
   blocked by an error about a row the operator has already decided against.
 
+**The scan dialog cannot be left listening** (0.2.1, L25). The guard around
+`discover_cameras()` covered the call and not the row building, so an
+exception two lines later escaped into Tk's callback handler, which prints it
+and carries on: the dialog sat reading "Listening for 3 seconds ..." for ever
+with only Cancel working, which is the exact failure the guard exists to
+prevent. It covers the building and the sizing now, and a failure there
+destroys the dialog and says what happened rather than leaving it up.
+
 **Scan network** puts `timelapse discover`'s capability on the camera page: one
 multicast WS-Discovery probe (`setup.discover_cameras()`, unchanged and
 unwrapped), a modal list of what answered, and a tick beside each. Everything it
@@ -3758,7 +3766,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,323 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,329 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4132,6 +4140,12 @@ how `WINDOW` came to be 660 rather than a guess.
 3. Basics, storage: type a relative path and a nonexistent drive. Both refused
    before Next, and the three derived directories update as you type. **Then
    press Browse: it must open at the folder already in the box.**
+3a. **With a config whose videos are on another disk** (edit `video_output` to
+   somewhere outside the data folder), open the wizard and press Next without
+   touching the Data folder. `video_output` must be **unchanged** in the file
+   afterwards, and the preview on the page must have shown the real one rather
+   than the derived one. Then change the Data folder and press Next: all three
+   move together, which is what one field for three directories is for.
 4. Basics, ffmpeg: point it at a folder rather than an executable. Both
    binaries are found and the encoder is named. Browse opens where the box
    points. Point it at nothing and the download page is offered.
@@ -4537,7 +4551,7 @@ scripts/timelapse_capture.py     daemon, 1584 lines
 scripts/timelapse_encode.py      batch job, 2382 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1049 lines
 scripts/timelapse_setup.py       configuration wizard, 4774 lines
-scripts/timelapse_gui.py         the same wizard in a window, 2946 lines
+scripts/timelapse_gui.py         the same wizard in a window, 2990 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 471 lines
 scripts/timelapse_platform.py    the only platform branch, 2583 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 438 lines

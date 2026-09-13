@@ -111,6 +111,16 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Windows: the graphical wizard keeps a videos folder you placed yourself.**
+  It derived frames, videos and logs from the data folder every time you
+  pressed Next, so a library kept on a second disk was moved back under the
+  data folder silently, just by opening the wizard for something else.
+  Changing the data folder still moves all three, which is what it is for.
+
+- **Windows: the network scan dialog can no longer be left saying
+  "Listening".** If anything went wrong while it was drawing what it found,
+  the dialog stayed on screen with only Cancel working.
+
 - **Windows: `timelapse version` now tells you whether the running service is
   the build you installed.** It printed the same "it might still be on the
   previous build" note every time capture was running, so the line said

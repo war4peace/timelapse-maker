@@ -97,6 +97,31 @@ class TestDecideLayerIsSeparate(unittest.TestCase):
                 names.add(token.string)
         return names
 
+    def test_the_show_half_derives_no_storage_paths_itself(self):
+        """The mirror of the rule above, and L25's call site.
+
+        `paths_to_store()` deciding correctly says nothing about the page
+        asking it, and the page is the half no unit test executes (that is the
+        decide/show split, and `temp/gui_smoke.py` plus the checklist are the
+        other half of the answer). What can be held here is that the page has
+        no second opinion: `storage_paths()` is called once, above the banner,
+        by the function that knows when it applies.
+        """
+        import io as _io
+        import tokenize
+
+        text = SOURCE.read_text(encoding="utf-8")
+        lines = text.splitlines()
+        banner = [n for n, line in enumerate(lines, 1)
+                  if "# THE SHOW LAYER" in line][0]
+        below = [t for t in tokenize.generate_tokens(
+            _io.StringIO(text).readline)
+            if t.start[0] > banner and t.type == tokenize.NAME]
+        self.assertNotIn("storage_paths", [t.string for t in below],
+                         "the page derives the paths itself again")
+        self.assertIn("paths_to_store", [t.string for t in below],
+                      "the page stopped asking the rule at all")
+
     def test_the_decide_half_uses_no_widgets(self):
         names = self.names_above_the_banner()
         self.assertGreater(len(names), 50, "the tokeniser found nothing")
@@ -2160,6 +2185,47 @@ class TestNoEmDashes(unittest.TestCase):
         text = SOURCE.read_text(encoding="utf-8")
         self.assertNotIn("\u2014", text)
         self.assertNotIn("&mdash;", text)
+
+
+
+class TestPageOneLeavesHandPlacedPathsAlone(unittest.TestCase):
+    """It rewrote all three storage paths from the data folder every pass.
+
+    So an operator who had put the library on a second disk, which is an
+    ordinary arrangement, had it moved back under the data folder every time
+    the wizard was opened for any other reason, silently, and the next encode
+    wrote somewhere else.
+    """
+
+    EXISTING = {"frames_root": "D:\\tl\\frames",
+                "video_output": "E:\\library",
+                "log_dir": "D:\\tl\\logs",
+                "ffmpeg": "C:\\ffmpeg\\bin\\ffmpeg.exe"}
+
+    def test_an_untouched_folder_changes_nothing(self):
+        out = gui.paths_to_store("D:\\tl", self.EXISTING, "D:\\tl")
+        self.assertEqual(out["video_output"], "E:\\library")
+
+    def test_whitespace_is_not_a_change(self):
+        out = gui.paths_to_store("  D:\\tl  ", self.EXISTING, "D:\\tl")
+        self.assertEqual(out["video_output"], "E:\\library")
+
+    def test_a_new_folder_moves_all_three(self):
+        # The control: the derivation is right for an answer somebody just
+        # typed, which is the whole reason the page has one field for three
+        # directories.
+        out = gui.paths_to_store("F:\\newdisk", self.EXISTING, "D:\\tl")
+        for key in ("frames_root", "video_output", "log_dir"):
+            self.assertTrue(out[key].startswith("F:"), out[key])
+
+    def test_a_first_run_derives_everything(self):
+        out = gui.paths_to_store("F:\\newdisk", {}, "")
+        self.assertEqual(sorted(out),
+                         ["frames_root", "log_dir", "video_output"])
+
+    def test_nothing_else_in_paths_is_disturbed(self):
+        out = gui.paths_to_store("D:\\tl", self.EXISTING, "D:\\tl")
+        self.assertEqual(out["ffmpeg"], "C:\\ffmpeg\\bin\\ffmpeg.exe")
 
 
 if __name__ == "__main__":

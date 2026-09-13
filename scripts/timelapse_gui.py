@@ -196,6 +196,24 @@ def storage_paths(base):
             "log_dir": str(root / "logs")}
 
 
+def paths_to_store(typed, existing, opened_with):
+    """The three storage paths to save, given what the page was opened with.
+
+    Deriving frames, videos and logs from one data folder is right for a
+    folder somebody has just typed, and wrong for a config that already says
+    where its videos live: a second disk for the library is an ordinary
+    arrangement, and page one is not where it should be silently undone. So
+    the derivation happens when the answer *changed*, and not otherwise.
+
+    Up here rather than inside the page's commit() because it is a rule, and
+    the rules in this file live above the banner where a test can reach them
+    without a display.
+    """
+    if str(typed).strip() == str(opened_with).strip():
+        return dict(existing)
+    return storage_paths(typed)
+
+
 def check_ffmpeg(answer):
     """(level, message, ffmpeg, ffprobe, codec).
 
@@ -1734,20 +1752,27 @@ def run(config_path=None, existing=None):
                 self.config(cursor="watch")
                 box.config(cursor="watch")
                 self.update_idletasks()
+                # The guard covers the row building too, not just the
+                # scan. An exception after discover_cameras() returned escaped
+                # into Tk's callback handler, which prints it and carries on,
+                # leaving the dialog reading "Listening for 3 seconds ..." for
+                # ever with only Cancel working: the failure this whole
+                # try/except exists to prevent, arriving two lines later.
                 try:
                     found = setup.discover_cameras()
+                    rows = scan_rows(found, cams)
                 except Exception as exc:            # noqa: BLE001
                     # Discovery is an offer. Anything at all going wrong here
                     # must leave the operator adding cameras by hand, never
                     # looking at a stack trace.
-                    found, failure = [], "%s: %s" % (type(exc).__name__, exc)
+                    found, rows = [], []
+                    failure = "%s: %s" % (type(exc).__name__, exc)
                 else:
                     failure = ""
                 finally:
                     self.config(cursor="")
                     box.config(cursor="")
 
-                rows = scan_rows(found, cams)
                 if not rows:
                     box.destroy()
                     messagebox.showinfo(
@@ -1755,16 +1780,24 @@ def run(config_path=None, existing=None):
                         ("Discovery failed (%s).\n\n" % failure if failure
                          else "") + nothing_found_advice())
                     return
-                heading.config(text=scan_summary(found, rows))
-                build_rows(rows)
-                # Sized to what answered, up to the cap: four cameras in a box
-                # of empty space looks like something failed to load. The
-                # geometry has to be cleared as well as the height set, or the
-                # window keeps whatever size it was given while it was still
-                # saying "listening".
-                canvas.config(height=min(240, max(56, 30 * len(rows))))
-                box.geometry("")
-                tally()
+                try:
+                    heading.config(text=scan_summary(found, rows))
+                    build_rows(rows)
+                    # Sized to what answered, up to the cap: four cameras in a
+                    # box of empty space looks like something failed to load.
+                    # The geometry has to be cleared as well as the height
+                    # set, or the window keeps whatever size it was given
+                    # while it was still saying "listening".
+                    canvas.config(height=min(240, max(56, 30 * len(rows))))
+                    box.geometry("")
+                    tally()
+                except Exception as exc:            # noqa: BLE001
+                    box.destroy()
+                    messagebox.showerror(
+                        "Scan network",
+                        "The scan found %d camera(s) and could not show "
+                        "them:\n%s: %s\n\nAdd them by hand instead."
+                        % (len(rows), type(exc).__name__, exc))
 
             box.update_idletasks()
             box.after(50, scan_now)
@@ -1796,10 +1829,14 @@ def run(config_path=None, existing=None):
             store = ttk.LabelFrame(self.body, text="Storage", padding=8)
             store.pack(fill="x")
             current = self.cfg["paths"].get("frames_root", "")
-            folder, row = self.field(store, "Data folder",
-                                     str(Path(current).parent)
-                                     if current else "", width=46,
-                                     label_width=LABELS)
+            # Remembered so commit() can tell "the operator changed the data
+            # folder" from "the operator opened this page". The three paths
+            # are derived from it, and rewriting them on every pass moved an
+            # operator's hand-placed videos folder back under the data folder
+            # silently, every time the wizard was opened for any other reason.
+            started_at = str(Path(current).parent) if current else ""
+            folder, row = self.field(store, "Data folder", started_at,
+                                     width=46, label_width=LABELS)
             ttk.Button(row, text="Browse",
                        command=lambda: self.browse_into(folder)).pack(
                            side="left", padx=6)
@@ -1893,7 +1930,12 @@ def run(config_path=None, existing=None):
                     level, message = check_storage(folder.get(), guard_gb)
                     self.say(store_note, level, message)
                 if folder.get().strip():
-                    p = storage_paths(folder.get())
+                    # What will actually be stored, not what the folder would
+                    # derive: with an untouched folder and a library on
+                    # another disk, those are two different answers and the
+                    # label has to be the one commit() will write.
+                    p = paths_to_store(folder.get(), self.cfg["paths"],
+                                       started_at)
                     derived.config(text="frames  -> %s\nvideos  -> %s\n"
                                         "logs    -> %s" % (p["frames_root"],
                                                            p["video_output"],
@@ -1937,7 +1979,9 @@ def run(config_path=None, existing=None):
                     messagebox.showerror("Frame rate", message)
                     return False
 
-                self.cfg["paths"].update(storage_paths(folder.get()))
+                self.cfg["paths"].update(
+                    paths_to_store(folder.get(), self.cfg["paths"],
+                                   started_at))
                 self.cfg["paths"]["ffmpeg"] = ffmpeg
                 if ffprobe:
                     self.cfg["paths"]["ffprobe"] = ffprobe
