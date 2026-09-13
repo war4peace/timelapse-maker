@@ -14,10 +14,13 @@ would be a sign this file had started deciding things.
 
 import contextlib
 import io
+import json
+import os
 import re
 import shutil
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -685,6 +688,187 @@ class TestVersions(unittest.TestCase):
         on_disk = {p.stem.replace("timelapse_", "")
                    for p in (ROOT / "scripts").glob("timelapse_*.py")}
         self.assertEqual(set(cli.SCRIPTS), on_disk)
+
+
+
+class TestTheVersionCommandComparesSomething(unittest.TestCase):
+    """It printed the "you may still be on the old build" hint whenever
+    capture was running at all.
+
+    Which is every healthy system, so the line said nothing and trained the
+    operator to skip it. CLAUDE.md and the Linux wrapper both describe this
+    command as comparing the running daemon against the files on disk, and
+    this one never compared anything.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def drive(self, running=True, started=None, newest=None):
+        """A real directory with a real mtime, rather than a faked stat.
+
+        `cli.HERE` is where the scripts are installed, so pointing it at a
+        temp directory is the seam. Patching `Path.glob` is not even possible
+        (the attribute is read-only), which is a fair hint that it was the
+        wrong level to reach for.
+        """
+        out = io.StringIO()
+        state = cli.SERVICE_RUNNING if running else 1
+        script = self.tmp / "timelapse_capture.py"
+        script.write_text("x", encoding="utf-8")
+        if newest is not None:
+            os.utime(str(script), (newest, newest))
+
+        with mock.patch.object(cli, "service_state", lambda u: state), \
+                mock.patch.object(cli, "installed_versions",
+                                  lambda: [("capture", "0.2.0")]), \
+                mock.patch.object(cli, "daemon_started_at", lambda: started), \
+                mock.patch.object(cli, "HERE", self.tmp), \
+                contextlib.redirect_stdout(out):
+            code = cli.do_version([])
+        return code, out.getvalue()
+
+    def test_files_installed_after_the_daemon_started_are_reported(self):
+        _, said = self.drive(started=1000.0, newest=2000.0)
+        self.assertIn("older build", said)
+        self.assertIn("sc stop", said)
+
+    def test_files_older_than_the_daemon_are_not(self):
+        # The ordinary healthy case, and the one that used to print the hint
+        # anyway.
+        _, said = self.drive(started=2000.0, newest=1000.0)
+        self.assertNotIn("older build", said)
+        self.assertNotIn("sc stop", said)
+
+    def test_no_heartbeat_says_so_rather_than_guessing(self):
+        _, said = self.drive(started=None, newest=2000.0)
+        self.assertIn("cannot be compared", said)
+        self.assertNotIn("sc stop", said)
+
+    def test_a_stopped_service_is_not_asked_about(self):
+        _, said = self.drive(running=False, started=1000.0, newest=2000.0)
+        self.assertNotIn("older build", said)
+        self.assertNotIn("cannot be compared", said)
+
+    def test_the_state_is_named_rather_than_numbered(self):
+        # `== 4` was a literal. The constant is in the platform module with
+        # every other SCM code, and a literal is how the two come apart.
+        src = Path(cli.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("service_state(CAPTURE_UNIT) == 4", src)
+
+
+class TestTheHeartbeatIsReadForThatComparison(unittest.TestCase):
+    """daemon_started_at(), on a real config and a real state file."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.config = self.tmp / "config.json"
+        self.config.write_text(json.dumps(
+            {"paths": {"state_dir": str(self.state)}}), encoding="utf-8")
+
+    def write_state(self, **fields):
+        body = {"started": "2026-09-13T10:00:00", "running": True}
+        body.update(fields)
+        (self.state / "capture.json").write_text(json.dumps(body),
+                                                 encoding="utf-8")
+
+    def read(self):
+        with mock.patch.object(cli, "CONFIG_PATH", str(self.config)):
+            return cli.daemon_started_at()
+
+    def test_it_reads_the_start_time(self):
+        self.write_state()
+        want = datetime(2026, 9, 13, 10, 0, 0).timestamp()
+        self.assertEqual(self.read(), want)
+
+    def test_a_stopped_daemon_reports_nothing(self):
+        # running=false is the final write of a clean shutdown, and its start
+        # time is about a process that is gone.
+        self.write_state(running=False)
+        self.assertIsNone(self.read())
+
+    def test_a_missing_heartbeat_reports_nothing(self):
+        self.assertIsNone(self.read())
+
+    def test_a_malformed_heartbeat_reports_nothing(self):
+        (self.state / "capture.json").write_text("{ not json",
+                                                 encoding="utf-8")
+        self.assertIsNone(self.read())
+
+    def test_a_heartbeat_with_no_start_time_reports_nothing(self):
+        self.write_state(started=None)
+        self.assertIsNone(self.read())
+
+
+class TestCtrlCIsNotACrash(unittest.TestCase):
+    """`timelapse encode` and `timelapse web-serve` both wait.
+
+    Ctrl-C is how they are meant to be stopped from a terminal, and a
+    traceback says a program has crashed. follow() already had its own guard;
+    nothing else did.
+    """
+
+    def drive(self, argv):
+        out = io.StringIO()
+        with mock.patch.object(cli, "is_elevated", return_value=True), \
+                mock.patch.object(cli, "run",
+                                  side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stdout(out):
+            return cli.main(argv), out.getvalue()
+
+    def test_a_command_that_waits_exits_130(self):
+        code, said = self.drive(["encode"])
+        self.assertEqual(code, 130)
+        self.assertNotIn("Traceback", said)
+
+    def test_a_special_command_is_covered_too(self):
+        out = io.StringIO()
+        with mock.patch.object(cli, "is_elevated", return_value=True), \
+                mock.patch.dict(cli.SPECIAL, {"status": lambda e: (_ for _ in
+                                                                  ()).throw(
+                    KeyboardInterrupt())}), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["status"]), 130)
+
+    def test_an_ordinary_run_is_unaffected(self):
+        # The control: catching the interrupt must not swallow the status.
+        out = io.StringIO()
+        with mock.patch.object(cli, "is_elevated", return_value=True), \
+                mock.patch.object(cli, "run", return_value=3), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["encode"]), 3)
+
+
+class TestTheEditorIsResolvedBeforeItIsRun(unittest.TestCase):
+    """EDITOR=code is a `.cmd` shim, and subprocess without shell resolves
+    only `.exe`, so a perfectly present editor failed with "file not found".
+    shutil.which honours PATHEXT."""
+
+    def drive(self, wanted, resolved):
+        out = io.StringIO()
+        with mock.patch.object(cli, "is_elevated", return_value=True), \
+                mock.patch.dict(cli.os.environ, {"EDITOR": wanted}), \
+                mock.patch.object(cli.shutil, "which",
+                                  lambda n: resolved), \
+                mock.patch.object(cli.subprocess, "run") as ran, \
+                contextlib.redirect_stdout(out):
+            ran.return_value = mock.Mock(returncode=0)
+            cli.do_config([])
+        return [c.args[0] for c in ran.call_args_list], out.getvalue()
+
+    def test_the_resolved_path_is_what_gets_run(self):
+        calls, _ = self.drive("code", "C:\\shims\\code.cmd")
+        self.assertIn("C:\\shims\\code.cmd", calls[-1])
+
+    def test_an_unresolvable_editor_is_still_attempted(self):
+        # Refusing outright would be worse: which() knows about PATH, and an
+        # absolute path to an editor that is not on it is a fair answer.
+        calls, _ = self.drive("myeditor", None)
+        self.assertIn("myeditor", calls[-1])
 
 
 if __name__ == "__main__":

@@ -2326,6 +2326,28 @@ argv and account.
 
 ### 4.6b `install.ps1` and `timelapse_cli.py` (0.2.0)
 
+**`timelapse version` compares something** (0.2.1, L23). It printed "if these
+files are newer than the running service, it is still on the previous build"
+whenever capture was running at all, which is every healthy system: a line
+that is true of everything is a line the operator learns to skip, and the one
+failure it exists to catch then goes past unread. It reads the daemon's start
+time out of `capture.json` now and compares it against the newest installed
+script, so it says "capture is running an older build" only when that is the
+case. No heartbeat means the comparison cannot be made, and it says that
+instead of implying either answer: the third state, as everywhere else here.
+A stopped daemon's heartbeat is not used, because `running: false` is the
+final write of a clean shutdown and its start time is about a process that is
+gone.
+
+**Ctrl-C is not a crash** (0.2.1, L24). `timelapse encode` and
+`timelapse web-serve` both wait, and Ctrl-C is how they are meant to be
+stopped; only `follow()` had a guard, so everything else printed a traceback,
+which says a program has broken. The dispatcher catches it around both tables
+and exits 130. And the editor for `timelapse config` is resolved with
+`shutil.which()` before being run: `EDITOR=code` is a `.cmd` shim, and
+`subprocess.run` without `shell=True` resolves only `.exe`, so a perfectly
+present editor failed with "file not found".
+
 The Windows front door: the counterpart to `install.sh` and to the bash wrapper
 it generates. Three properties are load-bearing.
 
@@ -3736,7 +3758,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,308 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,323 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4518,7 +4540,7 @@ scripts/timelapse_setup.py       configuration wizard, 4774 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2946 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 471 lines
 scripts/timelapse_platform.py    the only platform branch, 2583 lines
-scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
+scripts/timelapse_cli.py         the `timelapse` command on Windows, 438 lines
 scripts/timelapse_web.py         read-only web UI, 3596 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests

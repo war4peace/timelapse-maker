@@ -26,15 +26,18 @@ path to this file, and moving the install directory cannot leave a wrapper
 pointing at the old one.
 """
 
+import json
 import os
+import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 from timelapse_platform import (
-    CAPTURE_UNIT, CONFIG_DIR, CONFIG_PATH, LOG_STEMS, SERVICE_STATES,
-    elevation_hint, is_elevated, service_state,
+    CAPTURE_UNIT, CONFIG_DIR, CONFIG_PATH, LOG_STEMS, SERVICE_RUNNING,
+    SERVICE_STATES, elevation_hint, is_elevated, service_state,
 )
 
 __version__ = "0.2.0"
@@ -186,23 +189,62 @@ def installed_versions():
     return found
 
 
+def daemon_started_at():
+    """When the running capture daemon started, or None if it does not say.
+
+    From `capture.json`, which the daemon writes once at startup and then once
+    a minute. None for absent, unreadable or malformed, all of which mean the
+    same thing here: no comparison can be made, so none is claimed.
+    """
+    try:
+        with open(str(CONFIG_PATH), encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    try:
+        from timelapse_encode import CAPTURE_STATE, state_dir
+        with open(str(state_dir(cfg) / CAPTURE_STATE), encoding="utf-8") as fh:
+            state = json.load(fh)
+        started = state.get("started")
+        if not started or not state.get("running"):
+            return None
+        # fromisoformat, because stamp() in the daemon is isoformat() with the
+        # microseconds dropped, and reading it back with the writer's own
+        # function is one fewer format to keep in step.
+        return datetime.fromisoformat(started).timestamp()
+    except (OSError, ValueError, ImportError, TypeError):
+        return None
+
+
 def do_version(_extra):
     for name, version in installed_versions():
         print("  %-9s %s" % (name, version))
     # The daemon runs the code it read at startup, so a service that predates
     # the files on disk is an upgrade installed and never applied: the one
-    # failure a version number alone cannot show you.
-    if service_state(CAPTURE_UNIT) == 4:
-        try:
-            newest = max(p.stat().st_mtime for p in HERE.glob("timelapse_*.py"))
-        except (OSError, ValueError):
-            return 0
-        if newest > time.time() - 5:
-            return 0
+    # failure a version number alone cannot show you. The Linux wrapper
+    # compares the two, and this used to print the hint whenever capture was
+    # running at all, which trains people to ignore it.
+    if service_state(CAPTURE_UNIT) != SERVICE_RUNNING:
+        return 0
+    try:
+        newest = max(p.stat().st_mtime for p in HERE.glob("timelapse_*.py"))
+    except (OSError, ValueError):
+        return 0
+    started = daemon_started_at()
+    if started is None:
+        # No heartbeat to compare against: say what is known, which is that
+        # the question cannot be answered from here, rather than implying an
+        # answer either way.
         print()
-        print("  Capture is running. If these files are newer than the running")
-        print("  service, it is still on the previous build:")
-        print("    sc stop \"TimelapseCapture\" && sc start \"TimelapseCapture\"")
+        print("  Capture is running. Its build cannot be compared from here")
+        print("  (no heartbeat in the state folder yet).")
+        return 0
+    if newest <= started:
+        return 0
+    print()
+    print("  Capture is running an older build: these files were installed")
+    print("  after it started. Restart it to pick them up:")
+    print("    sc stop \"TimelapseCapture\" && sc start \"TimelapseCapture\"")
     return 0
 
 
@@ -334,11 +376,15 @@ def do_config(extra):
                            "--output", CONFIG_PATH])
     if made.returncode != 0:
         print("  (continuing without a backup)")
-    editor = os.environ.get("EDITOR") or "notepad"
+    # shutil.which, because it honours PATHEXT: EDITOR=code is a .cmd shim on
+    # Windows, and subprocess without shell=True resolves only .exe, so it
+    # would fail with "file not found" for an editor that is plainly there.
+    wanted = os.environ.get("EDITOR") or "notepad"
+    editor = shutil.which(wanted) or wanted
     try:
         return subprocess.run([editor, CONFIG_PATH]).returncode
     except OSError as exc:
-        print("  Could not start %s: %s" % (editor, exc))
+        print("  Could not start %s: %s" % (wanted, exc))
         return 1
 
 
@@ -366,10 +412,18 @@ def main(argv=None):
     if command in ("-V", "--version"):
         print("timelapse_cli.py %s" % __version__)
         return 0
-    if command in SPECIAL:
-        return SPECIAL[command](extra)
-    if command in COMMANDS:
-        return run(command, extra)
+    try:
+        if command in SPECIAL:
+            return SPECIAL[command](extra)
+        if command in COMMANDS:
+            return run(command, extra)
+    except KeyboardInterrupt:
+        # Ctrl-C is how `timelapse encode` and `timelapse web-serve` are meant
+        # to be stopped from a terminal, and a traceback says a program has
+        # crashed. 130 is the shell's convention for it. `follow()` already
+        # had its own guard; this covers every other command that waits.
+        print()
+        return 130
     if command == "update":
         print('  "timelapse update" is Linux-only so far.')
         print("  On Windows, download the new release and run install.ps1")

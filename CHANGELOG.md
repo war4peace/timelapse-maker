@@ -111,6 +111,20 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **Windows: `timelapse version` now tells you whether the running service is
+  the build you installed.** It printed the same "it might still be on the
+  previous build" note every time capture was running, so the line said
+  nothing. It compares the service's start time against the installed files,
+  and says plainly when it cannot tell.
+
+- **Windows: Ctrl-C in `timelapse encode` or `timelapse web-serve` exits
+  quietly.** It printed a Python traceback, which reads as a crash rather than
+  as the program stopping when asked.
+
+- **Windows: `timelapse config` works with an editor installed as a shim.**
+  `EDITOR=code` failed with "file not found" although it runs perfectly from
+  the same prompt.
+
 - **Windows: a service that will not stop now reports the right error.** The
   number printed was whichever Windows call happened to run last, not the one
   that failed, so "the service is still starting" and "the stop is hung"
