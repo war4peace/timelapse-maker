@@ -1359,7 +1359,10 @@ class TestLogHandler(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
 
     def tearDown(self):
-        logging.shutdown()
+        # Not logging.shutdown(): it closes every handler in the *process*,
+        # including ones other test modules are still using, and this class
+        # only ever opens its own. close() on what it opened is the whole
+        # obligation.
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def close(self, handler):
@@ -1397,6 +1400,23 @@ class TestLogHandler(unittest.TestCase):
         self.assertTrue(target.is_dir())
 
 
+class FixedClock(object):
+    """`datetime` with now() pinned. Everything else passes through.
+
+    The product calls datetime.now() on the name it imported, so that name is
+    what has to change; subclassing datetime would leave the call untouched.
+    """
+
+    def __init__(self, when):
+        self._when = when
+
+    def now(self):
+        return self._when
+
+    def __getattr__(self, name):
+        return getattr(datetime, name)
+
+
 class TestDailyFileHandler(unittest.TestCase):
     """The Windows handler, driven on whichever platform is running."""
 
@@ -1421,9 +1441,15 @@ class TestDailyFileHandler(unittest.TestCase):
         return sorted(p.name for p in self.tmp.glob("capture-*.log"))
 
     def test_it_writes_todays_file(self):
-        self.attach()
-        self.log.info("hello")
-        today = datetime.now().strftime("%Y%m%d")
+        # The handler stamps the name from the clock when the record arrives,
+        # and this reads it again afterwards: one run in a hundred thousand
+        # starts on one day and asserts on the next.
+        fixed = datetime(2026, 8, 11, 12, 0, 0)
+        with mock.patch.object(plat, "datetime",
+                               FixedClock(fixed)):
+            self.attach()
+            self.log.info("hello")
+        today = fixed.strftime("%Y%m%d")
         self.assertEqual(self.files(), [f"capture-{today}.log"])
         self.assertIn("hello", (self.tmp / f"capture-{today}.log")
                       .read_text(encoding="utf-8"))
@@ -1920,17 +1946,43 @@ class TestMappedDrives(unittest.TestCase):
         with mock.patch.object(plat, "IS_WINDOWS", False):
             self.assertEqual(plat.mapped_drives(), [])
 
-    def test_every_row_is_a_letter_and_a_target(self):
-        """Whatever this machine happens to have, including nothing.
+    def drives(self, registry):
+        """mapped_drives() over an injected registry, on either platform.
 
-        Asserting the shape rather than the contents is the point: the
-        developer's box has seven mappings and a CI runner has none, and a
-        test whose result depends on that is a test that reports the machine
-        rather than the code.
+        The test this replaces read the developer's real HKCU\\Network and
+        asserted the *shape* of whatever came back, so it passed with seven
+        mappings here and passed with none on a runner: it reported the
+        machine rather than the code, and every assertion in it was vacuous
+        on CI.
         """
-        for letter, unc in plat.mapped_drives():
-            self.assertRegex(letter, r"^[A-Z]:$")
-            self.assertTrue(unc, "a mapping with no target is not a mapping")
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+                mock.patch.object(plat, "_mapped_letters",
+                                  lambda: list(registry)), \
+                mock.patch.object(plat, "_mapped_in_registry",
+                                  lambda letter: registry[letter]):
+            return plat.mapped_drives()
+
+    def test_each_letter_is_paired_with_its_target(self):
+        self.assertEqual(
+            self.drives({"u": "\\\\tower\\cctv"}),
+            [("U:", "\\\\tower\\cctv")])
+
+    def test_the_letter_is_upper_cased_and_colonised(self):
+        # The registry holds them lower case; the wizard shows them as drives.
+        rows = self.drives({"z": "\\\\nas\\media"})
+        self.assertEqual(rows[0][0], "Z:")
+
+    def test_a_letter_with_no_target_is_not_a_mapping(self):
+        rows = self.drives({"u": "\\\\tower\\cctv", "x": None})
+        self.assertEqual([r[0] for r in rows], ["U:"])
+
+    def test_they_come_back_sorted(self):
+        rows = self.drives({"z": "\\\\nas\\z", "u": "\\\\nas\\u",
+                            "m": "\\\\nas\\m"})
+        self.assertEqual([r[0] for r in rows], ["M:", "U:", "Z:"])
+
+    def test_no_mappings_is_an_empty_list_not_an_error(self):
+        self.assertEqual(self.drives({}), [])
 
     def test_it_is_sorted_by_letter(self):
         rows = plat.mapped_drives()

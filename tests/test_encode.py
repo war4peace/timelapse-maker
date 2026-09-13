@@ -154,12 +154,39 @@ class TestWriteConcatList(unittest.TestCase):
         self.assertIn("'\\''", target.read_text(encoding="utf-8"))
 
 
+class FixedDate(object):
+    """`date` with today() pinned, and everything else left alone.
+
+    Subclassing date and overriding today() would be tidier and does not work:
+    the product calls date.today() on the name it imported, so what has to
+    change is that name.
+    """
+
+    def __init__(self, today):
+        self._today = today
+
+    def today(self):
+        return self._today
+
+    def __getattr__(self, name):
+        return getattr(date, name)
+
+
 class TestFindPending(unittest.TestCase):
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.root = self.tmp / "frames"
-        self.today = date.today()
+        # Pinned, not read. The directories are named relative to "today" here
+        # and find_pending() asks date.today() again, so a run that starts at
+        # 23:59:59.9 builds its fixture against one day and is measured
+        # against the next. Never observed; it is one run in a hundred
+        # thousand and the failure would be unreproducible, which is exactly
+        # the kind that costs an afternoon.
+        self.today = date(2026, 8, 10)
+        patch = mock.patch.object(enc, "date", FixedDate(self.today))
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -1007,6 +1034,11 @@ class TestTransferWithoutRsync(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        # The product logs "rsync is not installed", correctly, three times
+        # over. A suite that prints its expected failures teaches the reader
+        # to skim past the ones that are not expected.
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
         (self.tmp / "Roof.20260816.mkv").write_bytes(b"video")
         self.cfg = {"paths": {"video_output": str(self.tmp)},
                     "transfer": {"enabled": True, "destination": "/dest",
@@ -1233,7 +1265,6 @@ class TestPreflightWindowsTransfer(unittest.TestCase):
     """
 
     def setUp(self):
-        sys.path.insert(0, str(_support.SCRIPTS))
         import timelapse_test
         self.checker = timelapse_test
 
@@ -3253,6 +3284,24 @@ class TestOnlyOneRunAtATime(unittest.TestCase):
         self.held = []
         self.addCleanup(lambda: [plat.release_lock(h) for h in self.held])
 
+    def expect_refusal(self):
+        """Capture the "another run is in progress" line for this test.
+
+        assertLogs installs a handler, which is what keeps the record off
+        stderr; the assertion at the end is what makes the capture honest
+        rather than a mute button.
+        """
+        ctx = self.assertLogs(enc.log, level="ERROR")
+        watcher = ctx.__enter__()
+        # Cleanups run last in, first out, so the exit below happens before
+        # the assertion above it: the watcher has to be closed before its
+        # output means anything.
+        self.addCleanup(
+            lambda: self.assertTrue(
+                any("in progress" in line for line in watcher.output),
+                "the refusal was not logged"))
+        self.addCleanup(ctx.__exit__, None, None, None)
+
     def hold_the_lock(self):
         """Stand in for the other encode, from this process.
 
@@ -3305,12 +3354,17 @@ class TestOnlyOneRunAtATime(unittest.TestCase):
 
     def test_a_second_run_encodes_nothing_and_deletes_nothing(self):
         self.hold_the_lock()
+        # Captured rather than silenced: the encode logger has no handler in
+        # the suite, so logging's last resort printed this refusal to stderr
+        # on every run. It is behaviour, so it is asserted here instead.
+        self.expect_refusal()
         code, did = self.run_main()
         self.assertEqual(code, 1)
         self.assertEqual(did["encoded"], [])
         self.assertEqual(did["removed"], [])
 
     def test_it_sends_no_notification_and_writes_no_run_record(self):
+        self.expect_refusal()
         """Neither is true of a run that never started, and one message per
 
         contention would be noise from the thing that prevented the harm.

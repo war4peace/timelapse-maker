@@ -344,9 +344,14 @@ class TestOneDayOneCadence(unittest.TestCase):
         # place, because a directory can outlive the process that made it and
         # a marker can fail to be written.
         cam = self.camera()
-        today = cap.day_string(time.time())
+        # One instant for both: this names the directory from the clock and
+        # record_cadences() reads it again, so a run crossing midnight between
+        # the two lines builds one day and looks in another.
+        fixed = datetime(2026, 8, 11, 12, 0, 0).timestamp()
+        today = cap.day_string(fixed)
         (self.tmp / "Roof" / today).mkdir(parents=True)
-        cap.record_cadences([cam])
+        with mock.patch.object(cap.time, "time", lambda: fixed):
+            cap.record_cadences([cam])
         self.assertEqual(cap.read_cadence(self.tmp / "Roof" / today), (5, 60))
 
     def test_housekeeping_never_creates_a_directory(self):

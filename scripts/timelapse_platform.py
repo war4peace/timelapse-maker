@@ -2254,6 +2254,36 @@ def _mapped_in_registry(letter):
     return str(value) or None
 
 
+def _mapped_letters():
+    """The drive letters HKCU\\Network holds subkeys for, or [].
+
+    Split out so the pairing, the filtering and the sort above can be tested
+    on both CI legs. The test it replaced read the developer's real registry
+    and asserted the *shape* of whatever came back, so it passed on a machine
+    with seven mappings and passed on a runner with none: a test that reports
+    the machine rather than the code.
+    """
+    if not IS_WINDOWS:
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+    letters = []
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Network") as key:
+            index = 0
+            while True:
+                try:
+                    letters.append(winreg.EnumKey(key, index))
+                except OSError:
+                    break
+                index += 1
+    except OSError:
+        return []
+    return letters
+
+
 def mapped_drives():
     """Every persistent drive mapping this user has, as sorted (letter, unc).
 
@@ -2268,27 +2298,11 @@ def mapped_drives():
     for something that is not there. Offering the list from here is the only
     way that dialog can be pointed at a share the operator actually has.
     """
-    if not IS_WINDOWS:
-        return []
-    try:
-        import winreg
-    except ImportError:
-        return []
     found = []
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Network") as key:
-            index = 0
-            while True:
-                try:
-                    letter = winreg.EnumKey(key, index)
-                except OSError:
-                    break
-                index += 1
-                target = _mapped_in_registry(letter)
-                if target:
-                    found.append((letter.upper() + ":", target))
-    except OSError:
-        return []
+    for letter in _mapped_letters():
+        target = _mapped_in_registry(letter)
+        if target:
+            found.append((letter.upper() + ":", target))
     return sorted(found)
 
 

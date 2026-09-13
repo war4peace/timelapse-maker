@@ -8,6 +8,7 @@ and binding a port in a unit test invites flakiness on a CI runner.
 import contextlib
 import io
 import json
+import logging
 import os
 import re
 import shutil
@@ -4075,8 +4076,12 @@ class TestTodaysCoverage(StateMixin, unittest.TestCase):
         d = self.day_dir("Roof")
         for name in ("101500.jpg", "120000.jpg", "093000.jpg"):
             (d / name).write_bytes(b"\xff\xd8x")
-        day = web.datetime.datetime.now().strftime("%Y-%m-%d")
-        got = web.last_frame_epoch(self.config, {"name": "Roof"})
+        # `now` passed in, because the product takes it and the test read
+        # the clock separately: across midnight the day named here and the day
+        # last_frame_epoch() looks in are two different days.
+        now = web.datetime.datetime.now()
+        day = now.strftime("%Y-%m-%d")
+        got = web.last_frame_epoch(self.config, {"name": "Roof"}, now=now)
         self.assertEqual(got, web.frame_epoch(day, "120000.jpg"))
 
     def test_the_time_comes_from_the_name_never_from_mtime(self):
@@ -4087,9 +4092,11 @@ class TestTodaysCoverage(StateMixin, unittest.TestCase):
         f = d / "120000.jpg"
         f.write_bytes(b"\xff\xd8x")
         os.utime(f, (0, 0))                 # 1970, if anything read mtime
-        day = web.datetime.datetime.now().strftime("%Y-%m-%d")
-        self.assertEqual(web.last_frame_epoch(self.config, {"name": "Roof"}),
-                         web.frame_epoch(day, "120000.jpg"))
+        now = web.datetime.datetime.now()
+        day = now.strftime("%Y-%m-%d")
+        self.assertEqual(
+            web.last_frame_epoch(self.config, {"name": "Roof"}, now=now),
+            web.frame_epoch(day, "120000.jpg"))
 
     def test_the_dst_suffix_still_parses(self):
         # A duplicate second during the fall-back hour is written as

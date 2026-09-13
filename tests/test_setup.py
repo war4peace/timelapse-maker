@@ -1378,7 +1378,6 @@ class TestWebhookVerificationMarker(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.cfg_path = self.tmp / "config.json"
-        sys.path.insert(0, str(_support.SCRIPTS))
         import timelapse_test
         self.checker = timelapse_test
 
@@ -1913,7 +1912,6 @@ class TestChooseWebLogin(unittest.TestCase):
         return web, buf.getvalue()
 
     def configured(self, user="ed", password="hunter2"):
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
         import timelapse_web as web_mod
         return {"auth": {"username": user,
                          "password_hash": web_mod.hash_password(password,
@@ -2085,7 +2083,6 @@ class TestPasswordCommand(unittest.TestCase):
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
         self.path = Path(self.dir.name) / "config.json"
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
     def write(self, web=None):
         cfg = setup.default_config()
@@ -2100,11 +2097,15 @@ class TestPasswordCommand(unittest.TestCase):
         prev_tty, prev_auto = setup._TTY, setup.AUTO
         out = io.StringIO()
         try:
+            # stderr as well as stdout: argparse writes its usage block
+            # there, and one of these drives an invalid combination on
+            # purpose, so the suite printed a full usage message every run.
             with mock.patch.object(sys, "argv", argv), \
                     mock.patch.object(setup, "init_tty",
                                       lambda **kw: None), \
                     mock.patch.object(setup, "restart_web_if_running",
                                       lambda cfg: None), \
+                    contextlib.redirect_stderr(io.StringIO()), \
                     contextlib.redirect_stdout(out):
                 setup.AUTO = False
                 setup._TTY = FakeTTY(keystrokes, tty=False)
@@ -3672,7 +3673,6 @@ class TestChooseNotify(unittest.TestCase):
                          "https://new/x")
 
     def test_declining_everything_leaves_nothing_to_send_to(self):
-        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
         import timelapse_encode as enc_mod
         cfg, _ = self.drive(setup.choose_notify, ["n", "n", "n"])
         self.assertEqual(enc_mod.notify_sinks(cfg), [])
@@ -5589,13 +5589,17 @@ class TestPreflightSeesTheGuard(unittest.TestCase):
     GB = 1024 ** 3
 
     def setUp(self):
-        sys.path.insert(0, str(_support.SCRIPTS))
         import timelapse_test
         self.checker = timelapse_test
 
     def run_check(self, free_gb, guard_gb):
         Usage = collections.namedtuple("Usage", "total used free")
-        cfg = {"paths": {"frames_root": str(Path(tempfile.gettempdir()))},
+        # Its own directory, not the shared one. A check that reads the
+        # process's temp directory is a check whose subject is whatever else
+        # is in there, and this one goes on to stat it.
+        own = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, own, True)
+        cfg = {"paths": {"frames_root": str(own)},
                "capture": {"min_free_gb": guard_gb, "interval_seconds": 5},
                "cameras": [{"name": "a", "enabled": True}]}
         said = {"bad": [], "warn": [], "ok": [], "info": []}

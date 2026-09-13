@@ -146,9 +146,21 @@ class TestNoDrift(unittest.TestCase):
             self.assertIn("install.ps1", out.getvalue())
 
     def test_the_help_describes_every_command(self):
+        """Anchored on the entry, not on the word.
+
+        `web`, `test`, `setup` and `encode` are substrings of other help text
+        (`web-serve`, "the full wizard", "encoding"), so `assertIn(command,
+        HELP)` could not fail for four of the commands it was covering.
+        """
         for command in sorted(self.windows_commands()):
-            self.assertIn(command, cli.HELP,
-                          "%s is dispatchable and undocumented" % command)
+            self.assertRegex(
+                cli.HELP, r"(?m)^  %s\s" % re.escape(command),
+                "%s is dispatchable and has no entry of its own" % command)
+
+    def test_that_check_can_fail(self):
+        # The control, because the point of the change above is that the old
+        # one could not: a command with no entry must be caught.
+        self.assertNotRegex(cli.HELP, r"(?m)^  nonesuch\s")
 
 
 class TestDispatch(unittest.TestCase):
