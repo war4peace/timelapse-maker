@@ -421,6 +421,18 @@ resume on-boundary. Disabled by setting `min_free_gb: 0`.
 
 Batch job. `systemd` `Type=oneshot` + timer at 00:05, `Persistent=true`.
 
+**Every captured child goes through `run_captured()`** (0.2.1), which is the
+only `subprocess.run` in the file and is pinned there by a test. `text=True`
+decodes with the locale encoding, and a child that writes one byte that codec
+cannot read raises **UnicodeDecodeError out of `subprocess.run` itself**: 0x81
+on cp1252, and an invalid start byte in UTF-8 too. Where it landed decided how
+bad it was. In `encode_day()` it is raised after ffmpeg has finished, inside
+the `except` that reports a failure, so a *successful* encode was reported
+FAIL and its good video unlinked; in the encoder probe it read as "not
+available"; in `transfer()` as "rsync could not be started". ffmpeg's stderr
+carries whatever a camera put in a stream title and rsync's carries filenames,
+so neither is ours to promise is decodable: `errors="replace"`.
+
 **One run at a time, and the lock comes before everything else** (0.2.1).
 `take_lock(state_dir(cfg) / ".encode.lock")` is the first thing `main()` does
 after the `--watch` branch returns. Two encodes on the same night are data loss
@@ -561,6 +573,18 @@ Pipeline, in `main()`:
 7. `notify()` → one summary to every configured sink.
 8. Exit `0` all-good, `1` partial failure, `2` critical.
 
+**A run that found nothing says which nothing it found.** `explain_idle()`
+exists because "Nothing to process." is equally the right answer to five
+different situations, and they want opposite reactions. Since 0.2.1 it is
+**given `--date` as well** (`only_date=args.date`), and the notification body
+with it: a named day that is not there was answered with "Every day before
+today is already encoded", which is a true sentence about a question nobody
+asked. The real shape of this is `--date 2026-8-4`, a single-digit month where
+the directories are zero-padded, so it can never match anything. An explicit
+`--date` overrides the encoded marker, so an empty result under one can only
+mean the directory is absent, which is what makes the answer short: name the
+day, then list the days that do exist.
+
 **`encode_day()`** is the core. Notable choices:
 
 - `valid_frames()` filters on file size and a 3-byte SOI read: cheap, ~17k stats
@@ -572,6 +596,11 @@ Pipeline, in `main()`:
   demuxer. Dimensions are rounded down to even; NVENC requires it. This call
   lives *inside* the try block: a camera whose first frame won't probe must fail
   only itself, not abort the whole run.
+- **`-nostdin`** (0.2.1), as the capture daemon's grabber already had. Without
+  it ffmpeg reads the terminal under `timelapse encode`, so a stray `q` aborts
+  the encode and a backgrounded run stops on SIGTTIN. Invisible under systemd
+  and Task Scheduler, which is why it survived: neither has a terminal to
+  read.
 - **Colour handling.** JPEG decodes as `yuvj420p`, full range. The filter chain
   is `scale=W:H:in_range=full:out_range=limited,format=yuv420p` and the output is
   tagged `-color_range tv -colorspace bt709 -color_primaries bt709 -color_trc
@@ -589,9 +618,20 @@ Pipeline, in `main()`:
 - Failure is contained per camera-day. An exception is caught, recorded in the
   result dict, the partial output file is unlinked, and the loop continues.
 
-**`transfer()`** shells out to `rsync` with `--remove-source-files`. It globs
+**`transfer()`** shells out to `rsync` with `--remove-source-files`. It takes
 the whole of `video_output`, not just this run's output, which is what makes a
-failed night ship itself later with no bookkeeping. It is called even when
+failed night ship itself later with no bookkeeping. **What it takes is
+`videos_to_ship()`** (0.2.1), not `glob("*.*")`: `fnmatch(".tmp", "*.*")` is
+true, Explorer writes `Thumbs.db` and `desktop.ini` into any folder somebody
+browses, and a subdirectory named like a video was handed to `rsync -a`, which
+copies it recursively before the local original is deleted. The destination is
+the operator's own library, years and terabytes deep, so what gets moved into
+it is not a detail. Keyed on `VIDEO_SUFFIXES` rather than on
+`encode.container`, or changing the container from mkv to mp4 would strand
+everything encoded before the change; that set lives in `timelapse_encode.py`
+and **`timelapse_web.py` imports it**, because a suffix the index refuses is a
+file the encoder would never have put there, and two lists of the same thing
+drift. It is called even when
 `find_pending()` returned no jobs: the retry used to be reachable only from a
 run that also had something to encode, so the obvious repair after remounting
 a share, re-running the encode, was the one path that never retried. A no-op
@@ -3583,7 +3623,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,216 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,243 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4359,7 +4399,7 @@ installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1584 lines
-scripts/timelapse_encode.py      batch job, 2300 lines
+scripts/timelapse_encode.py      batch job, 2382 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1049 lines
 scripts/timelapse_setup.py       configuration wizard, 4814 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2946 lines

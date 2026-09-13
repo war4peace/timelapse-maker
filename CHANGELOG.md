@@ -111,6 +111,36 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **A successful encode is no longer reported as a failure because of one odd
+  byte.** Every program this one runs has its output decoded, and a single
+  byte the system's text encoding cannot read raised an error *inside* that
+  decoding. In the nightly encode it was raised after ffmpeg had already
+  finished, so the run reported FAILED and deleted the video that had just
+  been made correctly. It also read as "this encoder is not available" during
+  the encoder probe, and as "rsync could not be started" during transfer.
+  Nothing about the output is trusted to be readable text any more.
+
+- **Only videos are sent to the destination.** Everything with a dot in its
+  name was shipped from the videos folder, which includes `Thumbs.db` and
+  `desktop.ini` (Windows writes them into any folder you open), a part-written
+  file, and any folder that happened to be in there, copied recursively. The
+  local original is deleted after a successful transfer, so these ended up in
+  your library and nowhere else. Videos are selected by extension now, which
+  also means videos encoded before you changed the container setting still
+  get shipped rather than being left behind for ever.
+
+- **`timelapse encode --date ...` says whether that day exists.** Naming a day
+  with no frames folder, which most often means a date typed as `2026-8-4`
+  where the folders are `2026-08-04`, answered "Every day before today is
+  already encoded": true, and about a different question. It now names the day
+  it could not find and lists the days that are there, in the log and in the
+  notification.
+
+- **`timelapse encode` in a terminal no longer stops on a stray keypress.**
+  ffmpeg was reading the keyboard, so a `q` typed into that window aborted the
+  encode, and running it in the background stopped it outright. The nightly
+  run was never affected: it has no terminal to read.
+
 - **A camera whose frames folder is deleted while capture is running starts
   writing again on the next tick.** Clearing today's folder to "start again",
   or a network frames path dropping for a moment, used to leave that camera

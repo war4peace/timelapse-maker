@@ -47,6 +47,17 @@ __version__ = "0.2.0"
 log = logging.getLogger("encode")
 DATE_DIR = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# What this project treats as a video, in both directions: the encoder ships
+# these and the web index serves these. Defined once and imported by
+# timelapse_web, because two lists of the same thing drift and the copy that
+# drifts is the one nobody is watching.
+#
+# Neither "not a directory" nor "has a dot in it" is a test for "is a video".
+# The surveyed library has a leftover MakeTLALL_backup.ps1 sitting in its root,
+# and `fnmatch(".tmp", "*.*")` is True.
+VIDEO_SUFFIXES = {".mkv", ".mp4", ".mov", ".avi", ".webm", ".m4v", ".mpg",
+                  ".mpeg"}
+
 
 # ----------------------------------------------------------------------------
 # Credential redaction
@@ -351,6 +362,31 @@ PROBE_SIZE = "512x512"
 PIX_FMT = "yuv420p"
 
 
+def run_captured(cmd, **kw):
+    """subprocess.run with the capture settings every caller here wants.
+
+    `errors="replace"` is the reason this exists. `text=True` decodes the
+    child's output with the locale encoding, and a child that writes one byte
+    that codepage cannot decode raises **UnicodeDecodeError out of
+    subprocess.run itself**: measured on cp1252 with a single 0x81, and equally
+    true of UTF-8, where it is an invalid start byte. Where that landed decided
+    how bad it was. In `encode_day()` it is raised after ffmpeg has finished,
+    inside the `except` that reports a failure, so a *successful* encode was
+    reported FAIL and its good video unlinked; in the encoder probe it read as
+    "not available"; in `transfer()` as "rsync could not be started". ffmpeg's
+    stderr carries whatever a camera put in a stream title, and rsync's carries
+    filenames, so neither is ours to promise is decodable.
+
+    Windows-mostly in practice, because Linux coerces to UTF-8 for children,
+    but the decode is ours and so is the fix.
+    """
+    kw.setdefault("capture_output", True)
+    kw.setdefault("text", True)
+    kw.setdefault("errors", "replace")
+    kw.update(no_console())
+    return subprocess.run(cmd, **kw)
+
+
 def list_encoders(ffmpeg):
     """Encoder names this ffmpeg binary was built with, or None if unknown.
 
@@ -358,9 +394,8 @@ def list_encoders(ffmpeg):
     GPU or driver cannot use it" - which need completely different fixes.
     """
     try:
-        out = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
-                             capture_output=True, text=True, timeout=30,
-                             **no_console())
+        out = run_captured([ffmpeg, "-hide_banner", "-encoders"],
+                           timeout=30)
     except Exception:
         return None
     if out.returncode != 0:
@@ -385,8 +420,7 @@ def probe_encoder_detail(ffmpeg, candidate):
             "-frames:v", "1", "-pix_fmt", PIX_FMT]
            + candidate["args"] + ["-f", "null", "-"])
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90,
-                           **no_console())
+        p = run_captured(cmd, timeout=90)
     except FileNotFoundError:
         return False, f"{ffmpeg} not found"
     except subprocess.TimeoutExpired:
@@ -425,8 +459,7 @@ def probe_encoder_verbose(ffmpeg, candidate, size=None):
             "-frames:v", "1", "-pix_fmt", PIX_FMT]
            + candidate["args"] + ["-f", "null", "-"])
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=90,
-                           **no_console())
+        p = run_captured(cmd, timeout=90)
     except Exception as exc:
         return [f"could not run verbose probe: {exc}"]
     lines, seen = [], set()
@@ -503,9 +536,7 @@ def driver_mismatch(message="", runner=None):
     """
     if any(marker in (message or "").lower() for marker in MISMATCH_MARKERS):
         return True
-    run = runner or (lambda: subprocess.run(
-        ["nvidia-smi"], capture_output=True, text=True, timeout=30,
-        **no_console()))
+    run = runner or (lambda: run_captured(["nvidia-smi"], timeout=30))
     try:
         p = run()
     except Exception:
@@ -636,10 +667,11 @@ def valid_frames(day_dir, min_bytes):
 
 
 def probe_dimensions(ffprobe, path):
-    out = subprocess.run(
+    out = run_captured(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", str(path)],
-        capture_output=True, text=True, timeout=30, **no_console())
+         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x",
+         str(path)],
+        timeout=30)
     m = re.search(r"(\d+)x(\d+)", out.stdout)
     if not m:
         raise RuntimeError(f"could not probe dimensions of {path.name}")
@@ -1056,7 +1088,12 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
         args = next((c["args"] for c in build_candidates(enc, gop)
                      if c["codec"] == encoder["codec"]), encoder["args"])
 
-        cmd = ([ffmpeg, "-y", "-hide_banner", "-loglevel", "warning", "-nostats",
+        # -nostdin, as the capture daemon's grabber already has: under
+        # `timelapse encode` in a terminal ffmpeg reads the tty, so a stray `q`
+        # aborts the encode and a backgrounded run stops on SIGTTIN. Invisible
+        # under systemd and Task Scheduler, which is why it survived.
+        cmd = ([ffmpeg, "-nostdin", "-y", "-hide_banner",
+                "-loglevel", "warning", "-nostats",
                 "-f", "concat", "-safe", "0", "-r", fps, "-i", str(concat_path),
                 "-vf", vf]
                + args
@@ -1074,8 +1111,7 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
             result["seconds"] = time.time() - started
             return result
 
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              **no_console())
+        proc = run_captured(cmd)
         if proc.returncode != 0:
             tail = (proc.stderr or "").strip().splitlines()[-3:]
             raise RuntimeError(f"ffmpeg rc={proc.returncode}: {' | '.join(tail)}")
@@ -1243,8 +1279,7 @@ def try_rsync_args(dest, args, svcuser=None):
         cmd = list(prefix) + ["rsync"] + list(args) + [
             str(probe), str(dest).rstrip("/") + "/"]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=90, **no_console())
+            r = run_captured(cmd, timeout=90)
         except Exception as exc:                # noqa: BLE001
             return None, f"could not run rsync: {exc}"
         if r.returncode == 0:
@@ -1499,6 +1534,28 @@ def transfer_windows(t, files, dest, dry_run):
     return {"ok": True, "moved": moved, "detail": ""}
 
 
+def videos_to_ship(src):
+    """The finished videos in the output directory, by name.
+
+    `src.glob("*.*")` shipped whatever was in there. Explorer writes Thumbs.db
+    and desktop.ini into any folder somebody browses, and both match; so does
+    a bare `.tmp`; and a stray subdirectory was handed to `rsync -a`, which
+    copies it recursively, after which the mover deletes the local original.
+    The destination is the operator's own library, years of videos deep, so
+    what gets moved into it matters.
+
+    Keyed on the extension list rather than on `encode.container`, so a
+    container changed from mkv to mp4 still ships what was encoded before the
+    change rather than stranding it for ever.
+    """
+    try:
+        entries = sorted(src.iterdir())
+    except OSError:
+        return []
+    return [f for f in entries
+            if f.is_file() and f.suffix.lower() in VIDEO_SUFFIXES]
+
+
 def transfer(cfg, dry_run):
     """rsync the video folder to the destination. Works for both a local mount
     path and a remote user@host:/path spec."""
@@ -1506,7 +1563,7 @@ def transfer(cfg, dry_run):
     if not t.get("enabled", False):
         return None
     src = Path(cfg["paths"]["video_output"])
-    files = sorted(src.glob("*.*"))
+    files = videos_to_ship(src)
     if not files:
         return {"ok": True, "moved": 0, "detail": "nothing to transfer"}
 
@@ -1534,8 +1591,7 @@ def transfer(cfg, dry_run):
         return {"ok": True, "moved": 0, "detail": "dry run"}
 
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              **no_console())
+        proc = run_captured(cmd)
     except FileNotFoundError:
         # Linux only now: Windows returns above, through transfer_windows(),
         # and never reaches the code that looks for rsync.
@@ -2035,7 +2091,7 @@ def find_pending(frames_root, cameras, only_date, max_backlog, force=False):
     return sorted(jobs, key=lambda j: (j[1].name, j[0])), done
 
 
-def explain_idle(frames_root, cameras, today=None):
+def explain_idle(frames_root, cameras, today=None, only_date=None):
     """Lines saying WHY find_pending() came back empty.
 
     "Nothing to process." is the correct answer when the run fires an hour
@@ -2069,6 +2125,26 @@ def explain_idle(frames_root, cameras, today=None):
         lines.append("No frames directory under %s for: %s (nothing captured "
                      "yet, or renamed after its frames were written)."
                      % (frames_root, ", ".join(sorted(missing))))
+
+    if only_date:
+        # A day was named, so answer about that day. Everything below is about
+        # the backlog and was printed here regardless: "Every day before today
+        # is already encoded" is a true sentence and not an answer to
+        # `--date 2026-8-4`, which is a day this program has never heard of
+        # (single-digit month; the directories are zero-padded). An explicit
+        # --date ignores the encoded marker, so an empty result can only mean
+        # the directory is not there.
+        lines.append("No day folder named %s under any enabled camera."
+                     % only_date)
+        if days:
+            known = sorted(days)
+            shown = ", ".join(known[-8:])
+            lines.append("Days that do exist: %s%s."
+                         % ("... " if len(known) > 8 else "", shown))
+        else:
+            lines.append("No day folders under %s at all yet." % frames_root)
+        return lines
+
     if not days:
         if not missing:
             lines.append("No day folders under %s yet." % frames_root)
@@ -2179,7 +2255,8 @@ def main():
                      done)
         if not jobs:
             log.info("Nothing to process.")
-            for line in explain_idle(frames_root, cameras):
+            for line in explain_idle(frames_root, cameras,
+                                     only_date=args.date):
                 log.info("  %s", line)
             # Still ship the backlog. A transfer that failed last night leaves
             # videos in video_output, and returning here without trying again
@@ -2200,16 +2277,21 @@ def main():
             # that cannot tell that from "the timer never fired" is not.
             write_run_state(cfg, run_record(run_start, encoder, [], xfer,
                                             interval))
-            # "None found" and "all of them are already done" look identical
-            # from here and are very different things to read at breakfast,
-            # so say which one it was.
+            # "None found", "all of them are already done" and "the day you
+            # named is not there" look identical from here and are very
+            # different things to read at breakfast, so say which one it was.
+            if args.date:
+                said = ("No day folder named %s under any enabled camera."
+                        % args.date)
+            elif done:
+                said = ("%d completed day folder(s) were already encoded; "
+                        "nothing new." % done)
+            else:
+                said = "No completed day folders were found."
             notify(cfg,
                    "Timelapse - nothing to do" if good
                    else "⚠️ Timelapse - transfer failed",
-                   (f"{done} completed day folder(s) were already "
-                    f"encoded; nothing new." if done else
-                    "No completed day folders were found."),
-                   "info" if good else "warn", fields)
+                   said, "info" if good else "warn", fields)
             return 0 if good else 1
 
         log.info("Found %d job(s) across %d camera(s).", len(jobs), len(cameras))

@@ -68,7 +68,7 @@ from timelapse_update import (                            # noqa: E402
 # time and quietly leave the page unredacted; failing at startup is the
 # behaviour a security filter should have.
 from timelapse_encode import (hostport, is_ipv6, redact,  # noqa: E402
-                              replace_atomic)
+                              replace_atomic, VIDEO_SUFFIXES)
 
 # The runtime-state contract, from the module that defines it. Aliased on
 # purpose: this file already uses "state_dir" for web.state_dir, the UI's own
@@ -278,9 +278,9 @@ def parse_name(name):
 # Library index
 # ----------------------------------------------------------------------------
 
-# "not a directory" is not a test for "is a video": the surveyed library has a
-# leftover MakeTLALL_backup.ps1 sitting in its root.
-VIDEO_EXTS = {".mkv", ".mp4", ".mov", ".avi", ".webm", ".m4v", ".mpg", ".mpeg"}
+# The list lives in timelapse_encode, which is the module that also decides
+# what gets shipped to the library in the first place. One definition: a
+# suffix this index refuses is a file the encoder would never have put there.
 
 # A day's timelapse is hundreds of megabytes. Anything this small is a failed
 # encode; 11 such files exist in the surveyed library. They are listed with
@@ -530,7 +530,7 @@ class Index:
 
     @staticmethod
     def _row(rel, name, folder, entry):
-        if os.path.splitext(name)[1].lower() not in VIDEO_EXTS:
+        if os.path.splitext(name)[1].lower() not in VIDEO_SUFFIXES:
             return None
         st = entry.stat()
         cam, day, pattern = parse_name(name)
@@ -610,7 +610,7 @@ class Index:
         if not self.usable:
             return None
         name = os.path.basename(rel)
-        if os.path.splitext(name)[1].lower() not in VIDEO_EXTS:
+        if os.path.splitext(name)[1].lower() not in VIDEO_SUFFIXES:
             return None
         path = self.abs_path(rel)
         if path is None:

@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -3648,3 +3649,354 @@ class TestReplaceAtomic(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAChildsBytesCannotFailTheRun(unittest.TestCase):
+    """text=True decodes, and a decode can raise.
+
+    One byte the locale codec cannot read (0x81 on cp1252, an invalid start
+    byte in UTF-8) raises UnicodeDecodeError out of subprocess.run itself.
+    Where that lands decided how bad it was: in encode_day() it is raised
+    after ffmpeg has finished, inside the except that reports a failure, so a
+    successful encode was reported FAIL and its good video unlinked.
+
+    A real child rather than a mock, because the defect is in the decoding
+    subprocess does on the way back and a fake would simply hand us a str.
+    Platform-independent and unprivileged.
+    """
+
+    def child(self, code):
+        return enc.run_captured([sys.executable, "-c", code])
+
+    def test_an_undecodable_byte_on_stderr_does_not_raise(self):
+        out = self.child("import sys; sys.stderr.buffer.write(b'\\x81')")
+        self.assertEqual(out.returncode, 0)
+        self.assertIn("�", out.stderr)
+
+    def test_an_undecodable_byte_on_stdout_does_not_raise_either(self):
+        out = self.child("import sys; sys.stdout.buffer.write(b'\\x81')")
+        self.assertIn("�", out.stdout)
+
+    def test_ordinary_output_is_untouched(self):
+        out = self.child("print('hevc_nvenc')")
+        self.assertEqual(out.stdout.strip(), "hevc_nvenc")
+
+    def test_the_capture_settings_are_not_a_caller_decision(self):
+        # Every call site gets capture, text and the replacing decoder without
+        # asking, which is the point of the helper: the site that forgets is
+        # the one that meets a camera with an odd character in its stream
+        # title.
+        with mock.patch.object(enc.subprocess, "run") as run:
+            enc.run_captured(["x"], timeout=5)
+        kw = run.call_args[1]
+        self.assertTrue(kw["capture_output"])
+        self.assertTrue(kw["text"])
+        self.assertEqual(kw["errors"], "replace")
+        self.assertEqual(kw["timeout"], 5)
+
+    def test_nothing_captures_output_any_other_way(self):
+        # Anchored on the call at the start of a line, not on the words, so
+        # the docstring above that explains the rule is not read as a breach
+        # of it. A new site that spells the arguments out by hand is caught
+        # here rather than by an operator reading FAILED on a video that
+        # encoded correctly.
+        src = Path(enc.__file__).read_text(encoding="utf-8")
+        self.assertEqual(
+            len(re.findall(r"^\s*(?:return |\w+ = )?subprocess\.run\(",
+                           src, re.M)), 1)
+
+
+class TestOnlyVideosAreShipped(unittest.TestCase):
+    """`*.*` matched everything in the output folder.
+
+    The destination is the operator's own library, years deep, so what is
+    moved into it matters; and the mover deletes the local original.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def names(self):
+        return [f.name for f in enc.videos_to_ship(self.tmp)]
+
+    def test_a_video_is_shipped(self):
+        (self.tmp / "Gate.20260811.mkv").write_bytes(b"v")
+        self.assertEqual(self.names(), ["Gate.20260811.mkv"])
+
+    def test_explorers_leavings_are_not(self):
+        (self.tmp / "Gate.20260811.mkv").write_bytes(b"v")
+        (self.tmp / "Thumbs.db").write_bytes(b"x")
+        (self.tmp / "desktop.ini").write_bytes(b"x")
+        self.assertEqual(self.names(), ["Gate.20260811.mkv"])
+
+    def test_a_directory_is_not(self):
+        # Named like a video, which is the case that costs: rsync -a copies it
+        # recursively and then the local original is deleted. A directory with
+        # some other extension is refused by the suffix check anyway, so it
+        # would prove nothing about is_file().
+        (self.tmp / "Gate.20260811.mkv").write_bytes(b"v")
+        (self.tmp / "archive.mkv").mkdir()
+        self.assertEqual(self.names(), ["Gate.20260811.mkv"])
+
+    def test_a_partial_file_is_not(self):
+        (self.tmp / "Gate.20260811.mkv.part").write_bytes(b"v")
+        (self.tmp / ".tmp").write_bytes(b"v")
+        self.assertEqual(self.names(), [])
+
+    def test_a_container_changed_later_still_ships_the_old_videos(self):
+        # Keyed on the extension list, not on encode.container, or a config
+        # edited from mkv to mp4 would strand everything encoded before it.
+        (self.tmp / "Gate.20260810.mkv").write_bytes(b"v")
+        (self.tmp / "Gate.20260811.mp4").write_bytes(b"v")
+        self.assertEqual(self.names(),
+                         ["Gate.20260810.mkv", "Gate.20260811.mp4"])
+
+    def test_an_upper_case_extension_is_still_a_video(self):
+        (self.tmp / "Gate.20260811.MKV").write_bytes(b"v")
+        self.assertEqual(self.names(), ["Gate.20260811.MKV"])
+
+    def test_a_missing_output_directory_is_not_an_exception(self):
+        self.assertEqual(enc.videos_to_ship(self.tmp / "nope"), [])
+
+    def test_the_web_index_agrees_about_what_a_video_is(self):
+        # One definition, imported. Two lists of the same thing drift, and the
+        # copy that drifts is the one nobody is watching.
+        import timelapse_web as web
+        self.assertIs(web.VIDEO_SUFFIXES, enc.VIDEO_SUFFIXES)
+
+
+class TestTheIdleExplanationAnswersTheQuestionAsked(unittest.TestCase):
+    """--date names a day. Either it is there or it is not.
+
+    Without this the run printed "Every day before today is already encoded"
+    whenever any other day existed, which is a true sentence and not an answer.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def day(self, cam, name):
+        d = self.tmp / cam / name
+        d.mkdir(parents=True)
+        return d
+
+    def test_a_day_that_is_not_there_is_named(self):
+        # The real shape of this: a single-digit month, where the directories
+        # are zero-padded, so --date 2026-8-4 can never match anything.
+        self.day("Gate", "2026-08-04")
+        said = " ".join(enc.explain_idle(self.tmp, ["Gate"],
+                                         only_date="2026-8-4"))
+        self.assertIn("2026-8-4", said)
+        self.assertNotIn("already encoded", said)
+
+    def test_the_days_that_do_exist_are_listed(self):
+        self.day("Gate", "2026-08-04")
+        self.day("Gate", "2026-08-05")
+        said = " ".join(enc.explain_idle(self.tmp, ["Gate"],
+                                         only_date="2026-08-09"))
+        self.assertIn("2026-08-04", said)
+        self.assertIn("2026-08-05", said)
+
+    def test_an_empty_frames_root_says_so(self):
+        (self.tmp / "Gate").mkdir()
+        said = " ".join(enc.explain_idle(self.tmp, ["Gate"],
+                                         only_date="2026-08-09"))
+        self.assertIn("at all yet", said)
+
+    def test_a_stranded_camera_is_still_reported(self):
+        # The likeliest reason the named day is missing, so it survives the
+        # early return rather than being lost to it.
+        self.day("Gate", "2026-08-04")
+        said = " ".join(enc.explain_idle(self.tmp, ["Gate", "Roof"],
+                                         only_date="2026-08-09"))
+        self.assertIn("Roof", said)
+
+    def test_the_backlog_answer_is_unchanged_without_a_date(self):
+        self.day("Gate", "2020-01-01")
+        said = " ".join(enc.explain_idle(self.tmp, ["Gate"],
+                                         today="2026-08-09"))
+        self.assertIn("already encoded", said)
+
+
+class TestTheEncodeCommand(unittest.TestCase):
+    """The argv encode_day() actually builds, captured from the real call.
+
+    The smoke test proves the video comes out right, which is the other half;
+    this is the half that runs without ffmpeg, on either CI leg.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.day = self.tmp / "frames" / "Roof" / "2026-08-10"
+        for i in range(5):
+            make_frame(self.day / ("%06d.jpg" % (i * 5)))
+        self.out = self.tmp / "videos"
+        self.out.mkdir()
+
+    def cmd(self):
+        cfg = {"capture": {"interval_seconds": 5, "min_bytes": 100},
+               "encode": {"framerate": 60, "gop": 120, "min_frames": 1,
+                          "container": "mkv"},
+               "paths": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+               "cameras": [{"name": "Roof"}]}
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = list(cmd)
+            Path(cmd[-1]).write_bytes(b"x" * 4096)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(enc, "probe_dimensions",
+                               return_value=(512, 512)), \
+                mock.patch.object(enc.subprocess, "run", side_effect=fake_run):
+            enc.encode_day(cfg, {"codec": "libx264", "args": [],
+                                 "name": "libx264 (CPU)"},
+                           "Roof", self.day, self.out, False)
+        return seen["cmd"]
+
+    def test_it_does_not_read_the_terminal(self):
+        # Without -nostdin ffmpeg reads the tty under `timelapse encode`, so a
+        # stray keypress aborts the encode and a backgrounded run stops on
+        # SIGTTIN. Invisible under systemd and Task Scheduler.
+        self.assertIn("-nostdin", self.cmd())
+
+    def test_nostdin_is_an_input_option_and_is_placed_as_one(self):
+        cmd = self.cmd()
+        self.assertLess(cmd.index("-nostdin"), cmd.index("-i"))
+
+    def test_the_frame_rate_is_given_on_both_sides_and_agrees(self):
+        # -r appears twice, input and output. Both must match or frames
+        # duplicate or drop.
+        cmd = self.cmd()
+        rates = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-r"]
+        self.assertEqual(len(rates), 2)
+        self.assertEqual(rates[0], rates[1])
+
+    def test_the_colour_tags_are_on_the_output(self):
+        cmd = self.cmd()
+        self.assertEqual(cmd[cmd.index("-color_range") + 1], "tv")
+        self.assertEqual(cmd[cmd.index("-colorspace") + 1], "bt709")
+
+
+class TestOnlyVideosReachTheMover(unittest.TestCase):
+    """The filter has to be where transfer() builds its list, not beside it.
+
+    `videos_to_ship()` being right says nothing about `transfer()` calling it,
+    and the mover deletes the local original of everything it ships.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.videos = self.tmp / "videos"
+        self.videos.mkdir()
+        (self.videos / "Cam.20260804.mkv").write_bytes(b"x" * 2048)
+        (self.videos / "Thumbs.db").write_bytes(b"x")
+        (self.videos / "archive.mkv").mkdir()
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def test_the_rsync_command_carries_the_video_and_nothing_else(self):
+        cfg = {"paths": {"video_output": str(self.videos)},
+               "transfer": {"enabled": True, "destination": "/mnt/nas/tl/"}}
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"] = list(cmd)
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(enc, "IS_WINDOWS", False), \
+                mock.patch.object(enc, "mount_problem", lambda *a: None), \
+                mock.patch.object(enc.subprocess, "run", side_effect=fake_run):
+            enc.transfer(cfg, dry_run=False)
+        joined = " ".join(seen["cmd"])
+        self.assertIn("Cam.20260804.mkv", joined)
+        self.assertNotIn("Thumbs.db", joined)
+        # A directory named like a video is the one that costs: rsync -a
+        # copies it recursively and the local original is then deleted.
+        self.assertNotIn("archive.mkv", joined)
+
+    def test_the_windows_mover_is_handed_the_same_list(self):
+        cfg = {"paths": {"video_output": str(self.videos)},
+               "transfer": {"enabled": True,
+                            "destination": str(self.tmp / "library")}}
+        seen = {}
+
+        with mock.patch.object(enc, "IS_WINDOWS", True), \
+                mock.patch.object(enc, "transfer_windows",
+                                  lambda t, files, dest, dry: seen.setdefault(
+                                      "files", [f.name for f in files])):
+            enc.transfer(cfg, dry_run=False)
+        self.assertEqual(seen["files"], ["Cam.20260804.mkv"])
+
+
+class TestTheIdleRunAnswersTheDateItWasGiven(unittest.TestCase):
+    """main()'s idle path, which is where the explanation is actually said.
+
+    explain_idle() being right says nothing about main() passing it the date,
+    and that call is the whole of the finding: the run answered a question
+    nobody asked.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        cfg = {
+            "paths": {"frames_root": str(self.tmp / "frames"),
+                      "video_output": str(self.tmp / "videos"),
+                      "log_dir": str(self.tmp / "logs"),
+                      "state_dir": str(self.state),
+                      "ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+            "capture": {"interval_seconds": 5, "min_bytes": 4096},
+            "encode": {"framerate": 60, "min_frames": 1, "container": "mkv",
+                       "delete_frames_on_success": True,
+                       "max_backlog_days": 7},
+            "transfer": {"enabled": False},
+            "cameras": [{"name": "Gate", "enabled": True}],
+        }
+        self.config_path = self.tmp / "config.json"
+        self.config_path.write_text(json.dumps(cfg), encoding="utf-8")
+        # Today, so an ordinary run finds nothing to do without encoding
+        # anything for real.
+        make_frame(self.tmp / "frames" / "Gate" / date.today().isoformat()
+                   / "000001.jpg")
+
+    def run_main(self, extra=()):
+        notified = []
+        argv = ["timelapse_encode.py", str(self.config_path)] + list(extra)
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(enc, "setup_logging", lambda *a, **k: None), \
+                mock.patch.object(enc, "select_encoder",
+                                  lambda *a: {"name": "libx264", "args": []}), \
+                mock.patch.object(enc, "notify",
+                                  lambda *a, **k: notified.append(a)), \
+                mock.patch.object(enc, "write_run_state", lambda *a: None):
+            with self.assertLogs(enc.log, level="INFO") as caught:
+                code = enc.main()
+        return code, "\n".join(caught.output), notified
+
+    def test_the_log_names_the_day_that_was_asked_for(self):
+        code, said, _ = self.run_main(["--date", "2026-8-4"])
+        self.assertEqual(code, 0)
+        self.assertIn("2026-8-4", said)
+
+    def test_the_notification_names_it_too(self):
+        # This is the line an operator reads on their phone, and it used to
+        # say no completed day folders were found, which was about a different
+        # question entirely.
+        _, _, notified = self.run_main(["--date", "2026-8-4"])
+        self.assertTrue(notified)
+        self.assertIn("2026-8-4", notified[0][2])
+
+    def test_an_ordinary_idle_run_is_unchanged(self):
+        # The control: without it, "the date is named" would be satisfied by a
+        # run that names the date in every circumstance.
+        _, said, notified = self.run_main()
+        self.assertIn("still being captured", said)
+        self.assertNotIn("No day folder named", said)
+        self.assertIn("No completed day folders", notified[0][2])
