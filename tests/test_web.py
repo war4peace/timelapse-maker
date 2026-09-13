@@ -208,6 +208,19 @@ def request_bytes(path, config, index=None, method="GET", headers="",
     return int(head.split()[1]), head, body
 
 
+def session_count(auth):
+    """How many live sessions there are.
+
+    This was a property on Auth, and these tests were its only callers: a
+    maintenance cost carried by the product for the benefit of the test suite,
+    which is the wrong way round. Reaching past the lock would be worse, so
+    the helper moved rather than the assertions.
+    """
+    with auth._lock:
+        auth._prune()
+        return len(auth._sessions)
+
+
 def request(path, config, index=None, method="GET", headers="", updates=None,
             auth=None, body=None, client="127.0.0.1"):
     """As request_bytes, with the body decoded for HTML assertions."""
@@ -1891,8 +1904,18 @@ class TestParseRange(unittest.TestCase):
     def test_zero_length_suffix_is_unsatisfiable(self):
         self.assertIs(web.parse_range("bytes=-0", 1000), web.UNSATISFIABLE)
 
-    def test_backwards_range_is_unsatisfiable(self):
-        self.assertIs(web.parse_range("bytes=500-100", 1000), web.UNSATISFIABLE)
+    def test_a_backwards_range_is_ignored_rather_than_refused(self):
+        """RFC 7233 2.1: a last-byte-pos below first-byte-pos is syntactically
+        invalid, and an invalid Range header must be ignored, which is a 200
+        with the whole file. This test used to pin the deviation: 416, which
+        is the answer for a range that is merely unsatisfiable. No real player
+        sends one either way."""
+        self.assertIsNone(web.parse_range("bytes=500-100", 1000))
+
+    def test_a_range_past_the_end_is_still_unsatisfiable(self):
+        # The distinction the one above is about: well formed, and asking for
+        # something that is not there.
+        self.assertIs(web.parse_range("bytes=2000-", 1000), web.UNSATISFIABLE)
 
     def test_an_empty_file_satisfies_nothing(self):
         self.assertIs(web.parse_range("bytes=0-0", 0), web.UNSATISFIABLE)
@@ -3132,7 +3155,7 @@ class TestLoginForm(unittest.TestCase):
         self.assertEqual(status, 303)
         self.assertEqual(location(head), "/")
         self.assertIn(f"{web.SESSION_COOKIE}=", set_cookie(head))
-        self.assertEqual(self.auth.session_count, 1)
+        self.assertEqual(session_count(self.auth), 1)
 
     def test_the_cookie_it_sets_actually_works(self):
         # End to end rather than by inspection: the value it hands out must be
@@ -3168,7 +3191,7 @@ class TestLoginForm(unittest.TestCase):
         self.assertEqual(status, 401)
         self.assertEqual(set_cookie(head), "")
         self.assertIn('name="password"', body)
-        self.assertEqual(self.auth.session_count, 0)
+        self.assertEqual(session_count(self.auth), 0)
 
     def test_the_error_does_not_say_which_half_was_wrong(self):
         # Telling a guest that the username is right narrows their next
@@ -3272,10 +3295,13 @@ class TestLogout(unittest.TestCase):
         self.config = cfg(self.tmp, transfer={"enabled": False})
         self.auth = with_login()
 
+    def post_logout(self, token=None):
+        return request("/logout", self.config, method="POST", auth=self.auth,
+                       headers=cookie_header(token) if token else "")
+
     def test_it_clears_the_cookie(self):
         token = self.auth.open_session()
-        _, head, _ = request("/logout", self.config,
-                             headers=cookie_header(token), auth=self.auth)
+        _, head, _ = self.post_logout(token)
         self.assertIn("Max-Age=0", set_cookie(head))
         self.assertEqual(location(head), "/")
 
@@ -3283,24 +3309,34 @@ class TestLogout(unittest.TestCase):
         # A cookie copied out of the browser must stop working, which a
         # cleared cookie alone would not achieve.
         token = self.auth.open_session()
-        request("/logout", self.config, headers=cookie_header(token),
-                auth=self.auth)
+        self.post_logout(token)
         self.assertFalse(self.auth.valid(token))
 
     def test_it_leaves_the_other_browser_alone(self):
         phone, laptop = self.auth.open_session(), self.auth.open_session()
-        request("/logout", self.config, headers=cookie_header(phone),
-                auth=self.auth)
+        self.post_logout(phone)
         self.assertTrue(self.auth.valid(laptop))
 
     def test_logging_out_without_a_session_is_harmless(self):
-        status, _, _ = request("/logout", self.config, auth=self.auth)
+        status, _, _ = self.post_logout()
         self.assertEqual(status, 303)
 
-    def test_the_link_is_offered_while_logged_in(self):
+    def test_a_get_does_not_end_the_session(self):
+        """SameSite=Lax sends the cookie on a top-level cross-site
+        navigation, so any page the operator visited could end their session
+        by navigating to /logout. A nuisance rather than a breach, and it
+        costs one form to remove."""
+        token = self.auth.open_session()
+        status, _, _ = request("/logout", self.config,
+                               headers=cookie_header(token), auth=self.auth)
+        self.assertEqual(status, 405)
+        self.assertTrue(self.auth.valid(token), "a GET ended the session")
+
+    def test_the_control_is_offered_while_logged_in(self):
         _, _, body = request("/", self.config, auth=self.auth,
                              headers=cookie_header(self.auth.open_session()))
-        self.assertIn('href="/logout"', body)
+        self.assertIn('action="/logout"', body)
+        self.assertIn("<button", body)
 
     def test_no_link_when_there_is_no_login(self):
         # A control that does nothing is worse than no control.
@@ -3315,8 +3351,8 @@ class TestLogout(unittest.TestCase):
         tabs and coloured as an action."""
         _, _, body = request("/", self.config, auth=self.auth,
                              headers=cookie_header(self.auth.open_session()))
-        self.assertIn('href="/logout" class="signout"', body)
-        self.assertIn("nav a.signout", body)
+        self.assertIn('action="/logout"', body)
+        self.assertIn("nav form.signout", body)
         # Set apart from the tabs, and visibly not one of them.
         self.assertIn("margin-left: 3rem", body)
         self.assertIn("#8c1d18", body)
@@ -3561,7 +3597,7 @@ class TestSessions(unittest.TestCase):
         # They only leave on logout or expiry, so something has to bound them.
         auth = self.auth()
         tokens = [auth.open_session() for _ in range(web.MAX_SESSIONS + 5)]
-        self.assertLessEqual(auth.session_count, web.MAX_SESSIONS)
+        self.assertLessEqual(session_count(auth), web.MAX_SESSIONS)
         # The newest survive; the oldest are the ones dropped.
         self.assertTrue(auth.valid(tokens[-1]))
         self.assertFalse(auth.valid(tokens[0]))
@@ -4314,3 +4350,143 @@ class TestStampFormat(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestOnlyRealFilesAreServed(unittest.TestCase):
+    """The scan walks with is_file(follow_symlinks=False); this path stats a
+    name the request chose, and had no such check.
+
+    Measured in WSL: `ln -s notes.txt link.mkv` inside the library was skipped
+    by the scan, returned a row from reconcile_file(), and /video/link.mkv
+    would have served notes.txt as video/x-matroska. A directory named
+    `adir.mkv` was indexed with size 0 and /play/adir.mkv produced a playlist
+    for it.
+
+    Platform-independent and unprivileged. The symlink half needs a real
+    symlink, which needs a privilege or developer mode on Windows, so it is
+    skipped only on OSError and the directory half runs everywhere.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.lib = self.tmp / "library"
+        self.lib.mkdir()
+        self.index = web.Index(self.tmp / "state" / "index.db", self.lib)
+
+    def test_a_directory_named_like_a_video_is_not_a_video(self):
+        (self.lib / "adir.mkv").mkdir()
+        self.assertIsNone(self.index.reconcile_file("adir.mkv"))
+
+    def test_a_real_video_still_is(self):
+        # The control: the check must not refuse everything.
+        (self.lib / "Gate.20260811.mkv").write_bytes(b"x" * 2048)
+        row = self.index.reconcile_file("Gate.20260811.mkv")
+        self.assertIsNotNone(row)
+
+    def test_anything_that_is_not_a_regular_file_is_refused(self):
+        """A device node, a fifo, a socket: whatever it turns out to be.
+
+        The mode is injected rather than arranged on disk, because arranging
+        one needs a privilege on Windows and a device on Linux, and this test
+        would then run on one leg and be a skip on the other. os.stat is the
+        seam under test, so patching it is patching the thing the product
+        asks, not a layer above it.
+        """
+        (self.lib / "odd.mkv").write_bytes(b"x" * 2048)
+        real = os.stat(str(self.lib / "odd.mkv"))
+        fifo = os.stat_result((0o010777,) + tuple(real)[1:])
+        with mock.patch.object(web.os, "stat", return_value=fifo):
+            self.assertIsNone(self.index.reconcile_file("odd.mkv"))
+
+    def test_a_symlink_is_refused_one_layer_earlier(self):
+        """And this is why there is no symlink test here.
+
+        `ln -s notes.txt link.mkv` was measured in WSL: the scan skipped it
+        (it walks with follow_symlinks=False) and reconcile_file() returned a
+        row for it. abs_path() refuses it now, because resolve() lands
+        somewhere other than the path that was asked for, which is the same
+        check that stops two spellings of one file becoming two rows.
+        """
+        (self.lib / "notes.txt").write_text("secrets", encoding="utf-8")
+        target = self.lib / "notes.txt"
+        with mock.patch.object(web.Path, "resolve",
+                               autospec=True,
+                               side_effect=lambda p, **k: (
+                                   target if p.name == "link.mkv" else p)):
+            self.assertIsNone(self.index.abs_path("link.mkv"))
+
+
+class TestARequestCannotThrowAtTheFilesystem(unittest.TestCase):
+    """`GET /video/Gate%00.mkv` raised ValueError out of do_GET.
+
+    The connection was dropped and a traceback landed in the journal, which
+    the log panel then rendered back to the operator.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.lib = self.tmp / "library"
+        self.lib.mkdir()
+        self.index = web.Index(self.tmp / "state" / "index.db", self.lib)
+
+    def test_a_null_byte_is_refused_rather_than_raised(self):
+        self.assertIsNone(self.index.abs_path("a\x00.mkv"))
+
+    def test_a_null_byte_anywhere_in_the_path_is_refused(self):
+        self.assertIsNone(self.index.abs_path("2026-08/\x00Gate.mkv"))
+
+    def test_the_request_is_a_404_and_the_connection_survives(self):
+        config = cfg(str(self.tmp), transfer={"enabled": False})
+        status, _, _ = request("/video/Gate%00.mkv", config, index=self.index)
+        self.assertEqual(status, 404)
+
+
+class TestALoginRedirectIsAlwaysSendable(unittest.TestCase):
+    """http.server writes a header as latin-1, strict.
+
+    So a non-ASCII Location raised UnicodeEncodeError out of send_header,
+    after the session had already been opened: the operator saw a failed login
+    that had in fact succeeded. Only reachable from a crafted form.
+    """
+
+    def test_a_non_ascii_path_is_encoded_rather_than_refused(self):
+        # An accent in a folder name is an ordinary thing, so the answer is to
+        # encode it, not to send the operator to the home page.
+        out = web.safe_next("/day/Café")
+        self.assertTrue(out.isascii(), out)
+        self.assertTrue(out.startswith("/day/"))
+
+    def test_what_comes_back_can_be_put_in_a_header(self):
+        out = web.safe_next("/€")
+        out.encode("latin-1")           # raised before this fix
+
+    def test_another_site_is_still_refused(self):
+        # The control: encoding must not have turned the open-redirect guard
+        # into a formatter.
+        for value in ("//evil.example/", "https://evil.example/",
+                      "/\\evil.example"):
+            self.assertEqual(web.safe_next(value), "/", value)
+
+    def test_an_ordinary_path_is_untouched(self):
+        self.assertEqual(web.safe_next("/library?camera=Gate"),
+                         "/library?camera=Gate")
+
+
+class TestTheStylesheetSaysEachThingOnce(unittest.TestCase):
+    """A rule defined twice is a rule with two places to change.
+
+    `.bad` was declared in the shared head and then again further down, with
+    the same colour, so the second one was invisible until somebody changed
+    the first and wondered why nothing moved.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.config = cfg(self.tmp, transfer={"enabled": False})
+
+    def test_the_bad_colour_is_declared_once(self):
+        _, _, body = request("/", self.config)
+        self.assertEqual(body.count(".bad { color: #b3261e; }"), 1)

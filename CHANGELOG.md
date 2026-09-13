@@ -111,6 +111,27 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **A folder in your library named like a video is no longer listed as one.**
+  A folder called `Gate.20260811.mkv` was indexed with a size of zero and its
+  Play link handed VLC a playlist for it. Only real files are indexed now.
+
+- **A video request with a stray null byte in it is answered rather than
+  dropped.** It ended the connection and put a Python traceback in the log,
+  which the log page then showed you.
+
+- **Logging out is now a button rather than a link.** A link meant any other
+  site you had open could end your session by pointing your browser at it.
+  Nothing moves on the page and it is in the same place.
+
+- **Signing in with a non-English character in the page you came from now
+  works.** The sign-in succeeded and then the browser was sent an address it
+  could not be given, so it looked as though the password had been refused.
+
+- **A video request with a backwards byte range gets the video.** It was
+  answered with an error instead; the standard says an invalid range is to be
+  ignored. No player sends one, so this is tidiness rather than a fix you will
+  notice.
+
 - **Windows: the wizard no longer runs two Linux commands on every page that
   lists this machine's addresses.** It tried `ip -j addr` and then
   `hostname -I`, neither of which exists here, and fell back to showing

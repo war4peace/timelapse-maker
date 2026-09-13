@@ -39,6 +39,7 @@ import secrets
 import signal
 import socket
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -622,6 +623,15 @@ class Index:
                 db.execute("DELETE FROM files WHERE path = ?", (rel,))
                 db.commit()
             return None
+        # A directory called `adir.mkv` passed every check above and was
+        # indexed with size 0, and /play/adir.mkv then produced a playlist for
+        # it. The scan does not index one, because it walks with
+        # `entry.is_file(follow_symlinks=False)`; this path stats a name the
+        # request chose. The symlink half of the same finding is already
+        # refused by abs_path, which compares the resolved path against the
+        # one asked for.
+        if not stat.S_ISREG(st.st_mode):
+            return None
         folder = os.path.dirname(rel)
         cam, day, pattern = parse_name(name)
         row = (rel, name, folder, st.st_size, int(st.st_mtime), cam, day,
@@ -667,7 +677,13 @@ class Index:
             return root                  # normpath("") is ".", so say it here
         if (posixpath.normpath(rel) != rel
                 or posixpath.isabs(rel) or os.path.isabs(rel)
-                or rel == ".." or rel.startswith("../")):
+                or rel == ".." or rel.startswith("../")
+                # Refused here rather than caught below, because the throw is
+                # a ValueError out of resolve() and it happens before the
+                # containment check has said anything. GET /video/Gate%00.mkv
+                # dropped the connection and put a traceback in the journal,
+                # which the log panel then rendered.
+                or "\x00" in rel):
             return None
         candidate = (root / rel).resolve()
         try:
@@ -812,8 +828,14 @@ def parse_range(header, size):
         if end >= size:
             end = size - 1          # clamping is required, not an error
 
-    if size == 0 or start >= size or start > end:
+    if size == 0 or start >= size:
         return UNSATISFIABLE
+    if start > end:
+        # RFC 7233 2.1: a last-byte-pos below first-byte-pos makes the header
+        # syntactically invalid, and an invalid Range must be ignored rather
+        # than refused. Which is what this function's own docstring says it
+        # does with junk; 416 was the one place it did something else.
+        return None
     return start, end
 
 
@@ -1763,6 +1785,14 @@ def safe_next(where):
     if (not where.startswith("/") or where.startswith("//")
             or "\\" in where or any(c < " " for c in where)):
         return "/"
+    # Encoded, not refused: http.server writes a header as latin-1, strict, so
+    # a non-ASCII Location raises UnicodeEncodeError out of send_header.
+    # Measured with next=%2F%E2%82%AC and the right password: the session was
+    # opened and then the connection reset, so the operator saw a failed login
+    # that had in fact succeeded. A path with an accent in it is an ordinary
+    # path, and this is the last place that can still encode it.
+    if not where.isascii():
+        return quote(where, safe="/?&=%#")
     return where
 
 
@@ -1919,12 +1949,6 @@ class Auth:
         for token in [t for t, seen in self._sessions.items() if seen < cutoff]:
             del self._sessions[token]
 
-    @property
-    def session_count(self):
-        with self._lock:
-            self._prune()
-            return len(self._sessions)
-
     # -- what a wrong password costs -----------------------------------------
 
     def pause_after_failure(self):
@@ -2000,13 +2024,17 @@ LAYOUT = """<!doctype html>
      it repeatedly while trying to open the log (2026-08-14). So it is spaced
      away from the tabs and coloured as an action rather than dressed as one
      more of them. */
-  nav a.signout {{ margin-left: 3rem; background: #8c1d18; color: #fff;
-                   border-color: #8c1d18; }}
-  nav a.signout:hover {{ background: #6f1713; border-color: #6f1713; }}
+  nav form.signout {{ display: inline; margin-left: 3rem; }}
+  nav form.signout button {{ font: inherit; cursor: pointer;
+                             padding: .35rem .7rem; border-radius: 6px;
+                             border: 1px solid #8c1d18; background: #8c1d18;
+                             color: #fff; }}
+  nav form.signout button:hover {{ background: #6f1713;
+                                   border-color: #6f1713; }}
   @media (max-width: 30rem) {{
     /* Narrow enough that the bar wraps: the button is then on its own line
        and already separated, so the gap would only push it off-centre. */
-    nav a.signout {{ margin-left: .5rem; }}
+    nav form.signout {{ margin-left: .5rem; }}
   }}
   pre {{ overflow-x: auto; background: rgba(128,128,128,.12); border-radius: 6px;
          padding: .8rem .9rem; font-size: .82rem; line-height: 1.45;
@@ -2073,7 +2101,6 @@ LAYOUT = """<!doctype html>
                    border: 1px solid rgba(128,128,128,.45);
                    background: transparent; color: inherit; }}
   .signin button {{ margin-top: 1rem; }}
-  .bad {{ color: #b3261e; }}
   @media (prefers-color-scheme: dark) {{
     .flag, .bad {{ color: #ff7b72; }} }}
 </style>
@@ -2252,7 +2279,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._redirect("/")
             return
         if route == "/logout":
-            self._logout()
+            # POST only, and do_POST routes it. SameSite=Lax sends the cookie
+            # on a top-level cross-site navigation, so any page the operator
+            # happened to visit could have ended their session with a link.
+            self._send(405, "use POST\n", "text/plain; charset=utf-8")
             return
 
         # Prefix routes first: the rest of the path is a library-relative file
@@ -2511,7 +2541,13 @@ class Handler(BaseHTTPRequestHandler):
         # The logout link appears only when there is a session to end. With no
         # login configured it would be a control that does nothing, and on the
         # login page itself it would offer to leave somewhere nobody is.
-        logout = ('<a href="/logout" class="signout">Log out</a>'
+        # A form, not a link: SameSite=Lax sends the cookie on a
+        # top-level cross-site navigation, so any page the operator visited
+        # could end their session by navigating to /logout. Styled exactly as
+        # the link was, because the operator has already told us where this
+        # control needs to sit (2026-08-14) and that is not up for revision.
+        logout = ('<form method="post" action="/logout" class="signout">'
+                  '<button type="submit">Log out</button></form>'
                   if self.server.auth.enabled else "")
         bar = NAV.format(
             on_home="on" if page == "home" else "",

@@ -1303,6 +1303,21 @@ more than this would make worse trades:
   service actually serves, and the login would silently never take.
   `SameSite=Lax` is also what stops another site posting to `/rescan` with
   this cookie attached.
+- **Logging out is a POST** (0.2.1, L17). `SameSite=Lax` sends the session
+  cookie on a top-level cross-site navigation, so any page the operator
+  happened to visit could end their session by navigating to `/logout`. A
+  nuisance rather than a breach, and it costs one form: the control is a
+  one-button `<form>` styled exactly as the link was, because where it sits
+  and what colour it is were settled by an operator report and are not up for
+  revision. `GET /logout` answers 405, and with no login configured nothing
+  changes, because the control is not rendered at all.
+- **A redirect has to be sendable** (0.2.1, L16). `http.server` writes a
+  header as latin-1, strict, so a non-ASCII `Location` raised
+  `UnicodeEncodeError` out of `send_header` **after** the session had been
+  opened: the operator saw a failed login that had in fact succeeded.
+  `safe_next()` percent-encodes rather than refusing, because a folder with an
+  accent in its name is an ordinary folder; the open-redirect rules above it
+  are untouched and still answer `/`.
 - **A denied fragment gets 401, never a redirect.** `/scan` and `/update` are
   fetched by the pollers, which check `r.ok`; a 303 would be followed
   transparently and the login page would be spliced into the panel being
@@ -1568,6 +1583,21 @@ dropped NAS mount is a *correct* empty library, not a fault.
   a request leaving the library, this stops it reading everything inside.
   Found by a test, having shipped through a full review as `200 OK` on a
   `.txt`.
+- **And the name has to be a file** (0.2.1, L14). `reconcile_file()` stats a
+  name the *request* chose, where the scan walks with
+  `entry.is_file(follow_symlinks=False)`, so a directory called `adir.mkv` was
+  indexed with size 0 and `/play/adir.mkv` handed VLC a playlist for it. A
+  `stat.S_ISREG()` check before the row is built covers that and every other
+  thing a name can turn out to be. The symlink half of the same finding
+  (`ln -s notes.txt link.mkv`, measured in WSL: the scan skipped it and this
+  path indexed it) needs nothing further, because `abs_path()` already refuses
+  a path that resolves somewhere other than where it was asked for.
+- **A request must not be able to throw at the filesystem** (0.2.1, L15).
+  `GET /video/Gate%00.mkv` raised `ValueError: embedded null byte` out of
+  `resolve()`, before containment had said anything: the connection was
+  dropped and a traceback went into the journal, which the log panel then
+  rendered back to the operator. Refused up front with the other spelling
+  checks, where it is one clause rather than a `try` around the wrong line.
 - **`_pump()` sends exactly the promised length.** Bounded by the
   `Content-Length` already in the header rather than by EOF: a file that grew
   since the stat would otherwise corrupt the response, and one that shrank
@@ -1592,7 +1622,12 @@ dropped NAS mount is a *correct* empty library, not a fault.
   the file is **clamped, not refused**: required by RFC 7233, and a common
   place to get a 416 wrong. A start past the file, a backwards range, or
   `bytes=-0` is 416, which still carries `Content-Range: bytes */<size>` so the
-  client can correct itself.
+  client can correct itself. **A backwards range is not one of those**
+  (0.2.1, L18): RFC 7233 2.1 calls a last-byte-pos below first-byte-pos
+  syntactically invalid, and an invalid header must be *ignored*, so it is a
+  200 with the whole file, exactly as this function already answers every
+  other kind of junk. The old 416 was pinned by a test, which is how a
+  deviation survives: the test described the code rather than the rule.
 - **A header the server does not care for is ignored, not rejected.** RFC 7233
   permits that, so a multi-range request (which would need
   `multipart/byteranges`) and an unparseable one both fall back to a plain 200.
@@ -3679,7 +3714,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,275 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,289 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4462,7 +4497,7 @@ scripts/timelapse_gui.py         the same wizard in a window, 2946 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 471 lines
 scripts/timelapse_platform.py    the only platform branch, 2505 lines
 scripts/timelapse_cli.py         the `timelapse` command on Windows, 374 lines
-scripts/timelapse_web.py         read-only web UI, 3560 lines
+scripts/timelapse_web.py         read-only web UI, 3596 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_cli.py                unit tests
