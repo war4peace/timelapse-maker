@@ -54,10 +54,27 @@ GREEN, RED, YELLOW, DIM, RESET = (
     else ("", "", "", "", ""))
 
 
+# What this run found wrong, counted rather than only printed. A checker that
+# exits 0 whatever it saw cannot be acted on by anything but a human reading
+# it, and install.sh was written as though it could be: it ran this with
+# `|| warn ...`, which could only fire on a traceback, and then offered to
+# enable the services regardless.
+#
+# WARN deliberately does not count. A warning is something to know about, not
+# something that stops the product working, and turning every one of them into
+# a non-zero exit would make the status mean nothing within a release.
+_FAILS = 0
+
+
 def ok(msg):    print(f"  {GREEN}PASS{RESET}  {msg}")
-def bad(msg):   print(f"  {RED}FAIL{RESET}  {msg}")
 def warn(msg):  print(f"  {YELLOW}WARN{RESET}  {msg}")
 def info(msg):  print(f"  {DIM}....{RESET}  {msg}")
+
+
+def bad(msg):
+    global _FAILS
+    _FAILS += 1
+    print(f"  {RED}FAIL{RESET}  {msg}")
 
 
 # A camera may carry its own cadence and frame rate; absent means follow the
@@ -966,6 +983,9 @@ def main():
                     help="report frames and disk usage per camera")
     args = ap.parse_args()
 
+    global _FAILS
+    _FAILS = 0                      # so a second call in one process starts clean
+
     from timelapse_encode import load_config
     cfg = load_config(args.config)
 
@@ -973,13 +993,16 @@ def main():
     if args.camera:
         cams = [c for c in cams if c["name"].lower() == args.camera.lower()]
 
+    # The three report modes stay at 0 whatever they print. They answer a
+    # question rather than passing a verdict, and `timelapse usage` in a
+    # shell pipeline should not stop it.
     if args.usage:
         report_usage(cfg)
-        return
+        return 0
 
     if args.encoders:
         diagnose_encoders(cfg)
-        return
+        return 0
 
     if args.probe_profiles:
         onvif = [c for c in cams if "Profile_" in c.get("url", "")]
@@ -987,7 +1010,7 @@ def main():
         for cam in onvif:
             probe_profiles(cam, cfg)
         print(f"\nSample images: {OUT}\n")
-        return
+        return 0
 
     print("\n=== Camera names ===")
     check_camera_names(cfg)
@@ -1019,7 +1042,8 @@ def main():
         test_notify(cfg, args.config, args.force_notify)
 
     print(f"\nSample images: {OUT}\n")
+    return 1 if _FAILS else 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

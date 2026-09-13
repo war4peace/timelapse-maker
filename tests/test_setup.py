@@ -241,6 +241,45 @@ class TestUnitPathQuoting(unittest.TestCase):
         self.assertEqual(value.count('"'), 8)
 
 
+class TestTheInstallerActsOnThePreflight(unittest.TestCase):
+    """It ran the checker and ignored what it said, twice over.
+
+    `... || warn "Pre-flight reported problems"` could only fire on a
+    traceback, because the checker returned 0 whatever it found; and the next
+    question, "Enable capture and the nightly encode now?", defaulted to yes
+    regardless. So an install where every camera was refusing could report the
+    problem and enable the services in the same breath.
+
+    A source scan is what a unit test can do here. The end to end half is
+    `temp/h8_install_check.sh`, on real systemd.
+    """
+
+    def setUp(self):
+        self.source = (_support.REPO / "install.sh").read_text(
+            encoding="utf-8")
+
+    def body(self):
+        """The Next steps section, which is where both questions live."""
+        return self.source.split('step "Next steps"', 1)[1]
+
+    def test_the_enable_question_takes_a_variable_default(self):
+        """Not a literal y. The default is the whole mechanism: the question
+        is still asked, because the operator may know the camera is unplugged
+        today and want the services on anyway."""
+        self.assertIn(
+            'ask_yn "Enable capture and the nightly encode now?" '
+            '"$enable_default"', self.body())
+
+    def test_a_failing_pre_flight_flips_that_default(self):
+        self.assertIn('enable_default="n"', self.body())
+
+    def test_it_still_defaults_to_yes_otherwise(self):
+        self.assertIn('local enable_default="y"', self.body())
+
+    def test_the_warning_is_still_printed(self):
+        self.assertIn("Pre-flight reported problems", self.body())
+
+
 class TestTheInstallerUsesTheEmitter(unittest.TestCase):
     """install.sh splices what Python hands it, so both halves have to agree.
 

@@ -263,6 +263,13 @@ sudo timelapse update --force        # reinstall the version you already have
 `--check` exits 0 when up to date and 10 when an update is available, so a cron
 job can notify on it without a human reading the output.
 
+`timelapse test` is the other command with a status worth reading: **1 when
+any check reported FAIL**, 0 otherwise. A WARN does not make it non-zero, since
+a warning is something to know about rather than something that stops this
+working. The installer uses it: a pre-flight that fails makes "Enable capture
+and the nightly encode now?" default to no, and it still asks, because you may
+know the camera is unplugged today and want capture running anyway.
+
 What it does and does not touch:
 
 | | On upgrade |
@@ -747,7 +754,7 @@ of it; nothing needs a reinstall.
 | `timelapse status` | `systemctl status` for every unit in one shot: capture, the encode timer **and the encode service**, the credential watch timer, and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
 | `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
-| `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and every notification sink. Run it after any change. |
+| `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and every notification sink. Run it after any change. **Exits 1 if anything came back FAIL**, 0 otherwise, so a script can act on it; a WARN is not a failure. `--usage` and `--encoders` are reports and always exit 0. |
 | `timelapse cameras` | Add, edit, remove, enable/disable or test cameras, then restart capture. A menu with no options; `-l`, `-a`, `-e:CAM`, `-x:CAM`, `-t:CAM` and `-r:CAM` go straight to one. §9. |
 | `timelapse discover` | Lists ONVIF cameras answering on this network, with address and model. Needs no root, writes nothing and sends no credentials. Multicast does not cross subnets or VLANs, so an empty result is not proof there are no cameras. §9. |
 | `timelapse transfer` | Reconfigure just the transfer destination, including mounting an SMB/CIFS share and fixing `ReadWritePaths=`. §6. |

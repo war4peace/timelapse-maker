@@ -841,14 +841,26 @@ offer_enable() {
         return
     fi
 
+    # Default yes, flipped to no by a pre-flight that reported a FAIL. Asking
+    # is still right: the operator may know the camera is unplugged today and
+    # want the services on anyway. Answering for them when the check just said
+    # something is broken is not.
+    local enable_default="y"
     if ask_yn "Run the pre-flight check now?" y; then
         # Run as the service account, so permission problems surface here
         # rather than at 00:05 tonight.
-        as_service_user python3 "$PREFIX/timelapse_test.py" "$CONFIG" \
-            || warn "Pre-flight reported problems - fix them before enabling."
+        if as_service_user python3 "$PREFIX/timelapse_test.py" "$CONFIG"; then
+            :
+        else
+            # Until 0.2.1 the checker exited 0 whatever it found, so this
+            # branch could only fire on a traceback and the next question
+            # still defaulted to yes.
+            warn "Pre-flight reported problems - fix them before enabling."
+            enable_default="n"
+        fi
     fi
 
-    if ask_yn "Enable capture and the nightly encode now?" y; then
+    if ask_yn "Enable capture and the nightly encode now?" "$enable_default"; then
         systemctl enable --now timelapse-capture.service
         systemctl enable --now timelapse-encode.timer
         systemctl enable --now timelapse-watch.timer

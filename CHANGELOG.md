@@ -158,6 +158,18 @@ While the version is `0.x`, the configuration format may change in any release.
   every answer and dropped the camera from the discovered list. It now asks
   for a different name and keeps the rest.
 
+- **`timelapse test` now exits non-zero when it found something wrong.** It
+  printed FAIL lines and then reported success to whatever ran it, which
+  means a script could not act on it and the installer did not: it ran the
+  check, could only notice a crash, and offered to enable the services with
+  the same default whichever way the check had gone. It exits 1 when any
+  check failed and 0 otherwise. A WARN is not a failure, and `--usage` and
+  `--encoders` are reports and still always exit 0.
+
+  In the installer, a pre-flight that fails now makes "Enable capture and
+  the nightly encode now?" default to no. It still asks: you may know the
+  camera is unplugged today and want capture running anyway.
+
 - **A typo at the Auth question no longer deletes the camera's password.**
   The wizard printed `Auth (digest/basic/none)` and then stored whatever was
   typed, and anything that was not `digest` or `basic` meant no

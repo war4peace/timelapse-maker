@@ -655,6 +655,45 @@ logic cannot drift between the two).
 | `test_transfer` | unmounted CIFS path, missing SSH key |
 | `test_notify` | a bad webhook URL, a wrong ntfy topic, a Telegram bot nobody has messaged. It sends through the encoder's own `notify()`, so what is proven is the request the nightly run will make; a pre-flight that builds its own payload is how a check passes while the thing it checks is broken |
 
+**The status is part of the answer** (0.2.1). `bad()` only printed, `main()`
+returned nothing, and a run with two FAIL lines exited 0 like any other. So
+`install.sh`'s
+`as_service_user python3 timelapse_test.py "$CONFIG" || warn "Pre-flight
+reported problems"` could fire on a traceback and on nothing else, and the
+installer then offered to enable the services with the same default whatever
+the check had just found. The wrapper `exec`s Python, so a real status reaches
+a script that runs `timelapse test` too.
+
+`bad()` counts, `main()` returns `1 if _FAILS else 0`, and the entry point is
+`sys.exit(main())`, which is the half that is easy to leave out: a function
+returning a number nobody reads is not an exit code. **A WARN deliberately
+does not count.** A warning is something to know about rather than something
+that stops the product working, and a checker that exits non-zero for every one
+of them says nothing by the end of a release. The three report modes (`--usage`,
+`--encoders`, `--probe-profiles`) stay at 0 whatever they print: they answer a
+question rather than passing a verdict, and `timelapse usage` belongs in a
+pipeline. The counter resets at the top of `main()`, so two runs in one process
+are independent.
+
+`install.sh` acts on it by flipping the *default* of the next question, not by
+skipping it. The operator may know the camera is unplugged today and want
+capture on anyway; answering for them when the check has just said something is
+broken is the other error. Unattended, where `ask_yn` returns the default
+unread, that flip means the services are not enabled.
+
+**The two halves are reachable in two different ways, and the second one is
+awkward enough to be worth recording.** `offer_enable()` cannot be reached by
+an unattended install at all: it returns early on an upgrade, and again when no
+camera is configured, and an unattended wizard configures none, because
+`choose_cameras()` empties the list before it looks at anything (so seeding a
+camera into the config template does not help; measured, not assumed). So
+`temp/h8_install_check.sh` does part A for real, running the checker as the
+service account through the installed script against a camera that answers and
+one that does not, and for part B lifts `offer_enable()`'s own text out of the
+shipped `install.sh` and drives it with a stubbed pre-flight. What runs there is
+the shell this project ships; the only thing faked is the exit code being
+reacted to.
+
 It also hosts `--usage` (`timelapse usage`), which is a report rather than a
 check but belongs to the same "inspect this installation" job and reuses
 `test_disk`'s free-space handling. `report_usage()` walks `frames_root` with
@@ -3448,7 +3487,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,163 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,174 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4216,7 +4255,7 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 1002 lines
+install.sh                       bootstrap installer, 1014 lines
 install.ps1                      the Windows one, 578 lines
 setup-gui.ps1                    launcher for the graphical wizard, 111 lines
 timelapse-setup.cmd              double-click shim for the above
@@ -4225,7 +4264,7 @@ installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1427 lines
 scripts/timelapse_encode.py      batch job, 2300 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 1025 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 1049 lines
 scripts/timelapse_setup.py       configuration wizard, 4814 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2946 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 446 lines
