@@ -301,10 +301,26 @@ class TestTheInstallerUsesTheEmitter(unittest.TestCase):
         self.assertIn("--quote-unit-path", body)
         self.assertNotIn('\\"', body)
 
-    def test_the_two_single_directory_units_go_through_it(self):
-        for name in ("webrw_unit", "staterw_unit"):
-            self.assertIn('%s="$(quote_unit_path "$%s")"'
-                          % (name, name[:-5]), self.source)
+    def test_the_shell_no_longer_writes_a_unit_at_all(self):
+        """L46: there is one implementation, and it is not this one.
+
+        install.sh carried four sed blocks doing what timelapse_setup.py also
+        did, so the two disagreed the moment either grew a rule, and sed
+        cannot quote a path in any case: `&` becomes the matched text, a
+        backslash is an escape and `|` ends the expression, which is exactly
+        what C2 needed to fix.
+        """
+        self.assertNotIn("ReadWritePaths=$rw", self.source)
+        self.assertNotIn("s|^ExecStart=", self.source)
+        self.assertIn("--sync-units", self.source)
+
+    def test_it_still_makes_the_directories_a_unit_will_name(self):
+        # What only the installer can do, and what it kept: systemd refuses to
+        # start a unit whose ReadWritePaths points at a directory that is not
+        # there, and the service cannot create its own, because by then its
+        # parent is read-only to it.
+        self.assertIn("--print-state-path", self.source)
+        self.assertIn("--print-web-paths", self.source)
 
     def test_the_directories_themselves_are_made_from_the_bare_paths(self):
         # The other half of the same split: a directory whose name contains
@@ -312,19 +328,26 @@ class TestTheInstallerUsesTheEmitter(unittest.TestCase):
         for bare in ("staterw", "webrw"):
             self.assertIn('install -d -m 0750 "$%s"' % bare, self.source)
 
-    def test_the_list_is_rendered_by_python_not_joined_by_the_shell(self):
-        """--print-paths emits the finished value, quotes included.
+    def test_the_list_never_passes_through_a_shell_variable(self):
+        """The defect C2 was, and the reason L46 finished it.
 
-        A list cannot survive a shell variable once one of its entries has a
-        space in it, which is the defect itself: there is no spelling of
-        `ReadWritePaths=$rw` that both splits on the separators and does not
-        split on the spaces.
+        A list of paths cannot survive a shell variable once one entry has a
+        space in it: there is no spelling of `ReadWritePaths=$rw` that splits
+        on the separators and not on the spaces. install.sh spliced that value
+        until 0.2.1; now it does not build one at all, and the only strings it
+        still asks Python for are single directories it is about to create.
         """
-        self.assertIn("--print-paths", self.source)
-        self.assertIn("ReadWritePaths=$rw", self.source)
-        # And the fallback for a config that cannot be read is quoted too, or
-        # a default install would write a line the emitter would not have.
-        self.assertIn("""rw='"/var/lib/timelapse"'""", self.source)
+        self.assertNotIn("$rw", self.source)
+        self.assertNotIn("--print-paths", self.source)
+        import timelapse_setup as setup
+        cfg = {"paths": {"frames_root": "/media/My Disk/frames",
+                         "video_output": "/media/My Disk/videos",
+                         "log_dir": "/var/log/tl",
+                         "state_dir": "/srv/state"},
+               "transfer": {"enabled": False}}
+        value = setup.unit_writable_value(cfg, "data")
+        self.assertIn('"/media/My Disk/frames"', value)
+        self.assertEqual(value.count('"'), 8)
 
     def test_the_flag_answers_and_prompts_for_nothing(self):
         # Through main(), because the filter has to return before init_tty():

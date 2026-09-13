@@ -18,6 +18,7 @@ import errno
 import json
 import ntpath
 import os
+import posixpath
 import re
 import select
 import shutil
@@ -2844,6 +2845,151 @@ def setup_cifs_share(cfg, svcuser=None):
     return True
 
 
+# What each unit must say, in one place (0.2.1, L46). install.sh used to
+# carry four sed blocks doing this and timelapse_setup.py a Python subset of
+# it, so the two disagreed the moment either grew a rule: `timelapse transfer`
+# re-derived ReadWritePaths through the Python copy, which never touched the
+# watch or the web unit, and install.sh's copy did. Worse, sed cannot quote:
+# a path containing `&` becomes the matched text, a backslash is an escape,
+# and `|` ends the expression, so C2's fix could not have lived there at all.
+#
+# (unit, script and its flags, which directories it may write)
+UNIT_TEMPLATES = (
+    ("timelapse-capture.service", ("timelapse_capture.py",), "data"),
+    ("timelapse-encode.service", ("timelapse_encode.py",), "data"),
+    # --watch, and it must be rewritten separately: a rule matching any line
+    # that mentions timelapse_encode.py would strip the flag and turn this
+    # five-minute timer into a five-minute encode.
+    ("timelapse-watch.service", ("timelapse_encode.py", "--watch"), "state"),
+    # One directory, its sqlite index, and that is the whole structural claim
+    # the only network-facing unit makes. Never `data`.
+    ("timelapse-web.service", ("timelapse_web.py",), "web"),
+)
+
+
+def config_state_dir(cfg):
+    """The state directory as a *Linux* path, whoever computed it.
+
+    Same rule as writable_paths(): this goes into a systemd unit, so it is a
+    Linux artefact even when a Windows box worked it out, and a Path
+    stringifies with the running platform's separator.
+    """
+    configured = (cfg.get("paths", {}).get("state_dir") or "").strip()
+    return Path(configured).as_posix() if configured else LINUX_STATE_DIR
+
+
+def unit_writable_value(cfg, kind):
+    """The ReadWritePaths= value for one unit, quoted and ready to splice."""
+    if kind == "data":
+        return unit_path_value(writable_paths(cfg))
+    if kind == "state":
+        return quote_unit_path(config_state_dir(cfg))
+    return " ".join(quote_unit_path(p) for p in web_writable_paths(cfg))
+
+
+def unit_settings(script, kind, cfg, prefix, config_path, owner):
+    """Every `Field=value` line this unit must carry, as a dict.
+
+    Built rather than matched: the caller replaces whole lines by field name,
+    so a unit that has grown a field this does not know about keeps it.
+
+    Every path goes through quote_unit_path(), which is C2 reaching the other
+    two fields: an ExecStart whose script or config path contains a space is
+    two arguments to systemd, and the daemon starts with a truncated path.
+    """
+    out = {}
+    if owner:
+        out["User"] = owner
+        out["Group"] = owner
+    out["ReadWritePaths"] = unit_writable_value(cfg, kind)
+    argv = ["/usr/bin/python3",
+            quote_unit_path(posixpath.join(prefix, script[0]))]
+    argv += list(script[1:])
+    argv.append(quote_unit_path(config_path))
+    out["ExecStart"] = " ".join(argv)
+    return out
+
+
+def rewrite_unit(path, settings, drop=()):
+    """Replace the named fields in one unit file. (changed, error)."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError as exc:
+        return False, str(exc)
+    out, changed = [], False
+    for line in lines:
+        field = line.split("=", 1)[0] if "=" in line else ""
+        if any(line.strip() == d for d in drop):
+            changed = True
+            continue
+        if field in settings:
+            new = "%s=%s\n" % (field, settings[field])
+            changed = changed or new != line
+            out.append(new)
+        else:
+            out.append(line)
+    if not changed:
+        return False, None
+    try:
+        path.write_text("".join(out), encoding="utf-8")
+    except OSError as exc:
+        return False, str(exc)
+    return True, None
+
+
+def has_group(name):
+    """Is there such a group on this machine? False where there are none.
+
+    SupplementaryGroups naming a group that does not exist stops the unit from
+    starting outright, so the line is dropped rather than risking the web UI
+    failing to boot on a distro nobody here has tried. The cost is an empty
+    log pane, which the page itself explains.
+    """
+    try:
+        import grp
+    except ImportError:
+        return False
+    try:
+        grp.getgrnam(name)
+        return True
+    except KeyError:
+        return False
+
+
+def sync_units(cfg, unitdir, config_path, prefix, owner):
+    """Re-template every installed unit from the config. (status, detail).
+
+    The one implementation, called by install.sh through --sync-units and by
+    the wizard through sync_unit_readwritepaths(). Same status vocabulary as
+    that function, for the same reason: "nothing to do" and "could not do it"
+    are different answers.
+    """
+    touched, failed, seen = [], [], 0
+    for name, script, kind in UNIT_TEMPLATES:
+        unit = Path(unitdir) / name
+        if not unit.exists():
+            continue
+        seen += 1
+        settings = unit_settings(script, kind, cfg, prefix, config_path,
+                                 owner)
+        drop = ()
+        if (name == "timelapse-web.service"
+                and not has_group("systemd-journal")):
+            drop = ("SupplementaryGroups=systemd-journal",)
+        changed, error = rewrite_unit(unit, settings, drop)
+        if error:
+            failed.append("%s: %s" % (name, error))
+        elif changed:
+            touched.append(name)
+    if failed:
+        return "failed", "; ".join(failed)
+    if not seen:
+        return "absent", "no timelapse units in %s" % unitdir
+    if not touched:
+        return "current", unit_writable_value(cfg, "data")
+    return "changed", unit_writable_value(cfg, "data")
+
+
 def sync_unit_readwritepaths(cfg, unitdir="/etc/systemd/system"):
     """Update ReadWritePaths= in the installed units from the config.
 
@@ -2869,57 +3015,28 @@ def sync_unit_readwritepaths(cfg, unitdir="/etc/systemd/system"):
     """
     if not is_elevated():
         return "denied", "needs root to edit the unit files"
-    # Quoted, not joined with a space: see quote_unit_path(). The detail this
-    # returns is printed to the operator and is meant to be the line that went
-    # into the unit, quotes included, rather than a tidier version of it.
-    paths = unit_path_value(writable_paths(cfg))
-    if not paths:
+    if not writable_paths(cfg):
         return "empty", "the config names no writable paths"
 
-    touched, failed, seen = [], [], 0
-    for name in ("timelapse-capture.service", "timelapse-encode.service"):
-        unit = Path(unitdir) / name
-        if not unit.exists():
-            continue
-        seen += 1
-        try:
-            lines = unit.read_text(encoding="utf-8").splitlines(keepends=True)
-        except OSError as exc:
-            failed.append(f"{name}: {exc}")
-            continue
-        out, changed = [], False
-        for line in lines:
-            if line.startswith("ReadWritePaths="):
-                new = f"ReadWritePaths={paths}\n"
-                changed = changed or new != line
-                out.append(new)
-            else:
-                out.append(line)
-        if not changed:
-            continue
-        try:
-            unit.write_text("".join(out), encoding="utf-8")
-            touched.append(name)
-        except OSError as exc:
-            failed.append(f"{name}: {exc}")
+    # Through sync_units(), which is the one implementation (L46). This used to
+    # rewrite ReadWritePaths in two units and nothing else, so `timelapse
+    # transfer` left the watch and web units describing the old layout while
+    # install.sh's own copy of the rule updated all four.
+    here = str(Path(__file__).resolve().parent)
+    status, detail = sync_units(cfg, unitdir, CONFIG_PATH, here, None)
+    if status != "changed":
+        return status, detail
 
-    if failed:
-        return "failed", "; ".join(failed)
-    if not seen:
-        return "absent", f"no timelapse units in {unitdir}"
-    if not touched:
-        return "current", paths
-
-    good(f"Updated ReadWritePaths in {', '.join(touched)}")
-    note(f"  {paths}")
+    good("Updated the installed units from the config")
+    note(f"  {detail}")
     try:
         subprocess.run(["systemctl", "daemon-reload"],
                        capture_output=True, timeout=30, **no_console())
-    except Exception:
+    except Exception:                                        # noqa: BLE001
         pass
     note("Restart the encoder timer for it to take effect:")
     note("  systemctl restart timelapse-encode.timer")
-    return "changed", paths
+    return status, detail
 
 
 def report_readwritepaths(status, detail):
@@ -4476,6 +4593,11 @@ def main():
                         help="fetch one snapshot from CAM; changes nothing")
     picked.add_argument("-r", "--remove", metavar="CAM", type=strip_colon,
                         help="remove CAM, after one confirmation")
+    ap.add_argument("--sync-units", metavar="UNITDIR",
+                    help="re-template the installed systemd units from the "
+                         "config (install.sh calls this)")
+    ap.add_argument("--prefix", metavar="DIR",
+                    help="where the scripts are installed, for --sync-units")
     ap.add_argument("--print-paths", metavar="CONFIG",
                     help="print the paths systemd must be allowed to write")
     ap.add_argument("--print-web-paths", metavar="CONFIG",
@@ -4538,6 +4660,25 @@ def main():
     # sends no credentials, so it needs no privileges either.
     if args.discover:
         return print_discovered()
+
+    # The whole unit rewrite, in one place (L46). install.sh calls this rather
+    # than running four sed blocks of its own: sed cannot quote a path, which
+    # is C2, and two implementations of one rule disagree the moment either
+    # grows. It prints what it did and exits 0 for every outcome that is not a
+    # failure, because "the units were already right" is the ordinary case on
+    # an upgrade and is not news.
+    if args.sync_units:
+        try:
+            with open(args.output, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError) as exc:
+            print(f"  cannot read {args.output}: {exc}")
+            return 1
+        here = args.prefix or str(Path(__file__).resolve().parent)
+        status, detail = sync_units(cfg, args.sync_units,
+                                    args.output, here, args.owner)
+        print(f"  units {status}: {detail}")
+        return 1 if status == "failed" else 0
 
     # Machine-readable mode used by install.sh to template the systemd units.
     # This one emits the finished ReadWritePaths= value, quotes and all,

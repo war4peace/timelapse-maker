@@ -3466,22 +3466,49 @@ class TestWatchUnitWiring(unittest.TestCase):
         self.unit = (self.repo / "service" / "timelapse-watch.service"
                      ).read_text(encoding="utf-8")
         self.installer = (self.repo / "install.sh").read_text(encoding="utf-8")
+        self.cfg = {"paths": {"frames_root": "/srv/tl/frames",
+                              "video_output": "/srv/tl/videos",
+                              "log_dir": "/srv/tl/logs",
+                              "state_dir": "/srv/tl/state"},
+                    "transfer": {"enabled": False},
+                    "web": {"state_dir": "/srv/tl/web"}}
 
     def test_the_unit_asks_for_watch_mode(self):
         self.assertIn("timelapse_encode.py --watch", self.unit)
 
-    def test_the_installer_rewrites_it_with_the_flag_intact(self):
-        # The loop that templates capture and encode matches any ExecStart
-        # mentioning timelapse_encode.py. If the watch unit went through it,
-        # --watch would be stripped and a five-minute timer would become a
-        # five-minute *encode run*, silently, on every install.
-        self.assertIn("timelapse_encode.py --watch $CONFIG", self.installer)
+    def written(self, name):
+        """The lines the rewriter would put in one unit (0.2.1, L46).
 
-    def test_the_shared_loop_does_not_touch_the_watch_unit(self):
-        loop = self.installer.split("for unit in timelapse-capture.service "
-                                    "timelapse-encode.service; do")[1]
-        loop = loop.split("done")[0]
-        self.assertNotIn("watch", loop)
+        These three used to read install.sh's sed blocks. The rule is Python's
+        now, so they ask it what it produces, which is what they were reaching
+        for: a scan of the shell could see that `--watch` appeared somewhere
+        in the file and not that the right unit gets it.
+        """
+        import timelapse_setup as setup
+        script, kind = [(sc, k) for n, sc, k in setup.UNIT_TEMPLATES
+                        if n == name][0]
+        return setup.unit_settings(script, kind, self.cfg,
+                                   "/opt/timelapse",
+                                   "/etc/timelapse/config.json", "timelapse")
+
+    def test_the_installer_rewrites_it_with_the_flag_intact(self):
+        # If the watch unit were templated like the encode unit, --watch would
+        # be stripped and a five-minute timer would become a five-minute
+        # *encode run*, silently, on every install.
+        exec_start = self.written("timelapse-watch.service")["ExecStart"]
+        # Quoted, always: quote_unit_path() does not ask whether this
+        # particular path needs it, because a rule that applies sometimes is
+        # a rule somebody has to remember the exception to (C2).
+        self.assertIn("timelapse_encode.py", exec_start)
+        self.assertIn(" --watch ", exec_start)
+        self.assertTrue(exec_start.endswith('"/etc/timelapse/config.json"'),
+                        exec_start)
+
+    def test_the_encode_unit_does_not_get_the_flag(self):
+        # The control, and the shape of the defect: one rule for both units is
+        # how the flag went missing.
+        self.assertNotIn(
+            "--watch", self.written("timelapse-encode.service")["ExecStart"])
 
     def test_it_is_installed_and_removed_with_the_others(self):
         for phase in ("install -m 0644", "rm -f"):
@@ -3490,15 +3517,42 @@ class TestWatchUnitWiring(unittest.TestCase):
         self.assertIn("disable --now timelapse-watch.timer", self.installer)
 
     def test_its_writable_set_is_the_state_directory_alone(self):
-        # It reads the capture heartbeat and writes one small record. Giving it
-        # $rw would hand a five-minutely job write access to every frame.
-        #
-        # The _unit suffix is not cosmetic and is asserted rather than trimmed
-        # to the stem: $staterw is the bare directory, which this script also
-        # mkdirs, and $staterw_unit is that path quoted for a unit file. Naming
-        # the wrong one is either a directory with quote marks in it or a
-        # ReadWritePaths line that splits on the first space.
-        self.assertIn("ReadWritePaths=$staterw_unit", self.installer)
+        # It reads the capture heartbeat and writes one small record. The data
+        # set would hand a five-minutely job write access to every frame.
+        watch = self.written("timelapse-watch.service")["ReadWritePaths"]
+        capture = self.written("timelapse-capture.service")["ReadWritePaths"]
+        self.assertEqual(watch.strip('"'), "/srv/tl/state")
+        self.assertIn("/srv/tl/frames", capture)
+        self.assertNotIn("frames", watch)
+
+    def test_the_web_unit_writes_its_index_and_nothing_else(self):
+        """The only network-facing unit, and the one structural claim it makes.
+
+        `ReadWritePaths` is one directory and must stay one: widening it to
+        the data set would hand the page that lists files write access to
+        every captured frame, in exchange for nothing. The rewriter is where
+        that can now go wrong, so it is where the claim is checked.
+        """
+        web = self.written("timelapse-web.service")["ReadWritePaths"]
+        self.assertEqual(web, '"/srv/tl/web"')
+        self.assertNotIn("frames", web)
+        self.assertNotIn("videos", web)
+
+    def test_the_daemons_do_get_the_data_set(self):
+        # The control: a rewriter that gave every unit one directory would
+        # pass the test above and stop capture writing anything at all.
+        capture = self.written("timelapse-capture.service")["ReadWritePaths"]
+        for expected in ("frames", "videos", "logs", "state"):
+            self.assertIn(expected, capture)
+
+    def test_a_state_directory_with_a_space_is_quoted(self):
+        # Which is C2 reaching this unit: sed could not have done it, and
+        # ReadWritePaths splits on whitespace.
+        cfg = dict(self.cfg)
+        cfg["paths"] = dict(cfg["paths"], state_dir="/srv/my tl/state")
+        import timelapse_setup as setup
+        value = setup.unit_writable_value(cfg, "state")
+        self.assertEqual(value, '"/srv/my tl/state"')
 
     def test_new_timers_are_adopted_on_upgrade(self):
         # A unit that did not exist at the previous install is enabled by

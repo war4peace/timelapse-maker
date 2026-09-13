@@ -3259,6 +3259,40 @@ owns, and `web.auth`, because the login is keyed on **absence** and
 
 ### 4.7 `install.sh`
 
+**It no longer writes a systemd unit** (0.2.1, L46). It carried four `sed`
+blocks templating `User=`, `Group=`, `ReadWritePaths=` and `ExecStart=`, and
+`timelapse_setup.py` carried a Python subset of the same job, so the two
+disagreed the moment either grew a rule: `timelapse transfer` re-derived
+`ReadWritePaths` through the Python one, which touched two units, while the
+shell one touched four. And **sed cannot quote a path at all**: `&` becomes
+the matched text, a backslash is an escape and `|` ends the expression, so
+C2's fix for a frames root with a space in it could never have lived there.
+
+`--sync-units UNITDIR` is the one implementation. `UNIT_TEMPLATES` says what
+each unit is: which script and flags its `ExecStart` runs, and which set of
+directories it may write (`data`, `state` or `web`). Three things that were
+comments in two files are now structure:
+
+- the watch unit keeps `--watch`, because it is a row in the table rather
+  than a line the encode rule happens not to match;
+- the web unit gets `web`, one directory, which is the structural claim the
+  only network-facing unit makes;
+- **every path goes through `quote_unit_path()`**, including the two in
+  `ExecStart`, which is C2 reaching fields the sed version could not have
+  protected.
+
+What install.sh kept is what only it can do: creating the state and web index
+directories, as the account that will write to them, before a unit names them.
+systemd refuses to start a unit whose `ReadWritePaths` points at a directory
+that is not there, and the service cannot create its own, because by then its
+parent is read-only to it.
+
+**Verified on real systemd** (`temp/l46_wsl.sh`), nine checks, with the frames
+root at `/srv/My Timelapses/frames`: the spaced path is quoted in the unit,
+`systemctl show` reads it back as **one** entry, the watch unit still carries
+`--watch`, the web unit still gets one directory, and the daemon starts and
+writes frames into it.
+
 **Six small corrections** (0.2.1, L33 to L37, L40), each of which made the
 installer say something that was not so.
 
@@ -3855,7 +3889,7 @@ python3 -m unittest discover -s tests -t tests -p 'test_*.py'   # fast, no deps
 python3 tests/smoke_test.py                                     # needs ffmpeg
 ```
 
-**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,377 cases, about a
+**Unit tests** (`tests/test_*.py`, stdlib `unittest`, 2,381 cases, about a
 minute; `test_web.py` builds real sparse files on disk) cover the pure logic: frame validation, concat-list escaping,
 `find_pending` backlog selection, `human_*` formatting, the storage scan's
 filtering and deduplication, `_base_device` partition stripping, `recommend`,
@@ -4629,7 +4663,7 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 1047 lines
+install.sh                       bootstrap installer, 991 lines
 install.ps1                      the Windows one, 601 lines
 setup-gui.ps1                    launcher for the graphical wizard, 142 lines
 timelapse-setup.cmd              double-click shim for the above
@@ -4639,7 +4673,7 @@ installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1584 lines
 scripts/timelapse_encode.py      batch job, 2394 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1092 lines
-scripts/timelapse_setup.py       configuration wizard, 4787 lines
+scripts/timelapse_setup.py       configuration wizard, 4928 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2990 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 510 lines
 scripts/timelapse_platform.py    the only platform branch, 2597 lines

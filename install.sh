@@ -536,106 +536,50 @@ quote_unit_path() {
 # directory the daemons write to. Deriving it from the config is the whole
 # reason this is scripted: getting it wrong produces a baffling read-only error.
 sync_units() {
-    # Already quoted: --print-paths emits the finished value because a list of
-    # paths cannot survive a shell variable once one of them has a space in it.
-    local user_line="$SVCUSER" rw='"/var/lib/timelapse"'
-    if [ -f "$CONFIG" ]; then
-        rw="$(python3 "$PREFIX/timelapse_setup.py" --print-paths "$CONFIG" 2>/dev/null)" \
-            || rw='"/var/lib/timelapse"'
-        [ -z "$rw" ] && rw='"/var/lib/timelapse"'
-    fi
-    # The web UI gets its OWN ReadWritePaths, not this one. It writes exactly
-    # one thing - its sqlite index - and scoping the unit to that directory is
-    # what keeps the library, the frames and the config read-only to it. Giving
-    # it $rw would hand it write access to every captured frame for no reason.
-    local webrw="/var/lib/timelapse/web"
-    if [ -f "$CONFIG" ]; then
-        webrw="$(python3 "$PREFIX/timelapse_setup.py" --print-web-paths "$CONFIG" 2>/dev/null)" \
-            || webrw="/var/lib/timelapse/web"
-        [ -z "$webrw" ] && webrw="/var/lib/timelapse/web"
-    fi
-    # Where the daemons publish runtime state, and now part of $rw above. It is
-    # made HERE rather than only by the wizard, because an upgrade that answers
-    # "don't reconfigure" never runs the wizard: without this, ReadWritePaths
-    # would name a directory that does not exist and BOTH daemons would stop
-    # starting, reporting a mount namespace error that names neither the
-    # directory nor the release that added it.
-    local staterw="/var/lib/timelapse/state"
+    # The rewrite itself is Python's, through --sync-units (0.2.1, L46). This
+    # function used to carry four sed blocks doing the same job as
+    # timelapse_setup.py's own copy, and two implementations of one rule
+    # disagree the moment either grows: `timelapse transfer` re-derived
+    # ReadWritePaths through the Python one, which never touched the watch or
+    # the web unit, while this one did. And sed cannot quote a path at all,
+    # which is C2: `&` becomes the matched text, a backslash is an escape and
+    # `|` ends the expression, so the fix for a frames root with a space in it
+    # could not have lived here.
+    #
+    # What stays here is what only this script can do: making the directories
+    # a unit is about to name, as the account that will write to them.
+    local staterw="/var/lib/timelapse/state" webrw="/var/lib/timelapse/web"
     if [ -f "$CONFIG" ]; then
         staterw="$(python3 "$PREFIX/timelapse_setup.py" --print-state-path "$CONFIG" 2>/dev/null)" \
             || staterw="/var/lib/timelapse/state"
         [ -z "$staterw" ] && staterw="/var/lib/timelapse/state"
+        webrw="$(python3 "$PREFIX/timelapse_setup.py" --print-web-paths "$CONFIG" 2>/dev/null)" \
+            || webrw="/var/lib/timelapse/web"
+        [ -z "$webrw" ] && webrw="/var/lib/timelapse/web"
     fi
+    # Made HERE rather than only by the wizard, because an upgrade that keeps
+    # its configuration never runs the wizard: without this, ReadWritePaths
+    # would name a directory that does not exist and BOTH daemons would stop
+    # starting, reporting a mount namespace error that names neither the
+    # directory nor the release that added it. The web index directory is the
+    # same rule, and the service cannot create its own: by then its parent is
+    # read-only to it.
     install -d -m 0750 "$staterw" 2>/dev/null || true
     chown "$SVCUSER:$SVCUSER" "$staterw" 2>/dev/null || true
-
-    # These two stay bare above, because this script *creates* them as well as
-    # naming them in a unit, and a directory whose name contains quote marks is
-    # not what anybody asked for. One directory round-trips through argv where
-    # a list cannot, so each gets its unit spelling here instead.
-    local webrw_unit staterw_unit
-    webrw_unit="$(quote_unit_path "$webrw")"
-    staterw_unit="$(quote_unit_path "$staterw")"
-
-    for unit in timelapse-capture.service timelapse-encode.service; do
-        local f="$UNITDIR/$unit"
-        [ -f "$f" ] || continue
-        sed -i \
-            -e "s|^User=.*|User=$user_line|" \
-            -e "s|^Group=.*|Group=$user_line|" \
-            -e "s|^ReadWritePaths=.*|ReadWritePaths=$rw|" \
-            -e "s|^ExecStart=.*timelapse_capture.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_capture.py $CONFIG|" \
-            -e "s|^ExecStart=.*timelapse_encode.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_encode.py $CONFIG|" \
-            "$f"
-    done
-
     if [ -f "$UNITDIR/timelapse-web.service" ]; then
-        sed -i \
-            -e "s|^User=.*|User=$user_line|" \
-            -e "s|^Group=.*|Group=$user_line|" \
-            -e "s|^ReadWritePaths=.*|ReadWritePaths=$webrw_unit|" \
-            -e "s|^ExecStart=.*timelapse_web.py.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_web.py $CONFIG|" \
-            "$UNITDIR/timelapse-web.service"
-        # ReadWritePaths on a directory that does not exist stops the unit
-        # dead, and the service cannot create it: its parent is read-only to
-        # it by then. So it is made here, before anything tries to start.
         install -d -m 0750 "$webrw" 2>/dev/null || true
         chown "$SVCUSER:$SVCUSER" "$webrw" 2>/dev/null || true
     fi
 
-    # The credential watch gets the state directory and nothing else, for the
-    # same reason the web UI gets its index directory and nothing else: it
-    # reads the capture heartbeat and writes one small file recording what it
-    # has already reported. It has no business near the frames or the videos.
-    #
-    # Its ExecStart is rewritten separately too, and must be: the loop above
-    # matches any line mentioning timelapse_encode.py, which would silently
-    # strip the --watch flag and turn this timer into an encode run every five
-    # minutes.
-    if [ -f "$UNITDIR/timelapse-watch.service" ]; then
-        sed -i \
-            -e "s|^User=.*|User=$user_line|" \
-            -e "s|^Group=.*|Group=$user_line|" \
-            -e "s|^ReadWritePaths=.*|ReadWritePaths=$staterw_unit|" \
-            -e "s|^ExecStart=.*|ExecStart=/usr/bin/python3 $PREFIX/timelapse_encode.py --watch $CONFIG|" \
-            "$UNITDIR/timelapse-watch.service"
-    fi
-
-    # SupplementaryGroups naming a group that does not exist stops the unit
-    # from starting outright, so it is cheaper to drop the line than to have
-    # the web UI fail to boot on a distro we have never tried. The cost of
-    # dropping it is only that the log pane comes back empty - which the page
-    # explains, rather than leaving the reader guessing.
-    if [ -f "$UNITDIR/timelapse-web.service" ] \
-       && ! getent group systemd-journal >/dev/null 2>&1; then
-        sed -i '/^SupplementaryGroups=systemd-journal$/d' \
-            "$UNITDIR/timelapse-web.service"
-        note "No systemd-journal group here; the web log pane will be empty."
+    local out
+    if [ -f "$CONFIG" ]; then
+        out="$(python3 "$PREFIX/timelapse_setup.py" --sync-units "$UNITDIR" \
+                   --output "$CONFIG" --prefix "$PREFIX" --owner "$SVCUSER" \
+                   2>&1)" || warn "Could not re-template the units: $out"
+        [ -n "$out" ] && note "${out#  }"
     fi
 
     [ -d /run/systemd/system ] && systemctl daemon-reload || true
-    note "ReadWritePaths=$rw"
-    note "Web index dir=$webrw"
 }
 
 run_wizard() {
