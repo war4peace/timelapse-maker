@@ -608,17 +608,46 @@ def versions_differ(loaded, installed):
     return a[:n] != b[:n]
 
 
+def nvidia_driver_loaded(root="/"):
+    """True if the NVIDIA kernel driver is loaded, False if not, None if unknown.
+
+    "Cannot load libcuda.so.1" is what every NVENC probe prints on a machine
+    with no NVIDIA GPU, and the hint for it sent the operator to install NVENC
+    support for hardware they did not have: both test VMs, Fedora and Arch,
+    2026-09-14. False only where sysfs lists kernel modules and nvidia is not
+    among them, which is a Linux kernel answering. None anywhere without
+    sysfs, Windows included, and None under WSL2, whose GPU arrives through
+    /dev/dxg with no nvidia module and runs NVENC anyway (the 0.1.9 smoke test
+    needed CUDA_VISIBLE_DEVICES= to reach libx264 there).
+    """
+    base = Path(root)
+    try:
+        if (base / "sys/module/nvidia").is_dir():
+            return True
+        if (base / "dev/dxg").exists():
+            return None
+        if (base / "sys/module").is_dir():
+            return False
+    except OSError:
+        pass
+    return None
+
+
 def driver_state(root="/", runner=None):
     """(verdict, loaded, installed, source) for the hourly driver watch.
 
     verdict is True for a mismatch, False for none, None for cannot tell.
     The version files answer first because they need nothing; nvidia-smi is the
     fallback for a host where they are not where this expects, and it needs
-    the watch unit's DeviceAllow to see the driver at all.
+    the watch unit's DeviceAllow to see the driver at all. A machine with no
+    NVIDIA driver loaded has nothing to compare, and asking nvidia-smi every
+    hour there would be a subprocess spent learning that again.
     """
     loaded, installed = nvidia_versions(root)
     if loaded and installed:
         return versions_differ(loaded, installed), loaded, installed, "files"
+    if not loaded and nvidia_driver_loaded(root) is False:
+        return None, None, installed, "no driver"
     return driver_mismatch(runner=runner), loaded, installed, "nvidia-smi"
 
 
@@ -675,16 +704,53 @@ def rtsp_reason(stderr):
     return explain_rtsp(stderr), redact(evidence)[:200]
 
 
-def encoder_hint(codec, message, built_in=None, mismatch=None):
+# ffmpeg's "[av1_nvenc @ 0x5568004033c0] " prefixes, and the Windows spelling
+# without the 0x. An address is noise in a message an operator acts on.
+FFMPEG_ADDRESS = re.compile(r"\[[^\[\]]*@ (?:0x)?[0-9a-fA-F]+\]\s*")
+
+# What ffmpeg says after every encoder failure, whatever the reason. Shown
+# only when there is nothing more specific.
+FFMPEG_GENERIC = (
+    "error while opening encoder", "error selecting an encoder",
+    "error opening output file", "error sending frames", "conversion failed",
+    "error while filtering", "nothing was written",
+)
+
+
+def ffmpeg_evidence(message, limit=160):
+    """The one statement in an ffmpeg failure worth showing, never cut mid-word.
+
+    The wizard printed message[:150], and on both test VMs (2026-09-14) that
+    ended "Error while opening encod", which reads as this program having
+    crashed: the defect rtsp_reason() fixed for RTSP, still live beside it.
+    The probe's message is already whitespace-joined, so the statements are
+    recovered by splitting on ffmpeg's own address prefixes, and the first one
+    that is not the generic trailer wins: "Cannot load libcuda.so.1",
+    "Unknown encoder 'libx264'".
+    """
+    parts = [p.strip() for p in FFMPEG_ADDRESS.split(message or "")]
+    parts = [p for p in parts if p]
+    if not parts:
+        return ""
+    telling = [p for p in parts if not p.lower().startswith(FFMPEG_GENERIC)]
+    line = telling[0] if telling else parts[0]
+    if len(line) > limit:
+        line = line[:limit].rsplit(" ", 1)[0] + " ..."
+    return line
+
+
+def encoder_hint(codec, message, built_in=None, mismatch=None,
+                 driver_loaded=None):
     """Plain-language cause for a failed probe, or '' if there is nothing useful.
 
     Derived from ffmpeg's message, never guessed from the codec name. An
     earlier version guessed and told an RTX 4060 owner their GPU was too old
     for AV1, which was both wrong and a dead end.
 
-    `built_in` and `mismatch` are facts the caller established elsewhere, and
-    both are tri-state: None means nobody looked. Keeping them arguments is
-    what keeps this function pure and testable without a GPU.
+    `built_in`, `mismatch` and `driver_loaded` are facts the caller
+    established elsewhere, and all are tri-state: None means nobody looked, or
+    nobody could. Keeping them arguments is what keeps this function pure and
+    testable without a GPU.
     """
     m = (message or "").lower()
     # Every branch below that names a driver or a GPU applies to NVENC and to
@@ -696,6 +762,13 @@ def encoder_hint(codec, message, built_in=None, mismatch=None):
     if built_in is False or "unknown encoder" in m:
         return (f"this ffmpeg build does not include {codec}; "
                 f"try jellyfin-ffmpeg or a BtbN static build")
+    if is_nvenc(codec) and driver_loaded is False:
+        # Above the library branch below, which is what used to answer here:
+        # "Cannot load libcuda.so.1" matched "cannot load" and told a machine
+        # with no NVIDIA card to go and install NVENC support.
+        return ("no NVIDIA driver is loaded on this machine, and NVENC needs "
+                "an NVIDIA GPU with its driver. On a machine or VM without "
+                "one that is expected, not a fault")
     if is_nvenc(codec) and mismatch is True:
         # Above every NVENC branch below, because it is the one answer here
         # that is established rather than inferred, and the remedy is a reboot
@@ -742,6 +815,7 @@ def encoder_hint(codec, message, built_in=None, mismatch=None):
 def select_encoder(ffmpeg, enc):
     built = list_encoders(ffmpeg)
     mismatch, asked = None, False
+    loaded = nvidia_driver_loaded()
     for cand in build_candidates(enc):
         ok, message = probe_encoder_detail(ffmpeg, cand)
         log.info("  probe %-22s %s", cand["name"],
@@ -755,9 +829,11 @@ def select_encoder(ffmpeg, enc):
         # a subprocess. Found by reading temp/nvenc_hint_demo.py's output: an
         # earlier version of this line said the same thing in a comment and
         # then consulted nvidia-smi about libx264.
-        if not asked and in_build is not False and is_nvenc(cand["codec"]):
+        if (not asked and in_build is not False and loaded is not False
+                and is_nvenc(cand["codec"])):
             mismatch, asked = driver_mismatch(message), True
-        hint = encoder_hint(cand["codec"], message, in_build, mismatch)
+        hint = encoder_hint(cand["codec"], message, in_build, mismatch,
+                            driver_loaded=loaded)
         if hint:
             log.info("      %s", hint)
         # INFO, not debug. This runs at INFO, so a debug call here is a

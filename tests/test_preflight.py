@@ -31,6 +31,99 @@ import timelapse_encode as enc
 import timelapse_test as tt
 
 
+class TestEncodersReportWithoutAGpu(unittest.TestCase):
+    """`timelapse test --encoders` on a machine with no NVIDIA card.
+
+    The Fedora VM, 2026-09-14, after RPM Fusion: libx264 worked, no NVIDIA
+    driver was loaded, and the report closed with a page of GPU advice, an apt
+    command on a dnf system, "falling back to hevc_nvenc", and nothing about
+    which encoder the nightly run would use.
+    """
+
+    FAILED = "[av1_nvenc @ 0x1] Cannot load libcuda.so.1"
+    ALL = {"av1_nvenc", "hevc_nvenc", "h264_nvenc", "libx264"}
+
+    @staticmethod
+    def dnf(name):
+        return "/usr/bin/dnf" if name == "dnf" else None
+
+    @staticmethod
+    def apt(name):
+        return "/usr/bin/apt-get" if name == "apt-get" else None
+
+    def report(self, loaded, which, works=("libx264",)):
+        def fake_run(cmd, **kw):
+            if cmd[0] == "nvidia-smi":
+                raise FileNotFoundError("nvidia-smi")
+            return mock.Mock(stdout="ffmpeg version 8.1.2\n"
+                                    "configuration: --enable-nvenc",
+                             stderr="", returncode=0)
+
+        out = io.StringIO()
+        with mock.patch.object(tt.subprocess, "run", fake_run), \
+                mock.patch.object(enc, "list_encoders", return_value=self.ALL), \
+                mock.patch.object(enc, "probe_encoder_detail",
+                                  lambda f, c: (c["codec"] in works, self.FAILED)), \
+                mock.patch.object(enc, "probe_encoder_verbose", return_value=[]), \
+                mock.patch.object(enc, "nvidia_driver_loaded",
+                                  return_value=loaded), \
+                mock.patch.object(tt.shutil, "which", which), \
+                contextlib.redirect_stdout(out):
+            tt.diagnose_encoders({"paths": {"ffmpeg": "ffmpeg"}})
+        return out.getvalue()
+
+    def test_the_fedora_vm_report(self):
+        out = self.report(False, self.dnf)
+        self.assertIn("The nightly encode will use libx264", out)
+        self.assertIn("=== No NVIDIA GPU ===", out)
+        self.assertIn("no NVIDIA driver is loaded", out)
+        for wrong in ("RTX 40", "apt install", "hevc_nvenc is not a problem",
+                      "Loaded Nvenc version", "no NVIDIA driver installed?"):
+            self.assertNotIn(wrong, out)
+
+    def test_a_gpu_machine_keeps_the_gpu_advice(self):
+        # The control: the block was right for the machine it was written on.
+        out = self.report(True, self.apt, works=("hevc_nvenc", "libx264"))
+        self.assertIn("The nightly encode will use hevc_nvenc", out)
+        self.assertIn("RTX 40", out)
+        self.assertIn("sudo apt install jellyfin-ffmpeg7", out)
+        self.assertIn("hevc_nvenc is not a problem", out)
+
+    def test_nothing_working_is_said_plainly(self):
+        out = self.report(False, self.dnf, works=())
+        self.assertIn("No encoder works", out)
+
+    def test_no_apt_means_no_apt_command(self):
+        _nightly, _heading, lines = tt.closing_advice({"av1_nvenc"}, True,
+                                                      which=self.dnf)
+        self.assertFalse(any("apt install" in l for l in lines))
+        self.assertTrue(any("BtbN" in l for l in lines))
+
+    def test_the_fallback_sentence_names_the_real_fallback(self):
+        nightly, _h, lines = tt.closing_advice({"libx264"}, None,
+                                               which=self.apt)
+        text = "\n".join(lines)
+        self.assertEqual(nightly, "libx264")
+        self.assertIn("libx264 works, but in software", text)
+        self.assertNotIn("hevc_nvenc is not a problem", text)
+
+    def test_av1_needs_no_fallback_sentence(self):
+        _n, _h, lines = tt.closing_advice(self.ALL, True, which=self.apt)
+        self.assertFalse(any("Falling back" in l for l in lines))
+
+    def test_h264_nvenc_alone_is_not_a_nightly_encoder(self):
+        # The nightly order is build_candidates()'s, which has no h264_nvenc.
+        nightly, _h, _l = tt.closing_advice({"h264_nvenc"}, True,
+                                            which=self.apt)
+        self.assertIsNone(nightly)
+
+    def test_package_history_follows_the_package_manager(self):
+        self.assertEqual(tt.package_history(self.apt),
+                         "/var/log/apt/history.log")
+        self.assertEqual(tt.package_history(self.dnf), "dnf history list")
+        self.assertEqual(tt.package_history(lambda n: None), "its log")
+
+
 SECRET = "Sup3rS3cret!"
 
 # The Reolink shape: the credential is a query parameter, so the URL *is* the

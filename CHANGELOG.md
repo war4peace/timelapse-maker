@@ -62,6 +62,18 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **A Linux install now says when its ffmpeg cannot make a video.** On Fedora, `dnf install ffmpeg` gives you `ffmpeg-free`, which leaves out libx264, the one encoder that needs no graphics card. On a machine without an NVIDIA GPU nothing could be encoded, while the installer printed "OK Installed ffmpeg" and ended by asking only for cameras. The installer now warns at the dependency step, the setup names RPM Fusion's ffmpeg as the fix (`sudo dnf swap ffmpeg-free ffmpeg --allowerasing` once RPM Fusion is enabled), and the closing steps repeat that no video can be made until it is fixed.
+
+- **A machine with no NVIDIA card is no longer told to install NVIDIA encoding support.** Every NVIDIA encoder check there fails with "Cannot load libcuda.so.1", which the setup and `timelapse test` read as a missing library. They now say that no NVIDIA driver is loaded, which is simply expected on such a machine. The hourly driver watch also stops asking `nvidia-smi` on one.
+
+- **`timelapse test --encoders` ends with an answer.** It now says which encoder the nightly run will use. On a machine with no NVIDIA driver it closes with a short note that encoding will be in software, instead of a page of graphics card troubleshooting that ended "falling back to hevc_nvenc is not a problem" when the fallback was libx264. The `jellyfin-ffmpeg` suggestion is only shown where `apt` exists, and the advice after a driver update names the right package history for the system (`dnf history list` on Fedora rather than an apt log).
+
+- **ffmpeg's reason is quoted whole.** The setup cut it at 150 characters, so it ended in the middle of a word ("Error while opening encod") and read as a crash. It now shows the one statement that explains the failure, such as "Unknown encoder 'libx264'", without ffmpeg's memory addresses.
+
+- **Turning off the low-disk pause is no longer silent where it matters.** Answering 0 on the system disk, or right after the space estimate said "Tight", now prints a warning and a threshold that would protect the disk. 0 is still accepted. The Windows setup warns in the same words for its system drive.
+
+- **A first install no longer prints `units changed: "/var/lib/timelapse/frames" ...`.** That line is only printed now if the service files could not be updated.
+
 - **An encode that is interrupted no longer leaves a broken video that gets delivered as if it were finished.** ffmpeg wrote straight to the video's final name, so a power cut or a Ctrl-C part way through left a truncated `Camera.YYYYMMDD.mkv` that the next night's transfer moved into your library. Worse, re-encoding a day with `--force` while its good video was still in the videos folder emptied that video the moment ffmpeg started, and if the re-encode failed the only copy was gone. The encoder now writes to a temporary `.part` name and renames it only once the result has been checked; a failure removes the temporary file and nothing else.
 
 - **A hung ffmpeg or rsync can no longer stop every night's encode after it.** Neither had a time limit, and while the nightly job is still running the timer does not start another, so one wedged GPU session or a network share that vanished mid-copy meant no videos from then on, no notification and a status page saying the encode was running. An encode now gives up after an hour or three seconds per frame, whichever is longer, and fails that day only; rsync gives up after ten minutes with no data moving.

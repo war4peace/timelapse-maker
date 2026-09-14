@@ -168,6 +168,31 @@ install_deps() {
         note "build from BtbN or jellyfin-ffmpeg; the wizard will ask for the path."
     fi
 
+    # Installed is not the same as able to encode. Fedora's `dnf install ffmpeg`
+    # yields ffmpeg-free, which leaves out libx264, the one encoder that needs
+    # no GPU, and this step used to say "OK Installed ffmpeg" over it (Fedora
+    # VM, 2026-09-14). Captured first rather than piped into grep -q: under
+    # pipefail, grep exiting early hands ffmpeg a SIGPIPE, and the pipeline
+    # would fail precisely when libx264 is there.
+    if command -v ffmpeg >/dev/null 2>&1; then
+        local encoders
+        encoders="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"
+        case "$encoders" in
+            *" libx264 "*) ;;
+            *)
+                warn "This ffmpeg has no libx264, so without a working NVIDIA GPU"
+                note "nothing can be encoded."
+                case "$PKG" in
+                    dnf|yum)
+                        note "RPM Fusion's ffmpeg includes it. On Fedora:"
+                        # shellcheck disable=SC2016 # printed for the operator to run
+                        note '  sudo dnf install https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm'
+                        note "  sudo dnf swap ffmpeg-free ffmpeg --allowerasing"
+                        note "On RHEL and its rebuilds: rpmfusion.org/Configuration" ;;
+                esac ;;
+        esac
+    fi
+
     command -v python3 >/dev/null 2>&1 || die "python3 is required but missing."
     python3 -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
         || die "Python 3.9+ is required (found $(python3 -V 2>&1))."
@@ -824,6 +849,21 @@ offer_enable() {
         say "                systemctl enable --now timelapse-encode.timer"
         say "                systemctl enable --now timelapse-watch.timer"
         return
+    fi
+
+    # Before the cameras. An ffmpeg that cannot encode is the one finding that
+    # stops everything, and the wizard's FAIL for it has scrolled half a screen
+    # away by now: the Fedora VM, 2026-09-14, ended on "No cameras configured
+    # yet" with nothing about the encoder. Probed as the service account,
+    # which is who runs the nightly encode.
+    local enc_out
+    if ! enc_out="$(as_service_user python3 "$PREFIX/timelapse_setup.py" \
+                        --check-encoder --output "$CONFIG" 2>&1)"; then
+        warn "No video can be made: ffmpeg cannot encode anything here."
+        while IFS= read -r line; do
+            [ -n "$line" ] && note "$line"
+        done <<< "$enc_out"
+        say "Details:  timelapse test --encoders"
     fi
 
     local cams

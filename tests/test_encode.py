@@ -911,7 +911,8 @@ class TestSelectEncoderReporting(unittest.TestCase):
     something.
     """
 
-    PATCHED = ("list_encoders", "probe_encoder_detail", "driver_mismatch")
+    PATCHED = ("list_encoders", "probe_encoder_detail", "driver_mismatch",
+               "nvidia_driver_loaded")
 
     def setUp(self):
         self.saved = {n: getattr(enc, n) for n in self.PATCHED}
@@ -921,8 +922,11 @@ class TestSelectEncoderReporting(unittest.TestCase):
             setattr(enc, name, fn)
 
     def drive(self, message, built=("av1_nvenc", "hevc_nvenc", "libx264"),
-              mismatch=False):
+              mismatch=False, loaded=None):
         asked = []
+        # Declared, never inherited: a Linux runner has /sys/module and no
+        # nvidia in it, this box has neither, and WSL has /dev/dxg.
+        enc.nvidia_driver_loaded = lambda root="/": loaded
         enc.list_encoders = lambda ffmpeg: set(built)
         enc.probe_encoder_detail = lambda ffmpeg, cand: (False, message)
 
@@ -3902,6 +3906,156 @@ class TestNvidiaVersions(unittest.TestCase):
         def missing():
             raise FileNotFoundError("nvidia-smi")
         self.assertIsNone(enc.driver_state(self.root, missing)[0])
+
+
+class TestNoNvidiaDriver(unittest.TestCase):
+    """A machine with no NVIDIA card is told so, not sent to install NVENC.
+
+    Both test VMs, Fedora and Arch, 2026-09-14: every NVENC probe printed
+    "Cannot load libcuda.so.1" and the hint said "install the driver's NVENC
+    support", for hardware neither VM has.
+    """
+
+    # What the VMs' wizard showed, reassembled as probe_encoder_detail joins it.
+    FEDORA_AV1 = ("[av1_nvenc @ 0x5568004033c0] Cannot load libcuda.so.1 "
+                  "[vost#0:0/av1_nvenc @ 0x556800402dc0] [enc:av1_nvenc @ "
+                  "0x5568003fe700] Error while opening encoder - maybe "
+                  "incorrect parameters such as bit_rate, rate, width or height.")
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def mkdir(self, rel):
+        (self.root / rel).mkdir(parents=True, exist_ok=True)
+
+    def test_sysfs_without_the_module_is_no_driver(self):
+        self.mkdir("sys/module/ext4")
+        self.assertIs(enc.nvidia_driver_loaded(self.root), False)
+
+    def test_the_module_is_a_driver(self):
+        self.mkdir("sys/module/nvidia")
+        self.assertIs(enc.nvidia_driver_loaded(self.root), True)
+
+    def test_no_sysfs_cannot_tell(self):
+        # Windows, and anything else without sysfs.
+        self.assertIsNone(enc.nvidia_driver_loaded(self.root))
+
+    def test_wsl_cannot_tell(self):
+        # WSL2 has sysfs, no nvidia module, and a GPU through /dev/dxg that
+        # runs NVENC. False here would be a wrong answer about a working GPU.
+        self.mkdir("sys/module/ext4")
+        self.mkdir("dev")
+        (self.root / "dev" / "dxg").write_text("")
+        self.assertIsNone(enc.nvidia_driver_loaded(self.root))
+
+    def test_the_hint_says_no_driver_rather_than_install_one(self):
+        hint = enc.encoder_hint("av1_nvenc", self.FEDORA_AV1, True, None,
+                                driver_loaded=False)
+        self.assertIn("no NVIDIA driver is loaded", hint)
+        self.assertNotIn("install", hint)
+
+    def test_the_control_without_the_fact_keeps_the_old_hint(self):
+        # Which is also what Windows and WSL get, where nobody can tell.
+        hint = enc.encoder_hint("av1_nvenc", self.FEDORA_AV1, True, None)
+        self.assertIn("NVENC support", hint)
+
+    def test_a_missing_encoder_still_wins(self):
+        hint = enc.encoder_hint("av1_nvenc", "Unknown encoder 'av1_nvenc'",
+                                False, None, driver_loaded=False)
+        self.assertIn("does not include", hint)
+
+    def test_libx264_is_never_told_about_nvidia(self):
+        hint = enc.encoder_hint("libx264", "Unknown encoder 'libx264'", False,
+                                None, driver_loaded=False)
+        self.assertNotIn("NVIDIA", hint)
+
+    def test_select_encoder_does_not_ask_a_driver_that_is_not_there(self):
+        saved = {n: getattr(enc, n) for n in (
+            "list_encoders", "probe_encoder_detail", "driver_mismatch",
+            "nvidia_driver_loaded")}
+        self.addCleanup(lambda: [setattr(enc, n, f) for n, f in saved.items()])
+        asked = []
+        enc.nvidia_driver_loaded = lambda root="/": False
+        enc.list_encoders = lambda ffmpeg: {"av1_nvenc", "hevc_nvenc",
+                                            "libx264"}
+        enc.probe_encoder_detail = lambda ffmpeg, cand: (
+            cand["codec"] == "libx264", self.FEDORA_AV1)
+        enc.driver_mismatch = lambda msg="", runner=None: asked.append(1)
+        with self.assertLogs("encode", level="INFO") as logs:
+            chosen = enc.select_encoder("ffmpeg", {})
+        self.assertEqual(chosen["codec"], "libx264")
+        self.assertEqual(asked, [])
+        self.assertTrue(any("no NVIDIA driver" in l for l in logs.output))
+
+    def test_the_driver_watch_spends_no_subprocess_on_it(self):
+        self.mkdir("sys/module/ext4")
+
+        def unreachable():
+            raise AssertionError("nvidia-smi on a machine with no driver")
+        self.assertEqual(enc.driver_state(self.root, unreachable),
+                         (None, None, None, "no driver"))
+
+
+class TestFfmpegEvidence(unittest.TestCase):
+    """The statement worth showing from a probe failure, whole."""
+
+    def test_the_fedora_nvenc_failure_is_the_library_line(self):
+        self.assertEqual(enc.ffmpeg_evidence(TestNoNvidiaDriver.FEDORA_AV1),
+                         "Cannot load libcuda.so.1")
+
+    def test_the_fedora_libx264_failure_is_the_unknown_encoder(self):
+        text = ("[vost#0:0 @ 0x5627764b7dc0] Unknown encoder 'libx264' "
+                "[vost#0:0 @ 0x5627764b7dc0] Error selecting an encoder Error "
+                "opening output file -. Error opening output files: Encoder "
+                "not found")
+        self.assertEqual(enc.ffmpeg_evidence(text), "Unknown encoder 'libx264'")
+
+    def test_windows_addresses_have_no_0x(self):
+        text = "[hevc_nvenc @ 000001f7d2453fc0] No capable devices found"
+        self.assertEqual(enc.ffmpeg_evidence(text), "No capable devices found")
+
+    def test_only_the_generic_trailer_is_still_shown(self):
+        text = "[enc:x @ 0x1] Error while opening encoder"
+        self.assertEqual(enc.ffmpeg_evidence(text), "Error while opening encoder")
+
+    def test_a_long_statement_is_cut_between_words_and_says_so(self):
+        text = "word " * 60
+        said = enc.ffmpeg_evidence(text, limit=50)
+        self.assertTrue(said.endswith(" ..."), said)
+        self.assertTrue(all(w == "word" for w in said[:-4].split()), said)
+
+    def test_plain_messages_pass_through(self):
+        self.assertEqual(enc.ffmpeg_evidence("probe timed out"),
+                         "probe timed out")
+        self.assertEqual(enc.ffmpeg_evidence(""), "")
+        self.assertEqual(enc.ffmpeg_evidence(None), "")
+
+
+class TestInstallerEncoderChecks(unittest.TestCase):
+    """install.sh says when the ffmpeg it found cannot make a video."""
+
+    def setUp(self):
+        self.installer = (_support.REPO / "install.sh").read_text(
+            encoding="utf-8")
+
+    def body(self, name):
+        text = self.installer.split("\n%s() {" % name, 1)[1]
+        return text.split("\n}\n", 1)[0]
+
+    def test_dependencies_look_for_libx264_without_a_pipe(self):
+        deps = self.body("install_deps")
+        self.assertIn('*" libx264 "*)', deps)
+        # grep -q under pipefail fails the pipeline exactly when it matches.
+        self.assertNotIn("grep -q libx264", deps)
+        self.assertIn("ffmpeg-free ffmpeg --allowerasing", deps)
+
+    def test_next_steps_checks_the_encoder_before_the_cameras(self):
+        steps = self.installer
+        check = steps.index("--check-encoder")
+        cams = steps.index('warn "No cameras configured yet."')
+        self.assertLess(check, cams)
+        self.assertIn("as_service_user python3", steps[check - 200:check])
 
 
 class TestDriverWatch(unittest.TestCase):

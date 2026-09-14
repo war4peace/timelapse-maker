@@ -5392,6 +5392,209 @@ class TestEncoderDetection(unittest.TestCase):
                                       "with reaching it")
 
 
+class TestFedoraFfmpeg(unittest.TestCase):
+    """Fedora's default ffmpeg cannot encode without a GPU, and says where to go.
+
+    Measured on a Fedora Server VM 2026-09-14: `dnf install ffmpeg` gave
+    ffmpeg-free, libx264 was an unknown encoder, and the only advice named
+    jellyfin-ffmpeg and BtbN.
+    """
+
+    X264_MISSING = [("av1_nvenc", "Cannot load libcuda.so.1", "hint"),
+                    ("libx264", "[vost#0:0 @ 0x1] Unknown encoder 'libx264'",
+                     "hint")]
+
+    def test_dnf_gets_rpm_fusion(self):
+        lines = setup.encoder_remedy(
+            self.X264_MISSING, which=lambda name: name == "dnf" or None)
+        text = "\n".join(lines)
+        self.assertIn("rpmfusion-free-release", text)
+        self.assertIn("dnf swap ffmpeg-free ffmpeg --allowerasing", text)
+
+    def test_without_dnf_or_yum_there_is_nothing_to_add(self):
+        self.assertEqual(setup.encoder_remedy(self.X264_MISSING,
+                                              which=lambda name: None), [])
+
+    def test_an_ffmpeg_with_libx264_needs_no_remedy(self):
+        failures = [("av1_nvenc", "Cannot load libcuda.so.1", "hint")]
+        self.assertEqual(setup.encoder_remedy(
+            failures, which=lambda name: "/usr/bin/dnf"), [])
+
+
+class TestLinuxFfmpegThatCannotEncode(unittest.TestCase):
+    """The ffmpeg section as the Fedora VM saw it, end to end."""
+
+    FAILURES = [
+        ("av1_nvenc", "[av1_nvenc @ 0x5568004033c0] Cannot load libcuda.so.1 "
+                      "[vost#0:0/av1_nvenc @ 0x556800402dc0] [enc:av1_nvenc @ "
+                      "0x5568003fe700] Error while opening encoder - maybe "
+                      "incorrect parameters such as bit_rate, rate, width or "
+                      "height.", "no NVIDIA driver is loaded on this machine"),
+        ("libx264", "[vost#0:0 @ 0x5627764b7dc0] Unknown encoder 'libx264' "
+                    "[vost#0:0 @ 0x5627764b7dc0] Error selecting an encoder",
+         "this ffmpeg build does not include libx264"),
+    ]
+
+    def drive(self, which):
+        cfg = setup.default_config()
+        buf = io.StringIO()
+        with _support.wizard_tty("\n"), \
+                contextlib.redirect_stdout(buf), \
+                mock.patch.object(setup, "IS_WINDOWS", False), \
+                mock.patch.object(setup, "find_tool",
+                                  return_value="/usr/sbin/ffmpeg"), \
+                mock.patch.object(setup, "resolve_tool",
+                                  side_effect=lambda a, n: a), \
+                mock.patch.object(setup, "sibling_tool",
+                                  return_value="/usr/sbin/ffprobe"), \
+                mock.patch.object(setup, "detect_encoders",
+                                  return_value=(None, self.FAILURES, "")), \
+                mock.patch.object(setup.shutil, "which", which):
+            setup.choose_tools(cfg)
+        return buf.getvalue()
+
+    def test_ffmpeg_is_quoted_whole_and_without_addresses(self):
+        out = self.drive(lambda name: None)
+        self.assertIn("ffmpeg said: Cannot load libcuda.so.1\n", out)
+        self.assertIn("ffmpeg said: Unknown encoder 'libx264'\n", out)
+        self.assertNotIn("0x5568004033c0", out)
+        self.assertNotIn("opening encod\n", out)
+
+    def test_the_consequence_is_said_on_linux_too(self):
+        out = self.drive(lambda name: None)
+        self.assertIn("no product", out)
+        self.assertIn("timelapse test --encoders", out)
+        self.assertNotIn("ffmpeg.org", out)
+
+    def test_fedora_is_pointed_at_rpm_fusion(self):
+        out = self.drive(lambda name: "/usr/bin/dnf" if name == "dnf" else None)
+        self.assertIn("rpmfusion-free-release", out)
+
+    def test_the_libx264_hint_does_not_point_the_other_way(self):
+        # Fedora retest, 2026-09-14: "try jellyfin-ffmpeg or a BtbN static
+        # build" sat directly under the RPM Fusion instructions.
+        out = self.drive(lambda name: "/usr/bin/dnf" if name == "dnf" else None)
+        self.assertIn("RPM Fusion's does, as above", out)
+        self.assertNotIn("jellyfin", out)
+
+    def test_without_a_remedy_the_libx264_hint_is_unchanged(self):
+        out = self.drive(lambda name: None)
+        self.assertIn("this ffmpeg build does not include libx264", out)
+        self.assertNotIn("as above", out)
+
+
+class TestTurningTheGuardOff(unittest.TestCase):
+    """0 stays a valid answer, and is no longer a silent one where it is risky."""
+
+    GB = 1024 ** 3
+
+    def test_the_os_disk_is_named(self):
+        warning, advice = setup.guard_off_warning("/", True, "ok", 10)
+        self.assertIn("OS disk", warning)
+        self.assertIn("10 GB", advice)
+
+    def test_a_tight_estimate_is_named(self):
+        warning, _advice = setup.guard_off_warning("/srv", False, "tight", 10)
+        self.assertIn("tight", warning)
+
+    def test_a_roomy_data_disk_is_left_alone(self):
+        self.assertIsNone(setup.guard_off_warning("/srv", False, "ok", 10))
+
+    def drive(self, keys, verdict="tight", os_disk=True):
+        cfg = setup.default_config()
+        disk = {"mount": "/", "free": 25 * self.GB, "total": 30 * self.GB,
+                "fstype": "ext4", "rotational": True}
+        buf = io.StringIO()
+        with _support.wizard_tty(keys), \
+                contextlib.redirect_stdout(buf), \
+                mock.patch.object(setup, "choose_framerate"), \
+                mock.patch.object(setup, "estimate_budget",
+                                  return_value=verdict), \
+                mock.patch.object(setup, "is_os_disk", return_value=os_disk):
+            setup.choose_capture(cfg, disk)
+        return cfg, buf.getvalue()
+
+    def test_the_arch_vm_answer_is_kept_and_warned_about(self):
+        # Interval 5, one camera, then 0: exactly what the transcript typed.
+        cfg, out = self.drive("5\n1\n0\n")
+        self.assertEqual(cfg["capture"]["min_free_gb"], 0)
+        self.assertIn("OS disk", out)
+
+    def test_a_threshold_is_not_warned_about(self):
+        cfg, out = self.drive("5\n1\n10\n")
+        self.assertEqual(cfg["capture"]["min_free_gb"], 10)
+        self.assertNotIn("pausing off", out)
+
+    def test_the_estimate_returns_what_it_printed(self):
+        disk = {"mount": "/", "free": 25 * self.GB}
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(setup.estimate_budget({}, disk, 1, 17280),
+                             "tight")
+            self.assertEqual(setup.estimate_budget({}, None, 1, 17280), None)
+
+
+class TestInstallerFlags(unittest.TestCase):
+    """--check-encoder and a --sync-units that is quiet when it did its job."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.config = self.tmp / "config.json"
+        self.config.write_text(json.dumps({"paths": {"ffmpeg": "ffmpeg"}}),
+                               encoding="utf-8")
+
+    def main(self, *flags):
+        out = io.StringIO()
+        argv = ["timelapse_setup.py"] + list(flags) + ["--output",
+                                                       str(self.config)]
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(setup, "init_tty", mock.Mock(
+                    side_effect=AssertionError("asked for a terminal"))), \
+                contextlib.redirect_stdout(out):
+            rc = setup.main()
+        return rc, out.getvalue()
+
+    def test_an_encoder_that_works_exits_zero(self):
+        with mock.patch.object(setup, "detect_encoders",
+                               return_value=("libx264", [], "")):
+            rc, out = self.main("--check-encoder")
+        self.assertEqual((rc, out.strip()), (0, "libx264"))
+
+    def test_no_encoder_exits_one_and_says_where_to_go(self):
+        failures = TestFedoraFfmpeg.X264_MISSING
+        with mock.patch.object(setup, "detect_encoders",
+                               return_value=(None, failures, "")), \
+                mock.patch.object(setup.shutil, "which",
+                                  lambda name: "/usr/bin/dnf"
+                                  if name == "dnf" else None):
+            rc, out = self.main("--check-encoder")
+        self.assertEqual(rc, 1)
+        self.assertIn("no encoder works", out)
+        self.assertIn("rpmfusion", out)
+
+    def test_an_ffmpeg_that_will_not_run_exits_one(self):
+        with mock.patch.object(setup, "detect_encoders",
+                               return_value=(None, [], "could not run x")):
+            rc, out = self.main("--check-encoder")
+        self.assertEqual(rc, 1)
+        self.assertIn("could not run", out)
+
+    def test_units_rewritten_says_nothing(self):
+        # Both VMs printed `units changed: "/var/lib/timelapse/frames" ...`.
+        for status in ("changed", "current"):
+            with mock.patch.object(setup, "sync_units",
+                                   return_value=(status, '"/x"')):
+                rc, out = self.main("--sync-units", str(self.tmp))
+            self.assertEqual((rc, out), (0, ""), status)
+
+    def test_a_failure_is_still_reported(self):
+        with mock.patch.object(setup, "sync_units",
+                               return_value=("failed", "unit: read-only")):
+            rc, out = self.main("--sync-units", str(self.tmp))
+        self.assertEqual(rc, 1)
+        self.assertIn("units failed: unit: read-only", out)
+
+
 class TestFfprobeFollowsFfmpeg(unittest.TestCase):
     """One answer, two binaries."""
 

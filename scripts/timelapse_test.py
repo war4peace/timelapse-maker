@@ -305,7 +305,8 @@ def probe_profiles(cam, cfg):
 
 def test_encoders(cfg):
     from timelapse_encode import (build_candidates, driver_mismatch,
-                                  encoder_hint, is_nvenc, list_encoders,
+                                  encoder_hint, ffmpeg_evidence, is_nvenc,
+                                  list_encoders, nvidia_driver_loaded,
                                   probe_encoder_detail)
     ffmpeg = cfg["paths"]["ffmpeg"]
     if not ffmpeg:
@@ -322,6 +323,7 @@ def test_encoders(cfg):
     built = list_encoders(ffmpeg)
     found = False
     mismatch, asked = None, False
+    loaded = nvidia_driver_loaded()
     for cand in build_candidates(cfg["encode"]):
         available, message = probe_encoder_detail(ffmpeg, cand)
         if available:
@@ -333,13 +335,16 @@ def test_encoders(cfg):
         # Say *why*. "Unknown encoder" (rebuild ffmpeg) and "No capable
         # devices" (GPU/driver) share an exit code but need opposite fixes.
         in_build = None if built is None else (cand["codec"] in built)
-        if not asked and in_build is not False and is_nvenc(cand['codec']):
+        if (not asked and in_build is not False and loaded is not False
+                and is_nvenc(cand['codec'])):
             mismatch, asked = driver_mismatch(message), True
-        hint = encoder_hint(cand["codec"], message, in_build, mismatch)
+        hint = encoder_hint(cand["codec"], message, in_build, mismatch,
+                            driver_loaded=loaded)
         if hint:
             info(f"      {hint}")
-        if message:
-            info(f"      ffmpeg: {message[:140]}")
+        said = ffmpeg_evidence(message)
+        if said:
+            info(f"      ffmpeg: {said}")
     if not found:
         bad("No usable encoder at all - see the reasons above.")
 
@@ -352,9 +357,12 @@ def diagnose_encoders(cfg):
     default ("No capable devices found") is the least useful of all.
     """
     from timelapse_encode import (PROBE_SIZE, driver_mismatch, encoder_hint,
-                                  list_encoders, probe_encoder_detail,
-                                  probe_encoder_verbose)
+                                  list_encoders, nvidia_driver_loaded,
+                                  probe_encoder_detail, probe_encoder_verbose)
     ffmpeg = cfg["paths"].get("ffmpeg", "ffmpeg")
+    # Once, and early: it decides the GPU section's wording, every hint in the
+    # probe section, and whether the closing advice is about a GPU at all.
+    loaded = nvidia_driver_loaded()
 
     print("\n=== ffmpeg ===")
     try:
@@ -412,15 +420,21 @@ def diagnose_encoders(cfg):
                 info("  An upgraded NVIDIA driver looks exactly like this "
                      "until the machine is rebooted.")
                 info("  Nothing below will find a hardware encoder until you "
-                     "reboot; check /var/log/apt/history.log for when the")
-                info("  driver changed. Capture is unaffected, and the nightly "
-                     "encode falls back to libx264 in the meantime.")
+                     "reboot; your package manager's history")
+                info(f"  ({package_history()}) shows when the driver changed. "
+                     "Capture is unaffected, and the")
+                info("  nightly encode falls back to libx264 in the meantime.")
     except FileNotFoundError:
-        warn("nvidia-smi not found - no NVIDIA driver installed?")
+        if loaded is False:
+            # A statement, not a question: the kernel has already answered it.
+            info("nvidia-smi not found, and no NVIDIA driver is loaded")
+        else:
+            warn("nvidia-smi not found - no NVIDIA driver installed?")
     except Exception as exc:
         warn(f"nvidia-smi failed: {exc}")
 
     print(f"\n=== Probe ({PROBE_SIZE}) ===")
+    worked = set()
     for codec in ("av1_nvenc", "hevc_nvenc", "h264_nvenc", "libx264"):
         if codec not in built:
             continue
@@ -428,34 +442,98 @@ def diagnose_encoders(cfg):
         available, message = probe_encoder_detail(ffmpeg, cand)
         if available:
             ok(f"{codec} works")
+            worked.add(codec)
             continue
         bad(f"{codec} failed")
-        hint = encoder_hint(codec, message, True, gpu_mismatch)
+        hint = encoder_hint(codec, message, True, gpu_mismatch,
+                            driver_loaded=loaded)
         if hint:
             info(f"  {hint}")
         # The reason ffmpeg hides at error level.
         for line in probe_encoder_verbose(ffmpeg, cand):
             info(f"  ffmpeg: {line}")
 
-    print("\n=== If a hardware encoder you expect is missing ===")
-    info("'Codec not supported' means the driver did not advertise that codec")
-    info("for this GPU. Known causes, roughly in order:")
-    info("  - the GPU genuinely lacks it (AV1 encode needs Ada / RTX 40+)")
-    info("  - another process is holding every NVENC session; stop your NVR")
-    info("    or transcoder and re-run to rule this out")
-    info("  - the ffmpeg build's NVENC headers predate the codec - check the")
-    info("    'Loaded Nvenc version' line above; AV1 needs 11.1 or newer")
-    info("  - a container or VM exposing the GPU without full NVENC access")
-    info("")
-    info("A second opinion, independent of this ffmpeg:")
-    info("  sudo apt install jellyfin-ffmpeg7   # /usr/lib/jellyfin-ffmpeg/ffmpeg")
-    info("  or a static build from https://github.com/BtbN/FFmpeg-Builds")
-    info("If a different build succeeds, it was the build; if both fail the")
-    info("same way, it is the driver, the GPU or session contention.")
-    info("")
-    info("Falling back to hevc_nvenc is not a problem - it is fast and the")
-    info("quality is fine. AV1 mainly buys smaller files.")
+    nightly, heading, lines = closing_advice(worked, loaded)
+    print("\n=== Nightly encoder ===")
+    if nightly:
+        ok(f"The nightly encode will use {nightly}")
+    else:
+        bad("No encoder works, so the nightly encode cannot make a video")
+    print(f"\n=== {heading} ===")
+    for line in lines:
+        info(line)
     print()
+
+
+def package_history(which=None):
+    """Where this machine's package manager records when something changed."""
+    which = which or shutil.which
+    if which("apt-get"):
+        return "/var/log/apt/history.log"
+    if which("dnf"):
+        return "dnf history list"
+    if which("pacman"):
+        return "/var/log/pacman.log"
+    return "its log"
+
+
+def closing_advice(worked, driver_loaded, which=None):
+    """(nightly codec or None, heading, lines) for the end of --encoders.
+
+    Pure, because what it got wrong was entirely a matter of which facts it
+    ignored. On the Fedora VM (2026-09-14) the report had already established
+    that no NVIDIA driver was loaded and that libx264 worked, and then closed
+    with a page about AV1 needing an RTX 40, an NVR holding sessions, a
+    "Loaded Nvenc version line above" that was never printed, `sudo apt
+    install` on a dnf system, and "falling back to hevc_nvenc is not a
+    problem". It never said which encoder the nightly run would use.
+
+    The order is build_candidates()'s, so this cannot name a codec the
+    encoder would not choose.
+    """
+    from timelapse_encode import build_candidates
+    which = which or shutil.which
+    order = [c["codec"] for c in build_candidates({})]
+    nightly = next((c for c in order if c in worked), None)
+
+    if driver_loaded is False:
+        return nightly, "No NVIDIA GPU", [
+            "No NVIDIA driver is loaded, so this machine can only encode in",
+            "software, with libx264. That is expected on a machine or VM",
+            "without an NVIDIA GPU. A night takes longer on the CPU and the",
+            "files are larger, and the videos are otherwise the same.",
+        ]
+
+    lines = [
+        "'Codec not supported' means the driver did not advertise that codec",
+        "for this GPU. Known causes, roughly in order:",
+        "  - the GPU genuinely lacks it (AV1 encode needs Ada / RTX 40+)",
+        "  - another process is holding every NVENC session; stop your NVR",
+        "    or transcoder and re-run to rule this out",
+        "  - the ffmpeg build's NVENC headers predate the codec; its verbose",
+        "    output in the probe section names the NVENC version it loaded,",
+        "    and AV1 needs 11.1 or newer",
+        "  - a container or VM exposing the GPU without full NVENC access",
+        "",
+        "A second opinion, independent of this ffmpeg:",
+    ]
+    if which("apt-get"):
+        lines.append("  sudo apt install jellyfin-ffmpeg7   "
+                     "# /usr/lib/jellyfin-ffmpeg/ffmpeg")
+    lines += [
+        "  a static build from https://github.com/BtbN/FFmpeg-Builds",
+        "If a different build succeeds, it was the build; if both fail the",
+        "same way, it is the driver, the GPU or session contention.",
+    ]
+    if nightly == "hevc_nvenc":
+        lines += ["", "Falling back to hevc_nvenc is not a problem - it is "
+                      "fast and the", "quality is fine. AV1 mainly buys "
+                      "smaller files."]
+    elif nightly == "libx264":
+        lines += ["", "Falling back to libx264 works, but in software: a "
+                      "night takes much", "longer on the CPU and the files "
+                      "are larger."]
+    return nightly, "If a hardware encoder you expect is missing", lines
 
 
 def test_cadence(cfg, cams):

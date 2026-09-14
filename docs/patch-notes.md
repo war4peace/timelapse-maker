@@ -24,9 +24,9 @@ A reliability and safety release. Nearly everything in it came from a line-by-li
 - Linux: the capture, encode and watch services are now locked down as tightly as the web UI
 - Only one encode can run at a time; a second one is refused and says which process holds the lock
 
-### Fixes by importance: 4 Critical, 12 High, 35 Medium, 47 Low
+### Fixes by importance: 4 Critical, 12 High, 36 Medium, 52 Low
 
-Of these, 2 High and 1 Medium were found on the author's own machine, outside the review.
+Of these, 2 High and 1 Medium were found on the author's own machine, outside the review, and 1 Medium and 5 Low by test installs on Fedora and Arch Linux.
 
 #### Critical
 
@@ -52,6 +52,7 @@ Of these, 2 High and 1 Medium were found on the author's own machine, outside th
 
 #### Medium
 
+- Bug: On Fedora, the installer reported ffmpeg as installed when it could not encode anything on a machine without an NVIDIA card, and the install ended without saying so; it now says so at both points and names RPM Fusion as the fix
 - Bug: An interrupted encode could leave a half-written video that was then sent to the NAS as if it were complete
 - Bug: `timelapse encode --date` could not encode a disabled or removed camera's frames, though the docs said it could
 - Bug: Encoding today's date deleted the frames still being captured and skipped the rest of the day
@@ -90,6 +91,11 @@ Of these, 2 High and 1 Medium were found on the author's own machine, outside th
 
 #### Low
 
+- Bug: On a machine with no NVIDIA card, the setup told you to install NVIDIA encoding support; it now says that no NVIDIA driver is loaded, which is expected there
+- Bug: The setup cut ffmpeg's error messages off in the middle of a word
+- Bug: On a machine with no NVIDIA card, `timelapse test --encoders` ended with a page of graphics card advice, suggested an `apt` command on Fedora, and never said which encoder the nightly run would use
+- Bug: The installer printed a raw internal line (`units changed: ...`) on every first install
+- Bug: The setup accepted turning off the low-disk pause on the system disk, right after calling the space tight, without a word; it still accepts it, and now warns
 - Bug: Setting `log_every_n_failures` to 0 silently stopped that camera for good
 - Bug: One unreadable frames folder could stop the whole capture program
 - Bug: If a day's frames folder was deleted during the day, capture failed for that camera until midnight

@@ -265,6 +265,24 @@ class TestStorageGuard(unittest.TestCase):
         self.assertEqual(level, gui.OK)
         self.assertIn("19", message)
 
+    def test_never_pausing_on_the_windows_disk_warns(self):
+        # The Arch VM, 2026-09-14, from the console side: 0 accepted on the
+        # OS disk without a word. Same function, same words, both wizards.
+        with mock.patch.object(setup, "is_os_disk", return_value=True):
+            level, message = self.check(200, 0)
+        self.assertEqual(level, gui.WARN)
+        self.assertIn("OS disk", message)
+
+    def test_never_pausing_elsewhere_is_fine(self):
+        with mock.patch.object(setup, "is_os_disk", return_value=False):
+            level, _message = self.check(200, 0)
+        self.assertEqual(level, gui.OK)
+
+    def test_no_guard_given_is_not_a_guard_of_zero(self):
+        with mock.patch.object(setup, "is_os_disk", return_value=True):
+            level, _message = self.check(200, None)
+        self.assertEqual(level, gui.OK)
+
     def test_free_space_alone_is_not_the_answer(self):
         """29 GB is fine at one threshold and impossible at another.
 
@@ -275,8 +293,11 @@ class TestStorageGuard(unittest.TestCase):
         self.assertEqual(self.check(29, 60)[0], gui.FAIL)
 
     def test_a_disabled_guard_falls_back_to_the_plain_report(self):
+        # Not the OS disk, declared: BASE is C: here and under / on Linux, so
+        # inheriting the answer would test the warning instead of the report.
         for guard in (0, None):
-            level, message = self.check(29, guard)
+            with mock.patch.object(setup, "is_os_disk", return_value=False):
+                level, message = self.check(29, guard)
             self.assertEqual(level, gui.OK, guard)
             self.assertNotIn("threshold", message)
 

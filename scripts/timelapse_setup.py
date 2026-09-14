@@ -440,16 +440,24 @@ def choose_tools(cfg):
             ask("Path to ffprobe", ffprobe_default), "ffprobe")
 
     chosen, failures, problem = detect_encoders(cfg["paths"]["ffmpeg"])
+    remedy = encoder_remedy(failures) if chosen is None else []
 
     if problem:
         fail(problem[0].upper() + problem[1:])
     if chosen is None:
         fail("No usable encoder at all - ffmpeg cannot encode here.")
+        # On both platforms now. It was Windows-only, on the reasoning that a
+        # Linux installer had already provided a working ffmpeg; Fedora's
+        # default one cannot encode on a machine without an NVIDIA GPU.
+        note("Without a working ffmpeg there is no product: capture will")
+        note("collect frames and nothing will ever turn them into a video.")
+        for line in remedy:
+            note(line)
         if IS_WINDOWS:
-            note("Without a working ffmpeg there is no product: capture will")
-            note("collect frames and nothing will ever turn them into a video.")
             note(f"Builds for Windows: {FFMPEG_URL}")
             note("Re-run 'timelapse setup' once it is installed.")
+        else:
+            note("Check again once it is installed:  timelapse test --encoders")
     elif chosen == "av1_nvenc":
         good("av1_nvenc available - AV1 hardware encoding will be used.")
     elif chosen == "hevc_nvenc":
@@ -461,13 +469,21 @@ def choose_tools(cfg):
     # Report why each better encoder was skipped, using ffmpeg's own words
     # rather than a guess. Claiming "your GPU is too old" when the real cause
     # is the ffmpeg build sends people down entirely the wrong path.
+    from timelapse_encode import ffmpeg_evidence
     for codec, message, hint in failures:
         print()
         warn(f"{codec} unavailable")
+        if remedy and codec == "libx264":
+            # The generic hint names jellyfin-ffmpeg and BtbN, which on the
+            # Fedora VM (2026-09-14) sat directly under the RPM Fusion
+            # instructions and pointed the other way.
+            hint = ("this ffmpeg build does not include libx264; RPM "
+                    "Fusion's does, as above")
         if hint:
             note(hint)
-        if message:
-            note(f"ffmpeg said: {message[:150]}")
+        said = ffmpeg_evidence(message)
+        if said:
+            note(f"ffmpeg said: {said}")
 
 
 def sibling_tool(ffmpeg, name):
@@ -506,6 +522,7 @@ def detect_encoders(ffmpeg):
     try:
         from timelapse_encode import (driver_mismatch, encoder_hint,
                                       is_nvenc, list_encoders,
+                                      nvidia_driver_loaded,
                                       probe_encoder_detail)
     except ImportError as exc:
         return None, [], f"could not load the encoder probe: {exc}"
@@ -516,19 +533,69 @@ def detect_encoders(ffmpeg):
 
     failures = []
     mismatch, asked = None, False
+    loaded = nvidia_driver_loaded()
     for codec in ("av1_nvenc", "hevc_nvenc", "libx264"):
         ok, message = probe_encoder_detail(
             ffmpeg, {"codec": codec, "args": ["-c:v", codec]})
         if ok:
             return codec, failures, ""
-        # Once per call, and not for a codec this ffmpeg lacks: that failure is
-        # settled and nvidia-smi has nothing to add to it.
-        if not asked and codec in built and is_nvenc(codec):
+        # Once per call, and not for a codec this ffmpeg lacks, nor on a
+        # machine with no NVIDIA driver: either is settled and nvidia-smi has
+        # nothing to add to it.
+        if (not asked and codec in built and loaded is not False
+                and is_nvenc(codec)):
             mismatch, asked = driver_mismatch(message), True
         failures.append((codec, message,
                          encoder_hint(codec, message, codec in built,
-                                      mismatch)))
+                                      mismatch, driver_loaded=loaded)))
     return None, failures, ""
+
+
+def encoder_remedy(failures, which=None):
+    """Lines saying where to get an ffmpeg that can encode here, or [].
+
+    Only for the case measured on a Fedora VM 2026-09-14: `dnf install ffmpeg`
+    yields ffmpeg-free, which leaves libx264 out, so a machine without an
+    NVIDIA GPU has no encoder at all. The generic hint names jellyfin-ffmpeg
+    and BtbN, which is right on Debian and a detour on Fedora, where RPM
+    Fusion is two commands. Keyed on ffmpeg saying libx264 is unknown, and on
+    dnf or yum being present, never on a distro name.
+    """
+    which = which or shutil.which
+    lacks_x264 = any(codec == "libx264"
+                     and "unknown encoder" in (message or "").lower()
+                     for codec, message, _hint in failures)
+    if not lacks_x264 or not (which("dnf") or which("yum")):
+        return []
+    return [
+        "Fedora and RHEL ship ffmpeg without libx264 (the ffmpeg-free",
+        "package). RPM Fusion's ffmpeg includes it. On Fedora:",
+        "  sudo dnf install https://mirrors.rpmfusion.org/free/fedora/"
+        "rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm",
+        "  sudo dnf swap ffmpeg-free ffmpeg --allowerasing",
+        "On RHEL and its rebuilds, rpmfusion.org/Configuration has the "
+        "equivalent.",
+    ]
+
+
+def guard_off_warning(mount, on_os_disk, verdict, suggest):
+    """(warning, advice) when turning the disk guard off is risky, or None.
+
+    0 is a legitimate answer and stays one. But on the Arch VM, 2026-09-14,
+    the wizard had just called the OS disk "Tight" and accepted 0 without a
+    word, which switches off the only thing between the frames and a full
+    root filesystem. Both wizards say so; neither refuses.
+    """
+    if on_os_disk:
+        return (f"With pausing off, capture keeps writing until {mount} is "
+                f"full, and that is the OS disk.",
+                f"Kept. {suggest} GB would pause capture before the system "
+                f"itself runs out of space.")
+    if verdict in ("fail", "tight"):
+        return (f"With pausing off and the estimate this tight, capture will "
+                f"fill {mount} rather than pause.",
+                f"Kept. {suggest} GB would pause it first.")
+    return None
 
 
 def default_min_free_gb(free_bytes=None):
@@ -603,13 +670,20 @@ def choose_capture(cfg, disk):
     choose_framerate(cfg, per_day)
 
     n_cams = ask_int("Roughly how many cameras will you run?", 4, 1, 64)
-    estimate_budget(cfg, disk, n_cams, per_day)
+    verdict = estimate_budget(cfg, disk, n_cams, per_day)
 
     default_guard = default_min_free_gb(disk["free"] if disk else None)
     print()
     note("Capture pauses instead of filling the disk when free space is low.")
-    cfg["capture"]["min_free_gb"] = ask_int(
+    guard = ask_int(
         "Pause capture below how many GB free? (0 disables)", default_guard, 0)
+    cfg["capture"]["min_free_gb"] = guard
+    if guard == 0 and disk:
+        risky = guard_off_warning(disk["mount"], is_os_disk(disk), verdict,
+                                  default_guard)
+        if risky:
+            warn(risky[0])
+            note(risky[1])
     return n_cams
 
 
@@ -655,6 +729,11 @@ AVG_SNAPSHOT_KB = 600          # a 1440p JPEG; refined later by timelapse_test.p
 
 
 def estimate_budget(cfg, disk, n_cams, per_day):
+    """Print the space estimate. Returns "fail", "tight", "ok", or None.
+
+    The verdict is returned so the guard question after it can know what was
+    just said: it used to accept 0 right under a "Tight" it had printed.
+    """
     daily = AVG_SNAPSHOT_KB * 1024 * per_day * n_cams
     resident = daily * 2.2       # yesterday + today + margin
     print()
@@ -662,16 +741,20 @@ def estimate_budget(cfg, disk, n_cams, per_day):
          f"(a full-resolution 1440p JPEG):")
     note(f"  {human(daily)}/day, about {human(resident)} resident on disk")
     if not disk:
-        return
+        return None
     free = disk["free"]
     if free < resident:
         fail(f"{human(free)} free is not enough for {human(resident)}.")
         note("Use a larger disk, fewer cameras, or a longer interval.")
+        verdict = "fail"
     elif free < resident * 1.5:
         warn(f"Tight: {human(free)} free vs ~{human(resident)} needed.")
+        verdict = "tight"
     else:
         good(f"{human(free)} free - comfortable headroom.")
+        verdict = "ok"
     note("timelapse_test.py will replace this estimate with real measurements.")
+    return verdict
 
 
 # ----------------------------------------------------------------------------
@@ -4866,6 +4949,9 @@ def main():
                          "config (install.sh calls this)")
     ap.add_argument("--prefix", metavar="DIR",
                     help="where the scripts are installed, for --sync-units")
+    ap.add_argument("--check-encoder", action="store_true",
+                    help="exit 0 if the configured ffmpeg can encode anything "
+                         "here, 1 if not (install.sh calls this)")
     ap.add_argument("--print-paths", metavar="CONFIG",
                     help="print the paths systemd must be allowed to write")
     ap.add_argument("--print-web-paths", metavar="CONFIG",
@@ -4945,8 +5031,36 @@ def main():
         here = args.prefix or str(Path(__file__).resolve().parent)
         status, detail = sync_units(cfg, args.sync_units,
                                     args.output, here, args.owner)
-        print(f"  units {status}: {detail}")
+        # Silent when it did its job. "changed" printed the raw ReadWritePaths
+        # value to someone on their first install (both test VMs, 2026-09-14),
+        # which reads as leftover debugging; "current" is not news either.
+        if status not in ("changed", "current"):
+            print(f"  units {status}: {detail}")
         return 1 if status == "failed" else 0
+
+    # install.sh's last word on a fresh install. The wizard's "No usable
+    # encoder" FAIL is half a screen up by the time Next steps prints, and
+    # Next steps used to mention only the cameras: an install that can never
+    # make a video ended on "add a camera". Never prompts.
+    if args.check_encoder:
+        try:
+            with open(args.output, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except (OSError, ValueError) as exc:
+            print(f"cannot read {args.output}: {exc}")
+            return 2
+        ffmpeg = (cfg.get("paths", {}).get("ffmpeg") or "").strip()
+        if not ffmpeg:
+            print("paths.ffmpeg is empty")
+            return 1
+        chosen, failures, problem = detect_encoders(ffmpeg)
+        if chosen:
+            print(chosen)
+            return 0
+        print(problem or f"no encoder works with {ffmpeg}")
+        for line in encoder_remedy(failures):
+            print(line)
+        return 1
 
     # Machine-readable mode used by install.sh to template the systemd units.
     # This one emits the finished ReadWritePaths= value, quotes and all,
@@ -5200,7 +5314,9 @@ def main():
         return 1
     good(f"Wrote {args.output}")
     summarise(cfg, args.output)
-    print()
+    # No trailing blank line. install.sh's next heading opens with one, and
+    # with nothing between them two blank lines sat under the summary on both
+    # test VMs (2026-09-14), once the unit sync stopped printing there.
     return 0
 
 

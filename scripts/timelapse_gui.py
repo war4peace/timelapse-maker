@@ -182,6 +182,16 @@ def check_storage(base, guard_gb=None):
     # only has to hold one day of frames at a time, and what "enough" means
     # depends on the cadence and the camera count, which the capture page works
     # out properly. This is the obviously-wrong check.
+    #
+    # An explicit 0, never None: None is a caller that did not say, and only
+    # a deliberate "never pause" on the Windows disk earns the warning. The
+    # same words as the console wizard, from the same function.
+    if guard_gb == 0 and guard_gb is not False:
+        risky = setup.guard_off_warning(
+            root, setup.is_os_disk({"mount": root}), None,
+            setup.default_min_free_gb(free))
+        if risky:
+            return WARN, f"{setup.human(free)} free on {root}. " + " ".join(risky)
     if gb < 5:
         return WARN, (f"{setup.human(free)} free on {root}. That is very "
                       f"little for a day of full-resolution frames.")
@@ -263,9 +273,10 @@ def encoder_notes(answer):
         return []
     _codec, failures, _problem = setup.detect_encoders(
         resolve_tool(text, "ffmpeg"))
+    from timelapse_encode import ffmpeg_evidence
     lines = []
     for codec, message, hint in failures:
-        detail = hint or (message or "")[:150]
+        detail = hint or ffmpeg_evidence(message)
         lines.append(f"{codec}: {detail}" if detail else f"{codec} unavailable")
     return lines
 
