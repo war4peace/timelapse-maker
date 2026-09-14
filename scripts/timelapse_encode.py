@@ -1071,6 +1071,48 @@ def camera_gop(cfg, cam):
     return int(cfg["encode"].get("gop", 120))
 
 
+# ffmpeg picks a muxer from the output's extension, and the output is written
+# under a `.part` name that has none it recognises. Only the containers whose
+# muxer is not spelled like their extension need an entry; mp4, mov, avi and
+# webm are.
+CONTAINER_MUXERS = {"mkv": "matroska", "m4v": "ipod", "mpg": "mpeg",
+                    "mpeg": "mpeg"}
+
+
+def muxer_for(container):
+    container = str(container or "mkv").lower().lstrip(".")
+    return CONTAINER_MUXERS.get(container, container)
+
+
+# A floor and a per-frame allowance, and both are generous on purpose: this is
+# not a performance budget, it is the difference between a night that fails
+# and every night after it failing too. A wedged NVENC session leaves ffmpeg
+# alive and silent, the oneshot stays `activating`, and a timer does not fire
+# a unit that is still active, so without a bound one hang is the last encode
+# this install ever runs. Three seconds a frame is a CPU encode at a third of
+# a frame per second, which no real run is near.
+ENCODE_TIMEOUT_FLOOR = 3600
+ENCODE_SECONDS_PER_FRAME = 3
+
+
+def encode_timeout(n_frames):
+    return max(ENCODE_TIMEOUT_FLOOR, ENCODE_SECONDS_PER_FRAME * n_frames)
+
+
+def still_capturing(day_name, today=None):
+    """True for a day directory the capture daemon may still be writing.
+
+    `--date` can name today, deliberately (a look at the day so far is a fair
+    thing to want), and two things that are right for a finished day are
+    destructive for this one. Deleting the directory takes the frames out from
+    under the daemon, which recreates it, so the morning then exists only in a
+    partial video that tonight's encode of the afternoon overwrites under the
+    same name. And marking it encoded makes tonight's run skip it, so the
+    afternoon is never encoded at all.
+    """
+    return day_name >= (today or date.today().isoformat())
+
+
 def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
     enc = cfg["encode"]
     ffmpeg = cfg["paths"]["ffmpeg"]
@@ -1107,7 +1149,17 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
         log.warning("  %s %s: skipping - %s", camera, day, result["note"])
         return result
 
-    out_file = out_dir / f"{camera}.{day.replace('-', '')}.{enc.get('container','mkv')}"
+    container = enc.get("container", "mkv")
+    out_file = out_dir / f"{camera}.{day.replace('-', '')}.{container}"
+    # Written under a name nothing reads, then renamed once it is checked,
+    # which is move_video()'s rule applied to the file it moves. A run killed
+    # part way (power, Ctrl-C on a manual --date) used to leave a truncated
+    # video under the finished name, which transfer() then shipped into the
+    # library the next night. And `-y` onto the real name truncated a good
+    # video at the *start* of a --force retry, so a retry that failed deleted
+    # the only copy. `.part` is not a video suffix, so neither the mover nor
+    # the web index can pick it up.
+    part_file = out_dir / (out_file.name + PART_SUFFIX)
 
     with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
         concat_path = Path(tf.name)
@@ -1152,7 +1204,7 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
                + args
                + ["-color_range", "tv", "-colorspace", "bt709",
                   "-color_primaries", "bt709", "-color_trc", "bt709",
-                  "-r", fps, str(out_file)])
+                  "-r", fps, "-f", muxer_for(container), str(part_file)])
 
         log.info("  %s %s: encoding %d frames (%dx%d, %d bad) at %sfps%s -> %s",
                  camera, day, len(frames), w, h, bad, fps,
@@ -1164,18 +1216,25 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
             result["seconds"] = time.time() - started
             return result
 
-        proc = run_captured(cmd)
+        limit = encode_timeout(len(frames))
+        try:
+            # run() kills the child on expiry, so a timeout ends ffmpeg rather
+            # than abandoning it holding a GPU session.
+            proc = run_captured(cmd, timeout=limit)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError(f"ffmpeg did not finish within "
+                               f"{human_duration(limit)} and was stopped")
         if proc.returncode != 0:
             tail = (proc.stderr or "").strip().splitlines()[-3:]
             raise RuntimeError(f"ffmpeg rc={proc.returncode}: {' | '.join(tail)}")
 
-        if not out_file.exists() or out_file.stat().st_size < 1024:
+        if not part_file.exists() or part_file.stat().st_size < 1024:
             raise RuntimeError("output missing or implausibly small")
 
+        replace_atomic(str(part_file), str(out_file))
         result["size"] = out_file.stat().st_size
         result["status"] = "OK"
-        if bad:
-            result["note"] = f"{bad} bad frame(s) skipped"
+        notes = [f"{bad} bad frame(s) skipped"] if bad else []
 
         # After the file is closed and checked, and only on OK, so a day that
         # failed can never look finished. Written even when the frames are
@@ -1183,13 +1242,21 @@ def encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
         # a second later), because the caller's rmtree runs with
         # ignore_errors=True: a deletion that quietly failed would otherwise
         # leave an unmarked directory to be encoded all over again.
-        mark_encoded(day_dir, out_file, result, encoder["name"])
+        if still_capturing(day):
+            notes.append("today so far; tonight's run encodes the whole day")
+        else:
+            mark_encoded(day_dir, out_file, result, encoder["name"])
+        result["note"] = "; ".join(notes)
 
     except Exception as exc:
         result["note"] = str(exc)[:300]
         log.error("  %s %s: FAILED - %s", camera, day, result["note"])
-        if out_file.exists():
-            out_file.unlink(missing_ok=True)
+        # Only ever the temporary name. The finished name on a failure is a
+        # video an earlier run made, and it is the one copy there is.
+        try:
+            part_file.unlink(missing_ok=True)
+        except OSError:
+            pass
     finally:
         concat_path.unlink(missing_ok=True)
         result["seconds"] = time.time() - started
@@ -1345,7 +1412,9 @@ def try_rsync_args(dest, args, svcuser=None):
 
     landed = Path(dest) / probe.name
     try:
-        cmd = list(prefix) + ["rsync"] + list(args) + [
+        # with_io_timeout() because transfer() adds it, and the probe runs
+        # what the nightly job runs.
+        cmd = list(prefix) + ["rsync"] + with_io_timeout(args) + [
             str(probe), str(dest).rstrip("/") + "/"]
         try:
             r = run_captured(cmd, timeout=90)
@@ -1361,6 +1430,35 @@ def try_rsync_args(dest, args, svcuser=None):
         # turn a verdict into a traceback out of a `finally`.
         forget_probe(landed)
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# rsync's own --timeout is an I/O inactivity limit, which is the right shape
+# for the failure that matters: an NFS or SSH peer that went away mid-copy
+# stalls, it does not slow down. Ten minutes of nothing is not a slow link.
+RSYNC_IO_TIMEOUT = 600
+
+# And a wall-clock bound behind it, for a child that is stuck somewhere rsync's
+# timer cannot see. Scaled to what is being sent at a floor of 1 MB/s, so a
+# week of backlog over a slow link is not mistaken for a hang.
+TRANSFER_FLOOR_BYTES_PER_SECOND = 1024 * 1024
+
+
+def with_io_timeout(args):
+    """The configured rsync args, plus --timeout unless they already set one."""
+    args = list(args)
+    if not any(str(a).startswith("--timeout") for a in args):
+        args.append("--timeout=%d" % RSYNC_IO_TIMEOUT)
+    return args
+
+
+def transfer_timeout(files):
+    total = 0
+    for f in files:
+        try:
+            total += f.stat().st_size
+        except OSError:
+            pass
+    return max(ENCODE_TIMEOUT_FLOOR, int(total / TRANSFER_FLOOR_BYTES_PER_SECOND))
 
 
 def probe_rsync_flags(dest, svcuser=None):
@@ -1561,6 +1659,29 @@ def verify_share_credentials(t, dest):
     return (True, "") if ok else (False, why)
 
 
+ALREADY_THERE = "already at the destination"
+
+# FAT and some SMB servers keep modification times to two seconds.
+MTIME_SLACK = 2
+
+
+def already_there(src_file, final):
+    """True when final is this video: the same length, and not older than it.
+
+    Not older, rather than equal, is what keeps this right on a share that
+    refuses copystat(): there the copy's time is when it arrived, which is
+    after the encode, so an unchanged video still compares as delivered. A
+    video re-encoded with --force is newer than anything at the destination,
+    so it goes again, even at the same length.
+    """
+    try:
+        src, dst = src_file.stat(), final.stat()
+    except OSError:
+        return False
+    return (dst.st_size == src.st_size
+            and dst.st_mtime + MTIME_SLACK >= src.st_mtime)
+
+
 def move_video(src_file, dest_dir, delete_source=True):
     """Copy one video into place, then rename it, then drop the original.
 
@@ -1576,9 +1697,22 @@ def move_video(src_file, dest_dir, delete_source=True):
 
     The source is deleted last and only on success, so the failure mode is
     always a duplicate rather than a hole.
+
+    A destination that already holds this video is not copied again, which is
+    rsync's quick check and the reason `delete_local_after_transfer: false` is
+    nearly free on Linux. Here it copied every file in video_output every
+    night, a library growing by gigabytes a day, for a documented setting.
     """
     tmp = dest_dir / (src_file.name + PART_SUFFIX)
     final = dest_dir / src_file.name
+    if already_there(src_file, final):
+        if delete_source:
+            try:
+                src_file.unlink()
+            except OSError as exc:
+                return True, "already at the destination, but the local " \
+                    "file could not be removed: %s" % path_problem(exc)
+        return True, ALREADY_THERE
     try:
         shutil.copyfile(str(src_file), str(tmp))
         # Length is the one corruption a copy can hand back without raising,
@@ -1635,16 +1769,25 @@ def transfer_windows(t, files, dest, dry_run):
 
     dest_dir = Path(dest)
     delete = t.get("delete_local_after_transfer", True)
-    moved, problems = 0, []
+    moved, unchanged, problems = 0, 0, []
     for f in files:
         good, why = move_video(f, dest_dir, delete)
         if good:
+            # Counted as moved, as rsync's path counts a file its quick check
+            # skipped: the question the summary answers is "is it there".
             moved += 1
-            if why:
+            if why == ALREADY_THERE:
+                unchanged += 1
+            elif why:
                 log.warning("  %s: %s", f.name, why)
         else:
             problems.append("%s: %s" % (f.name, why))
             log.error("  %s: %s", f.name, why)
+    if unchanged:
+        # Once, not per file: with local copies kept this is every video ever
+        # made, every night.
+        log.info("  %d file(s) already at the destination, not copied again",
+                 unchanged)
 
     if problems:
         return {"ok": False, "moved": moved,
@@ -1701,15 +1844,26 @@ def transfer(cfg, dry_run):
         log.error("Refusing to transfer - %s", problem)
         return {"ok": False, "moved": 0, "detail": problem}
 
-    args = list(t.get("rsync_args", ["-a", "--partial", "--remove-source-files"]))
+    args = with_io_timeout(
+        t.get("rsync_args", ["-a", "--partial", "--remove-source-files"]))
     cmd = ["rsync"] + args + [str(f) for f in files] + [dest]
 
     log.info("Transferring %d file(s) to %s", len(files), dest)
     if dry_run:
         return {"ok": True, "moved": 0, "detail": "dry run"}
 
+    limit = transfer_timeout(files)
     try:
-        proc = run_captured(cmd)
+        proc = run_captured(cmd, timeout=limit)
+    except subprocess.TimeoutExpired:
+        # Before the generic handler, which would call this "could not be
+        # started". Nothing local is deleted: whatever --remove-source-files
+        # already took arrived, and the rest ships next run.
+        log.error("rsync did not finish within %s and was stopped",
+                  human_duration(limit))
+        return {"ok": False, "moved": 0,
+                "detail": "rsync did not finish within %s"
+                          % human_duration(limit)}
     except FileNotFoundError:
         # Linux only now: Windows returns above, through transfer_windows(),
         # and never reaches the code that looks for rsync.
@@ -2172,6 +2326,21 @@ def load_config(path):
         sys.exit(f"Cannot read {path}: {exc}")
 
 
+def camera_dirs(frames_root, cameras):
+    """The named cameras plus every directory under frames_root, sorted.
+
+    Unconfigured names are safe to hand to encode_day(): camera_entry() gives
+    them {}, so they encode at the global settings unless the day recorded its
+    own cadence, which a day captured by this program always has.
+    """
+    names = set(cameras)
+    try:
+        names.update(p.name for p in Path(frames_root).iterdir() if p.is_dir())
+    except OSError:
+        pass
+    return sorted(names)
+
+
 def find_pending(frames_root, cameras, only_date, max_backlog, force=False):
     """(jobs, done): date dirs older than today that still need encoding.
 
@@ -2185,10 +2354,17 @@ def find_pending(frames_root, cameras, only_date, max_backlog, force=False):
 
     An explicit --date overrides a marker, because re-encoding one day by hand
     has to stay possible; --force overrides it for the whole backlog.
+
+    An explicit --date also reaches every camera directory on disk, not only
+    the enabled ones, because it is the documented way to rescue frames a
+    disabled or removed camera left behind: the pre-flight, the camera wizard
+    and install.md all send the operator here for exactly that, and it used to
+    answer "Nothing to process." The nightly run still walks only what is
+    enabled, which is what makes disabling a camera mean anything.
     """
     today = date.today().isoformat()
     jobs, done = [], 0
-    for cam in cameras:
+    for cam in (camera_dirs(frames_root, cameras) if only_date else cameras):
         cam_dir = frames_root / cam
         if not cam_dir.is_dir():
             continue
@@ -2251,9 +2427,15 @@ def explain_idle(frames_root, cameras, today=None, only_date=None):
         # `--date 2026-8-4`, which is a day this program has never heard of
         # (single-digit month; the directories are zero-padded). An explicit
         # --date ignores the encoded marker, so an empty result can only mean
-        # the directory is not there.
-        lines.append("No day folder named %s under any enabled camera."
-                     % only_date)
+        # the directory is not there. It also reaches disabled and removed
+        # cameras, so the days listed come from every directory on disk.
+        lines.append("No day folder named %s under any camera." % only_date)
+        for cam in camera_dirs(frames_root, cameras):
+            try:
+                days.update(d.name for d in (frames_root / cam).iterdir()
+                            if d.is_dir() and DATE_DIR.match(d.name))
+            except OSError:
+                pass
         if days:
             known = sorted(days)
             shown = ", ".join(known[-8:])
@@ -2399,8 +2581,7 @@ def main():
             # named is not there" look identical from here and are very
             # different things to read at breakfast, so say which one it was.
             if args.date:
-                said = ("No day folder named %s under any enabled camera."
-                        % args.date)
+                said = "No day folder named %s under any camera." % args.date
             elif done:
                 said = ("%d completed day folder(s) were already encoded; "
                         "nothing new." % done)
@@ -2416,11 +2597,18 @@ def main():
 
         results = []
         for cam, day_dir in jobs:
+            if cam not in cameras:
+                log.info("  %s is not enabled in the config; encoding %s "
+                         "because --date named it", cam, day_dir.name)
             r = encode_day(cfg, encoder, cam, day_dir, out_dir, args.dry_run)
             results.append(r)
             if (r["status"] == "OK"
                     and cfg["encode"].get("delete_frames_on_success", True)
                     and not args.keep_frames and not args.dry_run):
+                if still_capturing(day_dir.name):
+                    log.info("  %s %s: frames kept, the day is still being "
+                             "captured", cam, day_dir.name)
+                    continue
                 shutil.rmtree(day_dir, ignore_errors=True)
                 log.info("  %s %s: frames deleted", cam, day_dir.name)
 

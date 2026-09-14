@@ -890,7 +890,9 @@ The two flagged rows are the point of the command. The encode job only walks
 cameras **enabled** in the config, so a camera you removed, or merely disabled,
 keeps everything it ever captured, and nothing will ever encode or delete it.
 That is normally what is eating the disk. Re-enable the camera, or encode the
-days out with `timelapse encode --date YYYY-MM-DD`.
+days out with `timelapse encode --date YYYY-MM-DD`: a named date reaches every
+camera folder on disk, including disabled and removed ones, while the nightly
+run leaves them alone.
 
 `ORPHAN` means no config entry at all; `disabled` means the entry exists with
 `enabled: false`. Frames are never deleted behind your back, so both are safe

@@ -111,6 +111,42 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ### Fixed
 
+- **An encode that is interrupted no longer leaves a broken video that gets
+  delivered as if it were finished.** ffmpeg wrote straight to the video's
+  final name, so a power cut or a Ctrl-C part way through left a truncated
+  `Camera.YYYYMMDD.mkv` that the next night's transfer moved into your
+  library. Worse, re-encoding a day with `--force` while its good video was
+  still in the videos folder emptied that video the moment ffmpeg started,
+  and if the re-encode failed the only copy was gone. The encoder now writes
+  to a temporary `.part` name and renames it only once the result has been
+  checked; a failure removes the temporary file and nothing else.
+
+- **A hung ffmpeg or rsync can no longer stop every night's encode after it.**
+  Neither had a time limit, and while the nightly job is still running the
+  timer does not start another, so one wedged GPU session or a network
+  share that vanished mid-copy meant no videos from then on, no notification
+  and a status page saying the encode was running. An encode now gives up
+  after an hour or three seconds per frame, whichever is longer, and fails
+  that day only; rsync gives up after ten minutes with no data moving.
+
+- **`timelapse encode --date` can rescue the frames of a disabled or removed
+  camera, as `timelapse test`, the camera wizard and the install guide all
+  said it could.** It only looked at enabled cameras, so it answered "Nothing
+  to process." A named date now reaches every camera folder on disk. The
+  nightly run still leaves disabled cameras alone.
+
+- **`timelapse encode --date` with today's date no longer loses the morning.**
+  It deleted today's frames while capture was still writing them, and marked
+  the day as encoded so the nightly run skipped the afternoon. Today's frames
+  are kept and the day is left for tonight's run to encode in full.
+
+- **Windows: keeping local copies of your videos no longer re-copies the whole
+  library to the destination every night.** With
+  `delete_local_after_transfer` off, every video in the videos folder was
+  copied again each night, however long ago it had arrived. A video already at
+  the destination with the same size, and not older than the local copy, is
+  left alone, the way rsync already behaves on Linux.
+
 - **Testing an RTSP camera now says what went wrong instead of "Operation not
   permitted".** ffmpeg uses that one phrase for several unrelated problems, and
   the setup window repeated it, so a camera that was refusing the connection

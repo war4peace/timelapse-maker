@@ -583,17 +583,38 @@ Pipeline, in `main()`:
    The marker check happens *before* the cap, or a week of finished days would
    push the one day that still needs encoding out of the window. `--date`
    overrides a marker (re-encoding one day by hand has to stay possible) and
-   `--force` overrides it for the whole backlog.
-3. `encode_day()` per job, sequentially. On `OK`, and only on `OK`, after the
-   output file is closed and size-checked, `mark_encoded()` writes
-   `.encoded.json`. It never raises: a marker that could not be written costs
-   a re-encode next night, which is the behaviour the project had for five
-   releases, and that is not worth failing a good run over.
+   `--force` overrides it for the whole backlog. **`--date` also walks every
+   directory under `frames_root`**, not only the enabled cameras (0.2.1):
+   it is the documented rescue for frames a disabled or removed camera left
+   behind, which the pre-flight, the camera wizard and install.md all
+   prescribe, and it used to answer "Nothing to process." The nightly run
+   still walks the enabled list, which is what disabling means.
+3. `encode_day()` per job, sequentially. ffmpeg writes `<name>.part`, with the
+   muxer named by `-f` since that suffix gives it none, and the file is
+   renamed onto the finished name only after the size check (0.2.1). A run
+   killed part way used to leave a truncated video under the finished name
+   for the next transfer to ship, and `-y` onto that name truncated a good
+   video at the start of a `--force` retry, so a retry that failed deleted the
+   only copy; a failure now unlinks only the `.part`. The encode is bounded by
+   `encode_timeout()` (an hour, or three seconds a frame, whichever is more):
+   a wedged NVENC session leaves a oneshot `activating` for ever, and a timer
+   does not fire a unit that is still active, so one hang used to be the last
+   encode an install ran. On `OK`, and only on `OK`, after the output file is
+   renamed, `mark_encoded()` writes `.encoded.json`. It never raises: a marker
+   that could not be written costs a re-encode next night, which is the
+   behaviour the project had for five releases, and that is not worth failing
+   a good run over. **A day still being captured is never marked**
+   (`still_capturing()`): `--date` may name today, and a marker would make
+   tonight's run skip the afternoon.
 4. `rmtree` the day directory on `OK` (unless `--keep-frames` or config says
-   otherwise). The marker is written even when this is about to delete it,
+   otherwise, **or the day is today**, whose directory the daemon is still
+   writing). The marker is written even when this is about to delete it,
    because `rmtree` runs with `ignore_errors=True`: a deletion that quietly
    failed would otherwise leave an unmarked directory to encode again.
-5. `transfer()` → rsync.
+5. `transfer()` → rsync, with `--timeout=600` added unless `rsync_args` sets
+   one (a peer that went away stalls rather than fails) and a wall-clock bound
+   scaled to the bytes being sent at a floor of 1 MB/s. The pre-flight's
+   rsync probe adds the same flag, so it tests what runs.
 6. `write_run_state()` → one record appended to `encode.json` (§3a), **before**
    the notification: Discord is the part that can be disabled, unreachable or
    rate-limited, and the local record of what happened should not depend on
@@ -2624,6 +2645,17 @@ rather than `os.replace` because the destination is a library the operator
 watches from, so the file being renamed over can genuinely be open in a media
 player, which is exactly the case that raises `PermissionError` on Windows and
 nowhere else.
+
+**A video already at the destination is not copied again** (0.2.1).
+`already_there()` is rsync's quick check: the same length, and a destination
+copy **not older** than the local one, with two seconds of slack for FAT and
+SMB. Not older rather than equal keeps it right on a share that refuses
+`copystat()`, where the copy is dated when it arrived; a video re-encoded with
+`--force` is newer than anything at the destination and goes again at any
+length. Before this, `delete_local_after_transfer: false` copied every video in
+`video_output` every night, a library growing by gigabytes a day, for a setting
+that is nearly free on Linux. A skipped file still counts as moved, as rsync's
+does, and a local copy the previous run failed to delete is deleted now.
 
 **The account is the hard part, and it is not a detail.** A connection to a
 share belongs to a *logon session*, and the nightly encode is a scheduled task

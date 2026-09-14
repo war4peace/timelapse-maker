@@ -185,6 +185,12 @@ def main():
 
     check("video is non-trivial", out.stat().st_size > 1024,
           f"{out.stat().st_size} B")
+    # ffmpeg writes <name>.part and the encoder renames it; a muxer that did
+    # not accept the name would have failed above, and a rename that did not
+    # happen would leave this behind.
+    check("no .part file left in the videos folder",
+          not list(videos.glob("*.part")),
+          ", ".join(p.name for p in videos.glob("*.part")))
 
     # 2 bad frames rejected, GOOD_FRAMES kept -> exact expected duration.
     expected = GOOD_FRAMES / FPS

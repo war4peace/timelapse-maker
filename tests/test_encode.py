@@ -272,6 +272,13 @@ class TestFindPending(unittest.TestCase):
         self.day("Ghost", -1)
         self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
 
+    def test_only_date_reaches_an_unconfigured_camera(self):
+        # The rescue for frames a removed or disabled camera left behind, and
+        # the reason the test above is about the nightly run only.
+        target = self.day("Ghost", -1)
+        jobs = self.pending(self.root, ["Cam"], target, 7)
+        self.assertEqual([(c, d.name) for c, d in jobs], [("Ghost", target)])
+
     def test_missing_camera_directory_is_not_an_error(self):
         self.root.mkdir(parents=True)
         self.assertEqual(self.pending(self.root, ["Cam"], None, 7), [])
@@ -4253,3 +4260,313 @@ class TestExplainingAnRtspFailure(unittest.TestCase):
     def test_it_cuts_on_a_line_and_never_mid_word(self):
         """The screenshot of the old version ends "Error opening in"."""
         self.assertTrue(enc.rtsp_reason(BUSY_CAMERA)[1].endswith("End of file"))
+
+
+class TestTheFinishedNameIsOnlyEverAFinishedVideo(unittest.TestCase):
+    """ffmpeg writes a `.part` name, renamed only once the output is checked.
+
+    It wrote the finished name directly. A run killed part way left a
+    truncated video under it, which the next night's transfer shipped into
+    the library; and `-y` truncated a good video at the start of a --force
+    retry, so a retry that failed deleted the only copy.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.day = self.tmp / "frames" / "Roof" / "2026-08-10"
+        for i in range(5):
+            make_frame(self.day / ("%06d.jpg" % (i * 5)))
+        self.out = self.tmp / "videos"
+        self.out.mkdir()
+        self.final = self.out / "Roof.20260810.mkv"
+        self.cfg = {"capture": {"interval_seconds": 5, "min_bytes": 100},
+                    "encode": {"framerate": 60, "gop": 120, "min_frames": 1,
+                               "container": "mkv"},
+                    "paths": {"ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+                    "cameras": [{"name": "Roof"}]}
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def run_day(self, rc=0, produce=True, then_raise=None):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["kw"] = list(cmd), kw
+            if produce:
+                Path(cmd[-1]).write_bytes(b"\0" * 4096)
+            if then_raise is not None:
+                raise then_raise
+            return mock.Mock(returncode=rc, stdout="", stderr="boom")
+
+        with mock.patch.object(enc, "probe_dimensions",
+                               return_value=(512, 512)), \
+                mock.patch.object(enc.subprocess, "run", side_effect=fake_run):
+            r = enc.encode_day(self.cfg, {"codec": "libx264", "args": [],
+                                          "name": "libx264 (CPU)"},
+                               "Roof", self.day, self.out, False)
+        return r, seen
+
+    def leftovers(self):
+        return sorted(p.name for p in self.out.iterdir()
+                      if p.name.endswith(enc.PART_SUFFIX))
+
+    def test_ffmpeg_is_handed_a_part_name_and_told_the_muxer(self):
+        _, seen = self.run_day()
+        cmd = seen["cmd"]
+        self.assertEqual(cmd[-1], str(self.final) + enc.PART_SUFFIX)
+        # The last -f, since the concat input carries one of its own.
+        self.assertEqual(cmd[-3:-1], ["-f", "matroska"])
+
+    def test_a_success_leaves_the_finished_name_and_nothing_else(self):
+        r, _ = self.run_day()
+        self.assertEqual(r["status"], "OK")
+        self.assertTrue(self.final.is_file())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_failed_retry_leaves_the_earlier_video_alone(self):
+        self.final.write_bytes(b"the good one" * 500)
+        r, _ = self.run_day(rc=1)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertEqual(self.final.read_bytes(), b"the good one" * 500)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_hung_ffmpeg_fails_the_day_and_only_the_day(self):
+        self.final.write_bytes(b"the good one" * 500)
+        hang = enc.subprocess.TimeoutExpired(["ffmpeg"], 3600)
+        r, _ = self.run_day(then_raise=hang)
+        self.assertEqual(r["status"], "FAIL")
+        self.assertIn("did not finish", r["note"])
+        self.assertIsNone(enc.day_encoded(self.day))
+        self.assertEqual(self.final.read_bytes(), b"the good one" * 500)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_the_encode_is_bounded(self):
+        _, seen = self.run_day()
+        self.assertGreaterEqual(seen["kw"].get("timeout") or 0,
+                                enc.ENCODE_TIMEOUT_FLOOR)
+
+    def test_the_bound_grows_with_the_day(self):
+        self.assertEqual(enc.encode_timeout(10), enc.ENCODE_TIMEOUT_FLOOR)
+        self.assertGreater(enc.encode_timeout(17280), enc.ENCODE_TIMEOUT_FLOOR)
+
+    def test_muxers_for_the_containers_that_need_naming(self):
+        self.assertEqual(enc.muxer_for("mkv"), "matroska")
+        self.assertEqual(enc.muxer_for("MKV"), "matroska")
+        self.assertEqual(enc.muxer_for(".m4v"), "ipod")
+        self.assertEqual(enc.muxer_for("mp4"), "mp4")
+
+    def test_a_part_file_is_never_shipped(self):
+        (self.out / ("Roof.20260811.mkv" + enc.PART_SUFFIX)).write_bytes(b"x")
+        self.assertEqual(enc.videos_to_ship(self.out), [])
+
+
+class TestTodayIsNeitherMarkedNorDeleted(unittest.TestCase):
+    """`--date` may name today, and a finished day's two last steps are not
+    safe for one still being captured.
+
+    Deleting it takes the frames from under the daemon, which recreates the
+    directory, so the morning survives only in a partial video that tonight's
+    encode of the afternoon overwrites. Marking it makes tonight skip it.
+    """
+
+    setUp = TestOnlyOneRunAtATime.setUp
+    run_main = TestOnlyOneRunAtATime.run_main
+
+    def pin(self, today):
+        p = mock.patch.object(enc, "date", FixedDate(today))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_main_keeps_the_frames_of_today(self):
+        self.pin(date(2026, 9, 12))
+        code, did = self.run_main(["--date", "2026-09-12"])
+        self.assertEqual(code, 0)
+        self.assertEqual(did["encoded"], [("Gate", "2026-09-12")])
+        self.assertEqual(did["removed"], [])
+
+    def test_the_control_a_finished_day_still_goes(self):
+        self.pin(date(2026, 9, 13))
+        _, did = self.run_main(["--date", "2026-09-12"])
+        self.assertEqual(did["removed"], [str(self.day)])
+
+    def test_encode_day_does_not_mark_today(self):
+        case = TestTheFinishedNameIsOnlyEverAFinishedVideo(
+            "test_a_success_leaves_the_finished_name_and_nothing_else")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        self.pin(date(2026, 8, 10))
+        r, _ = case.run_day()
+        self.assertEqual(r["status"], "OK")
+        self.assertIsNone(enc.day_encoded(case.day))
+        self.assertIn("today so far", r["note"])
+
+    def test_encode_day_still_marks_a_finished_day(self):
+        case = TestTheFinishedNameIsOnlyEverAFinishedVideo(
+            "test_a_success_leaves_the_finished_name_and_nothing_else")
+        case.setUp()
+        self.addCleanup(case.doCleanups)
+        self.pin(date(2026, 8, 11))
+        case.run_day()
+        self.assertIsNotNone(enc.day_encoded(case.day))
+
+
+class TestDateReachesWhatTheNightlyRunDoesNot(unittest.TestCase):
+    """The pre-flight, the camera wizard and install.md all send an operator
+    with a disabled or removed camera's frames to `timelapse encode --date`,
+    and it answered "Nothing to process." because it walked enabled cameras.
+    """
+
+    setUp = TestOnlyOneRunAtATime.setUp
+    run_main = TestOnlyOneRunAtATime.run_main
+
+    def rewrite(self, cameras):
+        self.cfg["cameras"] = cameras
+        self.config_path.write_text(json.dumps(self.cfg), encoding="utf-8")
+
+    def test_a_disabled_cameras_day(self):
+        self.rewrite([{"name": "Gate", "enabled": False}])
+        _, did = self.run_main(["--date", "2026-09-12"])
+        self.assertEqual(did["encoded"], [("Gate", "2026-09-12")])
+
+    def test_a_removed_cameras_day(self):
+        self.rewrite([{"name": "Street", "enabled": True}])
+        _, did = self.run_main(["--date", "2026-09-12"])
+        self.assertEqual(did["encoded"], [("Gate", "2026-09-12")])
+
+    def test_the_nightly_run_still_leaves_a_disabled_camera_alone(self):
+        # The control, and the part that makes disabling mean anything.
+        self.rewrite([{"name": "Gate", "enabled": False}])
+        _, did = self.run_main()
+        self.assertEqual(did["encoded"], [])
+        self.assertEqual(did["removed"], [])
+
+    def test_the_idle_explanation_lists_days_from_every_camera(self):
+        self.rewrite([{"name": "Street", "enabled": True}])
+        said = " ".join(enc.explain_idle(self.tmp / "frames", ["Street"],
+                                         only_date="2026-9-12"))
+        self.assertIn("2026-09-12", said)
+
+
+class TestTransferIsBounded(unittest.TestCase):
+    """A peer that went away mid-copy stalls rsync rather than failing it, and
+    a oneshot that never exits stops every later night's run too."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        self.video = self.tmp / "Roof.20260816.mkv"
+        self.video.write_bytes(b"video")
+        self.cfg = {"paths": {"video_output": str(self.tmp)},
+                    "transfer": {"enabled": True, "destination": "/dest",
+                                 "delete_local_after_transfer": True}}
+
+    def run_transfer(self, **run):
+        seen = {}
+
+        def fake_run(cmd, **kw):
+            seen["cmd"], seen["kw"] = list(cmd), kw
+            if "raise_" in run:
+                raise run["raise_"]
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(enc, "IS_WINDOWS", False), \
+                mock.patch.object(enc, "mount_problem", return_value=None), \
+                mock.patch.object(enc.subprocess, "run", side_effect=fake_run):
+            return enc.transfer(self.cfg, dry_run=False), seen
+
+    def test_rsync_gives_up_on_a_silent_peer(self):
+        _, seen = self.run_transfer()
+        self.assertIn("--timeout=%d" % enc.RSYNC_IO_TIMEOUT, seen["cmd"])
+
+    def test_a_configured_timeout_is_left_as_it_is(self):
+        self.cfg["transfer"]["rsync_args"] = ["-a", "--timeout=30"]
+        _, seen = self.run_transfer()
+        self.assertEqual([a for a in seen["cmd"] if a.startswith("--timeout")],
+                         ["--timeout=30"])
+
+    def test_the_run_is_bounded_too(self):
+        _, seen = self.run_transfer()
+        self.assertGreaterEqual(seen["kw"].get("timeout") or 0,
+                                enc.ENCODE_TIMEOUT_FLOOR)
+
+    def test_a_hung_rsync_is_a_failed_transfer_and_deletes_nothing(self):
+        result, _ = self.run_transfer(
+            raise_=enc.subprocess.TimeoutExpired(["rsync"], 3600))
+        self.assertFalse(result["ok"])
+        self.assertIn("did not finish", result["detail"])
+        self.assertTrue(self.video.exists())
+
+    def test_the_probe_runs_the_same_flags(self):
+        probe = TestRsyncProbe("test_success_is_reported_as_working")
+        probe.setUp()
+        self.addCleanup(probe.doCleanups)
+        with mock.patch.object(enc.subprocess, "run",
+                               probe.fake_run(0)) as run:
+            enc.try_rsync_args(probe.tmp, ["-a"])
+        self.assertIn("--timeout=%d" % enc.RSYNC_IO_TIMEOUT,
+                      run.call_args[0][0])
+
+
+class TestAVideoAlreadyDeliveredIsNotCopiedAgain(unittest.TestCase):
+    """With local copies kept, the Windows mover copied every video in
+    video_output every night; rsync's quick check makes the same setting
+    nearly free on Linux."""
+
+    setUp = TestMoveVideo.setUp
+
+    def deliver(self):
+        ok, _ = enc.move_video(self.src, self.dest, delete_source=False)
+        self.assertTrue(ok)
+
+    def refuse_copy(self):
+        return mock.patch.object(enc.shutil, "copyfile",
+                                 side_effect=AssertionError("copied again"))
+
+    def test_it_is_not_copied(self):
+        self.deliver()
+        with self.refuse_copy():
+            ok, why = enc.move_video(self.src, self.dest, delete_source=False)
+        self.assertEqual((ok, why), (True, enc.ALREADY_THERE))
+        self.assertTrue(self.src.exists())
+
+    def test_a_leftover_local_copy_is_removed_when_deleting(self):
+        # The case "the local file could not be removed" left behind.
+        self.deliver()
+        with self.refuse_copy():
+            ok, _ = enc.move_video(self.src, self.dest, delete_source=True)
+        self.assertTrue(ok)
+        self.assertFalse(self.src.exists())
+        self.assertTrue((self.dest / self.src.name).exists())
+
+    def test_a_share_that_keeps_no_mtimes_still_counts(self):
+        # Refused copystat: the copy is dated when it arrived, after the encode.
+        with mock.patch.object(enc.shutil, "copystat"):
+            self.deliver()
+        later = self.src.stat().st_mtime + 3600
+        os.utime(self.dest / self.src.name, (later, later))
+        with self.refuse_copy():
+            ok, why = enc.move_video(self.src, self.dest, delete_source=False)
+        self.assertEqual(why, enc.ALREADY_THERE)
+
+    def test_a_re_encoded_video_goes_again_at_the_same_length(self):
+        self.deliver()
+        self.src.write_bytes(b"VIDEO BYTES" * 100)
+        newer = (self.dest / self.src.name).stat().st_mtime + 60
+        os.utime(self.src, (newer, newer))
+        ok, why = enc.move_video(self.src, self.dest, delete_source=False)
+        self.assertEqual((ok, why), (True, ""))
+        self.assertEqual((self.dest / self.src.name).read_bytes(),
+                         b"VIDEO BYTES" * 100)
+
+    def test_a_different_length_goes_again(self):
+        self.deliver()
+        (self.dest / self.src.name).write_bytes(b"short")
+        old = self.src.stat().st_mtime + 60
+        os.utime(self.dest / self.src.name, (old, old))
+        ok, why = enc.move_video(self.src, self.dest, delete_source=False)
+        self.assertEqual(why, "")
+        self.assertEqual((self.dest / self.src.name).read_bytes(),
+                         b"video bytes" * 100)
