@@ -413,7 +413,10 @@ jobs:
           sudo test -r /etc/timelapse/config.json
           sudo python3 -m json.tool /etc/timelapse/config.json > /dev/null
           # ReadWritePaths must have been rewritten from the generated config.
-          grep -q '^ReadWritePaths=/var/lib/timelapse/' \
+          # Quoted, always: since 0.2.1 (C2) quote_unit_path() quotes every
+          # path, because a path with a space in it is two arguments to
+          # systemd. This check predated that and failed the v0.2.1 push.
+          grep -q '^ReadWritePaths="/var/lib/timelapse/' \
                /etc/systemd/system/timelapse-capture.service
           # All six, not two: the watch units were missing from uninstall for
           # releases while this step checked capture and the encode timer.

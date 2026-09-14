@@ -6370,7 +6370,12 @@ class TestAWindowsDestinationIsStoredAbsolute(unittest.TestCase):
         self.assertTrue(os.path.isabs(transfer["destination"]))
 
     def test_an_absolute_path_is_left_exactly_as_typed(self):
-        want = str(self.tmp / "library")
+        # A Windows path, on every leg. This was str(self.tmp / "library"),
+        # which on Linux is "/tmp/...": absolute to ntpath.isabs() up to 3.12
+        # and relative from 3.13, which stopped calling a path with one
+        # leading slash and no drive absolute. So the test failed on the 3.14
+        # leg of the v0.2.1 push while testing a path Windows never sees.
+        want = r"D:\timelapse\library"
         transfer, said = self.choose(want + "\n")
         self.assertEqual(transfer["destination"], want)
         self.assertNotIn("Storing the full path", said)
