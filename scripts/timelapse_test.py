@@ -176,11 +176,18 @@ def test_http(cam, cfg):
 
 def test_rtsp(cam, cfg):
     name = cam["name"]
+    # Checked rather than handed to subprocess: an empty or wrong path raised
+    # OSError out of main(), ending the run at the first RTSP camera before
+    # the Encoders section could name the actual problem.
+    ffmpeg = (cfg.get("paths") or {}).get("ffmpeg") or ""
+    if not ffmpeg:
+        bad(f"{name}: cannot test an RTSP camera, paths.ffmpeg is empty")
+        return None
     OUT.mkdir(parents=True, exist_ok=True)
     sample = OUT / f"{name}.jpg"
     # `warning` rather than `error`, for the reason grab_snapshot_rtsp()
     # gives: at error level every RTSP failure reads the same.
-    cmd = [cfg["paths"]["ffmpeg"], "-y", "-nostdin", "-hide_banner",
+    cmd = [ffmpeg, "-y", "-nostdin", "-hide_banner",
            "-loglevel", "warning", "-rtsp_transport", "tcp",
            "-i", cam["url"], "-frames:v", "1", "-q:v", "2", str(sample)]
     t0 = time.time()
@@ -189,6 +196,9 @@ def test_rtsp(cam, cfg):
                            **no_console())
     except subprocess.TimeoutExpired:
         bad(f"{name}: RTSP grab timed out after 45s")
+        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        bad(f"{name}: could not run ffmpeg ({ffmpeg}): {exc}")
         return None
     dt = time.time() - t0
     if p.returncode != 0 or not sample.exists():
@@ -791,9 +801,16 @@ def test_transfer(cfg):
         return
     if ":" in dest and not dest.startswith("/"):
         host = dest.split(":")[0]
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
-                            host, "true"], capture_output=True, text=True,
-                           **no_console())
+        try:
+            r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o",
+                                "ConnectTimeout=10", host, "true"],
+                               capture_output=True, text=True, timeout=60,
+                               **no_console())
+        except (OSError, subprocess.SubprocessError) as exc:
+            # No ssh client installed is a FileNotFoundError, and it used to
+            # end the pre-flight here rather than report as a failure.
+            bad(f"could not run ssh to check {host}: {exc}")
+            return
         if r.returncode == 0:
             ok(f"SSH to {host} works with key auth")
         else:
@@ -852,7 +869,10 @@ def check_windows_transfer(t, dest):
     if not good:
         bad(f"cannot write to {dest}: {why}")
         if is_unc(dest) and not user:
-            info("If the share needs a sign-in, re-run 'timelapse setup' and")
+            # `timelapse transfer`: the full wizard would start from an empty
+            # camera list and ask for every camera password again.
+            info("If the share needs a sign-in, run "
+                 f"'{admin_cmd('timelapse transfer')}' and")
             info("give a username and password for it.")
         return
 
@@ -867,7 +887,7 @@ def check_windows_transfer(t, dest):
         info("The nightly encode runs as the system account, which presents")
         info("this machine's name to the server rather than yours, so it may")
         info("be refused where you are allowed. Storing a username and")
-        info(f"password with '{admin_cmd('timelapse setup')}' removes the doubt.")
+        info(f"password with '{admin_cmd('timelapse transfer')}' removes the doubt.")
 
 
 def check_rsync_args(cfg, dest):

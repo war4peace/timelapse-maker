@@ -1102,6 +1102,20 @@ rather than the tail, because Reolink-style URLs are identical for their first
 40 characters and a plain truncation both makes every camera look the same and
 cuts off the `***`, reading as though nothing were masked.
 
+**Editing a camera does not offer its URL as a default when the URL holds a
+login** (0.2.1, M10). A default is printed in brackets, so `timelapse cameras
+-e` used to show `rtsp://admin:hunter2@...` and a Reolink `&password=` in full.
+`lift_url_credentials()` takes the login out of either shape (userinfo, or
+`user=` / `password=` in the query), `edit_camera_url()` offers the address
+without it and asks the username and the password (through `ask_secret()`)
+separately, and `put_url_credentials()` puts them back with the same escaping
+as `fill_template()`. The stored URL is rebuilt **only when something
+changed**, because rebuilding a hand-encoded `%40` would unescape it into a
+bare `@`. One trap found by the first test run: the query form offered for
+editing keeps `user=&password=` with empty values, and reading that as a
+pasted login emptied a Reolink's credentials on a plain Enter, so a paste
+counts only when it carries a username or a password.
+
 **`choose_web()`** is the wizard step for the web UI, and `--web-only` re-runs
 just it, same reasoning as `--transfer-only`: turning the UI on later must not
 mean walking the whole wizard, and a feature the wizard never offers is one
@@ -1112,6 +1126,16 @@ is not loopback. `create_web_state_dir()` makes the index directory here rather
 than in the service, which could not create it: `ReadWritePaths` naming a
 missing directory stops the unit dead, and inside the sandbox its parent is
 read-only.
+
+The preview's "is this remote" test is **`timelapse_web.is_remote_spec()`**,
+imported, since 0.2.1 (M13): it previews what the web UI will decide, and the
+wizard's own copy called `D:\timelapse\out` an rsync remote on Windows where the
+web UI's rule settles an absolute path first. The library root and the index
+directory are asked with **`ask_clearable()`** (M16): Enter keeps, `-` clears
+(back to working the library out, or to the default index), and the prompt says
+so only when there is something to clear. The ntfy token uses it too; before
+this a stored token could never be removed, under a prompt saying "blank for
+none".
 
 **Input handling.** `init_tty()` picks a source: stdin if it is a terminal,
 otherwise `/dev/tty`, otherwise defaults-only. It must *never* silently read a
@@ -1138,6 +1162,22 @@ the camera and says so.
 password and carried on, and every fetch from then on is refused by the
 camera. EOF there is a different cause and keeps the different answer, `""`
 plus `AUTO`, matching `ask()`.
+
+**Whether the config can be written is settled before the first question**
+(0.2.1, M14). `output_problem()` finds the nearest existing ancestor of the
+output and asks `os.access()` for write and search on it, and for write on the
+file if it exists: the directory matters as much as the file, because the write
+goes through a temporary file and a backup beside it. `main()` calls it once,
+just before `init_tty()`, for every path except a listing and a camera test.
+Before, an unprivileged `timelapse setup` on Linux walked storage, ffmpeg,
+every camera with its password, transfer, notifications and the web UI, then
+tracebacked. If the final write fails regardless, `report_unsaved()` prints the
+answers through `redact_config()`. **On Windows `os.access()` reads the
+read-only attribute and not the ACL**, so this says little there; the command
+wrapper's elevation gate is what covers that platform. Advice that sends an
+operator back to fix one section names that section's command (M15): "re-run
+`timelapse setup`" started from an empty camera list, so following it meant
+typing every camera password again.
 
 #### 4.4b A path with a space in it (0.2.1)
 
@@ -3598,6 +3638,13 @@ produce, because the consequence of these two numbers, how long tonight's
 video is, cannot be read off the config. It fails a camera whose frames/day
 falls below `encode.min_frames`: the encoder `SKIP`s that, so the camera would
 produce nothing at all, every night, without ever failing.
+
+**Both console prompts refuse such an interval** (0.2.1, M11), as the GUI's
+`check_interval()` always had: `ask_interval()` re-asks, naming the longest
+interval that works (`86400 // min_frames`), for the global interval, which had
+checked nothing, and per camera, which had only warned. With no terminal it
+keeps the value and still prints the refusal, because re-asking would be handed
+the same default for ever.
 
 ### 4.8a Per-camera motion smoothing
 

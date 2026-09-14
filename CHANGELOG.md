@@ -147,6 +147,43 @@ While the version is `0.x`, the configuration format may change in any release.
   the destination with the same size, and not older than the local copy, is
   left alone, the way rsync already behaves on Linux.
 
+- **Editing a camera no longer prints its password.** The address was offered
+  as the default in brackets, and for an RTSP camera or a Reolink that address
+  contains the login, so `timelapse cameras -e` put the password on the screen
+  and in the scroll-back. The address is now shown without it, and the
+  username and password are asked for separately, the password hidden as it
+  is everywhere else. Pressing Enter all the way through changes nothing.
+
+- **The setup wizard refuses a snapshot interval that would never produce a
+  video**, as the setup window already did. A day with fewer frames than
+  `encode.min_frames` is skipped, so an interval of 15 minutes or more was
+  accepted and then quietly made nothing, every night. It now says which is
+  the longest interval that works, for the whole install and per camera.
+
+- **Testing an RTSP camera, in the wizard or with `timelapse test`, when ffmpeg
+  is missing or not configured now says so** instead of ending in a Python
+  error. The same goes for checking an SSH destination on a machine with no ssh
+  client.
+
+- **Running the setup wizard without permission to write the configuration
+  now stops before the first question.** It used to ask everything, camera
+  passwords included, and then fail with a Python error at the very end. If
+  saving does fail after all, what you answered is printed with the passwords
+  masked, rather than lost.
+
+- **The advice to fix a refused network share names `timelapse transfer`.** It
+  said to re-run `timelapse setup`, which starts from scratch and would have
+  had you type every camera password again. The same slip is corrected where
+  the wizard suggests how to add cameras later.
+
+- **A stored ntfy token, a custom web library folder and the web index folder
+  can be cleared again.** Pressing Enter keeps what is set, which was the only
+  thing that could happen, while the prompt said "blank for none". Type `-` to
+  clear one; the prompt says so when there is something to clear.
+
+- **Windows: the web setup no longer calls a local drive path an rsync remote**
+  when previewing where the library will be read from.
+
 - **Linux: uninstalling removes the watch service and its timer as well.**
   `install.sh --uninstall` disabled them but left both unit files in
   `/etc/systemd/system`, so systemd still listed them, and a later reinstall

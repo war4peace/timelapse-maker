@@ -454,3 +454,47 @@ class TestThePreflightsRtspProbeKeepsTheDiagnosis(unittest.TestCase):
         self.assertIn("free client slot", said)
         self.assertIn("End of file", said)
         self.assertNotIn("hunter2", said)
+
+    def rtsp_with(self, ffmpeg, run):
+        cam = {"name": "Hallway", "url": "rtsp://war4peace:hunter2@h/stream1"}
+        before = tt._FAILS
+        self.addCleanup(setattr, tt, "_FAILS", before)
+        with mock.patch.object(tt.subprocess, "run", run), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            size = tt.test_rtsp(cam, {"paths": {"ffmpeg": ffmpeg}})
+        return size, out.getvalue(), tt._FAILS - before
+
+    def test_no_ffmpeg_configured_is_a_fail_line_not_a_traceback(self):
+        """A traceback here ended the run at the first RTSP camera, before
+        the Encoders section could name the actual problem (M12)."""
+        size, said, fails = self.rtsp_with(
+            "", mock.Mock(side_effect=AssertionError("ran nothing")))
+        self.assertIsNone(size)
+        self.assertIn("paths.ffmpeg is empty", said)
+        self.assertEqual(fails, 1)
+
+    def test_an_ffmpeg_that_will_not_start_is_a_fail_line(self):
+        size, said, fails = self.rtsp_with(
+            "/nowhere/ffmpeg",
+            mock.Mock(side_effect=FileNotFoundError(2, "No such file")))
+        self.assertIsNone(size)
+        self.assertIn("could not run ffmpeg", said)
+        self.assertNotIn("hunter2", said)
+        self.assertEqual(fails, 1)
+
+
+class TestNoSshClientIsAFailNotACrash(unittest.TestCase):
+    """The remote-destination check ran ssh bare, so a machine without an
+    ssh client ended the pre-flight with FileNotFoundError (M12)."""
+
+    def test_it_is_reported(self):
+        before = tt._FAILS
+        self.addCleanup(setattr, tt, "_FAILS", before)
+        cfg = {"transfer": {"enabled": True, "destination": "nas:/vol/tl"}}
+        with mock.patch.object(tt, "IS_WINDOWS", False), \
+                mock.patch.object(tt.subprocess, "run",
+                                  side_effect=FileNotFoundError(2, "ssh")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            tt.test_transfer(cfg)
+        self.assertIn("could not run ssh", out.getvalue())
+        self.assertEqual(tt._FAILS - before, 1)

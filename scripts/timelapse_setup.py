@@ -209,6 +209,29 @@ def ask_secret(question):
         return ask(question, "")
 
 
+# The answer that removes an optional value. A bare hyphen, because Enter
+# already means "keep", and no token, path or name this is asked about is one.
+CLEAR_ANSWER = "-"
+
+
+def ask_clearable(question, current, cleared="", blank=""):
+    """ask() for an optional value: Enter keeps what is there, '-' removes it.
+
+    ask() hands back the current value on a blank line, which is the promise
+    every prompt here makes, so a stored ntfy token could never be taken out
+    again, and two prompts said "blank for none" and "leave blank" about an
+    answer that kept the old value. `cleared` is what removing means: nothing
+    for a token, the default for a directory. `blank` is the hint shown when
+    there is nothing to keep, where blank really does mean none.
+    """
+    current = current or ""
+    if current and current != cleared:
+        answer = ask(f"{question} (Enter keeps, {CLEAR_ANSWER} clears)", current)
+    else:
+        answer = ask(f"{question} ({blank})" if blank else question, current)
+    return cleared if answer.strip() == CLEAR_ANSWER else answer
+
+
 def ask_yes(question, default=True):
     d = "Y/n" if default else "y/N"
     while True:
@@ -527,9 +550,48 @@ def default_min_free_gb(free_bytes=None):
     return max(10, min(60, int(free_bytes / 1024 ** 3 * 0.1)))
 
 
+def frames_shortfall(cfg, interval):
+    """(problem, advice) when a day at `interval` falls below min_frames, or None.
+
+    The encoder skips a day with fewer usable frames than encode.min_frames,
+    so an interval past the line never produces a video and never fails
+    either. One rule for both console prompts; the GUI's check_interval() has
+    refused the same values all along.
+    """
+    min_frames = int(cfg.get("encode", {}).get("min_frames", 100))
+    per_day = int(86400 / interval)
+    if per_day >= min_frames:
+        return None
+    return ("%ds gives %d frames a day, under encode.min_frames (%d), so the "
+            "nightly encode would skip every day and never make a video."
+            % (interval, per_day, min_frames),
+            "Use %ds or less, or lower encode.min_frames with "
+            "'timelapse config' first." % (86400 // min_frames))
+
+
+def ask_interval(cfg, question, default):
+    """ask_int() for a cadence, refusing one the encoder would skip every night.
+
+    The global question checked nothing and the per-camera one only warned,
+    while the window refused both. Refused here too, re-asking, except with
+    nothing to type an answer into: re-asking would hand back the same default
+    for ever, so the value is kept and the refusal still printed.
+    """
+    while True:
+        interval = ask_int(question, default, 1, 3600)
+        short = frames_shortfall(cfg, interval)
+        if short is None:
+            return interval
+        fail(short[0])
+        note(short[1])
+        if AUTO or _TTY is None:
+            warn("Kept anyway: there is no terminal to give another answer.")
+            return interval
+
+
 def choose_capture(cfg, disk):
     heading("Capture")
-    interval = ask_int("Seconds between snapshots", 5, 1, 3600)
+    interval = ask_interval(cfg, "Seconds between snapshots", 5)
     cfg["capture"]["interval_seconds"] = interval
 
     timeout = min(cfg["capture"]["timeout_seconds"], max(1, interval - 1))
@@ -994,7 +1056,7 @@ def choose_cameras(cfg, expected):
         # There is nothing sensible to invent without input, and probing four
         # imaginary addresses would just burn a timeout each.
         note("Running non-interactively - no cameras configured.")
-        note("Add them later with 'timelapse setup', or edit the config file.")
+        note("Add them later with 'timelapse cameras -a', or edit the config file.")
         return
 
     note("You can skip this and edit the config by hand later, but adding at")
@@ -1503,6 +1565,126 @@ def rename_camera_frames(cfg, old, new):
         warn(f"Frames under '{old}' will no longer be encoded.")
 
 
+# Query keys that carry a login in a camera's URL. `user` and `password` are
+# what the Reolink preset writes; the others are spellings redact() masks.
+URL_USER_KEYS = ("user", "username")
+URL_SECRET_KEYS = ("password", "passwd", "pwd", "pass")
+
+
+def lift_url_credentials(url):
+    """(bare_url, shape, user, password): the login taken out of a camera URL.
+
+    `shape` is "userinfo" for rtsp://user:pass@host, "query" for a URL with
+    ?...&user=&password=, or None when the URL carries no password, in which
+    case `bare_url` is the URL unchanged and the other two are None.
+
+    Editing a camera offered its stored URL as the default, and a default is
+    printed: `Snapshot URL [rtsp://admin:hunter2@192.0.2.9:554/stream1]:`. So
+    the one prompt the wizard owns that is not ask_secret() put the password
+    in the scroll-back of everyone who pressed Enter through it.
+    """
+    from urllib.parse import unquote, urlsplit, urlunsplit
+    text = str(url or "")
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return text, None, None, None
+    if parts.scheme and "@" in parts.netloc:
+        userinfo, host = parts.netloc.rsplit("@", 1)
+        user, _sep, password = userinfo.partition(":")
+        bare = urlunsplit((parts.scheme, host, parts.path, parts.query,
+                           parts.fragment))
+        return bare, "userinfo", unquote(user), unquote(password)
+    if parts.query:
+        user = password = None
+        kept = []
+        for item in parts.query.split("&"):
+            key, sep, value = item.partition("=")
+            low = key.lower()
+            if sep and low in URL_USER_KEYS and user is None:
+                user = unquote(value)
+                kept.append(key + "=")
+            elif sep and low in URL_SECRET_KEYS and password is None:
+                password = unquote(value)
+                kept.append(key + "=")
+            else:
+                kept.append(item)
+        if password is not None:
+            bare = urlunsplit((parts.scheme, parts.netloc, parts.path,
+                               "&".join(kept), parts.fragment))
+            return bare, "query", user or "", password
+    return text, None, None, None
+
+
+def put_url_credentials(bare, shape, user, password):
+    """The inverse of lift_url_credentials(), escaping as fill_template() does.
+
+    Both empty in a userinfo URL gives no userinfo at all, the rule
+    fill_template() already has. A query URL whose login parameters were
+    deleted while it was being edited gets them appended.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(bare)
+    if shape == "userinfo":
+        host = parts.netloc.rsplit("@", 1)[-1]
+        netloc = host if not (user or password) else "%s:%s@%s" % (
+            quote(user), quote(password), host)
+        return urlunsplit((parts.scheme, netloc, parts.path, parts.query,
+                           parts.fragment))
+    out, have_user, have_password = [], False, False
+    for item in (parts.query.split("&") if parts.query else []):
+        key, sep, _value = item.partition("=")
+        low = key.lower()
+        if sep and low in URL_USER_KEYS and not have_user:
+            out.append(key + "=" + quote(user))
+            have_user = True
+        elif sep and low in URL_SECRET_KEYS and not have_password:
+            out.append(key + "=" + quote(password))
+            have_password = True
+        else:
+            out.append(item)
+    if not have_user:
+        out.append("user=" + quote(user))
+    if not have_password:
+        out.append("password=" + quote(password))
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "&".join(out),
+                       parts.fragment))
+
+
+def edit_camera_url(cam):
+    """Ask for a camera's URL without printing the login inside it (M10).
+
+    A URL with no login is asked the ordinary way. One with a login is offered
+    without it, and the username and password are asked for as themselves,
+    the password through ask_secret(). The stored URL is rebuilt only when
+    something was changed, so pressing Enter through an address someone
+    percent-encoded by hand leaves it exactly as it was.
+    """
+    url = str(cam.get("url", ""))
+    label = "Stream URL" if cam.get("method", "http") == "rtsp" \
+        else "Snapshot URL"
+    bare, shape, user, password = lift_url_credentials(url)
+    if shape is None:
+        return ask(label, url)
+
+    note("The login in this address is asked for separately, not shown.")
+    typed = ask(label, bare)
+    pasted = lift_url_credentials(typed)
+    new_user, new_password = user, password
+    if pasted[1] is not None and (pasted[2] or pasted[3]):
+        # A whole address pasted in, login and all: take it as given. Only
+        # when it carries one: the query form offered above keeps `user=` and
+        # `password=` with nothing after them, and reading those as a pasted
+        # login emptied a Reolink camera's credentials on a plain Enter.
+        typed, shape, new_user, new_password = pasted
+    new_user = ask("Username", new_user)
+    new_password = ask_secret("Password (blank keeps the current one)") \
+        or new_password
+    if (typed, new_user, new_password) == (bare, user, password):
+        return url
+    return put_url_credentials(typed, shape, new_user, new_password)
+
+
 def edit_one_camera(cfg, cams, cam):
     old_name = str(cam.get("name", ""))
     print()
@@ -1518,7 +1700,7 @@ def edit_one_camera(cfg, cams, cam):
             continue
         break
 
-    cam["url"] = ask("Snapshot URL", str(cam.get("url", "")))
+    cam["url"] = edit_camera_url(cam)
     if cam.get("method", "http") == "http":
         cam["auth"] = ask_choice("Auth", AUTH_MODES,
                                  str(cam.get("auth", "none")).lower())
@@ -1560,8 +1742,8 @@ def edit_camera_cadence(cfg, cam):
          f"every {g_int}s, played at {g_fps}fps.")
     note("Answer with the default to go back to following it.")
 
-    interval = ask_int("Seconds between snapshots for this camera",
-                       camera_interval(cfg, cam), 1, 3600)
+    interval = ask_interval(cfg, "Seconds between snapshots for this camera",
+                            camera_interval(cfg, cam))
     fps = ask_int("Frame rate for this camera",
                   camera_framerate(cfg, cam), 1, 240)
 
@@ -1582,15 +1764,6 @@ def edit_camera_cadence(cfg, cam):
         # keeps the cadence it began with either way.
         note("This takes effect at midnight. Today keeps the cadence it "
              "started with, so a day is never half one rate and half another.")
-
-    min_frames = int(cfg.get("encode", {}).get("min_frames", 100))
-    if per_day < min_frames:
-        # The encoder SKIPs a day below min_frames, so this would produce
-        # nothing at all, every night, without ever failing.
-        warn(f"That is under encode.min_frames ({min_frames}), so the nightly "
-             f"encode would skip this camera every night.")
-        note(f"A {interval}s interval needs min_frames below {per_day} to "
-             f"produce anything.")
 
 
 def edit_camera_smoothing(cfg, cam):
@@ -2392,13 +2565,21 @@ def grab_snapshot_rtsp(cam, cfg):
     """One frame off an RTSP stream, through ffmpeg. (data, detail)."""
     detail = _grab_detail()
     import tempfile
+    # An RTSP camera is tested through ffmpeg, and paths.ffmpeg is "" on any
+    # Windows install where none was found and Enter was pressed. Handed to
+    # subprocess that raised OSError out of the wizard, one camera into it.
+    ffmpeg = (cfg.get("paths") or {}).get("ffmpeg") or ""
+    if not ffmpeg:
+        detail["reason"] = ("ffmpeg is not configured (paths.ffmpeg is empty), "
+                            "and an RTSP camera is tested through it.")
+        return None, detail
     t0 = time.time()
     with tempfile.TemporaryDirectory() as td:
         out = Path(td) / "frame.jpg"
         # `warning`, not `error`: at error level every RTSP failure is
         # "Operation not permitted", and the line that separates a full camera
         # from a wrong path is one level above it.
-        cmd = [cfg["paths"]["ffmpeg"], "-y", "-nostdin", "-hide_banner",
+        cmd = [ffmpeg, "-y", "-nostdin", "-hide_banner",
                "-loglevel", "warning", "-rtsp_transport", "tcp",
                "-i", cam["url"], "-frames:v", "1", "-q:v", "2", str(out)]
         try:
@@ -2407,6 +2588,10 @@ def grab_snapshot_rtsp(cam, cfg):
         except subprocess.TimeoutExpired:
             detail["seconds"] = time.time() - t0
             detail["reason"] = "RTSP grab timed out after 45s."
+            return None, detail
+        except (OSError, subprocess.SubprocessError) as exc:
+            detail["seconds"] = time.time() - t0
+            detail["reason"] = "Could not run ffmpeg (%s): %s" % (ffmpeg, exc)
             return None, detail
         detail["seconds"] = time.time() - t0
         if p.returncode != 0 or not out.exists():
@@ -2648,7 +2833,10 @@ def check_windows_destination(cfg, dest):
         if ok:
             warn("Saved without credentials, and untested for the account")
             warn("that will actually run.")
-        note("If the nightly transfer is refused, re-run 'timelapse setup'")
+        # `timelapse transfer`, not `timelapse setup`: the full wizard starts
+        # from an empty camera list, so following that advice meant typing
+        # every camera password again and losing the login and the sinks.
+        note("If the nightly transfer is refused, run 'timelapse transfer'")
         note("and answer yes here. 'timelapse test' reports it too.")
         return
 
@@ -2672,7 +2860,7 @@ def check_windows_destination(cfg, dest):
     else:
         fail(f"Could not write to {dest} as {user}: {why}")
         note("The credentials are saved so you can correct them with")
-        note("'timelapse setup' rather than retyping everything, but the")
+        note("'timelapse transfer' rather than retyping everything, but the")
         note("nightly transfer will fail until this passes.")
 
 
@@ -3210,8 +3398,11 @@ def web_library_preview(cfg):
     if override:
         return override, "web.library_root"
     if trans.get("enabled") and dest:
-        if dest.startswith("rsync://") or (not dest.startswith("/")
-                                           and ":" in dest.split("/", 1)[0]):
+        # The web UI's own rule, because this previews what the web UI will
+        # decide. The copy that lived here called D:\timelapse\out remote on
+        # Windows, where the web UI's rule settles an absolute path first.
+        from timelapse_web import is_remote_spec
+        if is_remote_spec(dest):
             return dest, "transfer.destination - REMOTE, not readable here"
         return dest, "transfer.destination"
     return cfg["paths"].get("video_output", ""), "paths.video_output"
@@ -3552,14 +3743,20 @@ def choose_web(cfg):
         warn("simply not be mounted. The page will say so rather than")
         warn("showing an empty library.")
     print()
-    note("Leave blank to use the path above.")
-    web["library_root"] = ask("Read videos from", web.get("library_root", ""))
+    if (web.get("library_root") or "").strip():
+        note(f"'{CLEAR_ANSWER}' goes back to working it out from the transfer "
+             f"settings.")
+    else:
+        note("Leave blank to use the path above.")
+    web["library_root"] = ask_clearable("Read videos from",
+                                        web.get("library_root", ""))
 
     print()
     note("The web UI writes one thing: an index of your library. The service")
     note("is allowed to write this directory and nothing else on the system.")
-    web["state_dir"] = ask("Index directory",
-                           web.get("state_dir", WEB_STATE_DIR_DEFAULT))
+    web["state_dir"] = ask_clearable("Index directory",
+                                     web.get("state_dir", WEB_STATE_DIR_DEFAULT),
+                                     cleared=WEB_STATE_DIR_DEFAULT)
 
     print()
     note("The Overview page can tell you when a new version is tagged, and")
@@ -3662,7 +3859,8 @@ def choose_ntfy_sink(cfg, config_path=None):
     # once rather than leaving as a surprise.
     if topic and "ntfy.sh" in server:
         note("On the public server a topic is the only secret there is.")
-    token = ask("Access token (blank for none)", current.get("token", ""))
+    token = ask_clearable("Access token", current.get("token", ""),
+                          blank="blank for none")
     sink = {"type": "ntfy", "enabled": bool(topic), "server": server,
             "topic": topic, "token": token}
     put_sink(cfg, "ntfy", sink)
@@ -4144,6 +4342,60 @@ def backup_config(out_path, keep=BACKUP_KEEP):
     else:
         note(f"Backed up to {dest.name}")
     return dest
+
+
+def output_problem(path):
+    """Why this account could not write the config at `path`, or None.
+
+    Asked before the first question, because the full wizard used to walk
+    storage, ffmpeg, every camera with its password, transfer, notifications
+    and the web UI, and only then meet PermissionError in write_config(). The
+    directory is what is checked, not only the file: the write goes through a
+    temporary file and a backup beside it.
+
+    On Windows os.access() reads the read-only attribute and not the ACL, so
+    this says little there; the command wrapper refuses an unelevated prompt
+    before this runs, which is what covers that platform.
+    """
+    out = Path(path)
+    try:
+        probe = out.parent
+        while not os.path.lexists(str(probe)) and probe.parent != probe:
+            probe = probe.parent
+        if not os.path.isdir(str(probe)):
+            return "%s is not a directory" % probe
+        if not os.access(str(probe), os.W_OK | os.X_OK):
+            return "%s is not writable by this account" % probe
+        if os.path.lexists(str(out)) and not os.access(str(out), os.W_OK):
+            return "%s is not writable by this account" % out
+    except OSError as exc:
+        return str(exc)
+    return None
+
+
+def refuse_unwritable_output(path):
+    """Say why the config cannot be written and return True, or return False."""
+    problem = output_problem(path)
+    if problem is None:
+        return False
+    fail(f"Cannot write {path}: {problem}.")
+    if not is_elevated():
+        note("The configuration holds your camera passwords, so changing it")
+        note("needs privilege. " + elevation_hint())
+    return True
+
+
+def report_unsaved(cfg, path, exc):
+    """A write that failed after every question was answered.
+
+    The answers are printed, with the secrets masked, so the rest of what was
+    typed is not simply gone: redact_config() is the same masking
+    `timelapse config --redacted` uses.
+    """
+    from timelapse_encode import redact_config
+    fail(f"Could not write {path}: {exc}")
+    note("Nothing was saved. What you answered, with passwords masked:")
+    print(json.dumps(redact_config(cfg), indent=2))
 
 
 def write_config(cfg, out_path, owner=None):
@@ -4763,6 +5015,14 @@ def main():
             return 0 if restart_units() else 1
         return 0 if install_units(scripts, args.output) else 1
 
+    # Every path from here writes the config except a listing and a camera
+    # test, so whether it can is settled before the first question rather than
+    # after the last (M14). The sections below that load a config report an
+    # unreadable one themselves; this is about the write.
+    action, _target = chosen_camera_action(args)
+    if action not in ("list", "test") and refuse_unwritable_output(args.output):
+        return 1
+
     init_tty(force_defaults=args.defaults, use_stdin=args.stdin)
 
     # A shortcut is a command, not a wizard. Announcing the setup wizard and
@@ -4931,8 +5191,12 @@ def main():
     choose_web(cfg)
 
     heading("Writing configuration")
-    create_directories(cfg, args.owner)
-    write_config(cfg, args.output, args.owner)
+    try:
+        create_directories(cfg, args.owner)
+        write_config(cfg, args.output, args.owner)
+    except OSError as exc:
+        report_unsaved(cfg, args.output, exc)
+        return 1
     good(f"Wrote {args.output}")
     summarise(cfg, args.output)
     print()

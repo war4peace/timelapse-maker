@@ -1686,6 +1686,84 @@ class TestHumanReadable(unittest.TestCase):
         self.assertEqual(setup.human(1024 ** 6), "1024.0 PB")
 
 
+class TestEditingACameraDoesNotPrintItsLogin(unittest.TestCase):
+    """The stored URL was offered as the default, and a default is printed.
+
+    Measured before the fix: `Snapshot URL [rtsp://admin:hunter2@...]:`, for
+    RTSP and for a Reolink `&password=` alike, from the one prompt about a
+    camera that did not go through ask_secret(). M10.
+    """
+
+    RTSP = "rtsp://admin:hunter2@192.0.2.9:554/stream1"
+    REOLINK = ("http://192.0.2.8/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=tl"
+               "&user=admin&password=hunter2")
+
+    def edit(self, cam, keys):
+        cfg = {"paths": {"frames_root": "/nonexistent"},
+               "capture": {"interval_seconds": 5},
+               "encode": {"framerate": 60}, "cameras": [cam]}
+        buf = io.StringIO()
+        with _support.wizard_tty(keys), contextlib.redirect_stdout(buf), \
+                mock.patch.object(setup, "test_camera", return_value=True), \
+                mock.patch.object(setup, "rename_camera_frames"):
+            setup.edit_one_camera(cfg, cfg["cameras"], cam)
+        return cam, buf.getvalue()
+
+    def rtsp(self, url=RTSP):
+        return {"name": "Hallway", "enabled": True, "method": "rtsp",
+                "url": url, "quality": 2}
+
+    def test_enter_through_an_rtsp_camera_prints_no_password(self):
+        # Name, address, username, password; the rest take their defaults.
+        cam, out = self.edit(self.rtsp(), "\n\n\n\n")
+        self.assertNotIn("hunter2", out)
+        self.assertEqual(cam["url"], self.RTSP)
+        self.assertIn("Stream URL", out)
+
+    def test_a_new_address_keeps_the_login(self):
+        cam, out = self.edit(self.rtsp(), "\nrtsp://192.0.2.10:554/stream1\n\n\n")
+        self.assertEqual(cam["url"], "rtsp://admin:hunter2@192.0.2.10:554/stream1")
+        self.assertNotIn("hunter2", out)
+
+    def test_a_new_password_goes_into_the_address(self):
+        cam, _ = self.edit(self.rtsp(), "\n\n\nnewpass\n")
+        self.assertEqual(cam["url"], "rtsp://admin:newpass@192.0.2.9:554/stream1")
+
+    def test_an_address_encoded_by_hand_survives_enter_byte_for_byte(self):
+        """Rebuilt only when something changed. Rebuilding anyway would turn
+        %40 into a bare @, which ends the userinfo one character early."""
+        url = "rtsp://admin:p%40ss@192.0.2.9:554/stream1"
+        cam, out = self.edit(self.rtsp(url), "\n\n\n\n")
+        self.assertEqual(cam["url"], url)
+        self.assertNotIn("p%40ss", out)
+
+    def test_a_reolink_login_in_the_query_is_hidden_too(self):
+        cam = {"name": "Drive", "enabled": True, "method": "http",
+               "auth": "none", "url": self.REOLINK}
+        cam, out = self.edit(cam, "\n\n\n\n\n")
+        self.assertNotIn("hunter2", out)
+        self.assertEqual(cam["url"], self.REOLINK)
+
+    def test_an_address_without_a_login_is_offered_as_before(self):
+        cam = {"name": "Gate", "enabled": True, "method": "http",
+               "auth": "digest", "username": "admin", "password": "hunter2",
+               "url": "http://192.0.2.1/snap"}
+        _, out = self.edit(cam, "\n\n")
+        self.assertIn("[http://192.0.2.1/snap]", out)
+
+    def test_lifting_and_putting_back_is_a_round_trip(self):
+        for url in (self.RTSP, self.REOLINK):
+            bare, shape, user, password = setup.lift_url_credentials(url)
+            self.assertNotIn("hunter2", bare)
+            self.assertEqual((user, password), ("admin", "hunter2"))
+            self.assertEqual(
+                setup.put_url_credentials(bare, shape, user, password), url)
+
+    def test_an_address_with_no_login_is_left_alone(self):
+        self.assertEqual(setup.lift_url_credentials("http://192.0.2.1/snap"),
+                         ("http://192.0.2.1/snap", None, None, None))
+
+
 class TestWebLibraryPreview(unittest.TestCase):
     """The wizard shows where videos will be read from, because that is the
     surprising part: transfer moves them away with --remove-source-files, so
@@ -1732,6 +1810,28 @@ class TestWebLibraryPreview(unittest.TestCase):
             web={"library_root": "/mnt/nas/tl/"}))
         self.assertEqual(where, "/mnt/nas/tl/")
         self.assertIn("library_root", why)
+
+    def test_it_agrees_with_the_web_ui_about_every_shape(self):
+        """One rule for one question (M13). The wizard kept its own, and on
+        Windows it called D:\\timelapse\\out an rsync remote spec."""
+        import timelapse_web as web
+        for dest in ("user@nas:/vol/tl/", "rsync://nas/tl",
+                     "/mnt/odd:name/tl/", "nas:tl", "D:\\timelapse\\out",
+                     "\\\\tower\\cctv\\TL"):
+            _, why = setup.web_library_preview(self.cfg(
+                transfer={"enabled": True, "destination": dest}))
+            self.assertEqual("REMOTE" in why, web.is_remote_spec(dest), dest)
+
+    def test_a_drive_path_is_not_remote_where_it_is_absolute(self):
+        # Declared rather than inherited: on the Linux legs D:\ is not an
+        # absolute path, and there the web UI's rule rightly calls it remote.
+        import ntpath
+        import timelapse_web as web
+        cfg = self.cfg(transfer={"enabled": True,
+                                 "destination": "D:\\timelapse\\out"})
+        with mock.patch.object(web.os.path, "isabs", ntpath.isabs):
+            _, why = setup.web_library_preview(cfg)
+        self.assertNotIn("REMOTE", why)
 
 
 class TestChooseWeb(unittest.TestCase):
@@ -1894,6 +1994,50 @@ class TestChooseWeb(unittest.TestCase):
         self.assertEqual(web["port"], 9000)
         self.assertEqual(web["library_root"], "/srv/tl")
         self.assertEqual(web["state_dir"], "/srv/idx")
+
+    def test_a_stored_library_and_index_can_be_reset(self):
+        """Enter keeps, which is the test above; '-' is the way back to
+        working the library out and to the default index (M16)."""
+        cfg = setup.default_config()
+        cfg["web"] = {"enabled": True, "bind": "10.0.0.5", "port": 9000,
+                      "library_root": "/srv/tl", "state_dir": "/srv/idx"}
+        web, out = self.drive("y\n\n\n\n-\n-\n", cfg)
+        self.assertEqual(web["library_root"], "")
+        self.assertEqual(web["state_dir"], setup.WEB_STATE_DIR_DEFAULT)
+        self.assertNotIn("Leave blank to use the path above", out)
+
+
+class TestClearingAnOptionalAnswer(unittest.TestCase):
+    """A stored ntfy token could never be removed, and the prompt said
+    "blank for none" while Enter kept it (M16)."""
+
+    def ntfy(self, keys, token):
+        sink = {"type": "ntfy", "enabled": True, "server": "https://ntfy.sh",
+                "topic": "t-9f3"}
+        if token is not None:
+            sink["token"] = token
+        cfg = {"notify": [sink]}
+        buf = io.StringIO()
+        with _support.wizard_tty(keys), contextlib.redirect_stdout(buf):
+            setup.choose_ntfy_sink(cfg)
+        return setup.existing_sink(cfg, "ntfy"), buf.getvalue()
+
+    def test_a_hyphen_removes_the_token(self):
+        # Send to ntfy, server, topic, token, test message.
+        sink, out = self.ntfy("y\n\n\n-\nn\n", "tk_old")
+        self.assertEqual(sink["token"], "")
+        self.assertIn("- clears", out)
+        self.assertNotIn("blank for none", out)
+
+    def test_enter_still_keeps_it(self):
+        sink, _ = self.ntfy("y\n\n\n\nn\n", "tk_old")
+        self.assertEqual(sink["token"], "tk_old")
+
+    def test_with_nothing_stored_blank_really_is_none(self):
+        sink, out = self.ntfy("y\n\n\n\nn\n", None)
+        self.assertEqual(sink["token"], "")
+        self.assertIn("blank for none", out)
+        self.assertNotIn("- clears", out)
 
 
 class TestChooseWebLogin(unittest.TestCase):
@@ -3004,16 +3148,54 @@ class TestPerCameraCadence(unittest.TestCase):
         self.assertIn("1,440", out)
         self.assertIn("0:48", out)
 
-    def test_a_cadence_below_min_frames_warns(self):
+    def test_a_cadence_below_min_frames_is_refused(self):
         # 86400/900 = 96 frames, under min_frames 100, so the nightly encode
-        # would SKIP this camera every night without ever failing.
-        _, out = self.edit({"name": "C"}, "900\n30\n")
+        # would SKIP this camera every night without ever failing. It used to
+        # warn and store it; the window refused it, and so does this now (M11).
+        cam, out = self.edit({"name": "C"}, "900\n60\n30\n")
+        self.assertEqual(cam["interval_seconds"], 60)
         self.assertIn("min_frames", out)
         self.assertIn("skip", out.lower())
 
     def test_a_normal_cadence_does_not_warn(self):
         _, out = self.edit({"name": "C"}, "60\n30\n")
         self.assertNotIn("min_frames", out)
+
+
+class TestTheGlobalIntervalIsCheckedToo(unittest.TestCase):
+    """choose_capture() accepted 3600 with nothing said, and had no test (M11)."""
+
+    def drive(self, keys, cfg=None, auto=False):
+        cfg = cfg or setup.default_config()
+        buf = io.StringIO()
+        with _support.wizard_tty(keys, auto=auto), \
+                contextlib.redirect_stdout(buf), \
+                mock.patch.object(setup, "choose_framerate"), \
+                mock.patch.object(setup, "estimate_budget"):
+            setup.choose_capture(cfg, None)
+        return cfg, buf.getvalue()
+
+    def test_an_interval_that_never_makes_a_video_is_refused(self):
+        cfg, out = self.drive("3600\n60\n")
+        self.assertEqual(cfg["capture"]["interval_seconds"], 60)
+        self.assertIn("min_frames", out)
+
+    def test_the_longest_interval_that_works_is_accepted(self):
+        # 86400 / 864 = 100 frames, exactly min_frames.
+        cfg, out = self.drive("864\n")
+        self.assertEqual(cfg["capture"]["interval_seconds"], 864)
+        self.assertNotIn("min_frames", out)
+
+    def test_the_advice_names_the_longest_interval_that_works(self):
+        _, out = self.drive("900\n60\n")
+        self.assertIn("864s or less", out)
+
+    def test_with_no_terminal_it_is_kept_and_said_rather_than_asked_for_ever(self):
+        cfg = setup.default_config()
+        cfg["encode"]["min_frames"] = 20000        # 5s gives 17,280
+        cfg, out = self.drive("", cfg, auto=True)
+        self.assertEqual(cfg["capture"]["interval_seconds"], 5)
+        self.assertIn("min_frames", out)
 
 
 class TestCadenceListing(unittest.TestCase):
@@ -6262,3 +6444,135 @@ Error opening input file rtsp://war4peace:hunter2@h:554/stream1.
         _argv, _data, detail = self.probe()
         self.assertNotIn("hunter2", detail["reason"])
         self.assertNotIn("hunter2", " ".join(detail["notes"]))
+
+    def test_no_ffmpeg_configured_is_a_reason_not_a_traceback(self):
+        """paths.ffmpeg is "" on a Windows install where none was found and
+        Enter was pressed; handed to subprocess that raised OSError (M12)."""
+        with mock.patch.object(setup.subprocess, "run",
+                               side_effect=AssertionError("ran nothing")):
+            data, detail = setup.grab_snapshot_rtsp(
+                {"url": "rtsp://x"}, {"paths": {"ffmpeg": ""}})
+        self.assertIsNone(data)
+        self.assertIn("paths.ffmpeg", detail["reason"])
+
+    def test_an_ffmpeg_that_will_not_start_is_a_reason(self):
+        with mock.patch.object(setup.subprocess, "run",
+                               side_effect=FileNotFoundError(2, "No such file")):
+            data, detail = setup.grab_snapshot_rtsp(
+                {"url": "rtsp://war4peace:hunter2@h/stream1"},
+                {"paths": {"ffmpeg": "/nowhere/ffmpeg"}})
+        self.assertIsNone(data)
+        self.assertIn("Could not run ffmpeg", detail["reason"])
+        self.assertIn("/nowhere/ffmpeg", detail["reason"])
+        self.assertNotIn("hunter2", detail["reason"])
+
+
+class TestAnUnwritableConfigIsSaidFirst(unittest.TestCase):
+    """The full wizard asked every question, typed passwords included, and
+    then tracebacked out of write_config() (M14)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.blocker = self.tmp / "a-file"
+        self.blocker.write_text("not a directory", encoding="utf-8")
+
+    def run_main(self, output, extra=(), tty=None):
+        argv = ["timelapse_setup.py", "--output", str(output)] + list(extra)
+        tty = tty or mock.Mock(side_effect=AssertionError("asked a question"))
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(setup, "init_tty", tty), \
+                mock.patch.object(setup, "is_elevated", return_value=False), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = setup.main()
+        return rc, out.getvalue()
+
+    def test_the_full_wizard_refuses_before_its_first_question(self):
+        rc, out = self.run_main(self.blocker / "config.json")
+        self.assertEqual(rc, 1)
+        self.assertIn("Cannot write", out)
+        self.assertIn("not a directory", out)
+
+    def test_every_section_that_writes_refuses_first_too(self):
+        for flag in ("--notify-only", "--transfer-only", "--web-only",
+                     "--cameras-only", "--password-only", "--restore-only"):
+            rc, out = self.run_main(self.blocker / "config.json", [flag])
+            self.assertEqual(rc, 1, flag)
+            self.assertIn("Cannot write", out, flag)
+
+    def test_a_camera_test_and_a_listing_are_not_writes(self):
+        # The control: these write nothing and must not be refused for it.
+        for extra in (["--cameras-only", "-t:Gate"], ["--cameras-only", "-l"]):
+            _rc, out = self.run_main(self.blocker / "config.json", extra,
+                                     tty=mock.Mock())
+            self.assertNotIn("Cannot write", out, extra)
+
+    def test_a_place_that_can_be_written_has_no_problem(self):
+        self.assertIsNone(setup.output_problem(self.tmp / "new" / "config.json"))
+
+    def test_a_failed_final_write_reports_the_answers_masked(self):
+        cfg = setup.default_config()
+        cfg["cameras"] = [{"name": "Gate", "method": "http", "auth": "digest",
+                           "username": "admin", "password": "hunter2",
+                           "url": "http://192.0.2.1/snap"}]
+        argv = ["timelapse_setup.py", "--output",
+                str(self.tmp / "config.json")]
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                mock.patch.object(setup, "init_tty", lambda **kw: None), \
+                mock.patch.object(setup, "default_config", lambda t=None: cfg), \
+                mock.patch.object(setup, "choose_storage", lambda c: None), \
+                mock.patch.object(setup, "choose_tools", lambda c: None), \
+                mock.patch.object(setup, "choose_capture", lambda c, d: 1), \
+                mock.patch.object(setup, "choose_cameras", lambda c, n: None), \
+                mock.patch.object(setup, "choose_transfer", lambda c, o: None), \
+                mock.patch.object(setup, "choose_notify", lambda c, p: None), \
+                mock.patch.object(setup, "choose_web", lambda c: None), \
+                mock.patch.object(setup, "create_directories", lambda c, o: None), \
+                mock.patch.object(setup, "write_config",
+                                  side_effect=PermissionError(13, "denied")), \
+                contextlib.redirect_stdout(out):
+            rc = setup.main()
+        self.assertEqual(rc, 1)
+        self.assertIn("Nothing was saved", out.getvalue())
+        self.assertIn("Gate", out.getvalue())
+        self.assertNotIn("hunter2", out.getvalue())
+
+
+class TestTheAdviceNamesTheCommandThatKeepsEverything(unittest.TestCase):
+    """`timelapse setup` starts from an empty camera list, so following the
+    advice meant retyping every camera password (M15)."""
+
+    DEST = "\\\\tower\\cctv\\TL"
+
+    def check(self, keys, verified=(True, "")):
+        import timelapse_encode as enc
+        cfg = {"transfer": {"enabled": True, "destination": self.DEST}}
+        buf = io.StringIO()
+        with _support.wizard_tty(keys), contextlib.redirect_stdout(buf), \
+                mock.patch.object(enc, "try_destination",
+                                  return_value=(True, "")), \
+                mock.patch.object(enc, "verify_share_credentials",
+                                  return_value=verified):
+            setup.check_windows_destination(cfg, self.DEST)
+        return buf.getvalue()
+
+    def test_declining_credentials_names_timelapse_transfer(self):
+        out = self.check("n\n")
+        self.assertIn("timelapse transfer", out)
+        self.assertNotIn("timelapse setup", out)
+
+    def test_credentials_that_fail_name_it_too(self):
+        out = self.check("y\nuser\npass\n", verified=(False, "refused"))
+        self.assertIn("timelapse transfer", out)
+        self.assertNotIn("timelapse setup", out)
+
+    def test_no_cameras_headless_names_the_command_that_adds_one(self):
+        cfg = setup.default_config()
+        buf = io.StringIO()
+        with _support.wizard_tty("", auto=True), contextlib.redirect_stdout(buf):
+            setup.choose_cameras(cfg, 1)
+        self.assertIn("timelapse cameras -a", buf.getvalue())
+        self.assertNotIn("timelapse setup", buf.getvalue())

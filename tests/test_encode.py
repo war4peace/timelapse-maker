@@ -1314,11 +1314,19 @@ class TestPreflightWindowsTransfer(unittest.TestCase):
         # same rule summarise() had to learn about webhook URLs.
         self.assertNotIn("hunter2", out)
 
-    def test_a_refusal_points_at_the_wizard(self):
+    def test_a_refusal_points_at_the_transfer_section(self):
+        """This asserted "timelapse setup", which pinned the wrong advice: the
+        full wizard starts from an empty camera list (M15)."""
         out = self.run_check({"destination": "\\\\tower\\cctv\\TL"},
                              reached=(False, "access denied (error 5)"))
         self.assertIn("access denied", out)
-        self.assertIn("timelapse setup", out)
+        self.assertIn("timelapse transfer", out)
+        self.assertNotIn("timelapse setup", out)
+
+    def test_an_unproven_share_points_at_the_transfer_section_too(self):
+        out = self.run_check({"destination": "\\\\tower\\cctv\\TL"})
+        self.assertIn("timelapse transfer", out)
+        self.assertNotIn("timelapse setup", out)
 
     def test_a_refused_local_path_does_not_suggest_credentials(self):
         out = self.run_check({"destination": "D:\\out"},
