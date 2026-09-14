@@ -1,7 +1,6 @@
 # Install and operation
 
-Operator guide. For how the system is built and why, see
-[architecture.md](architecture.md).
+Operator guide. For how the system is built and why, see [architecture.md](architecture.md).
 
 ---
 
@@ -52,8 +51,7 @@ Operator guide. For how the system is built and why, see
 <state_dir>/{capture,encode}.json                  ← what the services are doing
 ```
 
-Filenames are zero-padded `HHMMSS`, so lexical order **is** chronological.
-Nothing depends on file mtime.
+Filenames are zero-padded `HHMMSS`, so lexical order **is** chronological. Nothing depends on file mtime.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
@@ -67,14 +65,7 @@ sudo bash install_timelapse.sh
 rm install_timelapse.sh
 ```
 
-`install.sh` installs dependencies (apt, dnf, yum, pacman, zypper or apk),
-creates a `timelapse` system account, puts the scripts in `/opt/timelapse`, the
-units in `/etc/systemd/system`, a `timelapse` wrapper in `/usr/local/bin`, and
-then runs the setup wizard described in §3. Re-running it upgrades the scripts
-and **keeps your existing config without asking**: reconfiguring is a separate
-job with its own commands, and being walked through the whole wizard is a
-strange offer from something you ran to get a bug fix. New settings arrive with
-defaults, so an untouched config keeps working.
+`install.sh` installs dependencies (apt, dnf, yum, pacman, zypper or apk), creates a `timelapse` system account, puts the scripts in `/opt/timelapse`, the units in `/etc/systemd/system`, a `timelapse` wrapper in `/usr/local/bin`, and then runs the setup wizard described in §3. Re-running it upgrades the scripts and **keeps your existing config without asking**: reconfiguring is a separate job with its own commands, and being walked through the whole wizard is a strange offer from something you ran to get a bug fix. New settings arrive with defaults, so an untouched config keeps working.
 
 | Flag | Effect |
 |---|---|
@@ -84,30 +75,19 @@ defaults, so an untouched config keeps working.
 | `--prefix DIR` | Install somewhere other than `/opt/timelapse`. |
 | `--uninstall` | Remove programs and units. Captured data is never deleted. |
 
-The download and the execution are deliberately two steps, so you can read the
-script before running it as root.
+The download and the execution are deliberately two steps, so you can read the script before running it as root.
 
 ### Windows (early preview)
 
-Capture, encode and transfer run on Windows 10, 11 and Server. The web UI does
-not yet, and neither does upgrading in place. Everything else below applies:
-the same config file, the same wizard, the same `timelapse` command, the same
-`timelapse test`.
+Capture, encode and transfer run on Windows 10, 11 and Server. The web UI does not yet, and neither does upgrading in place. Everything else below applies: the same config file, the same wizard, the same `timelapse` command, the same `timelapse test`.
 
-There are two ways in. The **installer** is the one to use unless you have a
-reason not to; the PowerShell script underneath it is documented after it,
-because it is what the installer runs and what a scripted deployment wants.
+There are two ways in. The **installer** is the one to use unless you have a reason not to; the PowerShell script underneath it is documented after it, because it is what the installer runs and what a scripted deployment wants.
 
 #### The installer
 
-Download `timelapse-maker-setup-<version>.exe` from the
-[releases page](https://github.com/war4peace/timelapse-maker/releases) and run
-it. It asks for administrator rights, copies the files, and then opens the
-graphical wizard so you can add your cameras.
+Download `timelapse-maker-setup-<version>.exe` from the [releases page](https://github.com/war4peace/timelapse-maker/releases) and run it. It asks for administrator rights, copies the files, and then opens the graphical wizard so you can add your cameras.
 
-It is **not code-signed**, so Windows SmartScreen will say "Windows protected
-your PC". Choose "More info" and then "Run anyway". Every release publishes a
-`.sha256` beside the installer if you would rather check the download first:
+It is **not code-signed**, so Windows SmartScreen will say "Windows protected your PC". Choose "More info" and then "Run anyway". Every release publishes a `.sha256` beside the installer if you would rather check the download first:
 
 ```powershell
 Get-FileHash .\timelapse-maker-setup-0.2.0.exe -Algorithm SHA256
@@ -120,34 +100,18 @@ Two checkboxes on the way through, both ticked and both worth leaving that way:
 | Install Python | Only if the machine has none. An existing Python 3.9 or newer is used as it is. |
 | Install ffmpeg | Only if the machine has none. An ffmpeg you installed yourself is never replaced. |
 
-Both look first and download only what is missing, so on a machine that already
-has them the boxes cost nothing. What gets fetched is pinned by version and by
-SHA-256 in `installer/prerequisites.json`, and nothing is run before it matches.
+Both look first and download only what is missing, so on a machine that already has them the boxes cost nothing. What gets fetched is pinned by version and by SHA-256 in `installer/prerequisites.json`, and nothing is run before it matches.
 
-Uninstall it from **Settings, Apps** like anything else. That deregisters the
-service and both tasks and removes the program; your configuration, frames and
-videos are left alone, exactly as on Linux.
+Uninstall it from **Settings, Apps** like anything else. That deregisters the service and both tasks and removes the program; your configuration, frames and videos are left alone, exactly as on Linux.
 
-If something goes wrong, the installer says so rather than reporting success,
-and the whole log is at `%ProgramData%\timelapse\install.log`.
+If something goes wrong, the installer says so rather than reporting success, and the whole log is at `%ProgramData%\timelapse\install.log`.
 
 #### The PowerShell installer
 
-This is what the .exe runs, and running it directly is the right thing for a
-scripted deployment or an upgrade. It supplies neither prerequisite, so get
-them first:
+This is what the .exe runs, and running it directly is the right thing for a scripted deployment or an upgrade. It supplies neither prerequisite, so get them first:
 
-- **Python 3.9 or newer** from [python.org](https://www.python.org/downloads/windows/).
-  Prefer "install for all users". A per-user Python works, and the installer
-  says so, but it lives inside one account's profile and the service reads it
-  from outside: remove that profile, or reinstall Python for somebody else, and
-  the service stops starting weeks later with nothing to connect the two.
-- **ffmpeg** from [ffmpeg.org](https://ffmpeg.org/download.html), with NVENC if
-  the machine has an NVIDIA card. Windows has no package manager worth relying
-  on, and a recorder very often already has an ffmpeg its owner chose; putting
-  a second one on the machine would override a decision that was not ours. The
-  wizard asks where it is and checks it by running it, and it accepts the
-  folder holding `ffmpeg.exe` rather than making you type both paths.
+- **Python 3.9 or newer** from [python.org](https://www.python.org/downloads/windows/). Prefer "install for all users". A per-user Python works, and the installer says so, but it lives inside one account's profile and the service reads it from outside: remove that profile, or reinstall Python for somebody else, and the service stops starting weeks later with nothing to connect the two.
+- **ffmpeg** from [ffmpeg.org](https://ffmpeg.org/download.html), with NVENC if the machine has an NVIDIA card. Windows has no package manager worth relying on, and a recorder very often already has an ffmpeg its owner chose; putting a second one on the machine would override a decision that was not ours. The wizard asks where it is and checks it by running it, and it accepts the folder holding `ffmpeg.exe` rather than making you type both paths.
 
 Then, from **PowerShell running as administrator**:
 
@@ -162,27 +126,11 @@ Then, from **PowerShell running as administrator**:
 | `-Prefix DIR` | Install somewhere other than `%ProgramFiles%\timelapse`. |
 | `-Uninstall` | Remove programs and services. Captured data is never deleted. If the service or a task cannot be deregistered, or the Python it was installed with is gone, nothing is deleted and it prints what to remove by hand. |
 
-The uninstaller in **Apps and features** runs `-Uninstall` in a hidden window,
-so when that refusal happens there you will not see it: the entry disappears,
-`%ProgramFiles%\timelapse` stays, and the service may still be registered.
-Check with `sc query TimelapseCapture` from an Administrator prompt. If it is
-still there, remove what is left with `sc delete "TimelapseCapture"`,
-`schtasks /Delete /TN "Timelapse Encode" /F` and
-`schtasks /Delete /TN "Timelapse Watch" /F`, then delete
-`%ProgramFiles%\timelapse`.
+The uninstaller in **Apps and features** runs `-Uninstall` in a hidden window, so when that refusal happens there you will not see it: the entry disappears, `%ProgramFiles%\timelapse` stays, and the service may still be registered. Check with `sc query TimelapseCapture` from an Administrator prompt. If it is still there, remove what is left with `sc delete "TimelapseCapture"`, `schtasks /Delete /TN "Timelapse Encode" /F` and `schtasks /Delete /TN "Timelapse Watch" /F`, then delete `%ProgramFiles%\timelapse`.
 
-It places the scripts, restricts `%ProgramData%\timelapse` so that only the
-system and administrators can read the camera passwords in it, adds `timelapse`
-to the system PATH, and registers three things:
+It places the scripts, restricts `%ProgramData%\timelapse` so that only the system and administrators can read the camera passwords in it, adds `timelapse` to the system PATH, and registers three things:
 
-**The finished videos are the one exception to that restriction.** They are
-inside the same folder by default, and a timelapse you cannot double-click is
-not much of a timelapse, so the videos folder is granted read and execute to
-ordinary accounts: open and copy, but not alter or delete. If you pointed
-`video_output` at another drive, nothing there is touched. One wrinkle:
-*browsing* down to it from `%ProgramData%\timelapse` will not work, because the
-folder above it is closed. Open `%ProgramData%\timelapse\videos` directly, or
-keep a shortcut to it; saved playlists and file associations are unaffected.
+**The finished videos are the one exception to that restriction.** They are inside the same folder by default, and a timelapse you cannot double-click is not much of a timelapse, so the videos folder is granted read and execute to ordinary accounts: open and copy, but not alter or delete. If you pointed `video_output` at another drive, nothing there is touched. One wrinkle: *browsing* down to it from `%ProgramData%\timelapse` will not work, because the folder above it is closed. Open `%ProgramData%\timelapse\videos` directly, or keep a shortcut to it; saved playlists and file associations are unaffected.
 
 | Component | Windows | Linux equivalent |
 |---|---|---|
@@ -190,58 +138,21 @@ keep a shortcut to it; saved playlists and file associations are unaffected.
 | `Timelapse Encode` | a scheduled task, daily at 00:05 | `timelapse-encode.timer` |
 | `Timelapse Watch` | a scheduled task, every 5 minutes | `timelapse-watch.timer` |
 
-The service runs as LocalSystem and restarts itself if it stops unexpectedly,
-which is the equivalent of `Restart=always RestartSec=15`. Start it the first
-time with `sc start "TimelapseCapture"`; after a reboot it starts itself.
+The service runs as LocalSystem and restarts itself if it stops unexpectedly, which is the equivalent of `Restart=always RestartSec=15`. Start it the first time with `sc start "TimelapseCapture"`; after a reboot it starts itself.
 
-That covers a crash and an unhandled error alike: whatever the reason, it is
-started again fifteen seconds later, and each attempt appends a line to
-`%ProgramData%\timelapse\service-error.log` saying what happened. **A fault
-it cannot recover from, a configuration file it cannot read being the usual
-one, therefore retries every fifteen seconds indefinitely**, which is the same
-behaviour as on Linux and is deliberate: read that log, fix what it names, and
-the next attempt succeeds on its own.
+That covers a crash and an unhandled error alike: whatever the reason, it is started again fifteen seconds later, and each attempt appends a line to `%ProgramData%\timelapse\service-error.log` saying what happened. **A fault it cannot recover from, a configuration file it cannot read being the usual one, therefore retries every fifteen seconds indefinitely**, which is the same behaviour as on Linux and is deliberate: read that log, fix what it names, and the next attempt succeeds on its own.
 
-**Open a new terminal, as administrator, before using `timelapse`.** New,
-because a PATH change only reaches processes started after it. Administrator
-for every command and not only the ones that change something: the wrapper
-sits in `%ProgramData%\timelapse` beside the camera passwords, and that folder
-is restricted to SYSTEM and Administrators, so an ordinary window is refused
-with `Access is denied` before this program runs. See §8.
+**Open a new terminal, as administrator, before using `timelapse`.** New, because a PATH change only reaches processes started after it. Administrator for every command and not only the ones that change something: the wrapper sits in `%ProgramData%\timelapse` beside the camera passwords, and that folder is restricted to SYSTEM and Administrators, so an ordinary window is refused with `Access is denied` before this program runs. See §8.
 
-**There is a graphical wizard, if you would rather click than type.** The
-installer adds **Timelapse Setup** to the Start menu, under timelapse-maker. It
-asks the same questions as `timelapse setup`, applies the same checks and
-writes the same file, including backing up the configuration you already have.
-Use it for a first setup or to change something later; the console commands
-keep working and neither replaces the other. It elevates itself, so you do not
-need an Administrator prompt open first.
+**There is a graphical wizard, if you would rather click than type.** The installer adds **Timelapse Setup** to the Start menu, under timelapse-maker. It asks the same questions as `timelapse setup`, applies the same checks and writes the same file, including backing up the configuration you already have. Use it for a first setup or to change something later; the console commands keep working and neither replaces the other. It elevates itself, so you do not need an Administrator prompt open first.
 
 Two differences worth knowing:
 
-- **Logs are files, not a journal.** One per day, in `logs` under your data
-  directory: `capture-20260816.log`. `timelapse logs` follows the current one,
-  in the folder `paths.log_dir` names.
-- **A mapped drive letter is not a destination.** Drive mappings belong to
-  whoever signed in, and a service gets its own logon session with none in it,
-  so `U:\Videos` fails with "path not found" on a folder you can open in
-  Explorer. The wizard resolves a letter to its `\\server\share` form and
-  stores that; if you edit the config by hand, write the UNC path yourself.
-- **A network destination probably needs its own sign-in.** The nightly encode
-  runs as the system account, which introduces itself to your server as this
-  *computer* rather than as you, so a share you have used for years may refuse
-  it, and the error is an access denial on a path that demonstrably works. The
-  wizard offers to store a username and password for the share, tests them by
-  writing a file with them, and says so; the encode then signs in the same way.
-  Your current sign-in is tried first, so a share that is open to everyone
-  needs no password stored at all. `timelapse test` reports which of the two
-  it just proved. If you get this wrong, nothing is lost: the videos stay in
-  the local videos folder and the next night's run ships them.
+- **Logs are files, not a journal.** One per day, in `logs` under your data directory: `capture-20260816.log`. `timelapse logs` follows the current one, in the folder `paths.log_dir` names.
+- **A mapped drive letter is not a destination.** Drive mappings belong to whoever signed in, and a service gets its own logon session with none in it, so `U:\Videos` fails with "path not found" on a folder you can open in Explorer. The wizard resolves a letter to its `\\server\share` form and stores that; if you edit the config by hand, write the UNC path yourself.
+- **A network destination probably needs its own sign-in.** The nightly encode runs as the system account, which introduces itself to your server as this *computer* rather than as you, so a share you have used for years may refuse it, and the error is an access denial on a path that demonstrably works. The wizard offers to store a username and password for the share, tests them by writing a file with them, and says so; the encode then signs in the same way. Your current sign-in is tried first, so a share that is open to everyone needs no password stored at all. `timelapse test` reports which of the two it just proved. If you get this wrong, nothing is lost: the videos stay in the local videos folder and the next night's run ships them.
 
-> **Piping straight to bash** (`curl -sL … | sudo bash`) also works; the
-> installer and wizard read prompts from `/dev/tty` rather than stdin, because
-> under a pipe stdin *is* the script. If no terminal is reachable at all, both
-> fall back to accepting defaults instead of hanging.
+> **Piping straight to bash** (`curl -sL … | sudo bash`) also works; the installer and wizard read prompts from `/dev/tty` rather than stdin, because under a pipe stdin *is* the script. If no terminal is reachable at all, both fall back to accepting defaults instead of hanging.
 
 ### Upgrading
 
@@ -249,20 +160,11 @@ Two differences worth knowing:
 sudo timelapse update
 ```
 
-That asks GitHub for the newest release, shows you what changed, and installs
-it after one confirmation. `timelapse update --check` reports without
-installing and is the one command here that needs no root at all.
+That asks GitHub for the newest release, shows you what changed, and installs it after one confirmation. `timelapse update --check` reports without installing and is the one command here that needs no root at all.
 
-**Not answering that confirmation means no.** Ctrl-C at the prompt changes
-nothing and exits 130, and running it where there is no terminal (from cron,
-or a script) declines rather than upgrading. If you want it to upgrade without
-asking, say so with `--yes`.
+**Not answering that confirmation means no.** Ctrl-C at the prompt changes nothing and exits 130, and running it where there is no terminal (from cron, or a script) declines rather than upgrading. If you want it to upgrade without asking, say so with `--yes`.
 
-Under the covers it is the same thing the documentation has always said:
-re-run the installer. It downloads `install.sh` **from the tag it is about to
-install**, so the installer and the tree it unpacks are the same version, and
-it checks that what came back is really the installer and is valid bash before
-running it as root. The manual form still works and is unchanged:
+Under the covers it is the same thing the documentation has always said: re-run the installer. It downloads `install.sh` **from the tag it is about to install**, so the installer and the tree it unpacks are the same version, and it checks that what came back is really the installer and is valid bash before running it as root. The manual form still works and is unchanged:
 
 ```bash
 curl -sL https://raw.githubusercontent.com/war4peace/timelapse-maker/main/install.sh -o install_timelapse.sh
@@ -278,15 +180,9 @@ sudo timelapse update --ref v0.1.0   # a specific tag, including going back
 sudo timelapse update --force        # reinstall the version you already have
 ```
 
-`--check` exits 0 when up to date and 10 when an update is available, so a cron
-job can notify on it without a human reading the output.
+`--check` exits 0 when up to date and 10 when an update is available, so a cron job can notify on it without a human reading the output.
 
-`timelapse test` is the other command with a status worth reading: **1 when
-any check reported FAIL**, 0 otherwise. A WARN does not make it non-zero, since
-a warning is something to know about rather than something that stops this
-working. The installer uses it: a pre-flight that fails makes "Enable capture
-and the nightly encode now?" default to no, and it still asks, because you may
-know the camera is unplugged today and want capture running anyway.
+`timelapse test` is the other command with a status worth reading: **1 when any check reported FAIL**, 0 otherwise. A WARN does not make it non-zero, since a warning is something to know about rather than something that stops this working. The installer uses it: a pre-flight that fails makes "Enable capture and the nightly encode now?" default to no, and it still asks, because you may know the camera is unplugged today and want capture running anyway.
 
 What it does and does not touch:
 
@@ -301,12 +197,7 @@ What it does and does not touch:
 | An encode already in flight | Left alone. It is oneshot, so it finishes on the build it started with and the next nightly trigger uses the new one. |
 | A unit new in this release | Adopted only if it is a timer and the install is live. A new *service* is never switched on for you, which is what keeps the web UI opt-in. |
 
-**An upgrade asks nothing.** It records what is enabled and what is running
-before it touches anything, and puts that back afterwards, then prints one line
-per unit so you can see it did. There is no "reconfigure?", no "run the
-pre-flight?", no "enable capture?" and no "enable the web UI?": every one of
-those was a decision you had already made, and the installer can read it off the
-system instead of asking you again.
+**An upgrade asks nothing.** It records what is enabled and what is running before it touches anything, and puts that back afterwards, then prints one line per unit so you can see it did. There is no "reconfigure?", no "run the pre-flight?", no "enable capture?" and no "enable the web UI?": every one of those was a decision you had already made, and the installer can read it off the system instead of asking you again.
 
 ```
 ── Services ───────────────────────────────────────────────
@@ -316,20 +207,11 @@ system instead of asking you again.
         timelapse-web.service          disabled, stopped
 ```
 
-A unit that was running before and is not running after is reported as an
-error, with the `journalctl` line to look at. That is the one outcome worth
-interrupting you for, and it used to be reported as success.
+A unit that was running before and is not running after is reported as an error, with the `journalctl` line to look at. That is the one outcome worth interrupting you for, and it used to be reported as success.
 
-**The restart is not optional.** A running daemon keeps executing the code it
-read at startup, and `systemctl enable --now` does nothing to an already-active
-unit, so declining would leave the old build serving while every version number
-claimed otherwise. It costs only the frames due while it happens, a second or
-two. If you want to avoid even that, stop capture before upgrading: it will
-still be enabled and stopped afterwards, exactly as you left it.
+**The restart is not optional.** A running daemon keeps executing the code it read at startup, and `systemctl enable --now` does nothing to an already-active unit, so declining would leave the old build serving while every version number claimed otherwise. It costs only the frames due while it happens, a second or two. If you want to avoid even that, stop capture before upgrading: it will still be enabled and stopped afterwards, exactly as you left it.
 
-**New config keys** are read with defaults, so an older `config.json` keeps
-working; you get the new behaviour without editing anything. Re-run
-`timelapse setup` only if you actually want to change an answer.
+**New config keys** are read with defaults, so an older `config.json` keeps working; you get the new behaviour without editing anything. Re-run `timelapse setup` only if you actually want to change an answer.
 
 Check what is installed, and whether it is what is *running*:
 
@@ -349,8 +231,7 @@ timelapse version
   gui      0.2.0
 ```
 
-If the daemon predates the installed files it says so explicitly, which is the
-one failure mode a version number by itself cannot show you.
+If the daemon predates the installed files it says so explicitly, which is the one failure mode a version number by itself cannot show you.
 
 ### The manual way
 
@@ -372,26 +253,13 @@ sudo mkdir -p /var/lib/timelapse/{frames,videos,logs,state,web}
 sudo chown -R timelapse:timelapse /var/lib/timelapse
 ```
 
-`web` is for the optional web UI's index (§11). It costs nothing if you never
-turn that on, and creating it later is easy to forget: the unit names it in
-`ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths`
-points at a directory that is not there, with an error about mount namespaces
-that mentions neither.
+`web` is for the optional web UI's index (§11). It costs nothing if you never turn that on, and creating it later is easy to forget: the unit names it in `ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths` points at a directory that is not there, with an error about mount namespaces that mentions neither.
 
-Then edit `/etc/timelapse/config.json`: camera URLs, credentials, and, if you
-put frames anywhere other than `/var/lib/timelapse`, the `paths` block.
+Then edit `/etc/timelapse/config.json`: camera URLs, credentials, and, if you put frames anywhere other than `/var/lib/timelapse`, the `paths` block.
 
-> **If you change `paths`**, update `ReadWritePaths=` in *both* systemd units to
-> match. They run with `ProtectSystem=strict`, so an unlisted path fails with a
-> confusing read-only error. The same applies to a local transfer destination
-> such as a CIFS or NFS mountpoint.
+> **If you change `paths`**, update `ReadWritePaths=` in *both* systemd units to match. They run with `ProtectSystem=strict`, so an unlisted path fails with a confusing read-only error. The same applies to a local transfer destination such as a CIFS or NFS mountpoint.
 >
-> `state_dir` has a sharper version of the same rule: it is named in
-> `ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths`
-> points at a directory that does not exist. **Create it before you start the
-> services**, or both daemons fail with an error about mount namespaces that
-> mentions neither the directory nor the setting. The installer does this for
-> you; only a hand-built install has to remember.
+> `state_dir` has a sharper version of the same rule: it is named in `ReadWritePaths`, and systemd refuses to start a unit whose `ReadWritePaths` points at a directory that does not exist. **Create it before you start the services**, or both daemons fail with an error about mount namespaces that mentions neither the directory nor the setting. The installer does this for you; only a hand-built install has to remember.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
@@ -403,10 +271,7 @@ The installer runs it automatically. Run it again any time with:
 timelapse setup
 ```
 
-It scans `/proc/mounts` for real, writable, local filesystems (skipping pseudo
-filesystems, read-only mounts, snap/docker paths and network shares), reads free
-space with `statvfs`, and checks `/sys/block/<dev>/queue/rotational` to label
-each one SSD or HDD:
+It scans `/proc/mounts` for real, writable, local filesystems (skipping pseudo filesystems, read-only mounts, snap/docker paths and network shares), reads free space with `statvfs`, and checks `/sys/block/<dev>/queue/rotational` to label each one SSD or HDD:
 
 ```
    #  Mount                 Type          Free      Total   Notes
@@ -417,26 +282,16 @@ each one SSD or HDD:
   Which filesystem should hold the frames? [1]:
 ```
 
-It recommends the roomiest filesystem that isn't the OS disk. Every prompt has a
-default in brackets; Enter accepts it.
+It recommends the roomiest filesystem that isn't the OS disk. Every prompt has a default in brackets; Enter accepts it.
 
-It then covers ffmpeg paths (probing for NVENC and telling you which encoder you
-will actually get), the capture interval, a disk budget for your camera count,
-the low-space threshold, cameras, transfer, notifications and the optional
-web UI.
+It then covers ffmpeg paths (probing for NVENC and telling you which encoder you will actually get), the capture interval, a disk budget for your camera count, the low-space threshold, cameras, transfer, notifications and the optional web UI.
 
 Two things it does that are easy to get wrong by hand:
 
-- **URL-encodes credentials** that belong in a query string. A password
-  containing `&`, `#`, `=` or `%` silently breaks a hand-written Reolink URL.
-- **Derives `ReadWritePaths`** for the systemd units from the storage you chose.
-  The units run `ProtectSystem=strict`; an unlisted frames directory fails with
-  a read-only error that looks nothing like a permissions problem.
+- **URL-encodes credentials** that belong in a query string. A password containing `&`, `#`, `=` or `%` silently breaks a hand-written Reolink URL.
+- **Derives `ReadWritePaths`** for the systemd units from the storage you chose. The units run `ProtectSystem=strict`; an unlisted frames directory fails with a read-only error that looks nothing like a permissions problem.
 
-Network filesystems (NFS, CIFS, 9p, sshfs) are deliberately excluded as frame
-storage: `os.replace()` gives no atomicity guarantee across the wire, and 17k
-small writes per camera per day over a network is painful. They are still fine
-as a *transfer destination*, which is a nightly bulk copy.
+Network filesystems (NFS, CIFS, 9p, sshfs) are deliberately excluded as frame storage: `os.replace()` gives no atomicity guarantee across the wire, and 17k small writes per camera per day over a network is painful. They are still fine as a *transfer destination*, which is a nightly bulk copy.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
@@ -446,29 +301,20 @@ as a *transfer destination*, which is a nightly bulk copy.
 sudo -u timelapse python3 /opt/timelapse/timelapse_test.py /etc/timelapse/config.json
 ```
 
-This fetches one snapshot per camera and reports size, resolution, latency and
-auth result; writes samples to a temp directory so you can check quality; probes
-the encoders; projects daily disk usage against actual free space; verifies the
-transfer destination and the Discord webhook.
+This fetches one snapshot per camera and reports size, resolution, latency and auth result; writes samples to a temp directory so you can check quality; probes the encoders; projects daily disk usage against actual free space; verifies the transfer destination and the Discord webhook.
 
 Fix everything red before going further.
 
 ### Check the ONVIF profiles first
 
-If any camera URL contains `Profile_N`, check which profile is actually the main
-stream. On Hikvision, **Profile_1 is normally the main stream, Profile_2 the
-substream, Profile_3 the third stream**, but the numbering is not consistent
-across vendors, and nothing in the URL tells you which you got. Guessing wrong
-silently gives you a low-resolution timelapse.
+If any camera URL contains `Profile_N`, check which profile is actually the main stream. On Hikvision, **Profile_1 is normally the main stream, Profile_2 the substream, Profile_3 the third stream**, but the numbering is not consistent across vendors, and nothing in the URL tells you which you got. Guessing wrong silently gives you a low-resolution timelapse.
 
 ```bash
 sudo -u timelapse python3 /opt/timelapse/timelapse_test.py \
      /etc/timelapse/config.json --probe-profiles
 ```
 
-This fetches every profile from each ONVIF camera, prints the resolution and
-file size of each, saves samples for inspection and tells you which to put in
-the config:
+This fetches every profile from each ONVIF camera, prints the resolution and file size of each, saves samples for inspection and tells you which to put in the config:
 
 ```
   Workshop:
@@ -478,81 +324,31 @@ the config:
       -> highest resolution is Profile_1 (CHANGE the config from Profile_2 to Profile_1)
 ```
 
-Worth doing before the main test, because snapshot size drives the whole disk
-budget.
+Worth doing before the main test, because snapshot size drives the whole disk budget.
 
 ### Common snags
 
-- **HTTP 401**: try the other auth scheme (`digest` ↔ `basic`). **On Dahua and
-  Hikvision, check that you added an ONVIF user**, which is a list of its own,
-  separate from the web users: the admin account you sign in to the browser
-  with is refused on an ONVIF endpoint until it also exists there. Enabling the
-  ONVIF service is a separate step again, and both are needed. If the URL works
-  with no credentials at all, set `"auth": "none"` and drop the
-  username/password.
-- **Reolink-style URLs** put credentials in the query string, so they need
-  `"auth": "none"`. URL-encode any `&`, `#`, `+` or `%` in the password, or the
-  URL silently parses wrong.
-- **You changed a camera's password**: change it here too, with
-  `timelapse config` or `timelapse cameras`. Since 0.1.6 the daemon stops
-  presenting a rejected credential rather than repeating it every few seconds,
-  which is what used to hold the camera's account locked; it retries about
-  every half hour, so capture resumes on its own once the config is right, with
-  no restart needed. If you have notifications configured you get told when
-  this starts and when it clears. Note that a camera which has already locked
-  the account will refuse a **correct** password too, until its lockout
-  expires: that is the camera's timer, not this program's.
-- **A camera that passes one test fetch but fails in service**: some cameras
-  cope badly with sustained polling. Watch the first hour:
-  `grep <Camera> <log_dir>/capture.log`. Raising `interval_seconds` usually
-  fixes it.
-- **Regular bursts of HTTP 500 from one camera, minutes apart**: check whether
-  your NVR is *also* pulling from it. This is the most likely snag on a shared
-  host, because that is exactly where you would install this: leaving AgentDVR's
-  own timelapse or snapshot schedule enabled points two clients at one camera,
-  and most cameras answer the loser with `500` rather than queueing it.
+- **HTTP 401**: try the other auth scheme (`digest` ↔ `basic`). **On Dahua and Hikvision, check that you added an ONVIF user**, which is a list of its own, separate from the web users: the admin account you sign in to the browser with is refused on an ONVIF endpoint until it also exists there. Enabling the ONVIF service is a separate step again, and both are needed. If the URL works with no credentials at all, set `"auth": "none"` and drop the username/password.
+- **Reolink-style URLs** put credentials in the query string, so they need `"auth": "none"`. URL-encode any `&`, `#`, `+` or `%` in the password, or the URL silently parses wrong.
+- **You changed a camera's password**: change it here too, with `timelapse config` or `timelapse cameras`. Since 0.1.6 the daemon stops presenting a rejected credential rather than repeating it every few seconds, which is what used to hold the camera's account locked; it retries about every half hour, so capture resumes on its own once the config is right, with no restart needed. If you have notifications configured you get told when this starts and when it clears. Note that a camera which has already locked the account will refuse a **correct** password too, until its lockout expires: that is the camera's timer, not this program's.
+- **A camera that passes one test fetch but fails in service**: some cameras cope badly with sustained polling. Watch the first hour: `grep <Camera> <log_dir>/capture.log`. Raising `interval_seconds` usually fixes it.
+- **Regular bursts of HTTP 500 from one camera, minutes apart**: check whether your NVR is *also* pulling from it. This is the most likely snag on a shared host, because that is exactly where you would install this: leaving AgentDVR's own timelapse or snapshot schedule enabled points two clients at one camera, and most cameras answer the loser with `500` rather than queueing it.
 
-  The signature is a *fixed number* of consecutive failures per burst (a
-  duration, not a coin flip), recovering on its own each time. Turn off the
-  NVR's timelapse/snapshot schedule for cameras this tool owns; you are
-  replacing that feature, which is the point.
+  The signature is a *fixed number* of consecutive failures per burst (a duration, not a coin flip), recovering on its own each time. Turn off the NVR's timelapse/snapshot schedule for cameras this tool owns; you are replacing that feature, which is the point.
 
-  **The other symptom is a frame count that is short.** `timelapse usage`
-  reports one camera a few hundred frames below the others for the same day,
-  with nothing in the log that looks like a fault, because each individual
-  failure was retried or simply lost a tick. Confirmed on the author's own
-  deployment: one camera finished a day 220 frames (about 18 minutes) behind
-  six identical ones, purely because the NVR's own timelapse was still running
-  against it. If one camera is persistently short, look for the second client
-  before you look at the camera.
+  **The other symptom is a frame count that is short.** `timelapse usage` reports one camera a few hundred frames below the others for the same day, with nothing in the log that looks like a fault, because each individual failure was retried or simply lost a tick. Confirmed on the author's own deployment: one camera finished a day 220 frames (about 18 minutes) behind six identical ones, purely because the NVR's own timelapse was still running against it. If one camera is persistently short, look for the second client before you look at the camera.
 
-  You do not need to watch the journal for this. The nightly Discord summary
-  prints `Cov%` per camera; one camera sitting a few points below the others is
-  the same story.
-- **`av1_nvenc not available`**: distro ffmpeg builds often lack NVENC. Use a
-  BtbN static build or `jellyfin-ffmpeg` and point `paths.ffmpeg` at it. The
-  script falls back to HEVC then x264 rather than failing, but you lose AV1.
-- **Hardware encoding stopped working and nothing here changed**: the nightly
-  run reports every NVENC encoder as `not available`, selects
-  `H.264 (libx264)`, and an encode that took half an hour takes several. Check
-  the driver first, before the GPU and before this program:
+  You do not need to watch the journal for this. The nightly Discord summary prints `Cov%` per camera; one camera sitting a few points below the others is the same story.
+- **`av1_nvenc not available`**: distro ffmpeg builds often lack NVENC. Use a BtbN static build or `jellyfin-ffmpeg` and point `paths.ffmpeg` at it. The script falls back to HEVC then x264 rather than failing, but you lose AV1.
+- **Hardware encoding stopped working and nothing here changed**: the nightly run reports every NVENC encoder as `not available`, selects `H.264 (libx264)`, and an encode that took half an hour takes several. Check the driver first, before the GPU and before this program:
 
   ```bash
   nvidia-smi
   ```
 
-  `Failed to initialize NVML: Driver/library version mismatch` means the
-  NVIDIA packages were upgraded while the old kernel module was still loaded,
-  so the module and the userspace libraries are now different versions.
-  **Only a reboot fixes that.** On Ubuntu and Debian it is normally
-  unattended-upgrades, and `grep -i nvidia /var/log/apt/history.log` shows
-  when it happened.
+  `Failed to initialize NVML: Driver/library version mismatch` means the NVIDIA packages were upgraded while the old kernel module was still loaded, so the module and the userspace libraries are now different versions. **Only a reboot fixes that.** On Ubuntu and Debian it is normally unattended-upgrades, and `grep -i nvidia /var/log/apt/history.log` shows when it happened.
 
-  Nothing is lost while it lasts: capture never touches the GPU, and the
-  nightly encode keeps producing correct videos on libx264, just slowly and in
-  H.264. If you would rather it never happened unannounced, either hold the
-  driver packages and upgrade them deliberately, or let unattended-upgrades
-  reboot for you:
+  Nothing is lost while it lasts: capture never touches the GPU, and the nightly encode keeps producing correct videos on libx264, just slowly and in H.264. If you would rather it never happened unannounced, either hold the driver packages and upgrade them deliberately, or let unattended-upgrades reboot for you:
 
   ```bash
   sudo apt-mark hold nvidia-driver-XXX     # the version from history.log
@@ -560,10 +356,7 @@ budget.
   #   Unattended-Upgrade::Automatic-Reboot "true";
   ```
 
-  Since 0.2.1 both `timelapse test --encoders` and the nightly log name this
-  outright. Before that the log said `no free NVENC session`, which was a
-  guess, and a wrong one: read the `ffmpeg:` line under the hint, which is
-  what ffmpeg actually said.
+  Since 0.2.1 both `timelapse test --encoders` and the nightly log name this outright. Before that the log said `no free NVENC session`, which was a guess, and a wrong one: read the `ffmpeg:` line under the hint, which is what ffmpeg actually said.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
@@ -584,9 +377,7 @@ sudo systemctl enable --now timelapse-watch.timer
 journalctl -u timelapse-capture -f
 ```
 
-The web unit is copied and not enabled: it is off unless you ask for it (§11),
-and `timelapse web` is what turns it on. Copying it now means the file is
-there when you do.
+The web unit is copied and not enabled: it is off unless you ask for it (§11), and `timelapse web` is what turns it on. Copying it now means the file is there when you do.
 
 Check after an hour: at a 5s interval this should be ≈ 720 × cameras:
 
@@ -601,8 +392,7 @@ python3 /opt/timelapse/timelapse_encode.py /etc/timelapse/config.json \
         --date 2026-08-04 --dry-run --no-transfer
 ```
 
-`--dry-run --no-transfer` builds the concat list and reports frame counts
-without encoding, transferring or deleting anything. Safe on live data.
+`--dry-run --no-transfer` builds the concat list and reports frame counts without encoding, transferring or deleting anything. Safe on live data.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
@@ -610,36 +400,19 @@ without encoding, transferring or deleting anything. Safe on live data.
 
 ### If the destination is unavailable
 
-Nothing is lost. A failed transfer leaves the videos in `paths.video_output`
-and does not spoil the encode; the run exits `1`, so `timelapse status` shows
-`timelapse-encode.service` failed, and the Discord summary says
-`Transfer FAILED`. The next run picks up **everything** waiting in
-`video_output`, not just that night's video, so a backlog ships itself as soon
-as the destination comes back. A run with nothing to encode still ships the
-backlog, so fixing the share and running `timelapse encode` by hand works.
+Nothing is lost. A failed transfer leaves the videos in `paths.video_output` and does not spoil the encode; the run exits `1`, so `timelapse status` shows `timelapse-encode.service` failed, and the Discord summary says `Transfer FAILED`. The next run picks up **everything** waiting in `video_output`, not just that night's video, so a backlog ships itself as soon as the destination comes back. A run with nothing to encode still ships the backlog, so fixing the share and running `timelapse encode` by hand works.
 
-The one case that does **not** self-correct is a share that is not mounted
-while `require_mountpoint` is `false`. An unmounted mountpoint is an ordinary
-empty local directory, so rsync succeeds into it, `--remove-source-files`
-deletes the originals, and the run exits `0`. Nothing failed, so nothing is
-retried, and the videos sit on the local disk underneath the mountpoint where
-they will be hidden the moment the share mounts. Check yours:
+The one case that does **not** self-correct is a share that is not mounted while `require_mountpoint` is `false`. An unmounted mountpoint is an ordinary empty local directory, so rsync succeeds into it, `--remove-source-files` deletes the originals, and the run exits `0`. Nothing failed, so nothing is retried, and the videos sit on the local disk underneath the mountpoint where they will be hidden the moment the share mounts. Check yours:
 
 ```bash
 sudo grep require_mountpoint /etc/timelapse/config.json
 ```
 
-If the destination is a NAS share, this should be `true` (or the exact mount
-path, which is more precise). The wizard sets it for you when it recognises a
-CIFS/NFS destination or mounts the share itself, but a hand-written config or
-a path the wizard saw as an ordinary local directory will not have it.
+If the destination is a NAS share, this should be `true` (or the exact mount path, which is more precise). The wizard sets it for you when it recognises a CIFS/NFS destination or mounts the share itself, but a hand-written config or a path the wizard saw as an ordinary local directory will not have it.
 
-Note also that the backlog is unbounded: `encode.max_backlog_days` limits
-encoding, not transfer, and the disk guard watches `frames_root` rather than
-`video_output`. A destination that is down for weeks will accumulate videos.
+Note also that the backlog is unbounded: `encode.max_backlog_days` limits encoding, not transfer, and the disk guard watches `frames_root` rather than `video_output`. A destination that is down for weeks will accumulate videos.
 
-`transfer.destination` is either a local path or an rsync remote spec; one code
-path serves both.
+`transfer.destination` is either a local path or an rsync remote spec; one code path serves both.
 
 **rsync over SSH (recommended, no stale-mount failure mode):**
 
@@ -649,13 +422,7 @@ sudo -u timelapse ssh-copy-id user@nas
 # destination: "user@nas:/mnt/user/timelapse/"
 ```
 
-**CIFS/SMB share:** the wizard does this for you. Pick *"A network share
-(SMB/CIFS) - set it up for me"* at the transfer step and it will install
-`cifs-utils`, ask for the server, share, credentials and mount point, mount it
-(negotiating the SMB dialect), create the destination folder, work out which
-rsync flags the share accepts, and add an `/etc/fstab` entry with
-`nofail,x-systemd.automount` so it returns after a reboot without blocking boot
-if the NAS is down.
+**CIFS/SMB share:** the wizard does this for you. Pick *"A network share (SMB/CIFS) - set it up for me"* at the transfer step and it will install `cifs-utils`, ask for the server, share, credentials and mount point, mount it (negotiating the SMB dialect), create the destination folder, work out which rsync flags the share accepts, and add an `/etc/fstab` entry with `nofail,x-systemd.automount` so it returns after a reboot without blocking boot if the NAS is down.
 
 To set this up after the initial install, or to change it later:
 
@@ -665,63 +432,30 @@ sudo timelapse transfer
 
 Two things it exists to catch, both of which are silent by hand:
 
-- **`rsync -a` may or may not work.** `-a` implies `--owner --group`, which a
-  CIFS mount often cannot honour; rsync then exits `23` every night even
-  though the files arrived. Whether it happens depends on the server and the
-  mount options (`forceuid`/`forcegid` can make it a non-issue), so the script
-  tries `-a`, `-rt` and `-a --no-perms --no-owner --no-group` and tells you
-  which succeeded rather than guessing.
-- **A dropped mount is worse than a failed transfer.** An unmounted mountpoint
-  is an ordinary empty local directory, so rsync writes your videos to the
-  local disk and `--remove-source-files` then deletes the originals. Set
-  `"require_mountpoint": true` and the encoder refuses instead, leaving the
-  videos in `video_output` to ship on the next run.
+- **`rsync -a` may or may not work.** `-a` implies `--owner --group`, which a CIFS mount often cannot honour; rsync then exits `23` every night even though the files arrived. Whether it happens depends on the server and the mount options (`forceuid`/`forcegid` can make it a non-issue), so the script tries `-a`, `-rt` and `-a --no-perms --no-owner --no-group` and tells you which succeeded rather than guessing.
+- **A dropped mount is worse than a failed transfer.** An unmounted mountpoint is an ordinary empty local directory, so rsync writes your videos to the local disk and `--remove-source-files` then deletes the originals. Set `"require_mountpoint": true` and the encoder refuses instead, leaving the videos in `video_output` to ship on the next run.
 
-Whichever way you mount it, add the mountpoint to `ReadWritePaths=` in
-`timelapse-encode.service`; `ProtectSystem=strict` will otherwise fail the
-write read-only.
+Whichever way you mount it, add the mountpoint to `ReadWritePaths=` in `timelapse-encode.service`; `ProtectSystem=strict` will otherwise fail the write read-only.
 
-Set `transfer.enabled` to `false` to keep videos on the local disk. Note that
-nothing then prunes `video_output`; add your own retention if you do this.
+Set `transfer.enabled` to `false` to keep videos on the local disk. Note that nothing then prunes `video_output`; add your own retention if you do this.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
 ## 6a. Notifications
 
-One summary per nightly run: what encoded, coverage, size, failures, and
-whether the transfer worked. It goes to as many places as you like, or
-nowhere, which is the default.
+One summary per nightly run: what encoded, coverage, size, failures, and whether the transfer worked. It goes to as many places as you like, or nowhere, which is the default.
 
-![The nightly Discord summary from a Linux
-install](../screenshots/discord-notification-linux.png)
+![The nightly Discord summary from a Linux install](../screenshots/discord-notification-linux.png)
 
-*A full night on the Linux recorder. Roof reads 5,760 frames against the
-others' 17,280 and is still 100%: coverage is measured against the cadence
-**that camera** is running at, which is 15s there and 5s elsewhere, so a camera
-at a slower interval does not report as though it had missed most of the day.*
+*A full night on the Linux recorder. Roof reads 5,760 frames against the others' 17,280 and is still 100%: coverage is measured against the cadence **that camera** is running at, which is 15s there and 5s elsewhere, so a camera at a slower interval does not report as though it had missed most of the day.*
 
-![The same summary from a Windows
-install](../screenshots/discord-notification-windows.png)
+![The same summary from a Windows install](../screenshots/discord-notification-windows.png)
 
-*The same night from a Windows install running two of the same cameras, which
-is what the format looks like on the other platform: identical, because it is
-the same code. Two differences are worth reading. The encoder is `hevc_nvenc`
-rather than `av1_nvenc`, chosen by probing rather than configured, because that
-GPU does not offer AV1. And **Roof is at 42% and Street4K at 17%**, which is
-correct and is the case worth recognising: that install had been running for
-part of the day only, and coverage under 100% counts the part of the day before
-capture started as missing, because it is.*
+*The same night from a Windows install running two of the same cameras, which is what the format looks like on the other platform: identical, because it is the same code. Two differences are worth reading. The encoder is `hevc_nvenc` rather than `av1_nvenc`, chosen by probing rather than configured, because that GPU does not offer AV1. And **Roof is at 42% and Street4K at 17%**, which is correct and is the case worth recognising: that install had been running for part of the day only, and coverage under 100% counts the part of the day before capture started as missing, because it is.*
 
-Those two videos are the ones that appear twice in the library screenshot in
-[section 11](#the-index): two installs, one destination, one file each per
-camera per day.
+Those two videos are the ones that appear twice in the library screenshot in [section 11](#the-index): two installs, one destination, one file each per camera per day.
 
-The table is sized from its contents rather than to fixed widths, because **a
-Discord embed is narrower than a Discord message**: about 50 columns of a
-monospace block survive before it wraps, and a wrapped row folds its last field
-onto a second line under the first, which reads as this program having printed
-garbage. The date is a heading rather than a column for the same reason, since
-it would otherwise repeat the same value on every row and cost ten of them.
+The table is sized from its contents rather than to fixed widths, because **a Discord embed is narrower than a Discord message**: about 50 columns of a monospace block survive before it wraps, and a wrapped row folds its last field onto a second line under the first, which reads as this program having printed garbage. The date is a heading rather than a column for the same reason, since it would otherwise repeat the same value on every row and cost ten of them.
 
 ```bash
 sudo timelapse notify
@@ -733,25 +467,13 @@ sudo timelapse notify
 | **ntfy** | A topic name, and a server if you self-host | No account needed on `ntfy.sh`. Subscribe in the app or at `https://ntfy.sh/<topic>`. **On the public server the topic name is the only secret there is**, so pick one nobody would guess. An access token is supported for servers that require one. |
 | **Telegram** | A bot token from `@BotFather` and a chat id | Message your bot once before testing: a bot cannot open a conversation with you. For a group, add the bot and use the group's id, which starts with `-100`. |
 
-Each one is offered a test message as you configure it, and `timelapse test`
-sends one to every configured sink. It skips a sink the wizard verified in the
-last few minutes, so an install does not put two identical messages in your
-channel seconds apart; `timelapse test --force-notify` sends anyway.
+Each one is offered a test message as you configure it, and `timelapse test` sends one to every configured sink. It skips a sink the wizard verified in the last few minutes, so an install does not put two identical messages in your channel seconds apart; `timelapse test --force-notify` sends anyway.
 
-A failing sink can never fail the run it is reporting on, and one sink being
-down does not stop the others. Failures are logged and the encode's exit
-status is unaffected.
+A failing sink can never fail the run it is reporting on, and one sink being down does not stop the others. Failures are logged and the encode's exit status is unaffected.
 
-**If you configured Discord before 0.1.6**, nothing changes and there is
-nothing to do: the old `discord` block in `config.json` still works exactly as
-it did. The moment you run `timelapse notify`, the settings move into a
-`notify` list that can hold several sinks, and the old block is switched off so
-it cannot look configured while being ignored.
+**If you configured Discord before 0.1.6**, nothing changes and there is nothing to do: the old `discord` block in `config.json` still works exactly as it did. The moment you run `timelapse notify`, the settings move into a `notify` list that can hold several sinks, and the old block is switched off so it cannot look configured while being ignored.
 
-Notification credentials are masked by `timelapse config --redacted`: the bot
-token, the ntfy token and the secret half of a Discord webhook URL. The chat
-id, the topic and the webhook's numeric id survive, because they are what a
-fault report is about.
+Notification credentials are masked by `timelapse config --redacted`: the bot token, the ntfy token and the secret half of a Discord webhook URL. The chat id, the topic and the webhook's numeric id survive, because they are what a fault report is about.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
@@ -759,24 +481,17 @@ fault report is about.
 
 At a 5s interval: **17,280 frames/camera/day** → 4:48 of video at 60fps.
 
-At ~600 KB per 1440p snapshot that is ~10 GB/camera/day, and frames stay
-resident for up to two days (yesterday's are still there while the encoder works
-through them). Six cameras is therefore ~60 GB/day and ~130 GB resident.
+At ~600 KB per 1440p snapshot that is ~10 GB/camera/day, and frames stay resident for up to two days (yesterday's are still there while the encoder works through them). Six cameras is therefore ~60 GB/day and ~130 GB resident.
 
-Full-resolution main streams can be several times larger than that. Trust
-`timelapse_test.py`'s projection over any estimate; it measures your actual
-snapshots. A spinning disk is fine for frames; the access pattern is sequential
-write-once/read-once.
+Full-resolution main streams can be several times larger than that. Trust `timelapse_test.py`'s projection over any estimate; it measures your actual snapshots. A spinning disk is fine for frames; the access pattern is sequential write-once/read-once.
 
-Write endurance is a non-issue on SSD: even 110 GB/day is ~40 TB/year against a
-typical 600 TBW consumer rating.
+Write endurance is a non-issue on SSD: even 110 GB/day is ~40 TB/year against a typical 600 TBW consumer rating.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
 ## 8. Day to day: the `timelapse` command
 
-The installer puts a single wrapper on `PATH`. Everything below is a subcommand
-of it; nothing needs a reinstall.
+The installer puts a single wrapper on `PATH`. Everything below is a subcommand of it; nothing needs a reinstall.
 
 | Command | What it does |
 |---|---|
@@ -799,8 +514,7 @@ of it; nothing needs a reinstall.
 | `timelapse version` | The installed version of each script, and a warning if the running daemon predates them. |
 | `timelapse update` | Ask GitHub for the newest release, show what changed, and install it. §2. |
 
-**Which need root.** `config.json` is `0640 root:timelapse` because it holds
-camera credentials, so anything that touches it needs `sudo`:
+**Which need root.** `config.json` is `0640 root:timelapse` because it holds camera credentials, so anything that touches it needs `sudo`:
 
 | Needs `sudo` | Works unprivileged |
 |---|---|
@@ -810,59 +524,27 @@ camera credentials, so anything that touches it needs `sudo`:
 | `encode`, `web-serve` (they read it, and write frames and videos) | `version` |
 | `test`, `usage` (they read it) | `logs` |
 
-`test` and `usage` also work if you add yourself to the `timelapse` group,
-since they only read. The ones that write the config still need root: mode
-`0640` grants the group read but not write. `encode` needs root regardless,
-because group membership does not get it write access to the frame and video
-directories either.
+`test` and `usage` also work if you add yourself to the `timelapse` group, since they only read. The ones that write the config still need root: mode `0640` grants the group read but not write. `encode` needs root regardless, because group membership does not get it write access to the frame and video directories either.
 
-`logs` runs unprivileged but shows only your own messages unless you are in
-the `adm` or `systemd-journal` group, and says so when you are not.
+`logs` runs unprivileged but shows only your own messages unless you are in the `adm` or `systemd-journal` group, and says so when you are not.
 
-Getting this wrong is not dangerous: the command says which file it could not
-read and stops, rather than half-running.
+Getting this wrong is not dangerous: the command says which file it could not read and stops, rather than half-running.
 
-**On Windows the right-hand column is empty: open the prompt as
-administrator, whichever command you want.** The split above is about
-`config.json`, and that part is true on both systems, but `timelapse.cmd`
-itself lives in `%ProgramData%\timelapse`, which the installer restricts to
-SYSTEM and Administrators so that the camera passwords beside it are not
-readable by every account on the machine. Under UAC an allow entry for
-Administrators does not apply to an administrator who has not elevated, so
-`timelapse status` from an ordinary window is refused by Windows before this
-program starts, and the message is `Access is denied` with nothing after it.
-That is not a fault to report; it is the prompt.
+**On Windows the right-hand column is empty: open the prompt as administrator, whichever command you want.** The split above is about `config.json`, and that part is true on both systems, but `timelapse.cmd` itself lives in `%ProgramData%\timelapse`, which the installer restricts to SYSTEM and Administrators so that the camera passwords beside it are not readable by every account on the machine. Under UAC an allow entry for Administrators does not apply to an administrator who has not elevated, so `timelapse status` from an ordinary window is refused by Windows before this program starts, and the message is `Access is denied` with nothing after it. That is not a fault to report; it is the prompt.
 
-There is no `sudo` on Windows: privilege comes from how the window was opened.
-Right-click PowerShell or Command Prompt in the Start menu and choose **Run as
-administrator**. If you would rather not use a terminal at all, you do not have
-to: **Timelapse Setup** in the Start menu is the same wizard in a window, and
-it asks for administrator by itself.
+There is no `sudo` on Windows: privilege comes from how the window was opened. Right-click PowerShell or Command Prompt in the Start menu and choose **Run as administrator**. If you would rather not use a terminal at all, you do not have to: **Timelapse Setup** in the Start menu is the same wizard in a window, and it asks for administrator by itself.
 
-**A config change only reaches capture when it restarts.** The daemon reads its
-camera list once, at startup. `timelapse cameras` handles that for you; after a
-hand-edit with `timelapse config`, run `sudo systemctl restart
-timelapse-capture`. The encoder re-reads the config on every run, so it never
-needs this.
+**A config change only reaches capture when it restarts.** The daemon reads its camera list once, at startup. `timelapse cameras` handles that for you; after a hand-edit with `timelapse config`, run `sudo systemctl restart timelapse-capture`. The encoder re-reads the config on every run, so it never needs this.
 
 ### Asking for help without posting your passwords
 
-`config.json` holds a password for every camera, and for the Reolink-style
-cameras the password is *inside the URL*, which is easy to miss when pasting.
-Never post the file as it is.
+`config.json` holds a password for every camera, and for the Reolink-style cameras the password is *inside the URL*, which is easy to miss when pasting. Never post the file as it is.
 
 ```bash
 sudo timelapse config --redacted
 ```
 
-It prints the whole configuration with the credentials replaced by `***`:
-passwords under any key, credentials embedded in HTTP and RTSP URLs, and the
-Discord webhook token. Everything a fault report actually needs is kept, which
-is the deliberate part: camera addresses, usernames, the authentication mode,
-your paths, the transfer destination and the webhook's numeric id all remain,
-so read it through before posting it anywhere public if any of those are
-sensitive on your network. The dump says as much in a `_redacted` field at the
-top, so the warning travels with the text.
+It prints the whole configuration with the credentials replaced by `***`: passwords under any key, credentials embedded in HTTP and RTSP URLs, and the Discord webhook token. Everything a fault report actually needs is kept, which is the deliberate part: camera addresses, usernames, the authentication mode, your paths, the transfer destination and the webhook's numeric id all remain, so read it through before posting it anywhere public if any of those are sensitive on your network. The dump says as much in a `_redacted` field at the top, so the warning travels with the text.
 
 It writes nothing, takes no backup and opens no editor. To keep it in a file:
 
@@ -896,17 +578,9 @@ timelapse usage
   ....  The nightly encode skips them, so those frames stay forever.
 ```
 
-The two flagged rows are the point of the command. The encode job only walks
-cameras **enabled** in the config, so a camera you removed, or merely disabled,
-keeps everything it ever captured, and nothing will ever encode or delete it.
-That is normally what is eating the disk. Re-enable the camera, or encode the
-days out with `timelapse encode --date YYYY-MM-DD`: a named date reaches every
-camera folder on disk, including disabled and removed ones, while the nightly
-run leaves them alone.
+The two flagged rows are the point of the command. The encode job only walks cameras **enabled** in the config, so a camera you removed, or merely disabled, keeps everything it ever captured, and nothing will ever encode or delete it. That is normally what is eating the disk. Re-enable the camera, or encode the days out with `timelapse encode --date YYYY-MM-DD`: a named date reaches every camera folder on disk, including disabled and removed ones, while the nightly run leaves them alone.
 
-`ORPHAN` means no config entry at all; `disabled` means the entry exists with
-`enabled: false`. Frames are never deleted behind your back, so both are safe
-to leave; they just cost space.
+`ORPHAN` means no config entry at all; `disabled` means the entry exists with `enabled: false`. Frames are never deleted behind your back, so both are safe to leave; they just cost space.
 
 It stats every frame file, so on a busy install expect a few seconds.
 
@@ -917,16 +591,9 @@ timelapse_encode.py [config] [--date YYYY-MM-DD] [--dry-run]
                              [--keep-frames] [--no-transfer] [--force]
 ```
 
-Exit codes: `0` all good, `1` partial failure, `2` critical. Pass these through
-the wrapper too: `timelapse encode --date 2026-08-01 --keep-frames`.
+Exit codes: `0` all good, `1` partial failure, `2` critical. Pass these through the wrapper too: `timelapse encode --date 2026-08-01 --keep-frames`.
 
-**A day is encoded once.** On success the encoder drops a small
-`.encoded.json` into the day's frame directory, and skips any day that carries
-one. You will only ever notice this if you keep your frames
-(`encode.delete_frames_on_success: false`); when they are deleted, which is
-the default, the marker goes with them. Two ways to encode a day again:
-`--date 2026-08-01`, which ignores the marker for that one day, or `--force`,
-which ignores it for the whole backlog. Deleting the marker file works too.
+**A day is encoded once.** On success the encoder drops a small `.encoded.json` into the day's frame directory, and skips any day that carries one. You will only ever notice this if you keep your frames (`encode.delete_frames_on_success: false`); when they are deleted, which is the default, the marker goes with them. Two ways to encode a day again: `--date 2026-08-01`, which ignores the marker for that one day, or `--force`, which ignores it for the whole backlog. Deleting the marker file works too.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
@@ -936,8 +603,7 @@ which ignores it for the whole backlog. Deleting the marker file works too.
 sudo timelapse cameras
 ```
 
-No reinstall, and no walking the whole wizard again. It lists what you have and
-loops on single-key actions:
+No reinstall, and no walking the whole wizard again. It lists what you have and loops on single-key actions:
 
 ```
      #  Name           On  Type  URL
@@ -948,14 +614,11 @@ loops on single-key actions:
   a add   e edit   r remove   x enable/disable   t test   q save & quit
 ```
 
-Adding uses the same preset list and live test as the installer. Passwords in
-the query string are masked in the listing; `ask_secret` keeps them out of
-scroll-back when you type them, so printing them back would defeat it.
+Adding uses the same preset list and live test as the installer. Passwords in the query string are masked in the listing; `ask_secret` keeps them out of scroll-back when you type them, so printing them back would defeat it.
 
 ### Letting it find the cameras
 
-The first time you add a camera in a session, the wizard offers to look for
-them:
+The first time you add a camera in a session, the wizard offers to look for them:
 
 ```
   Scan this network for cameras? (Y/n):
@@ -970,9 +633,7 @@ them:
        0  none of these, enter an address by hand
 ```
 
-Picking one fills in the address and preselects the camera type. You still
-choose the **name**, because what a camera reports is its model, not where it
-is pointing, and three cameras from one maker report the same thing.
+Picking one fills in the address and preselects the camera type. You still choose the **name**, because what a camera reports is its model, not where it is pointing, and three cameras from one maker report the same thing.
 
 The same list on its own, without starting the wizard:
 
@@ -980,26 +641,14 @@ The same list on its own, without starting the wizard:
 timelapse discover
 ```
 
-That needs no root, writes nothing and sends no credentials, so it cannot lock
-a camera account no matter how often you run it.
+That needs no root, writes nothing and sends no credentials, so it cannot lock a camera account no matter how often you run it.
 
-Two things it cannot do, both worth knowing before you conclude something is
-broken:
+Two things it cannot do, both worth knowing before you conclude something is broken:
 
-- **It will not see a camera on another subnet or VLAN.** Discovery is
-  multicast, which stops at the first router. A camera VLAN is common in
-  exactly the setups that have the most cameras, so an empty result is normal
-  there and means nothing about whether the cameras work. Type the address in.
-- **It will not find a camera with ONVIF turned off**, and off is the state to
-  expect: every camera in the author's fleet arrived that way. It is a
-  per-camera setting in the camera's own web interface, so a scan that finds
-  nothing on a network full of cameras usually means exactly this rather than
-  a fault in the scan.
+- **It will not see a camera on another subnet or VLAN.** Discovery is multicast, which stops at the first router. A camera VLAN is common in exactly the setups that have the most cameras, so an empty result is normal there and means nothing about whether the cameras work. Type the address in.
+- **It will not find a camera with ONVIF turned off**, and off is the state to expect: every camera in the author's fleet arrived that way. It is a per-camera setting in the camera's own web interface, so a scan that finds nothing on a network full of cameras usually means exactly this rather than a fault in the scan.
 
-Cameras that report nothing about their maker (a Reolink calls itself
-`IPC-BO`, a TP-Link Tapo calls itself `TC40`) show `? choose below` and you
-pick the type from the list. That is deliberate: a wrong guess would be a
-wrong URL that looks like it was chosen on purpose.
+Cameras that report nothing about their maker (a Reolink calls itself `IPC-BO`, a TP-Link Tapo calls itself `TC40`) show `? choose below` and you pick the type from the list. That is deliberate: a wrong guess would be a wrong URL that looks like it was chosen on purpose.
 
 ### Skipping the menu
 
@@ -1014,27 +663,18 @@ sudo timelapse cameras -t:Doorbell     # fetch one snapshot; changes nothing
 sudo timelapse cameras -r:Doorbell     # remove it, after one confirmation
 ```
 
-Each takes **a name or the number `-l` prints**, so `-x:3` and `-x:Garage` are
-the same command. `-e 3`, `-e3` and `--edit=3` work too; the colon form is
-just the one that reads well next to a name.
+Each takes **a name or the number `-l` prints**, so `-x:3` and `-x:Garage` are the same command. `-e 3`, `-e3` and `--edit=3` work too; the colon form is just the one that reads well next to a name.
 
 Two details worth knowing:
 
-- **A name beats a number.** If you actually have a camera called `2`, then
-  `-e:2` edits *it*, not the second one in the list, and says so. Write `-e:#2`
-  to force the position. The number is only a position: nothing in the config
-  is a stable id, so it changes when you add or remove cameras above it.
-- **Nothing is fuzzy-matched.** `-r:Doorbel` is refused rather than guessed at.
-  One of these actions is "remove".
+- **A name beats a number.** If you actually have a camera called `2`, then `-e:2` edits *it*, not the second one in the list, and says so. Write `-e:#2` to force the position. The number is only a position: nothing in the config is a stable id, so it changes when you add or remove cameras above it.
+- **Nothing is fuzzy-matched.** `-r:Doorbel` is refused rather than guessed at. One of these actions is "remove".
 
-The warnings about stranded frames below apply exactly as they do in the menu,
-and `-t` writes nothing at all, so it neither backs up your config nor offers
-to restart capture.
+The warnings about stranded frames below apply exactly as they do in the menu, and `-t` writes nothing at all, so it neither backs up your config nor offers to restart capture.
 
 ### Giving one camera its own interval and frame rate
 
-The capture interval and the frame rate are global defaults, and **any camera
-can override either**. Editing a camera asks:
+The capture interval and the frame rate are global defaults, and **any camera can override either**. Editing a camera asks:
 
 ```
   This camera can run on its own cadence. The defaults are one frame
@@ -1045,22 +685,11 @@ can override either**. Editing a camera asks:
   1,440 frames/day -> 0:48 of video at 30fps
 ```
 
-A wide general view of a courtyard is fine at one frame a minute played at
-30fps. A workbench, where you want to watch a print finish or a miniature get
-painted, wants three seconds and produces a much longer video. Both can run on
-the same host at the same time.
+A wide general view of a courtyard is fine at one frame a minute played at 30fps. A workbench, where you want to watch a print finish or a miniature get painted, wants three seconds and produces a much longer video. Both can run on the same host at the same time.
 
-**A change takes effect at the next midnight.** One day is one video at one
-cadence, so today keeps the cadence it started with and the new one begins at
-00:00. Nothing to remember and nothing to time: you can restart capture
-straight away, or not, and it makes no difference. The day directory records
-what it began at, so a restart, a crash or a power cut in between all leave
-today alone.
+**A change takes effect at the next midnight.** One day is one video at one cadence, so today keeps the cadence it started with and the new one begins at 00:00. Nothing to remember and nothing to time: you can restart capture straight away, or not, and it makes no difference. The day directory records what it began at, so a restart, a crash or a power cut in between all leave today alone.
 
-**Answering with the global value removes the setting rather than storing a
-copy.** That is deliberate: a camera you have not pinned keeps following the
-defaults, so changing the global interval later still moves it. Only cameras
-you deliberately set stay put, and `timelapse cameras -l` marks them:
+**Answering with the global value removes the setting rather than storing a copy.** That is deliberate: a camera you have not pinned keeps following the defaults, so changing the global interval later still moves it. Only cameras you deliberately set stay put, and `timelapse cameras -l` marks them:
 
 ```
      #  Name           On  Cadence     Type URL
@@ -1071,20 +700,12 @@ you deliberately set stay put, and `timelapse cameras -l` marks them:
 
 Four things happen automatically, so they are not extra settings:
 
-- The **fetch timeout** is clamped below whichever interval applies. The
-  global timeout is chosen against the global interval, so a camera on a
-  shorter one would otherwise still have a request in flight when its next
-  snapshot is due.
-- The **keyframe interval** follows the frame rate, staying at two seconds'
-  worth rather than becoming four seconds at 30fps.
-- **`Cov%`** in the nightly Discord summary is measured against that camera's
-  interval. Otherwise a camera at one frame a minute would report 8% coverage
-  after a perfect day.
-- The **disk projection** in `timelapse test` sums per camera rather than
-  multiplying one figure by the camera count.
+- The **fetch timeout** is clamped below whichever interval applies. The global timeout is chosen against the global interval, so a camera on a shorter one would otherwise still have a request in flight when its next snapshot is due.
+- The **keyframe interval** follows the frame rate, staying at two seconds' worth rather than becoming four seconds at 30fps.
+- **`Cov%`** in the nightly Discord summary is measured against that camera's interval. Otherwise a camera at one frame a minute would report 8% coverage after a perfect day.
+- The **disk projection** in `timelapse test` sums per camera rather than multiplying one figure by the camera count.
 
-`timelapse test` gained a **Cadence** section that spells out what each camera
-will produce:
+`timelapse test` gained a **Cadence** section that spells out what each camera will produce:
 
 ```
 === Cadence ===
@@ -1093,26 +714,15 @@ will produce:
   PASS  Roof: every 60s at 30fps -> 1,440 frames/day, 0:48 of video (own)
 ```
 
-It **fails** a camera whose frames per day fall below `encode.min_frames`
-(default 100), because the nightly encode skips a day with fewer than that.
-An interval of 15 minutes or longer would otherwise produce nothing at all,
-every night, without anything ever reporting a failure.
+It **fails** a camera whose frames per day fall below `encode.min_frames` (default 100), because the nightly encode skips a day with fewer than that. An interval of 15 minutes or longer would otherwise produce nothing at all, every night, without anything ever reporting a failure.
 
-The recorded cadence lives in `.cadence.json` inside each day directory. It is
-a dotfile, so nothing counts it as a frame, and it goes when that day's frames
-go. Days captured before 0.1.2 have none, and both programs fall back to the
-config for those.
+The recorded cadence lives in `.cadence.json` inside each day directory. It is a dotfile, so nothing counts it as a frame, and it goes when that day's frames go. Days captured before 0.1.2 have none, and both programs fall back to the config for those.
 
-**It restarts capture for you.** The daemon reads its camera list once, at
-startup, so an edit does nothing until it restarts; you are asked, and told the
-command if you decline. Nothing here touches paths, so the systemd units are
-unaffected.
+**It restarts capture for you.** The daemon reads its camera list once, at startup, so an edit does nothing until it restarts; you are asked, and told the command if you decline. Nothing here touches paths, so the systemd units are unaffected.
 
 ### Smoothing one camera's motion
 
-Timelapses shimmer. At one frame every 5 seconds, leaves are somewhere
-different in every frame, so foliage boils and the whole picture looks like it
-is jumping. Adding or editing a camera offers to settle it:
+Timelapses shimmer. At one frame every 5 seconds, leaves are somewhere different in every frame, so foliage boils and the whole picture looks like it is jumping. Adding or editing a camera offers to settle it:
 
 ```
   Smoothing averages neighbouring frames when encoding, so wind
@@ -1125,11 +735,7 @@ is jumping. Adding or editing a camera offers to settle it:
   already encoded keep their video unless you re-encode with --force.
 ```
 
-**It is off unless you ask, and it is per camera.** There is no global setting,
-on purpose: this is not like the interval and frame rate, which have a default
-every camera follows. Smoothing is worth having on a roof full of trees and
-actively unwanted on a gate people walk through, so each camera answers for
-itself. Upgrading an existing install changes nothing.
+**It is off unless you ask, and it is per camera.** There is no global setting, on purpose: this is not like the interval and frame rate, which have a default every camera follows. Smoothing is worth having on a roof full of trees and actively unwanted on a gate people walk through, so each camera answers for itself. Upgrading an existing install changes nothing.
 
 `timelapse cameras -l` shows it as `+N` next to the cadence:
 
@@ -1141,47 +747,22 @@ itself. Upgrading an existing install changes nothing.
     +N averages N frames at encode time to smooth motion; capture is unchanged.
 ```
 
-**What to expect, honestly.** It fixes the shimmer, which is the constant,
-everyday judder. It cannot make cars or people fluid: at a 5 second interval
-something crossing the frame is photographed once and once only, so averaging
-softens the flash into a brief ghost instead of a hard pop, and that is the
-whole of what any amount of processing can do. The only real fix for fast
-motion is a shorter capture interval, which costs storage in proportion.
+**What to expect, honestly.** It fixes the shimmer, which is the constant, everyday judder. It cannot make cars or people fluid: at a 5 second interval something crossing the frame is photographed once and once only, so averaging softens the flash into a brief ghost instead of a hard pop, and that is the whole of what any amount of processing can do. The only real fix for fast motion is a shorter capture interval, which costs storage in proportion.
 
 Two side effects worth knowing:
 
-- **A camera's burnt-in clock blurs its fastest digits.** They are different in
-  every frame being averaged, so they smear. At 15 frames the date, hour and
-  minute stay readable and the seconds do not, which at 300x playback speed is
-  usually nobody's loss. If it bothers you, most cameras can drop seconds from
-  the overlay.
-- **Nothing else changes.** Capture, storage, frame counts, coverage and the
-  length of the video are all identical; only the picture differs. Encoding
-  costs a few percent more.
+- **A camera's burnt-in clock blurs its fastest digits.** They are different in every frame being averaged, so they smear. At 15 frames the date, hour and minute stay readable and the seconds do not, which at 300x playback speed is usually nobody's loss. If it bothers you, most cameras can drop seconds from the overlay.
+- **Nothing else changes.** Capture, storage, frame counts, coverage and the length of the video are all identical; only the picture differs. Encoding costs a few percent more.
 
-**Which value.** 15 is the offered default and suits a wide view where the
-detail is small anyway. Lower values keep events crisper: at 3 a passing
-delivery van is still clearly a van, while at 30 it is a faint wash. If you are
-unsure, start at 15 on one camera, watch a day, and adjust.
+**Which value.** 15 is the offered default and suits a wide view where the detail is small anyway. Lower values keep events crisper: at 3 a passing delivery van is still clearly a van, while at 30 it is a faint wash. If you are unsure, start at 15 on one camera, watch a day, and adjust.
 
-**Turn it on during the day and that same day is smoothed.** The nightly run
-just after midnight encodes the day that has just finished, and it reads the
-config as it stands then, so there is nothing to wait for.
+**Turn it on during the day and that same day is smoothed.** The nightly run just after midnight encodes the day that has just finished, and it reads the config as it stands then, so there is nothing to wait for.
 
-This is worth stating because it is the opposite of the interval and frame
-rate above. Those are pinned to what a day was actually *captured* at, so an
-edit cannot land halfway through a day and today keeps the cadence it started
-with. Smoothing is not part of the capture at all, so it has no such anchor:
-whatever the config says when the encoder runs is what that run uses. The same
-goes for any older days still waiting in the backlog, which that run will
-smooth too. Days already encoded keep the video they have; re-encoding one
-needs `timelapse_encode.py --force`.
+This is worth stating because it is the opposite of the interval and frame rate above. Those are pinned to what a day was actually *captured* at, so an edit cannot land halfway through a day and today keeps the cadence it started with. Smoothing is not part of the capture at all, so it has no such anchor: whatever the config says when the encoder runs is what that run uses. The same goes for any older days still waiting in the backlog, which that run will smooth too. Days already encoded keep the video they have; re-encoding one needs `timelapse_encode.py --force`.
 
 ### It will not let you strand frames silently
 
-The nightly encode builds its work list from the cameras **enabled** in the
-config and looks for `<frames_root>/<name>/`. So three things can orphan
-already-captured frames, and each one warns first:
+The nightly encode builds its work list from the cameras **enabled** in the config and looks for `<frames_root>/<name>/`. So three things can orphan already-captured frames, and each one warns first:
 
 | Action | What would be lost |
 |---|---|
@@ -1197,12 +778,9 @@ already-captured frames, and each one warns first:
   Remove it anyway? (y/N):
 ```
 
-A rename offers to move the directory with it, so that case is normally
-handled for you. Frames are never deleted; a removed camera's directory stays
-on disk, and re-adding it under the same name picks it straight back up.
+A rename offers to move the directory with it, so that case is normally handled for you. Frames are never deleted; a removed camera's directory stays on disk, and re-adding it under the same name picks it straight back up.
 
-Editing `config.json` by hand still works (`timelapse config`), but then the
-restart and the stranding checks are yours to remember.
+Editing `config.json` by hand still works (`timelapse config`), but then the restart and the stranding checks are yours to remember.
 
 ---
 
@@ -1210,9 +788,7 @@ restart and the stranding checks are yours to remember.
 
 ## 10. Config backups and restoring
 
-A backup is taken **before every change**, automatically, and the five most
-recent are kept. That covers the wizard, `timelapse cameras`, `transfer`,
-`web`, and `timelapse config` before it opens your editor.
+A backup is taken **before every change**, automatically, and the five most recent are kept. That covers the wizard, `timelapse cameras`, `transfer`, `web`, and `timelapse config` before it opens your editor.
 
 They live beside the config, named for when they were taken:
 
@@ -1238,40 +814,25 @@ sudo timelapse restore
   Restore which backup? (0 cancels) [0]:
 ```
 
-Newest first. The listing reads each one and says what is in it, so you are
-picking a configuration rather than a timestamp. Three things it tells you:
+Newest first. The listing reads each one and says what is in it, so you are picking a configuration rather than a timestamp. Three things it tells you:
 
-- **`= current`** marks a backup identical to what you are running, compared
-  on the parsed settings rather than the bytes, so a trailing newline does not
-  make two identical configs look different.
-- **`unreadable`** marks one that will not parse. It is still listed, and still
-  numbered, but picking it is refused rather than acted on.
-- **Restoring is reversible.** The current config is backed up first, so if you
-  pick the wrong one it is number 1 in the same list next time.
+- **`= current`** marks a backup identical to what you are running, compared on the parsed settings rather than the bytes, so a trailing newline does not make two identical configs look different.
+- **`unreadable`** marks one that will not parse. It is still listed, and still numbered, but picking it is refused rather than acted on.
+- **Restoring is reversible.** The current config is backed up first, so if you pick the wrong one it is number 1 in the same list next time.
 
 `sudo timelapse restore -l` lists without restoring, and works headless.
 
-**It does not need a working config.** "I broke it" and "it is gone" are the
-two reasons to run this, so it reads the backups directly and never refuses
-because `config.json` is corrupt or missing.
+**It does not need a working config.** "I broke it" and "it is gone" are the two reasons to run this, so it reads the backups directly and never refuses because `config.json` is corrupt or missing.
 
-Restoring restarts capture and the web UI for you, after asking, since both
-read the config only at startup.
+Restoring restarts capture and the web UI for you, after asking, since both read the config only at startup.
 
-Backups carry the config's `0640`, because they hold the same camera
-passwords. They are owned by `root` rather than `root:timelapse`: the service
-has no reason to read one.
+Backups carry the config's `0640`, because they hold the same camera passwords. They are owned by `root` rather than `root:timelapse`: the service has no reason to read one.
 
 ### Where camera passwords can turn up, and one place they used to
 
-The config, its backups and (for a Reolink-style camera) the URL itself are
-the places a password lives by design. All are `0640 root:timelapse`.
+The config, its backups and (for a Reolink-style camera) the URL itself are the places a password lives by design. All are `0640 root:timelapse`.
 
-**Versions before 0.1.3 also wrote it to the log.** A failed snapshot logged
-the error `requests` raised, and that error quotes the URL it was fetching,
-credentials and all. One 502 from a camera put the password in journald, in
-`capture.log`, and on the web UI's log page. If you have ever run an earlier
-version, assume it is exposed:
+**Versions before 0.1.3 also wrote it to the log.** A failed snapshot logged the error `requests` raised, and that error quotes the URL it was fetching, credentials and all. One 502 from a camera put the password in journald, in `capture.log`, and on the web UI's log page. If you have ever run an earlier version, assume it is exposed:
 
 ```bash
 sudo timelapse update                              # stop new leaks first
@@ -1280,22 +841,11 @@ sudo rm -f /var/lib/timelapse/logs/capture.log*
 sudo journalctl --rotate && sudo journalctl --vacuum-time=1s
 ```
 
-That last pair throws away the whole journal, not only these lines; journald
-has no way to delete selected entries. Who could have read them: anyone in the
-`systemd-journal` or `adm` groups, and anyone who could reach the web UI,
-which is worth checking if you moved `web.bind` off `127.0.0.1`.
+That last pair throws away the whole journal, not only these lines; journald has no way to delete selected entries. Who could have read them: anyone in the `systemd-journal` or `adm` groups, and anyone who could reach the web UI, which is worth checking if you moved `web.bind` off `127.0.0.1`.
 
-From 0.1.3 the daemons mask credentials in everything they log, and the web UI
-masks them in anything it displays, including the entries written before the
-fix.
+From 0.1.3 the daemons mask credentials in everything they log, and the web UI masks them in anything it displays, including the entries written before the fix.
 
-**Two more places worth knowing about.** Sending the config to somebody is the
-one route no daemon can guard, so use `timelapse config --redacted` for that;
-see §8. And your editor may keep a copy of its own: vim writes `config.json~`
-next to the file, or into wherever `backupdir` points, carrying the same
-`0640 root:timelapse`. That is no worse than the config itself, but it is an
-extra copy that nothing rotates, so it can still be holding a password you
-have since changed. `sudo ls -la /etc/timelapse` shows anything left there.
+**Two more places worth knowing about.** Sending the config to somebody is the one route no daemon can guard, so use `timelapse config --redacted` for that; see §8. And your editor may keep a copy of its own: vim writes `config.json~` next to the file, or into wherever `backupdir` points, carrying the same `0640 root:timelapse`. That is no worse than the config itself, but it is an extra copy that nothing rotates, so it can still be holding a password you have since changed. `sudo ls -la /etc/timelapse` shows anything left there.
 
 ---
 
@@ -1303,16 +853,11 @@ have since changed. `sudo ls -la /etc/timelapse` shows anything left there.
 
 ## 11. The web UI
 
-Optional, off by default, and read-only: it never triggers an encode, controls
-a camera, edits the config or deletes anything.
+Optional, off by default, and read-only: it never triggers an encode, controls a camera, edits the config or deletes anything.
 
 ![The Overview page](../screenshots/webui-overview.png)
 
-*The Overview, from a real eight-camera deployment. The camera table is the
-part `systemctl` cannot produce: Gate is answering and has still lost 88
-fetches today, and Roof is deliberately at a different cadence. The version
-panel is showing an out-of-date install on purpose, so that the update notice
-is visible.*
+*The Overview, from a real eight-camera deployment. The camera table is the part `systemctl` cannot produce: Gate is answering and has still lost 88 fetches today, and Roof is deliberately at a different cadence. The version panel is showing an out-of-date install on purpose, so that the update notice is visible.*
 
 Turn it on with:
 
@@ -1321,151 +866,72 @@ sudo timelapse web
 sudo systemctl enable --now timelapse-web.service
 ```
 
-It suggests this host's LAN address, so the page opens at whatever it reported,
-for example `http://192.168.1.50:8787/`. Read the section on securing it below
-before accepting that. If you would rather keep it to this machine, answer
-`127.0.0.1` at the prompt.
+It suggests this host's LAN address, so the page opens at whatever it reported, for example `http://192.168.1.50:8787/`. Read the section on securing it below before accepting that. If you would rather keep it to this machine, answer `127.0.0.1` at the prompt.
 
-Re-run `sudo timelapse web` any time to change the address, port or library
-path; it offers to restart the service so the change takes effect. Editing
-`config.json` by hand does not, so follow that with `sudo systemctl restart
-timelapse-web`: the server reads its config once, at startup.
+Re-run `sudo timelapse web` any time to change the address, port or library path; it offers to restart the service so the change takes effect. Editing `config.json` by hand does not, so follow that with `sudo systemctl restart timelapse-web`: the server reads its config once, at startup.
 
 It gives you six things:
 
-- **Where your videos actually are**, at the head of the Library tab: the
-  path, how it was worked out, and whether it can be read. See the warning
-  below, this is the question people get wrong. If it cannot be read the
-  Overview says so too, since that is a fault and not a detail.
-- **Whether your cameras are actually answering.** A table on the Overview,
-  one row per camera: when its last frame landed, the cadence it is running
-  at, how many frames are on disk for today, what percentage of the day that
-  covers, and how many fetches have failed. This is the thing `systemctl` cannot tell you. A daemon whose
-  cameras are all refusing connections is "running", and so is one that has
-  paused itself because the disk filled up; both look perfect in the Services
-  table and neither is capturing anything.
-- **What last night's encode did**: when it ran, how long it took, which
-  encoder, how many videos, whether the transfer worked, and a row per camera
-  with the frame count and the coverage percentage.
-- **Service status and recent log**, without an SSH session. Service status is
-  a row per unit on the Overview, saying whether each part is working
-  and what to do if it is not, rather than the page of systemd internals
-  `timelapse status` prints. *Technical data* links to the full output, which
-  is what to paste into a bug report.
+- **Where your videos actually are**, at the head of the Library tab: the path, how it was worked out, and whether it can be read. See the warning below, this is the question people get wrong. If it cannot be read the Overview says so too, since that is a fault and not a detail.
+- **Whether your cameras are actually answering.** A table on the Overview, one row per camera: when its last frame landed, the cadence it is running at, how many frames are on disk for today, what percentage of the day that covers, and how many fetches have failed. This is the thing `systemctl` cannot tell you. A daemon whose cameras are all refusing connections is "running", and so is one that has paused itself because the disk filled up; both look perfect in the Services table and neither is capturing anything.
+- **What last night's encode did**: when it ran, how long it took, which encoder, how many videos, whether the transfer worked, and a row per camera with the frame count and the coverage percentage.
+- **Service status and recent log**, without an SSH session. Service status is a row per unit on the Overview, saying whether each part is working and what to do if it is not, rather than the page of systemd internals `timelapse status` prints. *Technical data* links to the full output, which is what to paste into a bug report.
 - **An index of finished videos**, browsable by camera, by day and by folder.
-- **Playback in your own player.** Each video has a *Play* link that hands VLC
-  (or mpv, or whatever opens `.m3u`) a playlist pointing back at the server,
-  plus a *Download* link. There is also **one playlist per day**: open it and
-  your player queues that day's videos from every camera in turn.
-- **Whether there is a new version**, with the command to upgrade and a link
-  to the release notes. See below; you can turn it off.
+- **Playback in your own player.** Each video has a *Play* link that hands VLC (or mpv, or whatever opens `.m3u`) a playlist pointing back at the server, plus a *Download* link. There is also **one playlist per day**: open it and your player queues that day's videos from every camera in turn.
+- **Whether there is a new version**, with the command to upgrade and a link to the release notes. See below; you can turn it off.
 
 ### The update check, and the only packet this UI sends
 
-The Overview page tells you which version you are running, whether a newer one
-has been tagged, and the command to upgrade (`sudo timelapse update`). What
-changed is a link to the release on GitHub, which opens in a new tab: release
-notes are markdown, this page is not a markdown renderer, and GitHub already
-renders them properly. `sudo timelapse update` prints them in the terminal
-before asking to install, where plain text is the right format anyway.
+The Overview page tells you which version you are running, whether a newer one has been tagged, and the command to upgrade (`sudo timelapse update`). What changed is a link to the release on GitHub, which opens in a new tab: release notes are markdown, this page is not a markdown renderer, and GitHub already renders them properly. `sudo timelapse update` prints them in the terminal before asking to install, where plain text is the right format anyway.
 
-It asks `api.github.com` **at most once a day**, and only while somebody has
-the page open, so a service nobody looks at never contacts anything. The
-answer is cached in `web.state_dir` and survives restarts.
+It asks `api.github.com` **at most once a day**, and only while somebody has the page open, so a service nobody looks at never contacts anything. The answer is cached in `web.state_dir` and survives restarts.
 
-**This is the only outbound connection the web UI ever makes.** It sends no
-configuration, no camera names, and nothing about your videos or your library.
-GitHub sees this host's IP address and a User-Agent naming the project and
-version, the same as any browser visiting the repository page would.
+**This is the only outbound connection the web UI ever makes.** It sends no configuration, no camera names, and nothing about your videos or your library. GitHub sees this host's IP address and a User-Agent naming the project and version, the same as any browser visiting the repository page would.
 
-`timelapse web` asks whether you want it, and it is on by default, including
-after an upgrade. To turn it off:
+`timelapse web` asks whether you want it, and it is on by default, including after an upgrade. To turn it off:
 
 ```bash
 sudo timelapse web        # answer "n" to "Check GitHub for updates?"
 ```
 
-or set `"update_check": false` in the `web` section of `config.json` and run
-`sudo systemctl restart timelapse-web`.
+or set `"update_check": false` in the `web` section of `config.json` and run `sudo systemctl restart timelapse-web`.
 
 ### Your videos are probably not in `video_output`
 
-The nightly transfer runs `rsync --remove-source-files`, so once it has run,
-`paths.video_output` is **empty**; the videos are at `transfer.destination`.
-The UI works this out for you and says which path it chose. Two cases worth
-knowing:
+The nightly transfer runs `rsync --remove-source-files`, so once it has run, `paths.video_output` is **empty**; the videos are at `transfer.destination`. The UI works this out for you and says which path it chose. Two cases worth knowing:
 
-- **A remote destination** (`user@nas:/mnt/user/timelapse/`) is not a path this
-  host can read at all. The page says so rather than showing an empty list.
-- **A NAS that is not mounted** looks identical to an empty library, so the
-  page reports the directory as unreadable instead of pretending it is empty.
+- **A remote destination** (`user@nas:/mnt/user/timelapse/`) is not a path this host can read at all. The page says so rather than showing an empty list.
+- **A NAS that is not mounted** looks identical to an empty library, so the page reports the directory as unreadable instead of pretending it is empty.
 
-**Browsing the library requires a readable path, and that is a prerequisite
-rather than a limitation to be worked around.** There are exactly two ways to
-have one, and either is fine:
+**Browsing the library requires a readable path, and that is a prerequisite rather than a limitation to be worked around.** There are exactly two ways to have one, and either is fine:
 
-- **Mount the destination share** (CIFS, NFS, sshfs) and give the mount point
-  as `web.library_root`. A mounted share is an absolute path, so the UI treats
-  it as local and browses it normally. This is the usual answer, and the wizard
-  can set up a CIFS mount for you.
-- **Leave transfer disabled**, so the videos stay in `paths.video_output`,
-  which the UI reads by default.
+- **Mount the destination share** (CIFS, NFS, sshfs) and give the mount point as `web.library_root`. A mounted share is an absolute path, so the UI treats it as local and browses it normally. This is the usual answer, and the wizard can set up a CIFS mount for you.
+- **Leave transfer disabled**, so the videos stay in `paths.video_output`, which the UI reads by default.
 
-Reaching an SSH-only destination directly, over SFTP, was considered and
-**refused**: it would give the one network-facing service a second outbound
-connection, over SSH, to the host holding every video you have, and mounting
-the same share costs a line in `/etc/fstab`. The reasoning is in
-[decided-against.md](decided-against.md). So if the page tells you the library
-is a remote rsync target, mount it; nothing else is coming.
+Reaching an SSH-only destination directly, over SFTP, was considered and **refused**: it would give the one network-facing service a second outbound connection, over SSH, to the host holding every video you have, and mounting the same share costs a line in `/etc/fstab`. The reasoning is in [decided-against.md](decided-against.md). So if the page tells you the library is a remote rsync target, mount it; nothing else is coming.
 
-Do not put the library under `/tmp` or `/var/tmp`. The unit sets
-`PrivateTmp=true`, so the service gets a private empty one and reports your
-library as unreadable: correct, and thoroughly confusing.
+Do not put the library under `/tmp` or `/var/tmp`. The unit sets `PrivateTmp=true`, so the service gets a private empty one and reports your library as unreadable: correct, and thoroughly confusing.
 
 ### It is not secured, so bind it accordingly
 
-There is **no HTTPS**, and the optional login below is a door lock rather than
-a safe. The wizard suggests this host's LAN address, because a page you can
-only open on the recorder itself is not much use, and it says so plainly when
-you accept it: **anyone on that network can watch your cameras' footage.**
+There is **no HTTPS**, and the optional login below is a door lock rather than a safe. The wizard suggests this host's LAN address, because a page you can only open on the recorder itself is not much use, and it says so plainly when you accept it: **anyone on that network can watch your cameras' footage.**
 
-That is the right trade on a trusted home LAN and the wrong one anywhere else.
-Answer `127.0.0.1` to keep it to this machine. Put a reverse proxy with TLS and
-authentication in front of it for anything wider, and do not port-forward it.
+That is the right trade on a trusted home LAN and the wrong one anywhere else. Answer `127.0.0.1` to keep it to this machine. Put a reverse proxy with TLS and authentication in front of it for anything wider, and do not port-forward it.
 
-**IPv6 works here too.** Any address this host holds is accepted, `::1` is the
-IPv6 loopback, and `::` accepts IPv4 connections as well, so it is the IPv6
-equivalent of `0.0.0.0`. A link-local address (`fe80::`) is not offered,
-because it cannot be bound without naming the interface it belongs to.
+**IPv6 works here too.** Any address this host holds is accepted, `::1` is the IPv6 loopback, and `::` accepts IPv4 connections as well, so it is the IPv6 equivalent of `0.0.0.0`. A link-local address (`fe80::`) is not offered, because it cannot be bound without naming the interface it belongs to.
 
 ### The optional login
 
-`timelapse web` offers a single username and password. Leave it off and
-everything behaves as it always has. Turn it on and the Overview, the Library,
-the logs and the status pages ask for it first; a session lasts until you press
-**Log out**, and expires by itself after 30 days idle.
+`timelapse web` offers a single username and password. Leave it off and everything behaves as it always has. Turn it on and the Overview, the Library, the logs and the status pages ask for it first; a session lasts until you press **Log out**, and expires by itself after 30 days idle.
 
-Be clear about what this is. It keeps a household, or a guest on your wifi, out
-of your video index. It is **not** protection against anyone determined, and
-nothing here pretends otherwise:
+Be clear about what this is. It keeps a household, or a guest on your wifi, out of your video index. It is **not** protection against anyone determined, and nothing here pretends otherwise:
 
-- **There is no HTTPS**, so the password crosses your network in clear. Anyone
-  able to watch the traffic can read it.
-- **The video files stay reachable without it.** A request for
-  `/video/<name>` answers anybody who knows, or guesses, the exact name. Only
-  the pages are behind the login.
+- **There is no HTTPS**, so the password crosses your network in clear. Anyone able to watch the traffic can read it.
+- **The video files stay reachable without it.** A request for `/video/<name>` answers anybody who knows, or guesses, the exact name. Only the pages are behind the login.
 
-That second point is a deliberate trade, not an oversight. VLC is a separate
-program with no access to your browser's session, so gating the files would
-break every *Play* link, and a playlist you saved last month would stop working
-the moment you logged out. Leaving them open means a saved `.m3u` keeps playing
-for as long as the file exists.
+That second point is a deliberate trade, not an oversight. VLC is a separate program with no access to your browser's session, so gating the files would break every *Play* link, and a playlist you saved last month would stop working the moment you logged out. Leaving them open means a saved `.m3u` keeps playing for as long as the file exists.
 
-A wrong password costs three seconds and nothing else. **Attempts are never
-capped and nothing is ever locked out**: three seconds is plenty against
-somebody guessing at a keyboard, which is the threat this is for, and a locked
-account would mostly succeed at infuriating whoever mistyped their own
-password.
+A wrong password costs three seconds and nothing else. **Attempts are never capped and nothing is ever locked out**: three seconds is plenty against somebody guessing at a keyboard, which is the threat this is for, and a locked account would mostly succeed at infuriating whoever mistyped their own password.
 
 ### Turning it on and off, and changing the password
 
@@ -1474,105 +940,53 @@ sudo timelapse password             # set or change it
 sudo timelapse password --disable   # remove it; the pages open again
 ```
 
-A username, a password, twice, and done. It restarts the web UI, which logs
-everybody out.
+A username, a password, twice, and done. It restarts the web UI, which logs everybody out.
 
-`--disable` asks nothing: it needs no password to carry out and it is undone by
-running the command again, so it works unattended and in a script. Running it
-when no login is set is not an error, it says so and stops. `--enable` exists
-and means the same as the bare command, so nobody has to discover that.
+`--disable` asks nothing: it needs no password to carry out and it is undone by running the command again, so it works unattended and in a script. Running it when no login is set is not an error, it says so and stops. `--enable` exists and means the same as the bare command, so nobody has to discover that.
 
-`timelapse web` still offers the same on/off question as part of the wider web
-section; these are the shortcuts for when that is all you want to change.
+`timelapse web` still offers the same on/off question as part of the wider web section; these are the shortcuts for when that is all you want to change.
 
-**There is no way to turn the login on or off from the web UI itself, and there
-will not be.** The service is allowed to write exactly one directory, its own
-index; `config.json` is read-only to it, enforced by systemd rather than by
-intention. A page that could edit its own authentication would need write
-access to the config, which is the property that keeps a network-facing service
-from being able to change anything at all.
+**There is no way to turn the login on or off from the web UI itself, and there will not be.** The service is allowed to write exactly one directory, its own index; `config.json` is read-only to it, enforced by systemd rather than by intention. A page that could edit its own authentication would need write access to the config, which is the property that keeps a network-facing service from being able to change anything at all.
 
-It never asks for the old password, and that is not an oversight. The command
-needs root to write the config at all, and root can already read every camera
-password in that same file, so the question would prove nothing while locking
-out the one person entitled to fix a forgotten login.
+It never asks for the old password, and that is not an oversight. The command needs root to write the config at all, and root can already read every camera password in that same file, so the question would prove nothing while locking out the one person entitled to fix a forgotten login.
 
-There is also nothing to recover: the password is stored only as a PBKDF2 hash,
-so **it cannot be read back out of `config.json`**. Forgetting it is not a
-problem, it is one command.
+There is also nothing to recover: the password is stored only as a PBKDF2 hash, so **it cannot be read back out of `config.json`**. Forgetting it is not a problem, it is one command.
 
-Sessions live in memory, so restarting the service for any reason (an upgrade,
-a wizard run, this command) logs everybody out. To remove the login entirely,
-run `sudo timelapse web`.
+Sessions live in memory, so restarting the service for any reason (an upgrade, a wizard run, this command) logs everybody out. To remove the login entirely, run `sudo timelapse web`.
 
-The wizard also checks that the address you give actually exists on this host.
-It used to accept anything, and a wrong address is the worst kind of mistake
-here: the service starts, logs the address it is serving and is unreachable,
-with nothing in the journal to say why.
+The wizard also checks that the address you give actually exists on this host. It used to accept anything, and a wrong address is the worst kind of mistake here: the service starts, logs the address it is serving and is unreachable, with nothing in the journal to say why.
 
 ### What it is allowed to write
 
-One directory: `web.state_dir`, default `/var/lib/timelapse/web`, which holds
-an index of your library. `timelapse-web.service` lists exactly that path in
-`ReadWritePaths=`, so the videos, the captured frames and `config.json` are
-read-only to it: enforced by systemd, not merely intended.
+One directory: `web.state_dir`, default `/var/lib/timelapse/web`, which holds an index of your library. `timelapse-web.service` lists exactly that path in `ReadWritePaths=`, so the videos, the captured frames and `config.json` are read-only to it: enforced by systemd, not merely intended.
 
-The installer creates that directory. The service cannot: a `ReadWritePaths=`
-naming a directory that does not exist stops the unit from starting, and inside
-the sandbox its parent is read-only anyway.
+The installer creates that directory. The service cannot: a `ReadWritePaths=` naming a directory that does not exist stops the unit from starting, and inside the sandbox its parent is read-only anyway.
 
 ### The index
 
-![The Library tab: where the videos are, and every camera name found in
-them](../screenshots/webui-library-1.png)
+![The Library tab: where the videos are, and every camera name found in them](../screenshots/webui-library-1.png)
 
-*The same real library: 6,922 files, 2.8 TB, spanning five years and three
-tools. `Garaj`/`Garage`, `Roof`/`roof` and `Workshop`/`workshop` are each two
-entries sorted together, never one. `(no name in filename)` is 450 files whose
-names carry no camera at all, which a parser that only understood this tool's
-own convention would have dropped silently.*
+*The same real library: 6,922 files, 2.8 TB, spanning five years and three tools. `Garaj`/`Garage`, `Roof`/`roof` and `Workshop`/`workshop` are each two entries sorted together, never one. `(no name in filename)` is 450 files whose names carry no camera at all, which a parser that only understood this tool's own convention would have dropped silently.*
 
-The first scan runs in the background, so the page is usable immediately and
-reports progress. After that, opening a folder re-reads that one directory and
-opening a video re-checks that one file, so browsing does not walk your whole
-NAS. *Rescan* forces a full pass.
+The first scan runs in the background, so the page is usable immediately and reports progress. After that, opening a folder re-reads that one directory and opening a video re-checks that one file, so browsing does not walk your whole NAS. *Rescan* forces a full pass.
 
 Below the camera list are the days and the folders it found:
 
 ![Recent days, with one playlist per day](../screenshots/webui-library-2.png)
 
-![Folders, which on this library are the months the predecessor tool wrote
-into](../screenshots/webui-library-3.png)
+![Folders, which on this library are the months the predecessor tool wrote into](../screenshots/webui-library-3.png)
 
 Opening a day lists every video for that date:
 
 ![A single day expanded](../screenshots/webui-library-daily-view.png)
 
-*Each entry carries the exact path it came from, so a file you did not expect
-can be traced without guessing. The duplicate names here are real and worth
-understanding: a **second install writing to the same destination**, into its
-own folder, so `Roof` and `Street4K` each appear twice for 2026-08-17 at
-different sizes. The index lists both, because the primary key is the **path**,
-not the camera and the date. Two files can legitimately be one camera's same
-day, and which one you wanted is not the index's decision to make.*
+*Each entry carries the exact path it came from, so a file you did not expect can be traced without guessing. The duplicate names here are real and worth understanding: a **second install writing to the same destination**, into its own folder, so `Roof` and `Street4K` each appear twice for 2026-08-17 at different sizes. The index lists both, because the primary key is the **path**, not the camera and the date. Two files can legitimately be one camera's same day, and which one you wanted is not the index's decision to make.*
 
-**Two installs can share a destination.** Nothing coordinates them, and nothing
-needs to: each writes its own files, and the index reads whatever is there.
-Point the second one at a subfolder rather than the same directory, or the two
-will write the same `<Camera>.<YYYYMMDD>.mkv` name and the later transfer will
-overwrite the earlier one.
+**Two installs can share a destination.** Nothing coordinates them, and nothing needs to: each writes its own files, and the index reads whatever is there. Point the second one at a subfolder rather than the same directory, or the two will write the same `<Camera>.<YYYYMMDD>.mkv` name and the later transfer will overwrite the earlier one.
 
-It reads whatever is in the destination, not only what this tool wrote. Six
-different filename conventions from predecessor tools are recognised, including
-files with no camera name in them at all. **Names are never merged**: if you
-have both `Workshop` and `workshop`, or `garaj` and `Garage`, you get both,
-sorted next to each other. A camera name is a *place*, places get recycled
-between cameras over the years, and deciding whether two labels mean the same
-thing is your call, not the index's.
+It reads whatever is in the destination, not only what this tool wrote. Six different filename conventions from predecessor tools are recognised, including files with no camera name in them at all. **Names are never merged**: if you have both `Workshop` and `workshop`, or `garaj` and `Garage`, you get both, sorted next to each other. A camera name is a *place*, places get recycled between cameras over the years, and deciding whether two labels mean the same thing is your call, not the index's.
 
-Videos too small to be a real day (a few kilobytes where a day is hundreds of
-megabytes) are listed under **Flagged** with their full path, so you can check
-and delete them by whatever means you prefer. The UI will not do it for you.
+Videos too small to be a real day (a few kilobytes where a day is hundreds of megabytes) are listed under **Flagged** with their full path, so you can check and delete them by whatever means you prefer. The UI will not do it for you.
 
 ### Snags
 
