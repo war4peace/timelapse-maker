@@ -41,8 +41,26 @@ from timelapse_platform import (CONFIG_PATH, IS_WINDOWS,  # noqa: E402
 
 __version__ = "0.2.0"
 
-OUT = Path(os.environ.get("TIMELAPSE_TEST_DIR") or
-           Path(tempfile.gettempdir()) / "timelapse-test")
+# Where camera samples go. A fixed /tmp/timelapse-test was shared by every
+# account that runs this, which is three of them (the service user from
+# install.sh, root under sudo, and group members), and whichever ran first
+# owned it: the next one's mkdir succeeded and its write raised PermissionError
+# out of main(), so `sudo timelapse test` today broke tomorrow's upgrade
+# pre-flight until /tmp was cleaned. The samples are pictures of the operator's
+# property, too, and sat 0644 in a directory anyone could list, which a root run
+# would follow symlinks out of. So: TIMELAPSE_TEST_DIR if set, otherwise a
+# private directory made for this run on first use (sample_dir()).
+OUT = (Path(os.environ["TIMELAPSE_TEST_DIR"])
+       if os.environ.get("TIMELAPSE_TEST_DIR") else None)
+
+
+def sample_dir():
+    """This run's sample directory, made on first use. Raises OSError."""
+    global OUT
+    if OUT is None:
+        OUT = Path(tempfile.mkdtemp(prefix="timelapse-test-"))
+    OUT.mkdir(parents=True, exist_ok=True)
+    return OUT
 # Conditional, which it was not until 0.2.0. Two things were wrong with the
 # unconditional version and only one of them was about Windows: a plain
 # `timelapse test > report.txt` wrote escape codes into the file on every
@@ -159,9 +177,15 @@ def test_http(cam, cfg):
             bad(f"{name}: 200 OK but not a JPEG. First bytes: {head!r}")
         return None
 
-    OUT.mkdir(parents=True, exist_ok=True)
-    sample = OUT / f"{name}.jpg"
-    sample.write_bytes(data)
+    try:
+        sample = sample_dir() / f"{name}.jpg"
+        sample.write_bytes(data)
+    except OSError as exc:
+        # The camera answered with a JPEG, which is the verdict; failing to
+        # keep a copy is this checker's problem, not the camera's.
+        ok(f"{name}: {len(data)/1024:.0f} KB, {dt:.2f}s")
+        warn(f"{name}: could not save the sample image: {exc}")
+        return len(data)
     dims = dimensions(cfg["paths"].get("ffprobe", "ffprobe"), sample)
 
     ok(f"{name}: {len(data)/1024:.0f} KB, {dims}, {dt:.2f}s  -> {sample}")
@@ -183,8 +207,12 @@ def test_rtsp(cam, cfg):
     if not ffmpeg:
         bad(f"{name}: cannot test an RTSP camera, paths.ffmpeg is empty")
         return None
-    OUT.mkdir(parents=True, exist_ok=True)
-    sample = OUT / f"{name}.jpg"
+    try:
+        sample = sample_dir() / f"{name}.jpg"
+    except OSError as exc:
+        warn(f"{name}: no directory to put an RTSP sample in, so it was not "
+             f"tested: {exc}")
+        return None
     # `warning` rather than `error`, for the reason grab_snapshot_rtsp()
     # gives: at error level every RTSP failure reads the same.
     cmd = [ffmpeg, "-y", "-nostdin", "-hide_banner",
@@ -240,7 +268,11 @@ def probe_profiles(cam, cfg):
     elif mode == "basic":
         sess.auth = HTTPBasicAuth(cam.get("username"), cam.get("password"))
 
-    OUT.mkdir(parents=True, exist_ok=True)
+    try:
+        folder = sample_dir()
+    except OSError as exc:
+        warn(f"{name}: no directory to put profile samples in: {exc}")
+        return
     print(f"  {name}:")
     best = (0, None)
     for n in range(1, 5):
@@ -252,8 +284,12 @@ def probe_profiles(cam, cfg):
         if r.status_code != 200 or r.content[:2] != b"\xff\xd8":
             print(f"      Profile_{n}: HTTP {r.status_code}, not a JPEG")
             continue
-        sample = OUT / f"{name}-Profile_{n}.jpg"
-        sample.write_bytes(r.content)
+        sample = folder / f"{name}-Profile_{n}.jpg"
+        try:
+            sample.write_bytes(r.content)
+        except OSError as exc:
+            print(f"      Profile_{n}: could not save the sample ({exc})")
+            continue
         dims = dimensions(cfg["paths"].get("ffprobe", "ffprobe"), sample)
         m = re.match(r"(\d+),(\d+)", dims)
         px = int(m.group(1)) * int(m.group(2)) if m else 0
@@ -1077,7 +1113,8 @@ def main():
         print(f"\n=== ONVIF profile comparison ({len(onvif)} camera(s)) ===")
         for cam in onvif:
             probe_profiles(cam, cfg)
-        print(f"\nSample images: {OUT}\n")
+        if OUT is not None:
+            print(f"\nSample images: {OUT}\n")
         return 0
 
     print("\n=== Camera names ===")
@@ -1109,7 +1146,8 @@ def main():
         print("\n=== Notifications ===")
         test_notify(cfg, args.config, args.force_notify)
 
-    print(f"\nSample images: {OUT}\n")
+    if OUT is not None:
+        print(f"\nSample images: {OUT}\n")
     return 1 if _FAILS else 0
 
 

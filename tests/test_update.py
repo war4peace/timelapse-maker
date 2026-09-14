@@ -437,6 +437,46 @@ class TestNoAccidentalNetwork(unittest.TestCase):
         self.assertIn("timelapse-maker", upd.UPDATE_UA)
 
 
+class TestTheFetchersSendTheUserAgent(unittest.TestCase):
+    """The test above asserts on a constant. fetch_json and fetch_text were
+    executed by no test, so removing the header from either passed the suite,
+    and GitHub refuses a request without one (M27)."""
+
+    class Reply(io.BytesIO):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self.close()
+
+    def fetch(self, call, body):
+        seen = {}
+
+        def urlopen(req, timeout=None):
+            seen["req"] = req
+            return self.Reply(body)
+
+        with mock.patch.object(upd.urllib.request, "urlopen", urlopen):
+            result = call()
+        return seen["req"], result
+
+    def test_fetch_json_sends_it(self):
+        req, data = self.fetch(
+            lambda: upd.fetch_json("https://api.github.com/repos/x/releases"),
+            b'{"tag_name": "v0.2.1"}')
+        self.assertIn("timelapse-maker", req.get_header("User-agent") or "")
+        self.assertEqual(data, {"tag_name": "v0.2.1"})
+
+    def test_fetch_text_sends_it(self):
+        req, text = self.fetch(
+            lambda: upd.fetch_text("https://raw.githubusercontent.com/x", 1000),
+            b"#!/usr/bin/env bash\n")
+        self.assertIn("timelapse-maker", req.get_header("User-agent") or "")
+        self.assertEqual(text, "#!/usr/bin/env bash\n")
+
+
 
 class TestAPreReleaseIsNotTheRelease(unittest.TestCase):
     """VERSION_RE had no end anchor.

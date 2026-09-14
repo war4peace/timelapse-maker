@@ -832,12 +832,13 @@ class TestCredentialsNeverReachTheLog(unittest.TestCase):
 
     SECRET = "Sup3rS3cret!"
 
-    def logged(self, call):
+    def logged(self, call, formatter=None):
         """Run `call` against a logger wired exactly as the daemon wires its
-        own, and return what would have been written."""
+        own, and return what would have been written. `formatter` is the class
+        to wire, the daemon's by default."""
         stream = io.StringIO()
         handler = logging.StreamHandler(stream)
-        handler.setFormatter(cap.RedactingFormatter("%(message)s"))
+        handler.setFormatter((formatter or cap.RedactingFormatter)("%(message)s"))
         logger = logging.getLogger("redaction-test")
         logger.handlers = [handler]
         logger.propagate = False
@@ -1057,6 +1058,27 @@ class TestCredentialsNeverReachTheLog(unittest.TestCase):
                          inspect.getsource(enc.replace_atomic))
         self.assertEqual(cap.REPLACE_TRIES, enc.REPLACE_TRIES)
         self.assertEqual(cap.REPLACE_WAIT, enc.REPLACE_WAIT)
+
+    def test_the_encoders_formatter_redacts_too(self):
+        """Its format() was entered by no test (M28). Type identity and pattern
+        equality both held with the override deleted, which would have left a
+        plain Formatter logging webhook URLs and camera errors verbatim."""
+        import timelapse_encode as enc
+        out = self.logged(
+            lambda log: log.warning(
+                "notify failed: https://discord.com/api/webhooks/42/tok-abc "
+                "and http://cam/a?password=%s", self.SECRET),
+            formatter=enc.RedactingFormatter)
+        self.assertIn("notify failed", out)
+        self.assertNotIn(self.SECRET, out)
+        self.assertNotIn("tok-abc", out)
+
+    def test_the_two_formatters_are_the_same_code(self):
+        # Pinned like the other duplicates: a copy that drifts is the one
+        # nobody is looking at.
+        import timelapse_encode as enc
+        self.assertEqual(inspect.getsource(cap.RedactingFormatter),
+                         inspect.getsource(enc.RedactingFormatter))
 
     def test_the_daemons_copy_of_the_rule_has_not_drifted(self):
         """The rule exists twice: this daemon imports nothing from its

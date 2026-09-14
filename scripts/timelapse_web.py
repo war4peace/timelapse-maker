@@ -578,24 +578,42 @@ class Index:
                     paths.add(child)
         except OSError:
             # The directory is gone: drop everything filed under it.
-            with self._connect() as db:
-                gone = db.execute("SELECT COUNT(*) c FROM files WHERE folder=?",
-                                  (rel,)).fetchone()["c"]
-                db.execute("DELETE FROM files WHERE folder = ?", (rel,))
-                db.commit()
+            try:
+                with self._connect() as db:
+                    gone = db.execute(
+                        "SELECT COUNT(*) c FROM files WHERE folder=?",
+                        (rel,)).fetchone()["c"]
+                    db.execute("DELETE FROM files WHERE folder = ?", (rel,))
+                    db.commit()
+            except sqlite3.Error as exc:
+                log.warning("Index could not refresh %s (%s); showing what it "
+                            "already has.", rel or "the library root", exc)
+                return False
             return bool(gone)
 
-        with self._connect() as db:
-            before = {r["path"]: (r["size"], r["mtime"]) for r in db.execute(
-                "SELECT path, size, mtime FROM files WHERE folder = ?", (rel,))}
-            now = {r[0]: (r[3], r[4]) for r in rows}
-            if rows:
-                self._write(db, rows)
-            stale = [p for p in before if p not in paths]
-            if stale:
-                db.executemany("DELETE FROM files WHERE path = ?",
-                               ((p,) for p in stale))
-            db.commit()
+        # Caught like _query() catches, and for the reason it does: this runs
+        # inside a page request, and a write refused by a full disk or a
+        # read-only index escaped do_GET, logged a traceback and closed the
+        # connection with no response, on every folder view. Measured
+        # (temp/m17_probe.py): reads still work in both failure modes, so the
+        # page can be drawn from what the index already holds.
+        try:
+            with self._connect() as db:
+                before = {r["path"]: (r["size"], r["mtime"]) for r in db.execute(
+                    "SELECT path, size, mtime FROM files WHERE folder = ?",
+                    (rel,))}
+                now = {r[0]: (r[3], r[4]) for r in rows}
+                if rows:
+                    self._write(db, rows)
+                stale = [p for p in before if p not in paths]
+                if stale:
+                    db.executemany("DELETE FROM files WHERE path = ?",
+                                   ((p,) for p in stale))
+                db.commit()
+        except sqlite3.Error as exc:
+            log.warning("Index could not refresh %s (%s); showing what it "
+                        "already has.", rel or "the library root", exc)
+            return False
         return before != now
 
     def reconcile_file(self, rel):
@@ -619,9 +637,12 @@ class Index:
         try:
             st = os.stat(path)
         except OSError:
-            with self._connect() as db:
-                db.execute("DELETE FROM files WHERE path = ?", (rel,))
-                db.commit()
+            try:
+                with self._connect() as db:
+                    db.execute("DELETE FROM files WHERE path = ?", (rel,))
+                    db.commit()
+            except sqlite3.Error as exc:
+                log.warning("Index could not forget %s (%s).", rel, exc)
             return None
         # A directory called `adir.mkv` passed every check above and was
         # indexed with size 0, and /play/adir.mkv then produced a playlist for
@@ -636,8 +657,17 @@ class Index:
         cam, day, pattern = parse_name(name)
         row = (rel, name, folder, st.st_size, int(st.st_mtime), cam, day,
                pattern, 1 if st.st_size < SUSPECT_BYTES else 0)
-        with self._connect() as db:
-            self._write(db, [row])
+        try:
+            with self._connect() as db:
+                self._write(db, [row])
+        except sqlite3.Error as exc:
+            # Every /video/, /play/ and /day/ request comes through here, so
+            # this is the difference between a full disk degrading to "served
+            # from the stale index" and every video dropping its connection.
+            # A file the index has never seen still answers 404 until the
+            # write works again.
+            log.warning("Index could not record %s (%s); serving what it "
+                        "already has.", rel, exc)
         return self.get(rel)
 
     def abs_path(self, rel):

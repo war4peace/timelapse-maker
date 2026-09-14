@@ -1029,19 +1029,27 @@ class TestParseName(unittest.TestCase):
 
 
 def build_library(root):
-    """A miniature of the surveyed library: every pattern, both eras."""
+    """A miniature of the surveyed library: every pattern, both eras.
+
+    The real sizes divided by 250 (M29). They exist to sit either side of
+    SUSPECT_BYTES (1 MiB), and every good file here is still above it while
+    the failed encode is still below. At full size this fixture seek-wrote
+    3.95 GB per setUp, which NTFS does not keep sparse, across about a hundred
+    setUps, and serving one of them pushed half a gigabyte through
+    FakeRequest.sendall: the web tests peaked at 2.2 GB of traced memory.
+    """
     files = {
-        "Gate.20260707.mkv": 500_000_000,
-        "Workshop.20260707.mkv": 400_000_000,
+        "Gate.20260707.mkv": 2_000_000,
+        "Workshop.20260707.mkv": 1_600_000,
         "Gate.20260706.mkv": 17_298,             # a failed encode
-        "2024-01/2024-01-01_Workshop.mp4": 600_000_000,
+        "2024-01/2024-01-01_Workshop.mp4": 2_400_000,
         # The other spelling, on a different day: two names differing only in
         # case cannot coexist as the SAME filename on NTFS or an SMB share,
         # which is exactly how the real library carries both.
-        "2024-01/2024-01-02_workshop.mp4": 600_000_000,
-        "2021-11/2021-11-01.mp4": 520_000_000,   # no camera in the name
-        "2021-11/Courtyard_4K_2021-11-02.mp4": 545_000_000,
-        "2023-05-10 - Renovari/2023-05-10_Roof.mp4": 788_000_000,
+        "2024-01/2024-01-02_workshop.mp4": 2_400_000,
+        "2021-11/2021-11-01.mp4": 2_080_000,     # no camera in the name
+        "2021-11/Courtyard_4K_2021-11-02.mp4": 2_180_000,
+        "2023-05-10 - Renovari/2023-05-10_Roof.mp4": 3_152_000,
         "MakeTLALL_backup.ps1": 18_514,          # not a video
         "notes.txt": 12,
     }
@@ -1849,6 +1857,58 @@ class TestServing(IndexCase):
         status, _, _ = self.get("/video/Gate.20260707.mkv")
         self.assertEqual(status, 404)
         self.assertIsNone(self.index.get("Gate.20260707.mkv"))
+
+    def refuse_writes(self):
+        """Writes fail the way a full disk fails them, and reads still work,
+        which is what temp/m17_probe.py measured for both a full disk and a
+        read-only index file."""
+        def full(db, rows):
+            raise web.sqlite3.OperationalError("database or disk is full")
+
+        self.index._write = full
+        # The fallback logs a warning, which is correct and would otherwise
+        # reach stderr through logging's last resort.
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+
+    def test_a_full_index_still_serves_a_video_it_knows(self):
+        """A refused write escaped do_GET, and the connection was closed with
+        no response for every video, playlist and day page (M17)."""
+        self.refuse_writes()
+        status, head, _ = self.get("/video/Gate.20260707.mkv")
+        self.assertEqual(status, 200)
+        self.assertIn("Content-Type: video/x-matroska", head)
+
+    def test_a_full_index_answers_404_for_a_video_it_has_never_seen(self):
+        # Honest rather than invented: without its row there is nothing to
+        # serve from, and the next successful write fixes it.
+        (self.root / "Gate.20260708.mkv").write_bytes(b"\0" * 2_000_000)
+        self.refuse_writes()
+        status, _, _ = self.get("/video/Gate.20260708.mkv")
+        self.assertEqual(status, 404)
+
+    def test_a_full_index_still_forgets_nothing_it_should_not(self):
+        (self.root / "Gate.20260707.mkv").unlink()
+        self.refuse_writes()
+        with mock.patch.object(web.Index, "_connect",
+                               side_effect=web.sqlite3.OperationalError("full")):
+            status, _, _ = self.get("/video/Gate.20260707.mkv")
+        self.assertEqual(status, 404)
+
+    def test_a_full_index_still_draws_a_folder(self):
+        self.refuse_writes()
+        (self.root / "Gate.20260708.mkv").write_bytes(b"\0" * 2_000_000)
+        status, _, body = self.get("/library?folder=")
+        self.assertEqual(status, 200)
+        self.assertIn("Gate.20260707.mkv", body)
+
+    def test_a_folder_that_vanished_under_a_broken_index_still_renders(self):
+        with mock.patch.object(web.Index, "_connect",
+                               side_effect=web.sqlite3.OperationalError("full")):
+            logging.disable(logging.CRITICAL)
+            self.addCleanup(logging.disable, logging.NOTSET)
+            status, _, _ = self.get("/library?folder=gone-now")
+        self.assertEqual(status, 200)
 
     def test_serving_reconciles_a_file_changed_in_place(self):
         """A file overwritten at the same name does not move its directory's

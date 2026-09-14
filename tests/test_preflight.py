@@ -483,6 +483,200 @@ class TestThePreflightsRtspProbeKeepsTheDiagnosis(unittest.TestCase):
         self.assertEqual(fails, 1)
 
 
+class TestTheSampleDirectoryIsPrivatePerRun(unittest.TestCase):
+    """/tmp/timelapse-test was one directory for every account that runs this,
+    so the second account's write raised PermissionError out of main() (M20)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        self.addCleanup(setattr, tt, "_FAILS", tt._FAILS)
+
+    def test_each_run_makes_its_own(self):
+        made = []
+        for _ in range(2):
+            with mock.patch.object(tt, "OUT", None):
+                folder = tt.sample_dir()
+                self.addCleanup(shutil.rmtree, str(folder), True)
+                self.assertEqual(tt.sample_dir(), folder, "not stable in a run")
+                made.append(folder)
+        self.assertNotEqual(made[0], made[1])
+        for folder in made:
+            self.assertTrue(folder.name.startswith("timelapse-test-"), folder)
+
+    def test_nothing_is_made_until_a_sample_is_saved(self):
+        with mock.patch.object(tt, "OUT", None):
+            self.assertIsNone(tt.OUT)
+
+    def test_a_sample_that_cannot_be_kept_is_a_warning_not_a_crash(self):
+        """The camera answered with a JPEG, which is the verdict; failing to
+        keep a copy is this checker's own problem."""
+        blocker = self.tmp / "a-file"
+        blocker.write_text("not a directory", encoding="utf-8")
+        body = b"\xff\xd8\xff" + b"\0" * 5000
+        session = mock.Mock()
+        session.get.return_value = mock.Mock(status_code=200, content=body)
+        tt._FAILS = 0
+        with mock.patch.object(tt, "OUT", blocker / "samples"), \
+                mock.patch.object(tt.requests, "Session", return_value=session), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            size = tt.test_http(
+                {"name": "Gate", "url": "http://192.0.2.1/snap"},
+                {"capture": {"interval_seconds": 5, "timeout_seconds": 4},
+                 "paths": {}})
+        self.assertEqual(size, len(body))
+        self.assertIn("WARN", out.getvalue())
+        self.assertIn("could not save the sample", out.getvalue())
+        self.assertEqual(tt._FAILS, 0)
+
+
+class TestThePreflightRunsEndToEnd(unittest.TestCase):
+    """main() against a real config, a real HTTP camera on loopback and a port
+    nothing listens on (M33).
+
+    Only the ffmpeg seams are stubbed (ffprobe's dimensions and the encoder
+    probe), because those need a binary this suite does not assume. Every
+    check the operator sees runs for real, which is the half nothing had ever
+    executed: C1, M12 and M20 were all found in it.
+    """
+
+    def setUp(self):
+        import http.server
+        import socket
+        import threading
+
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.tmp), True)
+        for name in ("frames", "videos", "logs", "state", "samples"):
+            (self.tmp / name).mkdir()
+        frame = self.tmp / "frame.jpg"
+        _support.make_frame(frame, size=8192)
+        body = frame.read_bytes()
+
+        class Snapshot(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "image/jpeg")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        self.server = http.server.HTTPServer(("127.0.0.1", 0), Snapshot)
+        thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+
+        # A port that was free a moment ago and is closed now: refused at once.
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        self.closed_port = probe.getsockname()[1]
+        probe.close()
+        self.addCleanup(setattr, tt, "_FAILS", tt._FAILS)
+
+    def camera(self, name, port):
+        return {"name": name, "enabled": True, "method": "http", "auth": "none",
+                "url": "http://127.0.0.1:%d/snapshot.jpg" % port}
+
+    def config(self, cameras):
+        cfg = {
+            "paths": {"frames_root": str(self.tmp / "frames"),
+                      "video_output": str(self.tmp / "videos"),
+                      "log_dir": str(self.tmp / "logs"),
+                      "state_dir": str(self.tmp / "state"),
+                      "ffmpeg": sys.executable, "ffprobe": sys.executable},
+            "capture": {"interval_seconds": 5, "timeout_seconds": 4,
+                        "min_bytes": 4096, "min_free_gb": 0},
+            "encode": {"framerate": 60, "container": "mkv", "gop": 120,
+                       "av1_cq": 30, "hevc_cq": 28, "x264_crf": 23,
+                       "min_frames": 100, "delete_frames_on_success": True,
+                       "max_backlog_days": 7},
+            "transfer": {"enabled": False},
+            "cameras": cameras,
+        }
+        path = self.tmp / "config.json"
+        path.write_text(json.dumps(cfg), encoding="utf-8")
+        return path
+
+    def run_main(self, cameras):
+        path = self.config(cameras)
+        loopback = {"NO_PROXY": "127.0.0.1,localhost",
+                    "no_proxy": "127.0.0.1,localhost"}
+        with mock.patch.object(sys, "argv", ["timelapse_test.py", str(path)]), \
+                mock.patch.object(tt, "OUT", self.tmp / "samples"), \
+                mock.patch.object(tt, "dimensions",
+                                  lambda ffprobe, sample: "64,64,yuvj420p"), \
+                mock.patch.object(enc, "list_encoders",
+                                  lambda ffmpeg: {"libx264"}), \
+                mock.patch.object(enc, "probe_encoder_detail",
+                                  lambda ffmpeg, cand:
+                                  (cand["codec"] == "libx264", "")), \
+                mock.patch.dict(os.environ, loopback), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = tt.main()
+        return rc, out.getvalue()
+
+    def test_a_working_install_passes_and_exits_zero(self):
+        """The control: every section is green for this config, so a non-zero
+        exit below is the camera and nothing else."""
+        rc, out = self.run_main([self.camera("Gate", self.server.server_port)])
+        self.assertIn("PASS  Gate:", out)
+        self.assertNotIn("FAIL", out)
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.tmp / "samples" / "Gate.jpg").is_file())
+
+    def test_a_camera_nobody_answers_for_fails_the_run(self):
+        rc, out = self.run_main([self.camera("Gate", self.server.server_port),
+                                 self.camera("Shed", self.closed_port)])
+        self.assertIn("PASS  Gate:", out)
+        self.assertIn("FAIL  Shed: request failed", out)
+        self.assertEqual(rc, 1)
+
+    def test_every_section_ran(self):
+        _, out = self.run_main([self.camera("Gate", self.server.server_port)])
+        for heading in ("=== Camera names ===", "=== Cameras (1 enabled) ===",
+                        "=== Cadence ===", "=== Encoders ===", "=== Disk ===",
+                        "=== Transfer destination ===", "=== Notifications ==="):
+            self.assertIn(heading, out)
+        self.assertIn("libx264", out)
+
+
+class TestTheCadenceAndNotifySections(unittest.TestCase):
+    """The two section checks M33 names that had no test of their own."""
+
+    def setUp(self):
+        self.addCleanup(setattr, tt, "_FAILS", tt._FAILS)
+        tt._FAILS = 0
+
+    def test_a_camera_that_would_never_make_a_video_fails(self):
+        cfg = {"capture": {"interval_seconds": 5, "timeout_seconds": 4},
+               "encode": {"framerate": 60, "min_frames": 100}}
+        cams = [{"name": "Slow", "interval_seconds": 900}]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            tt.test_cadence(cfg, cams)
+        self.assertIn("FAIL", out.getvalue())
+        self.assertEqual(tt._FAILS, 1)
+
+    def test_an_ordinary_cadence_passes_quietly(self):
+        cfg = {"capture": {"interval_seconds": 5, "timeout_seconds": 4},
+               "encode": {"framerate": 60, "min_frames": 100}}
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            tt.test_cadence(cfg, [{"name": "Gate"}])
+        self.assertNotIn("FAIL", out.getvalue())
+        self.assertEqual(tt._FAILS, 0)
+
+    def test_no_sinks_sends_nothing_and_says_so(self):
+        with mock.patch.object(enc, "notify",
+                               side_effect=AssertionError("sent something")), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            tt.test_notify({"cameras": []}, None)
+        self.assertIn("No notification sinks configured", out.getvalue())
+        self.assertEqual(tt._FAILS, 0)
+
+
 class TestNoSshClientIsAFailNotACrash(unittest.TestCase):
     """The remote-destination check ran ssh bare, so a machine without an
     ssh client ended the pre-flight with FileNotFoundError (M12)."""

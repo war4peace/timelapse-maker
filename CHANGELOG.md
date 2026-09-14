@@ -147,6 +147,20 @@ While the version is `0.x`, the configuration format may change in any release.
   the destination with the same size, and not older than the local copy, is
   left alone, the way rsync already behaves on Linux.
 
+- **The web UI keeps serving videos when its index cannot be written.** A
+  full disk, or an index file that had become read-only, made every video,
+  playlist and folder page drop the connection with an error in the log,
+  because opening one also updates the index. Those pages now answer from what
+  the index already holds and log a warning.
+
+- **`timelapse test` no longer breaks for the next account to run it.** Camera
+  sample images went into one shared `timelapse-test` folder in the system temp
+  directory, so after `sudo timelapse test` the check run by the service
+  account during an upgrade could not write there and stopped with a Python
+  error at the first camera. Each run now gets a private folder of its own, and
+  a sample that cannot be saved is a warning rather than a failure, since the
+  camera itself answered.
+
 - **RTSP cameras no longer mix two days' frames on the days the clocks
   change.** The grabber is told to stop at midnight, and that was worked out
   as if every day had 24 hours. In spring it ran an hour into the next day

@@ -905,7 +905,16 @@ that died between `write()` and `os.replace()`, and folding them into the frame
 total would misreport both count and size.
 
 Samples land in a temp directory (override with `TIMELAPSE_TEST_DIR`) for visual
-inspection. `--probe-profiles` short-circuits everything else.
+inspection. `--probe-profiles` short-circuits everything else. **The directory
+is private to the run** since 0.2.1 (M20): `sample_dir()` makes one with
+`mkdtemp` on first use. A fixed `/tmp/timelapse-test` was shared by the three
+accounts that run this (the service user from install.sh, root under sudo, and
+group members), so whichever ran second hit PermissionError out of `main()`,
+and a root run would follow symlinks another user planted there. A sample that
+cannot be saved is a WARN, because the camera answered and keeping a copy is
+the checker's own business. `main()` is executed end to end by
+`TestThePreflightRunsEndToEnd` (M33), against a loopback HTTP camera and a
+closed port, with only the ffmpeg seams stubbed.
 
 ### 4.4 `timelapse_setup.py`
 
@@ -1712,6 +1721,14 @@ dropped NAS mount is a *correct* empty library, not a fault.
   a request leaving the library, this stops it reading everything inside.
   Found by a test, having shipped through a full review as `200 OK` on a
   `.txt`.
+- **A write the index cannot make is not a request failure** (0.2.1, M17).
+  `reconcile_file()` and `reconcile_dir()` write inside page requests, and
+  unlike `_query()` they did not catch `sqlite3.Error`, so a full disk or a
+  read-only index file dropped every `/video/`, `/play/`, `/day/` and folder
+  request with a traceback. `temp/m17_probe.py` measured that reads still
+  work in both failure modes, so both now log a warning and answer from the
+  rows already there: a known video is still served, a folder is still drawn,
+  and a file the index has never seen stays 404 until a write succeeds.
 - **And the name has to be a file** (0.2.1, L14). `reconcile_file()` stats a
   name the *request* chose, where the scan walks with
   `entry.is_file(follow_symlinks=False)`, so a directory called `adir.mkv` was
@@ -4870,22 +4887,22 @@ predict. Treat 1.7 s as a floor observed once, never as a budget.
 ## 10. File inventory
 
 ```
-install.sh                       bootstrap installer, 991 lines
-install.ps1                      the Windows one, 601 lines
+install.sh                       bootstrap installer, 1018 lines
+install.ps1                      the Windows one, 699 lines
 setup-gui.ps1                    launcher for the graphical wizard, 142 lines
 timelapse-setup.cmd              double-click shim for the above
 installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
-scripts/timelapse_capture.py     daemon, 1584 lines
-scripts/timelapse_encode.py      batch job, 2500 lines
-scripts/timelapse_test.py        pre-flight checks + usage report, 1097 lines
-scripts/timelapse_setup.py       configuration wizard, 4936 lines
+scripts/timelapse_capture.py     daemon, 1683 lines
+scripts/timelapse_encode.py      batch job, 2710 lines
+scripts/timelapse_test.py        pre-flight checks + usage report, 1155 lines
+scripts/timelapse_setup.py       configuration wizard, 5207 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2990 lines
 scripts/timelapse_update.py      release query + `timelapse update`, 510 lines
-scripts/timelapse_platform.py    the only platform branch, 2605 lines
-scripts/timelapse_cli.py         the `timelapse` command on Windows, 438 lines
-scripts/timelapse_web.py         read-only web UI, 3596 lines
+scripts/timelapse_platform.py    the only platform branch, 2616 lines
+scripts/timelapse_cli.py         the `timelapse` command on Windows, 475 lines
+scripts/timelapse_web.py         read-only web UI, 3626 lines
 tests/_support.py                path setup and fakes
 tests/test_capture.py            unit tests
 tests/test_cli.py                unit tests
