@@ -31,7 +31,9 @@
     "x264_crf": 20,
     "min_frames": 100,
     "delete_frames_on_success": true,
-    "max_backlog_days": 7
+    "max_backlog_days": 7,
+    "_comment_driver": "notify_driver_mismatch: once an hour, check whether the NVIDIA driver was updated while the old one is still loaded. Until the machine restarts, the nightly encode cannot use the GPU and falls back to libx264, which is slower and makes larger files. Logs every hour it is true, and notifies once when it starts and once when it clears. Uses no GPU time. Set false to turn it off.",
+    "notify_driver_mismatch": true
   },
   "transfer": {
     "_comment": "Set enabled false to keep videos local. destination is a local mount path OR a remote rsync spec such as user@nas:/mnt/user/timelapse/",

@@ -1964,7 +1964,7 @@ def service_definitions(scripts_dir, config_path, python=None):
         # timelapse-watch.timer: every 5 minutes, TimeoutStartSec=60, and
         # deliberately NOT Persistent, because a missed check is not worth
         # catching up on.
-        (WATCH_UNIT, "Report cameras that are refusing our credentials",
+        (WATCH_UNIT, "Report refused camera credentials and a stale NVIDIA driver",
          argv("timelapse_encode.py", "--watch"),
          {"triggers": repeating_trigger(5),
           "catch_up": False, "time_limit": "PT1M"}),
@@ -4094,7 +4094,8 @@ def default_config(template_path=None):
         "encode": {"framerate": 60, "container": "mkv", "gop": 120,
                    "av1_preset": "p6", "av1_cq": 26, "hevc_cq": 24,
                    "x264_crf": 20, "min_frames": 100,
-                   "delete_frames_on_success": True, "max_backlog_days": 7},
+                   "delete_frames_on_success": True, "max_backlog_days": 7,
+                   "notify_driver_mismatch": True},
         # Every key config.example.json carries, and no more: the two are one
         # document written twice, and a test holds them together. The example
         # is the only place an operator ever sees a new key, and this is the

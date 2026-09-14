@@ -141,7 +141,7 @@ A **second** on-disk contract, and it will outlive whatever reads it first, so i
 |---|---|---|
 | `capture.json` | the capture daemon, once a minute, plus once at startup and once on clean shutdown | pid, start time, `running`, `paused`, and a per-camera block: cadence, last attempt, last success, an `error` object (0.1.6) and either frame counters (HTTP) or restarts and process liveness (RTSP) |
 | `encode.json` | the encoder, at the end of every run including one that found nothing to do | the newest `MAX_RUNS` (14) run records: times, encoder, counts, bytes, transfer outcome, and a per-camera-day list with frames and coverage |
-| `notified.json` | the credential watch, when it reports a change | `{camera: incident_start}` for refusals already announced, so a timer that fires every five minutes says each thing once |
+| `notified.json` | the watch: the credential half when it reports a change, the driver half once an hour | `incidents`, `{camera: incident_start}` for refusals already announced, so a timer that fires every five minutes says each thing once; and `gpu`, `{checked_epoch, mismatch}` where `mismatch` is the `"loaded -> installed"` pair already announced or null (0.2.1). Each half rewrites only its own section. |
 
 Rules that hold this together:
 
@@ -314,6 +314,13 @@ Five rules, four of which are about not lying:
 - **No sinks means no record either**, checked before anything is written. Marking an incident as reported when there was nowhere to report it would leave today's refusal permanently unannounced if a sink were added tomorrow.
 - **A stale heartbeat is not acted on**, in either direction. A file older than `CAPTURE_STALE` (300s), or one whose `running` is false, describes a moment that has passed: a stopped daemon is not a camera that recovered, and an all-clear sent from that would be an invention.
 - **It logs to the journal only.** Its unit may write exactly one directory, the state directory, so opening `encode.log` under `ProtectSystem=strict` kills the process at startup with a read-only filesystem error. Found on real systemd, not in a test, which is the second time that has been true of a `ReadWritePaths` assumption in this release.
+
+**The same timer watches the NVIDIA driver (0.2.1).** unattended-upgrades replaces the driver package under a running kernel module, and until a reboot no new process can open an NVENC session, so the nightly encode falls back to libx264 and succeeds, slower and about twice the size. Seen on the deployment 2026-09-13. The upgrade lands in the daytime and the encode at 00:05, so `watch_gpu_driver()` looks once an hour (`GPU_CHECK_EVERY`, throttled through `notified.json` because the timer fires every five minutes), logs a warning on every check that finds it, and notifies once when it starts and once when it clears, under the same rules as the credential half. Four things about how it looks:
+
+- **It yields to the host.** The GPU belongs to the NVR and its object detection, so the check never encodes, never opens a session and never restarts anything. A reboot interrupts the NVR too, so the message says what a restart clears and leaves the timing to the operator. Pinning the driver out of unattended-upgrades was considered and refused for the same reason: the driver's update policy is not this program's to set.
+- **Version files first.** `nvidia_versions()` reads the loaded module's version from `/sys/module/nvidia/version` (measured on the deployment: `595.91.07`) and the installed one from the `libnvidia-ml.so.<version>` and `libnvidia-encode.so.<version>` names in the usual library directories. Two file reads, no device, no library loaded. Compared on the components both spellings carry, so `595.91` and `595.91.07` agree. More than one installed version is "cannot tell", not a guess.
+- **nvidia-smi only where the files are not found**, through `driver_mismatch()`. That needs `/dev/nvidiactl` and `/dev/nvidia0`, which `PrivateDevices=true` hides, so the watch unit carries `DevicePolicy=closed` plus `DeviceAllow=char-nvidia-frontend rw` instead: a closed device set with exactly the NVIDIA frontend let back in.
+- **"Could not ask" is not "healthy".** `driver_mismatch()` used to answer False for any nvidia-smi output without a mismatch marker, including "couldn't communicate with the NVIDIA driver", which is what a sandboxed unit gets. Under the old unit that would have made the fallback a check that cannot fail. It answers False now only when nvidia-smi printed a driver version, and None otherwise.
 
 **Severity, not colour.** Call sites pass `"ok"`, `"info"`, `"warn"` or `"error"`; each sink maps that to its own vocabulary (a Discord embed colour, an ntfy priority, nothing at all for Telegram). They used to pass a hex colour, which meant a Discord concept travelling through code with no business knowing what Discord is.
 
@@ -1153,6 +1160,7 @@ Single JSON file, default `/etc/timelapse/config.json`, mode `640`. Both program
 | `min_frames` | 100 | Below this, `SKIP` rather than produce a 2-second video. |
 | `delete_frames_on_success` | true | Off keeps the day directory. Safe since 0.1.6: `.encoded.json` is what stops the day being encoded again. There is no age-based sweeper and there is not going to be one (decided-against.md), so kept frames are kept forever, one directory per camera per day. |
 | `max_backlog_days` | 7 | Bounds a catch-up run after long downtime. A count of the newest distinct dates *still pending*, not an age cutoff: downtime produces fewer date directories, never more, so it cannot strand a day. |
+| `notify_driver_mismatch` | true | Once an hour, from the watch timer, check whether the NVIDIA driver was upgraded under the running kernel module (§4.2). Logs every hour it is true; notifies once when it starts and once when it clears. Uses no GPU time. |
 
 ### `transfer`
 | Key | Notes |
@@ -1484,7 +1492,7 @@ installer/timelapse-maker.iss    the .exe, for Inno Setup 6, 237 lines
 installer/prepare.ps1            prerequisites, then install.ps1, 493 lines
 installer/prerequisites.json     the pinned Python and ffmpeg downloads
 scripts/timelapse_capture.py     daemon, 1683 lines
-scripts/timelapse_encode.py      batch job, 2710 lines
+scripts/timelapse_encode.py      batch job, 2915 lines
 scripts/timelapse_test.py        pre-flight checks + usage report, 1155 lines
 scripts/timelapse_setup.py       configuration wizard, 5207 lines
 scripts/timelapse_gui.py         the same wizard in a window, 2990 lines
@@ -1510,7 +1518,7 @@ config/config.example.json       template; the real config.json is gitignored
 service/timelapse-capture.service
 service/timelapse-encode.service
 service/timelapse-encode.timer
-service/timelapse-watch.service   credential watch, oneshot
+service/timelapse-watch.service   credential and NVIDIA driver watch, oneshot
 service/timelapse-watch.timer     every 5 minutes
 service/timelapse-web.service
 docs/architecture.md             this file
@@ -1525,7 +1533,7 @@ docs/decided-against.md          considered and refused, and why
 
 Dependencies: Python 3.9+ stdlib, `requests`, `ffmpeg`/`ffprobe` (NVENC for AV1/HEVC), `rsync`. No virtualenv required, one pip package, no database. The web UI adds nothing: it is `http.server` and the stdlib.
 
-**The daemons are hardened like the page that lists files** (0.2.1, L38). They were not: `timelapse-web.service` carried `RestrictAddressFamilies`, `ProtectKernelTunables`, `ProtectControlGroups` and `PrivateDevices`, and the capture daemon, which holds every camera password and talks to the LAN, had none of the four. Capture and watch now have all four; encode has three, because **`PrivateDevices=true` hides `/dev/nvidia*`** and an encode that cannot see the GPU falls back to libx264 and *succeeds*, taking hours instead of minutes with nothing to say why. Measured on systemd 255: `systemd-analyze security` moves the daemon from **8.4 EXPOSED to 7.0 MEDIUM**, the same score the web unit has.
+**The daemons are hardened like the page that lists files** (0.2.1, L38). They were not: `timelapse-web.service` carried `RestrictAddressFamilies`, `ProtectKernelTunables`, `ProtectControlGroups` and `PrivateDevices`, and the capture daemon, which holds every camera password and talks to the LAN, had none of the four. Capture has all four; encode has three, because **`PrivateDevices=true` hides `/dev/nvidia*`** and an encode that cannot see the GPU falls back to libx264 and *succeeds*, taking hours instead of minutes with nothing to say why. The watch had all four until its NVIDIA driver check arrived later in 0.2.1, and now replaces `PrivateDevices` with `DevicePolicy=closed` plus `DeviceAllow=char-nvidia-frontend rw`, so its nvidia-smi fallback can reach the driver and nothing else in `/dev`. Measured on systemd 255: `systemd-analyze security` moves the daemon from **8.4 EXPOSED to 7.0 MEDIUM**, the same score the web unit has.
 
 The two timer-fired oneshots also lost their `[Install]` sections. They carried `WantedBy=multi-user.target`, so `systemctl enable timelapse-encode.service` ran a full backlog pass at every boot, which is the worst possible moment for one; neither is ever enabled directly, because the installer enables the timers. They report `static` now, and `systemctl enable` on them explains itself and exits 0 rather than failing, so the check for this reads `is-enabled`, not the exit code.
 

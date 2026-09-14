@@ -42,6 +42,14 @@ While the version is `0.x`, the configuration format may change in any release.
 
   This one goes to the screen rather than to a file, but `install.sh` runs the checker on every install and every upgrade, and `timelapse test > report.txt` writes it down. **If you have pasted a pre-flight transcript into a bug report, a forum or a chat, treat that camera password as exposed**, and change it on the camera. There is nothing to purge locally unless you redirected the output somewhere yourself.
 
+### Added
+
+- **A warning before the nightly encode loses the GPU to a driver update (Linux).** When the NVIDIA driver package is updated while the old driver is still loaded, which is what unattended upgrades do, no new program can use the GPU to encode until the machine restarts, and the nightly encode quietly falls back to libx264: slower, with files about twice the size. The watch timer now checks for that once an hour, writes a warning to the journal every hour it is true, and sends one notification when it starts and one when it clears, so there is time to choose a moment to restart before 00:05.
+
+  It uses no GPU time and changes nothing on the machine. It compares the loaded driver's version with the installed one, which are two small files, and asks `nvidia-smi` only when those are not where it expects. The restart is left to you, since it interrupts the NVR as well. Set `encode.notify_driver_mismatch` to `false` to turn it off.
+
+  To let that `nvidia-smi` fallback reach the driver, the watch unit swaps `PrivateDevices=true` for a closed device list that admits the NVIDIA device alone. An upgrade installs the new unit.
+
 ### Changed
 
 - **Windows: your finished videos open without administrator rights.** The installer closes `%ProgramData%\timelapse` so that the camera passwords in `config.json` are not readable by every account on the machine, and by default the videos are inside it, so double-clicking your own timelapse asked for administrator. The videos folder is now granted read and execute to ordinary accounts. Read and execute only: an account that is not an administrator can open and copy a video but cannot alter or delete one. Nothing else opens up, and the frames, the logs and `config.json` stay exactly as restricted as before. Applied on upgrade as well as on a fresh install, and only when the videos are in the folder this program restricted: a `video_output` you put on another drive is left alone.

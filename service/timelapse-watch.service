@@ -1,5 +1,5 @@
 [Unit]
-Description=Report cameras that are refusing our credentials
+Description=Report refused camera credentials and a stale NVIDIA driver
 Documentation=https://github.com/war4peace/timelapse-maker
 After=network-online.target
 Wants=network-online.target
@@ -24,7 +24,17 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-PrivateDevices=true
+# Not PrivateDevices=true, which the other daemons carry. Once an hour this
+# checks whether the NVIDIA driver was upgraded under the running kernel
+# module. It compares two version files first and opens no device for that;
+# where those files are not found it asks nvidia-smi, which needs
+# /dev/nvidiactl and /dev/nvidia0, and PrivateDevices would hide both. So the
+# device set is closed and exactly the NVIDIA frontend (major 195, both nodes)
+# is let back in, read-write because nvidia-smi opens it that way. If the
+# driver is not loaded when this unit starts, the class is unknown, nothing is
+# allowed, and there is nothing to check anyway.
+DevicePolicy=closed
+DeviceAllow=char-nvidia-frontend rw
 ProtectKernelTunables=true
 ProtectControlGroups=true
 # AF_UNIX is not optional: it is how a child reaches systemd, journald and

@@ -16,6 +16,7 @@ A reliability and safety release. Nearly everything in it came from a line-by-li
 - Windows: the capture service really does restart itself after it fails, up to three times
 - Testing an RTSP camera now says what went wrong: wrong password, wrong stream path, or the camera has no free connections
 - `timelapse test --encoders` says when the NVIDIA driver has been updated and the machine needs a reboot
+- Linux: once an hour, a warning in the log and one notification when the NVIDIA driver was updated but the old one is still loaded, so you can restart before the nightly encode falls back to the slow encoder; a second notification says when it is fixed
 - `timelapse test` now exits with an error code when a check fails, so scripts and the installer can act on it
 - Editing a camera in the wizard asks for the username and password separately, and never shows the password
 - Typing `-` in the wizard clears an optional setting (ntfy token, web library folder, web index folder)

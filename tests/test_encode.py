@@ -881,6 +881,19 @@ class TestDriverMismatch(unittest.TestCase):
             raise FileNotFoundError("nvidia-smi")
         self.assertIsNone(enc.driver_mismatch(runner=missing))
 
+    def test_a_sandbox_that_hides_the_device_is_not_a_healthy_answer(self):
+        """What nvidia-smi prints when it cannot open /dev/nvidiactl.
+
+        That is what a unit with PrivateDevices=true gets, and it used to read
+        as False. The hourly driver watch would then have been a check that
+        cannot fail: quiet on every night, including the one with a mismatch.
+        """
+        reply = self.Reply(stdout="NVIDIA-SMI has failed because it couldn't "
+                                  "communicate with the NVIDIA driver. Make "
+                                  "sure that the latest NVIDIA driver is "
+                                  "installed and running.")
+        self.assertIsNone(enc.driver_mismatch(runner=lambda: reply))
+
     def test_cannot_tell_produces_no_hint(self):
         hint = enc.encoder_hint("hevc_nvenc", "something odd",
                                 built_in=True, mismatch=None)
@@ -3569,8 +3582,25 @@ class TestOnlyOneRunAtATime(unittest.TestCase):
         argv = ["timelapse_encode.py", str(self.config_path), "--watch"]
         with mock.patch.object(sys, "argv", argv), \
              mock.patch.object(enc, "setup_logging", lambda *a, **k: None), \
-             mock.patch.object(enc, "watch_credentials", lambda cfg: 0):
+             mock.patch.object(enc, "watch_credentials", lambda cfg: 0), \
+             mock.patch.object(enc, "watch_gpu_driver", lambda cfg: 0):
             self.assertEqual(enc.main(), 0)
+
+    def test_one_watch_failing_does_not_stop_the_other(self):
+        ran = []
+
+        def broken(cfg):
+            raise RuntimeError("capture.json exploded")
+
+        argv = ["timelapse_encode.py", str(self.config_path), "--watch"]
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(enc, "setup_logging", lambda *a, **k: None), \
+             mock.patch.object(enc, "watch_credentials", broken), \
+             mock.patch.object(enc, "watch_gpu_driver",
+                               lambda cfg: ran.append(1) or 0), \
+             self.assertLogs(enc.log, "ERROR"):
+            self.assertEqual(enc.main(), 0)
+        self.assertEqual(ran, [1])
 
     def test_a_lock_that_cannot_be_taken_at_all_does_not_stop_the_run(self):
         """Three answers and not two. A lock file that cannot be created is an
@@ -3773,6 +3803,244 @@ class TestWatchUnitWiring(unittest.TestCase):
         src = (self.repo / "scripts" / "timelapse_encode.py").read_text(
             encoding="utf-8")
         self.assertIn("None if args.watch else", src)
+
+    @staticmethod
+    def settings(text):
+        """A unit's directives, without its comments.
+
+        The watch unit's comment explains why it does not carry
+        PrivateDevices=true, so a substring scan would find the very line
+        saying it is absent.
+        """
+        return [l.strip() for l in text.splitlines()
+                if l.strip() and not l.strip().startswith("#")]
+
+    def test_it_can_reach_the_nvidia_driver(self):
+        # PrivateDevices hides /dev/nvidiactl, and nvidia-smi then prints
+        # "couldn't communicate", which is not an answer about the driver.
+        lines = self.settings(self.unit)
+        self.assertNotIn("PrivateDevices=true", lines)
+        self.assertIn("DevicePolicy=closed", lines)
+        self.assertIn("DeviceAllow=char-nvidia-frontend rw", lines)
+
+    def test_the_daemons_keep_their_device_sandbox(self):
+        # The control: loosening one oneshot is not a licence for the others.
+        for name in ("timelapse-capture.service", "timelapse-web.service"):
+            text = (self.repo / "service" / name).read_text(encoding="utf-8")
+            self.assertIn("PrivateDevices=true", self.settings(text), name)
+
+
+class TestNvidiaVersions(unittest.TestCase):
+    """Two version strings read from files, and nvidia-smi only without them."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def put(self, rel, text=""):
+        path = self.root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="ascii")
+
+    def module(self, version):
+        self.put("sys/module/nvidia/version", version + "\n")
+
+    def libs(self, version, sub="usr/lib/x86_64-linux-gnu"):
+        for name in ("libnvidia-ml.so.%s" % version, "libnvidia-ml.so.1",
+                     "libnvidia-encode.so.%s" % version,
+                     "libnvidia-encode.so.1"):
+            self.put("%s/%s" % (sub, name))
+
+    @staticmethod
+    def unreachable():
+        raise AssertionError("nvidia-smi must not run when the files answer")
+
+    def test_the_deployment_module_version_is_read_as_written(self):
+        # `cat /sys/module/nvidia/version` on the deployment, 2026-09-14.
+        self.module("595.91.07")
+        self.assertEqual(enc.nvidia_versions(self.root)[0], "595.91.07")
+
+    def test_matching_versions_are_no_mismatch(self):
+        self.module("595.91.07")
+        self.libs("595.91.07")
+        self.assertEqual(enc.driver_state(self.root, self.unreachable),
+                         (False, "595.91.07", "595.91.07", "files"))
+
+    def test_an_upgrade_under_the_running_module_is_a_mismatch(self):
+        self.module("595.84.03")
+        self.libs("595.91.07")
+        self.assertEqual(enc.driver_state(self.root, self.unreachable),
+                         (True, "595.84.03", "595.91.07", "files"))
+
+    def test_a_shorter_spelling_is_the_same_version(self):
+        self.assertFalse(enc.versions_differ("595.91.07", "595.91"))
+        self.assertTrue(enc.versions_differ("595.84.03", "595.91"))
+
+    def test_other_distro_layouts_are_found(self):
+        self.module("595.84.03")
+        self.libs("595.91.07", sub="usr/lib64")
+        self.assertIs(enc.driver_state(self.root, self.unreachable)[0], True)
+
+    def test_other_nvidia_libraries_are_not_read(self):
+        # glcore and friends ship in the same package, but a stray one from an
+        # old install must not count as "two versions installed".
+        self.module("595.91.07")
+        self.libs("595.91.07")
+        self.put("usr/lib/x86_64-linux-gnu/libnvidia-glcore.so.570.10")
+        self.assertEqual(enc.nvidia_versions(self.root),
+                         ("595.91.07", "595.91.07"))
+
+    def test_two_installed_versions_ask_nvidia_smi(self):
+        self.module("595.91.07")
+        self.libs("595.84.03")
+        self.libs("595.91.07", sub="usr/lib64")
+        healthy = mock.Mock(stdout="Driver Version: 595.91.07", stderr="")
+        self.assertEqual(enc.driver_state(self.root, lambda: healthy),
+                         (False, "595.91.07", None, "nvidia-smi"))
+
+    def test_no_module_and_no_nvidia_smi_cannot_tell(self):
+        def missing():
+            raise FileNotFoundError("nvidia-smi")
+        self.assertIsNone(enc.driver_state(self.root, missing)[0])
+
+
+class TestDriverWatch(unittest.TestCase):
+    """Hourly, once per incident, and never from a machine it cannot read."""
+
+    T = 1_800_000_000
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.root = self.tmp / "root"
+        self.cfg = {"paths": {"state_dir": str(self.tmp)},
+                    "notify": [{"type": "discord", "enabled": True,
+                                "webhook_url": "https://example.invalid/w"}]}
+        self.sent = []
+        self.reply = (1, 0)
+        patcher = mock.patch.object(
+            enc, "notify",
+            side_effect=lambda cfg, title, desc, level, fields:
+                self.sent.append((title, level, fields)) or self.reply)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.smi_calls = 0
+
+    def runner(self):
+        self.smi_calls += 1
+        raise FileNotFoundError("nvidia-smi")
+
+    def versions(self, loaded, installed):
+        shutil.rmtree(self.root, True)
+        if loaded:
+            p = self.root / "sys/module/nvidia/version"
+            p.parent.mkdir(parents=True)
+            p.write_text(loaded + "\n", encoding="ascii")
+        if installed:
+            d = self.root / "usr/lib/x86_64-linux-gnu"
+            d.mkdir(parents=True)
+            (d / ("libnvidia-ml.so." + installed)).write_text("")
+
+    def run_at(self, offset):
+        return enc.watch_gpu_driver(self.cfg, now=self.T + offset,
+                                    root=self.root, runner=self.runner)
+
+    def gpu_record(self):
+        return enc.load_watch_record(self.cfg).get("gpu")
+
+    def test_a_mismatch_is_reported_once(self):
+        self.versions("595.84.03", "595.91.07")
+        self.assertEqual(self.run_at(0), 1)
+        self.assertEqual(self.run_at(3600), 0)
+        self.assertEqual(self.run_at(7200), 0)
+        self.assertEqual(len(self.sent), 1)
+        title, level, fields = self.sent[0]
+        self.assertIn("NVIDIA", title)
+        self.assertEqual(level, "warn")
+        self.assertIn(("Loaded", "595.84.03"), fields)
+        self.assertIn(("Installed", "595.91.07"), fields)
+
+    def test_it_logs_on_every_hourly_check(self):
+        self.versions("595.84.03", "595.91.07")
+        for offset in (0, 3600):
+            with self.assertLogs(enc.log, "WARNING") as logs:
+                self.run_at(offset)
+            self.assertIn("595.84.03", logs.output[0])
+
+    def test_it_looks_at_most_once_an_hour(self):
+        self.versions("595.91.07", "595.91.07")
+        self.assertEqual(self.run_at(0), 0)
+        self.versions("595.84.03", "595.91.07")
+        self.assertEqual(self.run_at(300), 0)
+        self.assertEqual(self.run_at(3599), 0)
+        self.assertEqual(self.run_at(3600), 1)
+
+    def test_the_all_clear_follows_a_restart(self):
+        self.versions("595.84.03", "595.91.07")
+        self.run_at(0)
+        self.versions("595.91.07", "595.91.07")
+        self.assertEqual(self.run_at(3600), 1)
+        self.assertIn("match again", self.sent[-1][0])
+        self.assertEqual(self.sent[-1][1], "ok")
+        self.assertEqual(self.run_at(7200), 0)
+        self.assertEqual(len(self.sent), 2)
+
+    def test_cannot_tell_moves_nothing(self):
+        # No module file and no nvidia-smi: not a driver that was fixed.
+        self.versions("595.84.03", "595.91.07")
+        self.run_at(0)
+        self.versions(None, None)
+        self.assertEqual(self.run_at(3600), 0)
+        self.assertEqual(self.gpu_record()["mismatch"],
+                         "595.84.03 -> 595.91.07")
+        self.assertEqual(self.smi_calls, 1)
+        self.versions("595.91.07", "595.91.07")
+        self.assertEqual(self.run_at(7200), 1)
+
+    def test_no_sinks_logs_but_records_no_incident(self):
+        self.cfg["notify"] = []
+        self.versions("595.84.03", "595.91.07")
+        with self.assertLogs(enc.log, "WARNING"):
+            self.assertEqual(self.run_at(0), 0)
+        self.assertIsNone(self.gpu_record()["mismatch"])
+        self.cfg["notify"] = [{"type": "discord", "enabled": True,
+                               "webhook_url": "https://example.invalid/w"}]
+        self.assertEqual(self.run_at(3600), 1)
+
+    def test_a_failed_delivery_is_retried_on_the_next_tick(self):
+        self.versions("595.84.03", "595.91.07")
+        self.reply = (0, 1)
+        self.assertEqual(self.run_at(0), 0)
+        self.reply = (1, 0)
+        self.assertEqual(self.run_at(300), 1)
+
+    def test_it_can_be_switched_off(self):
+        self.cfg["encode"] = {"notify_driver_mismatch": False}
+        self.versions("595.84.03", "595.91.07")
+        self.assertEqual(self.run_at(0), 0)
+        self.assertEqual(self.sent, [])
+        self.assertFalse((self.tmp / enc.WATCH_STATE).exists())
+
+    def test_it_is_on_when_the_key_is_absent(self):
+        self.assertNotIn("encode", self.cfg)
+        self.versions("595.84.03", "595.91.07")
+        self.assertEqual(self.run_at(0), 1)
+
+    def test_a_clock_stepped_back_does_not_skip_the_check(self):
+        self.versions("595.91.07", "595.91.07")
+        self.run_at(0)
+        self.versions("595.84.03", "595.91.07")
+        self.assertEqual(self.run_at(-7200), 1)
+
+    def test_the_two_watches_keep_each_others_records(self):
+        enc.save_notified(self.cfg, {"Roof": "2026-09-14T09:00:00"})
+        self.versions("595.84.03", "595.91.07")
+        self.run_at(0)
+        self.assertEqual(enc.load_notified(self.cfg),
+                         {"Roof": "2026-09-14T09:00:00"})
+        enc.save_notified(self.cfg, {})
+        self.assertEqual(self.gpu_record()["mismatch"],
+                         "595.84.03 -> 595.91.07")
 
 
 class TestAddressFormatting(unittest.TestCase):

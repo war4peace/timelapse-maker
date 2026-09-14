@@ -382,7 +382,7 @@ CHECKING
                        folders that no enabled camera will ever encode, which
                        is how stranded frames get found.
   status               systemctl status for every unit at once: capture, the
-                       encode timer and service, the credential watch timer
+                       encode timer and service, the watch timer
                        and service, and the web UI. Each oneshot is listed
                        separately from its timer on purpose, because a failed
                        run leaves the service failed while the timer still

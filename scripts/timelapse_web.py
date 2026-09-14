@@ -934,7 +934,7 @@ STATUS_UNITS = (
     ("timelapse-capture.service", "Capture", "daemon"),
     ("timelapse-encode.timer", "Nightly encode", "timer"),
     ("timelapse-encode.service", "Last encode run", "oneshot"),
-    ("timelapse-watch.timer", "Credential watch", "timer"),
+    ("timelapse-watch.timer", "Watch", "timer"),
     ("timelapse-web.service", "Web interface", "daemon"),
 )
 

@@ -348,15 +348,13 @@ Worth doing before the main test, because snapshot size drives the whole disk bu
 
   `Failed to initialize NVML: Driver/library version mismatch` means the NVIDIA packages were upgraded while the old kernel module was still loaded, so the module and the userspace libraries are now different versions. **Only a reboot fixes that.** On Ubuntu and Debian it is normally unattended-upgrades, and `grep -i nvidia /var/log/apt/history.log` shows when it happened.
 
-  Nothing is lost while it lasts: capture never touches the GPU, and the nightly encode keeps producing correct videos on libx264, just slowly and in H.264. If you would rather it never happened unannounced, either hold the driver packages and upgrade them deliberately, or let unattended-upgrades reboot for you:
+  Nothing is lost while it lasts: capture never touches the GPU, and the nightly encode keeps producing correct videos on libx264, just slowly and in H.264.
 
-  ```bash
-  sudo apt-mark hold nvidia-driver-XXX     # the version from history.log
-  # or, in /etc/apt/apt.conf.d/50unattended-upgrades:
-  #   Unattended-Upgrade::Automatic-Reboot "true";
-  ```
+  **Since 0.2.1 you hear about it before the encode does.** Once an hour the watch timer compares the loaded driver's version with the installed one, writes a warning to the journal every hour they differ (`journalctl -u timelapse-watch`), and sends one notification when it starts and one when it clears, through whatever sinks you configured in [section 6a](#6a-notifications). An update during the day therefore usually leaves hours to pick a moment to restart before 00:05. It uses no GPU time and changes nothing on the machine. Set `encode.notify_driver_mismatch` to `false` to turn it off.
 
-  Since 0.2.1 both `timelapse test --encoders` and the nightly log name this outright. Before that the log said `no free NVENC session`, which was a guess, and a wrong one: read the `ffmpeg:` line under the hint, which is what ffmpeg actually said.
+  When to restart is your decision, and this program deliberately does not make it for you: on a recorder the restart interrupts the NVR too, and anything else using the GPU, such as object detection. For the same reason it does not suggest pinning the driver: that machine's update policy belongs to the software it was set up for.
+
+  Both `timelapse test --encoders` and the nightly log also name this outright since 0.2.1. Before that the log said `no free NVENC session`, which was a guess, and a wrong one: read the `ffmpeg:` line under the hint, which is what ffmpeg actually said.
 
 <sub>[&uarr; Contents](#contents)</sub>
 
@@ -471,6 +469,13 @@ Each one is offered a test message as you configure it, and `timelapse test` sen
 
 A failing sink can never fail the run it is reporting on, and one sink being down does not stop the others. Failures are logged and the encode's exit status is unaffected.
 
+The same sinks carry two warnings from the watch timer, each sent once when the problem starts and once when it clears, never repeated while it lasts:
+
+- **A camera is refusing our credentials** (`capture.notify_auth_failures`). Capture from that camera pauses apart from an occasional retry, so this program does not keep the camera's account locked.
+- **The NVIDIA driver was updated but the old one is still loaded** (`encode.notify_driver_mismatch`, Linux, checked hourly). Until a restart, the nightly encode falls back to libx264; see [Common snags](#common-snags).
+
+With no sink configured, the driver warning is still written to the log every hour. Neither is recorded as announced until a sink has actually accepted it, so the first sink you add announces whatever is still going on.
+
 **If you configured Discord before 0.1.6**, nothing changes and there is nothing to do: the old `discord` block in `config.json` still works exactly as it did. The moment you run `timelapse notify`, the settings move into a `notify` list that can hold several sinks, and the old block is switched off so it cannot look configured while being ignored.
 
 Notification credentials are masked by `timelapse config --redacted`: the bot token, the ntfy token and the secret half of a Discord webhook URL. The chat id, the topic and the webhook's numeric id survive, because they are what a fault report is about.
@@ -495,7 +500,7 @@ The installer puts a single wrapper on `PATH`. Everything below is a subcommand 
 
 | Command | What it does |
 |---|---|
-| `timelapse status` | `systemctl status` for every unit in one shot: capture, the encode timer **and the encode service**, the credential watch timer, and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
+| `timelapse status` | `systemctl status` for every unit in one shot: capture, the encode timer **and the encode service**, the watch timer (refused camera credentials, and a stale NVIDIA driver), and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
 | `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and every notification sink. Run it after any change. **Exits 1 if anything came back FAIL**, 0 otherwise, so a script can act on it; a WARN is not a failure. `--usage` and `--encoders` are reports and always exit 0. |

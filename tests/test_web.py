@@ -568,7 +568,7 @@ class TestUnitStates(unittest.TestCase):
                 "timelapse-watch.timer",
                 NextElapseUSecRealtime="",
                 NextElapseUSecMonotonic="5min 1.016502s",
-            )))["Credential watch"]
+            )))["Watch"]
         self.assertEqual(row[1:3], ("ok", "Scheduled"))
         self.assertIn("next run in 4m", row[3])
 
@@ -577,20 +577,20 @@ class TestUnitStates(unittest.TestCase):
             "timelapse-watch.timer",
             NextElapseUSecMonotonic="infinity",
             LastTriggerUSec="Fri 2026-08-14 22:50:12 EEST",
-        )))["Credential watch"]
+        )))["Watch"]
         self.assertIn("last ran 2026-08-14 22:50:12", row[3])
 
     def test_a_timer_that_will_never_fire_again_says_that(self):
         row = self.rows(self.show(self.daemon(
             "timelapse-watch.timer",
-            NextElapseUSecMonotonic="infinity")))["Credential watch"]
+            NextElapseUSecMonotonic="infinity")))["Watch"]
         self.assertEqual(row[3], "no further runs scheduled")
 
     def test_a_timer_about_to_fire_says_due_now(self):
         with mock.patch.object(web.time, "monotonic", return_value=301.0):
             row = self.rows(self.show(self.daemon(
                 "timelapse-watch.timer",
-                NextElapseUSecMonotonic="5min 1.016502s")))["Credential watch"]
+                NextElapseUSecMonotonic="5min 1.016502s")))["Watch"]
         self.assertEqual(row[3], "due now")
 
     def test_no_timer_row_is_ever_left_with_an_empty_detail(self):
@@ -602,7 +602,7 @@ class TestUnitStates(unittest.TestCase):
                       {"LastTriggerUSec": "Fri 2026-08-14 22:50:12 EEST"}):
             row = self.rows(self.show(
                 self.daemon("timelapse-watch.timer", **props)
-            ))["Credential watch"]
+            ))["Watch"]
             self.assertTrue(row[3], f"empty Detail for {props}")
 
 

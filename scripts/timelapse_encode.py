@@ -542,7 +542,84 @@ def driver_mismatch(message="", runner=None):
     except Exception:
         return None
     text = ((p.stdout or "") + (p.stderr or "")).lower()
-    return True if any(k in text for k in MISMATCH_MARKERS) else False
+    if any(k in text for k in MISMATCH_MARKERS):
+        return True
+    # False only when nvidia-smi actually answered. "couldn't communicate
+    # with the NVIDIA driver" is what it prints when it cannot open
+    # /dev/nvidiactl, which is exactly what a sandboxed unit gets, and reading
+    # that as "no mismatch" would make the hourly watch a check that cannot
+    # fail: silent every night, including the night it matters.
+    return False if "driver version" in text else None
+
+
+# Where a Linux NVIDIA driver package puts its userspace libraries. Debian and
+# Ubuntu use the multiarch directory, Fedora and RHEL use lib64, Arch uses lib.
+# Unverified beyond the author's own Ubuntu host, which is why none of these
+# being present is "cannot tell" rather than "no driver".
+NVIDIA_LIB_DIRS = (
+    "usr/lib/x86_64-linux-gnu",
+    "usr/lib/aarch64-linux-gnu",
+    "usr/lib64",
+    "usr/lib",
+)
+NVIDIA_LIB = re.compile(r"^libnvidia-(?:ml|encode)\.so\.(\d+(?:\.\d+)+)$")
+
+
+def nvidia_versions(root="/"):
+    """(loaded, installed): the kernel module's version and the libraries'.
+
+    Either is None when this machine cannot say. Two plain file reads, which is
+    the point: this runs from a sandboxed timer every hour on a host whose GPU
+    belongs to the NVR and its object detection, so it must not open a device,
+    start an encode session or load a driver library to find out.
+
+    `installed` is None as well when the libraries carry more than one version,
+    because the half-finished upgrade that would produce that is not something
+    to guess about.
+    """
+    base = Path(root)
+    try:
+        loaded = (base / "sys/module/nvidia/version").read_text(
+            encoding="ascii", errors="replace").strip() or None
+    except OSError:
+        loaded = None
+    found = set()
+    for sub in NVIDIA_LIB_DIRS:
+        try:
+            names = [p.name for p in (base / sub).iterdir()]
+        except OSError:
+            continue
+        for name in names:
+            m = NVIDIA_LIB.match(name)
+            if m:
+                found.add(m.group(1))
+    installed = found.pop() if len(found) == 1 else None
+    return loaded, installed
+
+
+def versions_differ(loaded, installed):
+    """Whether two driver version strings disagree, on the parts both carry.
+
+    A package may name its library 595.91 while the module reports 595.91.07;
+    that is one version, spelled at two lengths.
+    """
+    a, b = loaded.split("."), installed.split(".")
+    n = min(len(a), len(b))
+    return a[:n] != b[:n]
+
+
+def driver_state(root="/", runner=None):
+    """(verdict, loaded, installed, source) for the hourly driver watch.
+
+    verdict is True for a mismatch, False for none, None for cannot tell.
+    The version files answer first because they need nothing; nvidia-smi is the
+    fallback for a host where they are not where this expects, and it needs
+    the watch unit's DeviceAllow to see the driver at all.
+    """
+    loaded, installed = nvidia_versions(root)
+    if loaded and installed:
+        return versions_differ(loaded, installed), loaded, installed, "files"
+    return driver_mismatch(runner=runner), loaded, installed, "nvidia-smi"
 
 
 def explain_rtsp(stderr):
@@ -2163,22 +2240,39 @@ def read_capture_state(cfg):
     return state
 
 
-def load_notified(cfg):
-    """Which camera incidents have already been reported. {name: since}."""
+def load_watch_record(cfg):
+    """The whole of notified.json, or {} if it is absent or unreadable."""
     try:
         with open(state_dir(cfg) / WATCH_STATE, encoding="utf-8") as fh:
             data = json.load(fh)
-        return data.get("incidents", {}) if isinstance(data, dict) else {}
+        return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def save_notified(cfg, incidents):
+def load_notified(cfg):
+    """Which camera incidents have already been reported. {name: since}."""
+    incidents = load_watch_record(cfg).get("incidents", {})
+    return incidents if isinstance(incidents, dict) else {}
+
+
+def save_notified(cfg, incidents=None, **sections):
+    """Update notified.json, keeping every section this call does not name.
+
+    Two watches share the file, the credentials one and the GPU driver one,
+    and each rewrites it. Writing only its own section would erase the other's
+    record, and an erased record is a repeated notification.
+    """
     path = state_dir(cfg) / WATCH_STATE
+    record = load_watch_record(cfg)
+    record["version"] = STATE_VERSION
+    if incidents is not None:
+        record["incidents"] = incidents
+    record.update(sections)
     try:
         tmp = path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"version": STATE_VERSION, "incidents": incidents}, fh)
+            json.dump(record, fh)
         replace_atomic(tmp, path)
         return True
     except OSError as exc:
@@ -2257,6 +2351,110 @@ def watch_credentials(cfg):
     if changed:
         save_notified(cfg, known)
     return changed
+
+
+# ----------------------------------------------------------------------------
+# NVIDIA driver watch
+#
+# unattended-upgrades replaces the NVIDIA driver package under a running kernel
+# module, and from then until a reboot no new process can open an NVENC
+# session: the nightly encode falls back to libx264 and succeeds, slower and
+# twice the size, and the first anybody hears of it is the morning summary.
+# Seen on the deployment 2026-09-13 (595.84 to 595.91). The upgrade happens in
+# the daytime and the encode at 00:05, so an hourly look gives the operator
+# hours to choose a moment to restart.
+#
+# It must yield to the machine it is a guest on. The GPU belongs to the NVR and
+# its object detection, so this never encodes, never holds a session and never
+# restarts anything: it reads two version strings, and asks nvidia-smi only
+# where those are not found. When to reboot is the operator's decision.
+# ----------------------------------------------------------------------------
+
+GPU_CHECK_EVERY = 3600
+
+
+def driver_fields(loaded, installed, source):
+    return [
+        ("Loaded", loaded or "unknown"),
+        ("Installed", installed or "unknown"),
+        ("Checked with", "version files" if source == "files" else source),
+    ]
+
+
+def watch_gpu_driver(cfg, now=None, root="/", runner=None):
+    """Hourly: notify once when the driver goes stale, once when it is fixed.
+
+    Returns how many notifications were delivered. Logs a warning on every
+    check that finds the mismatch, sinks or not, because the journal is the
+    record an operator reads after the fact.
+
+    Follows the credential watch's rules: nothing delivered is not "already
+    told them", no sinks means no record, and "cannot tell" moves nothing in
+    either direction, since a machine this cannot read is not a driver that
+    was fixed.
+    """
+    if not cfg.get("encode", {}).get("notify_driver_mismatch", True):
+        return 0
+    now = time.time() if now is None else now
+    record = load_watch_record(cfg)
+    gpu = record.get("gpu") if isinstance(record.get("gpu"), dict) else {}
+    last = gpu.get("checked_epoch") or 0
+    # A negative age is a clock stepped backwards, and waiting it out could
+    # skip the check for as long as the step was.
+    if 0 <= now - last < GPU_CHECK_EVERY:
+        return 0
+
+    verdict, loaded, installed, source = driver_state(root, runner)
+    known = gpu.get("mismatch")
+    sent_count, retry = 0, False
+
+    if verdict is True:
+        log.warning("NVIDIA driver: loaded %s, installed %s (%s). New "
+                    "programs cannot use NVENC until this machine restarts; "
+                    "the nightly encode falls back to libx264 meanwhile.",
+                    loaded or "unknown", installed or "unknown", source)
+        key = f"{loaded or '?'} -> {installed or '?'}"
+        if known != key and notify_sinks(cfg):
+            sent, _failed = notify(
+                cfg, "⚠️ Timelapse - NVIDIA driver updated, restart pending",
+                "The NVIDIA driver on this machine was updated while the "
+                "previous version is still loaded. Until the machine "
+                "restarts, new programs cannot use the GPU to encode, so the "
+                "nightly encode will fall back to libx264: slower, with "
+                "larger files. Programs that already had the GPU open usually "
+                "keep running. When to restart is up to you; "
+                "'timelapse test --encoders' shows what the encoder sees in "
+                "the meantime.",
+                "warn", driver_fields(loaded, installed, source))
+            if sent:
+                known, sent_count = key, 1
+            else:
+                retry = True
+    elif verdict is False and known:
+        log.info("NVIDIA driver: loaded and installed versions match again.")
+        if notify_sinks(cfg):
+            sent, _failed = notify(
+                cfg, "✅ Timelapse - NVIDIA driver versions match again",
+                "The loaded NVIDIA driver and the installed one are the same "
+                "version again, so the reason the encode could not use the "
+                "GPU is gone.",
+                "ok", driver_fields(loaded, installed, source))
+            if sent:
+                known, sent_count = None, 1
+            else:
+                retry = True
+        else:
+            # Nowhere to send the all-clear, and nothing to gain by holding
+            # an incident open for a sink that was removed.
+            known = None
+    elif verdict is None:
+        log.debug("NVIDIA driver: cannot tell on this machine (%s)", source)
+
+    # A failed delivery keeps the old timestamp, so the next five-minute tick
+    # retries it rather than the next hour.
+    save_notified(cfg, gpu={"checked_epoch": last if retry else now,
+                            "mismatch": known})
+    return sent_count
 
 
 def send_discord(cfg, title, description, color, fields):
@@ -2508,10 +2706,17 @@ def main():
         # Deliberately silent when there is nothing to say: this runs every few
         # minutes, and a line per run would bury the nightly encode in its own
         # log within a week.
-        changed = watch_credentials(cfg)
-        if changed:
-            log.info("Credential watch: %d camera state change(s) reported.",
-                     changed)
+        # Each in its own guard: one watch going wrong must not cost the other
+        # its check, which is the failure isolation the encoder has per camera.
+        for label, watch in (("Credential watch", watch_credentials),
+                             ("Driver watch", watch_gpu_driver)):
+            try:
+                changed = watch(cfg)
+            except Exception:
+                log.exception("%s failed", label)
+                continue
+            if changed:
+                log.info("%s: %d change(s) reported.", label, changed)
         return 0
 
     # One run at a time, and this is not a nicety. Two encodes writing the same
