@@ -81,6 +81,8 @@ The download and the execution are deliberately two steps, so you can read the s
 
 Capture, encode and transfer run on Windows 10, 11 and Server. The web UI does not yet, and neither does upgrading in place. Everything else below applies: the same config file, the same wizard, the same `timelapse` command, the same `timelapse test`.
 
+**Windows in a language other than English is best effort, not supported.** Everything here has been tested on English copies of Windows only. The installer is written not to depend on the display language: for example, the permissions on the configuration folder name the built-in accounts by their fixed identifiers rather than by names that Windows translates. That has never been tried on a non-English copy, though. If it works, it works; if it does not, [open an issue](https://github.com/war4peace/timelapse-maker/issues) and attach `%ProgramData%\timelapse\install.log`. It will be investigated, without a promise of a fix.
+
 There are two ways in. The **installer** is the one to use unless you have a reason not to; the PowerShell script underneath it is documented after it, because it is what the installer runs and what a scripted deployment wants.
 
 #### The installer

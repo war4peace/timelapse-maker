@@ -200,6 +200,7 @@ Full descriptions in [docs/install.md](docs/install.md#8-day-to-day-the-timelaps
 ## Requirements and sizing
 
 - **Linux with systemd** (developed on Ubuntu Server; nothing is distro-specific), or **Windows 10/11 and Server**.
+- **Windows in a language other than English is best effort, not supported.** The installer is written not to depend on the display language, but it has only ever been run on English copies of Windows. If something does not work on yours, [open an issue](https://github.com/war4peace/timelapse-maker/issues) and it will be looked into, without a promise of a fix.
 - **Python 3.9 or newer.** The floor is deliberate and machine-checked: RHEL 9 and its rebuilds ship 3.9 as the system `python3`, and that is the interpreter their packaged `requests` is built for, so requiring a newer one would mean pip and a venv on one distro family for no gain. It costs this project nothing to hold: stdlib only, no type hints, no compatibility shims, no version-gated code. CI runs the suite on 3.9, 3.12 and 3.14.
 - **ffmpeg and ffprobe**, with NVENC if you want AV1 or HEVC hardware encoding.
 - **rsync**, on Linux, only if you enable transfer.
