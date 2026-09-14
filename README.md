@@ -10,7 +10,7 @@ NVR timelapse features are generally built around *clips*, not around one contig
 
 This application handles both aspects. Frame capture is decoupled from the cameras' state, so a camera that drops out contributes fewer frames to the same day's file instead of splitting it, and finished videos are moved wherever you want them (e.g. to a remote NAS). The application can also post-process generated timelapses to smooth out the video.
 
-> [!IMPORTANT] **Version 0.2.0. Early software, under active development.**
+> [!IMPORTANT] **Version 0.2.1. Early software, under active development.**
 >
 > It runs daily on the author's own recorder, and has been installed and exercised on three machines across Linux and Windows. That means the common paths work; it does not mean every combination of distribution, camera and GPU has been tried.
 >
@@ -98,7 +98,7 @@ It also derives systemd's `ReadWritePaths` from the storage you chose. That is t
 ```bash
 sudo bash install_timelapse.sh --unattended   # no questions, sane defaults
 sudo bash install_timelapse.sh --no-wizard    # install files only
-sudo bash install_timelapse.sh --ref v0.2.0   # pin to a tag
+sudo bash install_timelapse.sh --ref v0.2.1   # pin to a tag
 sudo bash install_timelapse.sh --uninstall    # remove; captured data is kept
 ```
 

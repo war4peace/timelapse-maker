@@ -4,9 +4,9 @@ What was fixed in each version, one line per fix, in plain language. Newest vers
 
 ## Contents
 
-- [0.2.1 (unreleased)](#021-unreleased)
+- [0.2.1 - 2026-09-14](#021---2026-09-14)
 
-## 0.2.1 (unreleased)
+## 0.2.1 - 2026-09-14
 
 A reliability and safety release. Nearly everything in it came from a line-by-line review of the whole program on 2026-09-13, plus three problems found on the author's own machine while that review was being worked through. The biggest themes: passwords that could appear on screen, days of footage that could be lost, checks that reported success when something was wrong, and Windows install and service problems. It also adds many new tests of code that had never actually been run by one.
 

@@ -69,7 +69,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$VERSION   = '0.2.0'
+$VERSION   = '0.2.1'
 $SRC       = Split-Path -Parent $MyInvocation.MyCommand.Path
 $CONFDIR   = Join-Path $env:ProgramData 'timelapse'
 $CONFIG    = Join-Path $CONFDIR 'config.json'

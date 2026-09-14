@@ -38,7 +38,7 @@
   ; The release workflow passes /DAppVersion=<tag>, so this default only ever
   ; applies to a local build. It is checked against install.ps1's $VERSION by a
   ; test, because a version that lives in ten places drifts in one of them.
-  #define AppVersion "0.2.0"
+  #define AppVersion "0.2.1"
 #endif
 
 #define AppName "timelapse-maker"

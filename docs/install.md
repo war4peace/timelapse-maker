@@ -92,7 +92,7 @@ Download `timelapse-maker-setup-<version>.exe` from the [releases page](https://
 It is **not code-signed**, so Windows SmartScreen will say "Windows protected your PC". Choose "More info" and then "Run anyway". Every release publishes a `.sha256` beside the installer if you would rather check the download first:
 
 ```powershell
-Get-FileHash .\timelapse-maker-setup-0.2.0.exe -Algorithm SHA256
+Get-FileHash .\timelapse-maker-setup-0.2.1.exe -Algorithm SHA256
 ```
 
 Two checkboxes on the way through, both ticked and both worth leaving that way:
@@ -222,15 +222,15 @@ timelapse version
 ```
 
 ```
-  capture  0.2.0
-  encode   0.2.0
-  test     0.2.0
-  setup    0.2.0
-  update   0.2.0
-  platform 0.2.0
-  web      0.2.0
-  cli      0.2.0
-  gui      0.2.0
+  capture  0.2.1
+  encode   0.2.1
+  test     0.2.1
+  setup    0.2.1
+  update   0.2.1
+  platform 0.2.1
+  web      0.2.1
+  cli      0.2.1
+  gui      0.2.1
 ```
 
 If the daemon predates the installed files it says so explicitly, which is the one failure mode a version number by itself cannot show you.
