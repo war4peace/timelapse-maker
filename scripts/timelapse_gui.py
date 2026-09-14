@@ -26,6 +26,7 @@ scope would take them all down.
 """
 
 import base64
+import ntpath
 import os
 import sys
 from pathlib import Path
@@ -206,7 +207,7 @@ def storage_paths(base):
             "log_dir": str(root / "logs")}
 
 
-def paths_to_store(typed, existing, opened_with):
+def paths_to_store(typed, existing, opened_with, consolidate=False):
     """The three storage paths to save, given what the page was opened with.
 
     Deriving frames, videos and logs from one data folder is right for a
@@ -215,13 +216,47 @@ def paths_to_store(typed, existing, opened_with):
     arrangement, and page one is not where it should be silently undone. So
     the derivation happens when the answer *changed*, and not otherwise.
 
+    `consolidate` is the way back, and the reason it is an explicit flag
+    rather than a smarter comparison. Once the three are split, retyping the
+    original folder is indistinguishable from leaving it alone, so the page
+    could not regroup them at all: found by the operator 2026-09-15, whose
+    only routes were saving a different folder and running setup again, or
+    editing config.json. Only somebody pressing "Consolidate paths" asks for
+    it.
+
     Up here rather than inside the page's commit() because it is a rule, and
     the rules in this file live above the banner where a test can reach them
     without a display.
     """
-    if str(typed).strip() == str(opened_with).strip():
-        return dict(existing)
-    return storage_paths(typed)
+    if consolidate or str(typed).strip() != str(opened_with).strip():
+        return storage_paths(typed)
+    return dict(existing)
+
+
+def same_path(a, b):
+    """Whether two Windows paths name one folder: case and slashes aside."""
+    def norm(p):
+        return ntpath.normcase(ntpath.normpath(str(p or "").strip().strip('"')))
+    return norm(a) == norm(b)
+
+
+def needs_consolidating(typed, existing, opened_with, consolidated=False):
+    """Whether to offer "Consolidate paths": the three folders are split.
+
+    Only while the Data folder still reads what the page opened with, since
+    typing a different one derives all three anyway, and only for a config
+    that has the three to compare. The comparison is the Windows one, so
+    `D:\\TL\\Videos\\` and `d:\\tl\\videos` are not reported as a split.
+    """
+    if consolidated or not str(typed).strip():
+        return False
+    if str(typed).strip() != str(opened_with).strip():
+        return False
+    keys = ("frames_root", "video_output", "log_dir")
+    if not all(existing.get(k) for k in keys):
+        return False
+    derived = storage_paths(typed)
+    return not all(same_path(existing[k], derived[k]) for k in keys)
 
 
 def check_ffmpeg(answer):
@@ -1865,6 +1900,16 @@ def run(config_path=None, existing=None):
             derived = ttk.Label(store, text="", foreground="#555",
                                 justify="left")
             derived.pack(anchor="w", pady=(4, 0))
+            # The way back from a hand-placed folder. The row is always packed
+            # and only its contents come and go: re-packing a widget appends
+            # it, which would drop the button below whatever follows.
+            regroup = {"on": False}
+            regroup_row = ttk.Frame(store)
+            regroup_row.pack(anchor="w", fill="x", pady=(4, 0))
+            regroup_note = ttk.Label(
+                regroup_row, foreground="#555",
+                text="Frames, videos and logs are not all under this folder.")
+            regroup_button = ttk.Button(regroup_row, text="Consolidate paths")
 
             # -- ffmpeg ---------------------------------------------------
             tools = ttk.LabelFrame(self.body, text="ffmpeg", padding=8)
@@ -1946,17 +1991,31 @@ def run(config_path=None, existing=None):
                     # another disk, those are two different answers and the
                     # label has to be the one commit() will write.
                     p = paths_to_store(folder.get(), self.cfg["paths"],
-                                       started_at)
+                                       started_at, regroup["on"])
                     derived.config(text="frames  -> %s\nvideos  -> %s\n"
                                         "logs    -> %s" % (p["frames_root"],
                                                            p["video_output"],
                                                            p["log_dir"]))
                 else:
                     derived.config(text="")
+                if needs_consolidating(folder.get(), self.cfg["paths"],
+                                       started_at, regroup["on"]):
+                    if not regroup_note.winfo_ismapped():
+                        regroup_note.pack(side="left")
+                        regroup_button.pack(side="left", padx=(10, 0))
+                else:
+                    regroup_note.pack_forget()
+                    regroup_button.pack_forget()
                 level, message, seconds = check_interval(iv.get())
                 self.say(iv_note, level, message)
                 level, message, _rate = check_framerate(fps.get(), seconds)
                 self.say(fps_note, level, message)
+
+            def consolidate():
+                regroup["on"] = True
+                refresh()
+
+            regroup_button.config(command=consolidate)
 
             for var in (folder, guard, iv, fps):
                 var.trace_add("write", refresh)
@@ -1992,7 +2051,7 @@ def run(config_path=None, existing=None):
 
                 self.cfg["paths"].update(
                     paths_to_store(folder.get(), self.cfg["paths"],
-                                   started_at))
+                                   started_at, regroup["on"]))
                 self.cfg["paths"]["ffmpeg"] = ffmpeg
                 if ffprobe:
                     self.cfg["paths"]["ffprobe"] = ffprobe

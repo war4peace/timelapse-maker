@@ -33,6 +33,10 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows: the setup window can put the storage folders back together.** 0.2.1 made the setup window keep a videos folder you had placed somewhere else, instead of quietly moving it back under the data folder. But once the frames, videos and logs folders were split, nothing in the window could regroup them: retyping the original data folder looked exactly like not touching it. When they are split, the Global configuration page now says so and offers a **Consolidate paths** button, which puts all three back under the data folder shown. The lines under the field show the result before you save.
+
 ## [0.2.1] - 2026-09-14
 
 ### Security

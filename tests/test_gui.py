@@ -2248,6 +2248,57 @@ class TestPageOneLeavesHandPlacedPathsAlone(unittest.TestCase):
         out = gui.paths_to_store("D:\\tl", self.EXISTING, "D:\\tl")
         self.assertEqual(out["ffmpeg"], "C:\\ffmpeg\\bin\\ffmpeg.exe")
 
+    def test_consolidate_puts_all_three_back_under_the_folder(self):
+        # The way back, found missing by the operator 2026-09-15: retyping
+        # the original folder is not a change, so nothing else can ask.
+        out = gui.paths_to_store("D:\\tl", self.EXISTING, "D:\\tl",
+                                 consolidate=True)
+        for key, leaf in (("frames_root", "frames"), ("video_output", "videos"),
+                          ("log_dir", "logs")):
+            self.assertTrue(out[key].startswith("D:\\tl"), out[key])
+            self.assertTrue(out[key].endswith(leaf), out[key])
+
+    def test_consolidate_touches_only_the_three(self):
+        # commit() merges this into cfg["paths"], so ffmpeg must not be in it
+        # at all rather than be in it with a derived value.
+        out = gui.paths_to_store("D:\\tl", self.EXISTING, "D:\\tl",
+                                 consolidate=True)
+        self.assertEqual(sorted(out), ["frames_root", "log_dir", "video_output"])
+
+
+class TestConsolidatePathsButton(unittest.TestCase):
+    """When "Consolidate paths" is offered: the three folders are split."""
+
+    SPLIT = TestPageOneLeavesHandPlacedPathsAlone.EXISTING
+
+    def test_a_split_config_offers_it(self):
+        self.assertTrue(gui.needs_consolidating("D:\\tl", self.SPLIT, "D:\\tl"))
+
+    def test_it_goes_away_once_pressed(self):
+        self.assertFalse(gui.needs_consolidating("D:\\tl", self.SPLIT, "D:\\tl",
+                                                 consolidated=True))
+
+    def test_a_new_folder_needs_no_button(self):
+        # Typing a different folder derives all three already.
+        self.assertFalse(gui.needs_consolidating("F:\\new", self.SPLIT, "D:\\tl"))
+
+    def test_folders_already_together_need_no_button(self):
+        together = gui.storage_paths("D:\\tl")
+        self.assertFalse(gui.needs_consolidating("D:\\tl", together, "D:\\tl"))
+
+    def test_case_and_trailing_slashes_are_not_a_split(self):
+        # Windows calls these one folder, so offering to fix them would be
+        # offering to fix nothing.
+        looks_different = {"frames_root": "d:\\TL\\Frames\\",
+                           "video_output": "D:\\tl\\VIDEOS",
+                           "log_dir": "D:\\Tl\\logs\\"}
+        self.assertFalse(gui.needs_consolidating("D:\\tl", looks_different,
+                                                 "D:\\tl"))
+
+    def test_a_first_run_needs_no_button(self):
+        self.assertFalse(gui.needs_consolidating("D:\\tl", {}, ""))
+        self.assertFalse(gui.needs_consolidating("", self.SPLIT, ""))
+
 
 if __name__ == "__main__":
     unittest.main()

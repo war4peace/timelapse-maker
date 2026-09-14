@@ -4,7 +4,14 @@ What was fixed in each version, one line per fix, in plain language. Newest vers
 
 ## Contents
 
+- [0.2.2 (unreleased)](#022-unreleased)
 - [0.2.1 - 2026-09-14](#021---2026-09-14)
+
+## 0.2.2 (unreleased)
+
+### Fixes
+
+- Bug: Windows: once the frames, videos and logs folders were in different places, the setup window had no way to put them back together; a **Consolidate paths** button now does
 
 ## 0.2.1 - 2026-09-14
 
