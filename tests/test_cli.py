@@ -260,9 +260,55 @@ class TestLogSelection(unittest.TestCase):
     def test_it_says_where_it_looked_when_there_is_nothing(self):
         out = io.StringIO()
         with mock.patch.object(cli, "newest_log", return_value=None), \
+             mock.patch.object(cli, "configured_log_dir", return_value=None), \
              contextlib.redirect_stdout(out):
             self.assertEqual(cli.do_logs([]), 1)
         self.assertIn("log_dir", out.getvalue())
+
+    def test_a_directory_it_may_not_read_is_not_an_empty_one(self):
+        # Measured in WSL: Path.glob returns [] for a directory it cannot open,
+        # so the refusal never reached the old except clause at all.
+        with mock.patch.object(cli.os, "listdir",
+                               side_effect=PermissionError(13, "denied")):
+            with self.assertRaises(PermissionError):
+                cli.newest_log("capture", self.tmp)
+
+    def test_logs_says_elevate_rather_than_no_log_yet(self):
+        out = io.StringIO()
+        with mock.patch.object(cli, "configured_log_dir", return_value=None), \
+             mock.patch.object(cli, "newest_log",
+                               side_effect=PermissionError(13, "denied")), \
+             contextlib.redirect_stdout(out):
+            self.assertEqual(cli.do_logs([]), 1)
+        self.assertIn(cli.elevation_hint(), out.getvalue())
+        self.assertNotIn("No capture log yet", out.getvalue())
+
+    def config_naming(self, log_dir):
+        import json
+        path = self.tmp / "config.json"
+        paths = {"log_dir": str(log_dir)} if log_dir else {}
+        path.write_text(json.dumps({"paths": paths}), encoding="utf-8")
+        return mock.patch.object(cli, "CONFIG_PATH", str(path))
+
+    def test_logs_looks_where_the_config_says(self):
+        elsewhere = self.tmp / "D-drive" / "logs"
+        elsewhere.mkdir(parents=True)
+        (elsewhere / "capture-20260914.log").write_text("x\n", encoding="utf-8")
+        followed = []
+        with self.config_naming(elsewhere), \
+             mock.patch.object(cli, "follow",
+                               lambda path, *a: followed.append(path) or 0), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(cli.do_logs([]), 0)
+        self.assertEqual(followed, [elsewhere / "capture-20260914.log"])
+
+    def test_a_config_without_a_log_dir_falls_back_to_the_default(self):
+        with self.config_naming(None):
+            self.assertIsNone(cli.configured_log_dir())
+
+    def test_an_unreadable_config_falls_back_too(self):
+        with mock.patch.object(cli, "CONFIG_PATH", str(self.tmp / "absent.json")):
+            self.assertIsNone(cli.configured_log_dir())
 
 
 class TestEveryPowerShellFile(unittest.TestCase):
@@ -406,6 +452,80 @@ class TestSetupLauncher(unittest.TestCase):
         # box has to key on there being output rather than on the exit code.
         code = self.code_only(self.SOURCE)
         self.assertIn("$detail.Trim()", code)
+
+
+class TestInstallerChildrenAndThePath(unittest.TestCase):
+    """install.ps1's native calls, its uninstall order and its PATH edit.
+
+    None of it can run here, so the harnesses in temp/ are the measurement
+    (m24_console_probe.ps1, m24_step_probe.ps1, m23_path_probe.ps1) and these
+    pin the text those harnesses were run against.
+    """
+
+    SOURCE = (ROOT / "install.ps1").read_text(encoding="ascii")
+
+    def code_lines(self):
+        # Prose that describes a rule is not a breach of it.
+        return [line for line in self.SOURCE.splitlines()
+                if not line.lstrip().startswith("#")]
+
+    def function(self, name):
+        body = self.SOURCE.split("function %s {" % name, 1)[1]
+        return body.split("\nfunction ", 1)[0]
+
+    def test_invoke_tool_always_discards_the_childs_output(self):
+        """Measured in a real console: a native command inside a function
+        writes its stdout into the function's return value whenever the caller
+        captures it, so `$code -ne 0` was true on a success."""
+        body = self.function("Invoke-Tool")
+        self.assertIn("& $Exe @Arguments 2>&1 | Out-Null", body)
+        self.assertEqual(body.count("& $Exe @Arguments"), 1)
+
+    def test_invoke_step_is_never_captured(self):
+        code = "\n".join(self.code_lines())
+        self.assertGreaterEqual(code.count("Invoke-Step $"), 6,
+                                "the scan found no calls to check")
+        for captured in ("= Invoke-Step", "(Invoke-Step", "| Invoke-Step"):
+            self.assertNotIn(captured, code)
+
+    def test_what_the_operator_should_see_goes_through_invoke_step(self):
+        code = self.code_lines()
+        for marker in ("'--install-units'", "'--remove-units'",
+                       "'--restart-units'", "'--grant-video-access'",
+                       "+ $wizard", "'pip', 'install'"):
+            found = [i for i, line in enumerate(code) if marker in line]
+            self.assertTrue(found, marker)
+            window = "\n".join(code[max(0, found[0] - 2):found[0] + 1])
+            self.assertIn("Invoke-Step", window, marker)
+            self.assertNotIn("Invoke-Tool", window, marker)
+
+    def test_uninstall_deletes_nothing_when_deregistration_failed(self):
+        body = self.function("Invoke-Uninstall")
+        check = body.index("if ($script:StepExit -ne 0)")
+        delete = body.index("Remove-Item -Recurse -Force $Prefix")
+        self.assertLess(body.index("'--remove-units'"), check)
+        self.assertLess(check, delete)
+        self.assertIn("exit 1", body[check:delete])
+
+    def test_uninstall_without_python_removes_nothing_and_says_what_is_left(self):
+        block = self.SOURCE.split("if (-not $python) {", 1)[1]
+        block = block.split("\n}\n", 1)[0]
+        self.assertIn("if ($Uninstall)", block)
+        self.assertIn("Show-ManualRemoval", block)
+        self.assertLess(block.index("if ($Uninstall)"), block.index("exit 1"))
+
+    def test_the_machine_path_keeps_its_variables(self):
+        code = "\n".join(self.code_lines())
+        self.assertNotIn("GetEnvironmentVariable('Path'", code)
+        self.assertNotIn("SetEnvironmentVariable('Path'", code)
+        self.assertIn("DoNotExpandEnvironmentNames",
+                      self.function("Get-MachinePath"))
+        self.assertIn("RegistryValueKind]::ExpandString",
+                      self.function("Set-MachinePath"))
+        for name in ("Add-ToPath", "Remove-FromPath"):
+            body = self.function(name)
+            self.assertIn("Get-MachinePath", body, name)
+            self.assertIn("Set-MachinePath", body, name)
 
 
 class TestSetupShortcut(unittest.TestCase):

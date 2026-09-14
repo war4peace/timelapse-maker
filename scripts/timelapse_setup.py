@@ -1911,8 +1911,15 @@ def print_unit_status():
         if is_scheduled(unit):
             info = task_info(unit)
             if info is None:
-                state = "not installed" if task_exists(unit) is False \
-                    else "unknown"
+                exists = task_exists(unit)
+                if exists is False:
+                    state = "not installed"
+                elif not is_elevated():
+                    # Neither query can see a SYSTEM task from here, so say
+                    # what would answer it rather than a bare "unknown".
+                    state = "unknown (needs an elevated prompt)"
+                else:
+                    state = "unknown"
             else:
                 # Translated, never the raw number: a task that has never run
                 # reports 267011, and printed as a figure that is indis-

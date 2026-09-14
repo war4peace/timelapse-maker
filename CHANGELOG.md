@@ -147,6 +147,48 @@ While the version is `0.x`, the configuration format may change in any release.
   the destination with the same size, and not older than the local copy, is
   left alone, the way rsync already behaves on Linux.
 
+- **Linux: uninstalling removes the watch service and its timer as well.**
+  `install.sh --uninstall` disabled them but left both unit files in
+  `/etc/systemd/system`, so systemd still listed them, and a later reinstall
+  took the leftover timer for one you had set up yourself and did not turn it
+  on. One list of units now drives both installing and removing.
+
+- **Linux: a dependency that fails to install now says why, and curl can no
+  longer take the other dependencies down with it.** Package manager output was
+  thrown away, so a refusal read only "Some base packages failed to install."
+  The last lines of what the package manager said are shown now. And curl was
+  installed in the same transaction as Python's `requests` and rsync; on Fedora
+  and RHEL, which ship a `curl-minimal` that conflicts with the `curl` package,
+  that is expected to fail the whole transaction. curl is now installed on its
+  own, and only when there is no `curl` command at all.
+
+- **Windows: running `install.ps1` directly shows what it is doing again, and
+  no longer warns about a registration that worked.** The helper it runs each
+  step through swallowed the step's output whenever its result was kept, so an
+  install printed "Registration did not fully succeed; see above." with nothing
+  above it, and the setup wizard it starts on a first install had its questions
+  sent nowhere. The .exe installer was affected only in its log file.
+
+- **Windows: installing no longer rewrites the system PATH into a fixed
+  string.** The installer read the PATH with its variables already filled in
+  and wrote it back as plain text, so entries like `%SystemRoot%\system32` were
+  frozen to what they meant on the day of the install. The PATH now keeps its
+  variables, and running programs are told it changed.
+
+- **Windows: uninstalling no longer deletes the program while its service is
+  still registered.** If the service or a scheduled task could not be removed,
+  the files were deleted anyway, leaving a service that pointed at nothing and
+  kept restarting. Uninstall now stops, deletes nothing, and prints the
+  commands to finish by hand. The same happens when the Python it was installed
+  with has already been removed.
+
+- **Windows: `timelapse status` from a window that is not elevated says so,
+  instead of reporting the encode and watch tasks as not installed.**
+
+- **Windows: `timelapse logs` looks in the log folder your configuration
+  names**, not only the default one, and says when the folder cannot be read
+  from this window rather than claiming there is no log yet.
+
 - **Testing an RTSP camera now says what went wrong instead of "Operation not
   permitted".** ffmpeg uses that one phrase for several unrelated problems, and
   the setup window repeated it, so a camera that was refusing the connection

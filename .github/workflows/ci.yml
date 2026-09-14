@@ -168,10 +168,9 @@ jobs:
           # step on exactly the outcome this step says is acceptable.
           $global:LASTEXITCODE = 0
 
-      # The Windows analogue of the `shell` job's bash -n and shellcheck.
-      # install.ps1 cannot be *run* here (it registers services and needs
-      # elevation) but it can be parsed, which catches the whole class of
-      # mistake that would otherwise be found by an operator mid-install.
+      # The Windows analogue of the `shell` job's bash -n and shellcheck, and
+      # cheap enough to keep beside the real install that windows-install runs:
+      # a parse error is found here in seconds.
       #
       # Globbed rather than listed, and temp/ is not in the glob. The first
       # version of this step named temp/step3b_check.ps1, which is gitignored:
@@ -208,6 +207,127 @@ jobs:
           $out = python scripts/timelapse_cli.py nonsense 2>&1 | Out-String
           if ($LASTEXITCODE -eq 0) { throw "an unknown command exited 0" }
           if ($out -notmatch 'unknown command') { throw "no usage error" }
+          $global:LASTEXITCODE = 0
+
+  # The Windows counterpart of the `install` job. This leg's comment used to
+  # say install.ps1 could not be run on a runner because it needs elevation,
+  # and a hosted Windows runner is an administrator with UAC off, so the gap
+  # was being defended rather than noticed. Run as prepare.ps1 runs it: under
+  # Windows PowerShell 5.1, in its own process, because that is what ships.
+  #
+  # Not yet run at the time of writing: the branch it was written on was local
+  # (M34 in improvement-plan.md), so its first run is the release push.
+  windows-install:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: The runner is elevated
+        run: |
+          $me = New-Object Security.Principal.WindowsPrincipal(
+            [Security.Principal.WindowsIdentity]::GetCurrent())
+          if (-not $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw "not elevated: every step below would be refused, not tested"
+          }
+
+      - name: Record the machine PATH before
+        run: |
+          $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+            'SYSTEM\CurrentControlSet\Control\Session Manager\Environment')
+          [string]$key.GetValueKind('Path') |
+            Set-Content "$env:RUNNER_TEMP\path-kind.txt"
+          [string]$key.GetValue('Path', '', 'DoNotExpandEnvironmentNames') |
+            Set-Content "$env:RUNNER_TEMP\path-raw.txt"
+          Write-Host "machine PATH is $(Get-Content "$env:RUNNER_TEMP\path-kind.txt")"
+
+      - name: Install unattended
+        run: |
+          $out = powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                   -File .\install.ps1 -Unattended 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          Write-Host $out
+          if ($rc -ne 0) { throw "install.ps1 exited $rc" }
+          # Registration's own lines, which Invoke-Tool used to swallow while
+          # printing a warning that it had failed.
+          if ($out -notmatch 'Registered TimelapseCapture') {
+            throw "the registration output did not reach the log"
+          }
+          if ($out -match 'Registration did not fully succeed') {
+            throw "a registration that worked was reported as failing"
+          }
+
+      - name: Verify what landed
+        run: |
+          foreach ($f in "$env:ProgramFiles\timelapse\timelapse_capture.py",
+                         "$env:ProgramData\timelapse\config.json",
+                         "$env:ProgramData\timelapse\bin\timelapse.cmd") {
+            if (-not (Test-Path $f)) { throw "missing: $f" }
+          }
+          sc.exe query TimelapseCapture
+          if ($LASTEXITCODE -ne 0) { throw "TimelapseCapture is not registered" }
+          foreach ($task in 'Timelapse Encode', 'Timelapse Watch') {
+            if (-not (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue)) {
+              throw "$task is not registered"
+            }
+          }
+          & "$env:ProgramData\timelapse\bin\timelapse.cmd" version
+          if ($LASTEXITCODE -ne 0) { throw "timelapse version exited $LASTEXITCODE" }
+          $status = & "$env:ProgramData\timelapse\bin\timelapse.cmd" status | Out-String
+          Write-Host $status
+          if ($status -match 'not installed') { throw "status calls a registered unit absent" }
+          $global:LASTEXITCODE = 0
+
+      - name: The machine PATH kept its kind and its variables
+        run: |
+          $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+            'SYSTEM\CurrentControlSet\Control\Session Manager\Environment')
+          $kind = [string]$key.GetValueKind('Path')
+          $raw = [string]$key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          $before = (Get-Content "$env:RUNNER_TEMP\path-kind.txt").Trim()
+          if ($kind -ne $before) { throw "machine PATH went from $before to $kind" }
+          $old = (Get-Content -Raw "$env:RUNNER_TEMP\path-raw.txt").Trim()
+          foreach ($entry in ($old -split ';' | Where-Object { $_ -match '%' })) {
+            if (-not $raw.Contains($entry)) { throw "lost the unexpanded entry $entry" }
+          }
+          if (-not $raw.Contains("$env:ProgramData\timelapse\bin")) {
+            throw "the command directory was not added"
+          }
+
+      - name: Uninstall removes the program and keeps the configuration
+        run: |
+          $out = powershell.exe -NoProfile -ExecutionPolicy Bypass `
+                   -File .\install.ps1 -Uninstall 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          Write-Host $out
+          if ($rc -ne 0) { throw "uninstall exited $rc" }
+          sc.exe query TimelapseCapture | Out-Null
+          if ($LASTEXITCODE -eq 0) { throw "TimelapseCapture is still registered" }
+          foreach ($task in 'Timelapse Encode', 'Timelapse Watch') {
+            if (Get-ScheduledTask -TaskName $task -ErrorAction SilentlyContinue) {
+              throw "$task is still registered"
+            }
+          }
+          if (Test-Path "$env:ProgramFiles\timelapse") { throw "the scripts are still there" }
+          if (-not (Test-Path "$env:ProgramData\timelapse\config.json")) {
+            throw "uninstall removed the configuration"
+          }
+          $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+            'SYSTEM\CurrentControlSet\Control\Session Manager\Environment')
+          $raw = [string]$key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+          if ($raw.Contains("$env:ProgramData\timelapse\bin")) {
+            throw "the command directory is still on the PATH"
+          }
+          $before = (Get-Content "$env:RUNNER_TEMP\path-kind.txt").Trim()
+          if ([string]$key.GetValueKind('Path') -ne $before) {
+            throw "uninstall changed the machine PATH's kind"
+          }
+          # sc.exe query failing is the pass here, and GitHub's PowerShell
+          # wrapper ends the step with whatever $LASTEXITCODE holds.
           $global:LASTEXITCODE = 0
 
   shell:
@@ -295,8 +415,14 @@ jobs:
           # ReadWritePaths must have been rewritten from the generated config.
           grep -q '^ReadWritePaths=/var/lib/timelapse/' \
                /etc/systemd/system/timelapse-capture.service
-          systemd-analyze verify /etc/systemd/system/timelapse-capture.service
-          systemd-analyze verify /etc/systemd/system/timelapse-encode.timer
+          # All six, not two: the watch units were missing from uninstall for
+          # releases while this step checked capture and the encode timer.
+          for u in timelapse-capture.service timelapse-encode.service \
+                   timelapse-encode.timer timelapse-web.service \
+                   timelapse-watch.service timelapse-watch.timer; do
+            test -f "/etc/systemd/system/$u"
+            systemd-analyze verify "/etc/systemd/system/$u"
+          done
 
       - name: Re-running is safe
         run: |
@@ -309,5 +435,9 @@ jobs:
           test "$rc" = "0" || { echo "uninstall exited $rc, expected 0"; exit 1; }
           test ! -e /opt/timelapse
           test ! -e /usr/local/bin/timelapse
-          test ! -e /etc/systemd/system/timelapse-capture.service
-          test ! -e /etc/systemd/system/timelapse-encode.timer
+          for u in timelapse-capture.service timelapse-encode.service \
+                   timelapse-encode.timer timelapse-web.service \
+                   timelapse-watch.service timelapse-watch.timer; do
+            test ! -e "/etc/systemd/system/$u" \
+              || { echo "uninstall left $u behind"; exit 1; }
+          done

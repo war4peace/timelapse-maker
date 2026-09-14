@@ -160,7 +160,16 @@ Then, from **PowerShell running as administrator**:
 | `-Unattended` | No questions. Defaults everywhere. |
 | `-NoWizard` | Place files and register services only. |
 | `-Prefix DIR` | Install somewhere other than `%ProgramFiles%\timelapse`. |
-| `-Uninstall` | Remove programs and services. Captured data is never deleted. |
+| `-Uninstall` | Remove programs and services. Captured data is never deleted. If the service or a task cannot be deregistered, or the Python it was installed with is gone, nothing is deleted and it prints what to remove by hand. |
+
+The uninstaller in **Apps and features** runs `-Uninstall` in a hidden window,
+so when that refusal happens there you will not see it: the entry disappears,
+`%ProgramFiles%\timelapse` stays, and the service may still be registered.
+Check with `sc query TimelapseCapture` from an Administrator prompt. If it is
+still there, remove what is left with `sc delete "TimelapseCapture"`,
+`schtasks /Delete /TN "Timelapse Encode" /F` and
+`schtasks /Delete /TN "Timelapse Watch" /F`, then delete
+`%ProgramFiles%\timelapse`.
 
 It places the scripts, restricts `%ProgramData%\timelapse` so that only the
 system and administrators can read the camera passwords in it, adds `timelapse`
@@ -211,7 +220,8 @@ need an Administrator prompt open first.
 Two differences worth knowing:
 
 - **Logs are files, not a journal.** One per day, in `logs` under your data
-  directory: `capture-20260816.log`. `timelapse logs` follows the current one.
+  directory: `capture-20260816.log`. `timelapse logs` follows the current one,
+  in the folder `paths.log_dir` names.
 - **A mapped drive letter is not a destination.** Drive mappings belong to
   whoever signed in, and a service gets its own logon session with none in it,
   so `U:\Videos` fails with "path not found" on a folder you can open in

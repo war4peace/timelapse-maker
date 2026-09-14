@@ -4142,6 +4142,37 @@ never fired. `Invoke-Tool` now owns every native call there, relaxing the
 preference and putting it back, and seeding `$LASTEXITCODE` with a sentinel
 because that variable is only written by a process that actually started.
 
+**And that helper could not return an exit code** (0.2.1, found while fixing
+M24). A native command inside a PowerShell function writes its stdout into the
+function's output whenever the caller captures the call, measured in a real
+console with a bare call as the control (`temp/m24_console_probe.ps1`). So
+`$code = Invoke-Tool ... --install-units` came back as the child's lines plus
+the code, `$code -ne 0` was true on a success, and "Registration did not fully
+succeed" printed under a registration whose own lines had been swallowed; and
+`[void](Invoke-Tool ...)` discarded the output outright, which for the console
+wizard meant its prompts went into a pipe. The helper is split now.
+`Invoke-Tool` always discards the child's output, so its return value is the
+code and nothing else. `Invoke-Step` runs a command in front of the operator,
+returns nothing, is only ever called as a bare statement, and leaves the code in
+`$script:StepExit`; `temp/m24_step_probe.ps1` confirms the child keeps its
+terminal both at top level and inside a function. A test holds that no
+`Invoke-Step` is captured and that every call the operator should see goes
+through it.
+
+**The PATH edit keeps `%SystemRoot%`** (0.2.1, M23). `[Environment]::
+GetEnvironmentVariable('Path', 'Machine')` returns the value expanded and
+`SetEnvironmentVariable` writes it back as `REG_SZ`, so a stock machine PATH
+came out of an install frozen to its expansions. `Get-MachinePath` reads the
+registry with `DoNotExpandEnvironmentNames` and `Set-MachinePath` writes
+`ExpandString`, then clears a variable that is never set through the
+Environment class, which is the `WM_SETTINGCHANGE` broadcast without a
+P/Invoke. `temp/m23_path_probe.ps1` runs the real function text against a probe
+value under HKCU, unelevated, with the committed version as a control that must
+reproduce the defect. **Uninstall stops before deleting anything** when
+`--remove-units` fails (M24), since deleting the scripts left the capture
+service registered against a program that no longer existed; without a Python
+it removes nothing and prints what is left to remove by hand.
+
 The second was in the prerequisite stage and is worth keeping for how it was
 nearly misdiagnosed. `& $exe -version 2>$null | Select-Object -First 1` reports
 a **non-zero exit code**, because `Select-Object -First` stops the pipeline as

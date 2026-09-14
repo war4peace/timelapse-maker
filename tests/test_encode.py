@@ -3606,11 +3606,38 @@ class TestWatchUnitWiring(unittest.TestCase):
         self.assertNotIn(
             "--watch", self.written("timelapse-encode.service")["ExecStart"])
 
+    def body(self, name):
+        """One shell function's text, so an assertion is about that function.
+
+        The version before this looped over ("install -m 0644", "rm -f") and
+        never used the loop variable, asserting only that the two names appear
+        somewhere in install.sh. The install list satisfied it, while uninstall
+        removed four units of six.
+        """
+        text = self.installer.split("\n%s() {" % name, 1)[1]
+        return text.split("\n}\n", 1)[0]
+
+    def test_one_list_names_every_unit_shipped(self):
+        block = self.installer.split("\nALL_UNITS=(", 1)[1].split(")", 1)[0]
+        shipped = sorted(p.name for p in (self.repo / "service").iterdir())
+        self.assertEqual(sorted(block.split()), shipped)
+
     def test_it_is_installed_and_removed_with_the_others(self):
-        for phase in ("install -m 0644", "rm -f"):
-            self.assertIn("timelapse-watch.service", self.installer)
-            self.assertIn("timelapse-watch.timer", self.installer)
-        self.assertIn("disable --now timelapse-watch.timer", self.installer)
+        self.assertIn('for unit in "${ALL_UNITS[@]}"; do\n        install -m 0644',
+                      self.body("install_units"))
+        uninstall = self.body("do_uninstall")
+        self.assertIn('systemctl disable --now "$unit"', uninstall)
+        self.assertIn('rm -f "${UNITDIR:?}/$unit"', uninstall)
+        # Both loops walk the shared list, and nothing is removed by name.
+        self.assertEqual(uninstall.count('"${ALL_UNITS[@]}"'), 2)
+        self.assertNotIn('"$UNITDIR"/timelapse-', uninstall)
+
+    def test_each_timer_is_stopped_before_its_service(self):
+        units = self.installer.split("\nALL_UNITS=(", 1)[1].split(")", 1)[0]
+        units = units.split()
+        for base in ("timelapse-encode", "timelapse-watch"):
+            self.assertLess(units.index(base + ".timer"),
+                            units.index(base + ".service"))
 
     def test_its_writable_set_is_the_state_directory_alone(self):
         # It reads the capture heartbeat and writes one small record. The data

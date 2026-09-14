@@ -129,9 +129,9 @@ install_deps() {
         apt-get)
             export DEBIAN_FRONTEND=noninteractive
             apt-get update -qq || warn "apt-get update failed; continuing"
-            pyreq="python3 python3-requests rsync curl"; ffm="ffmpeg" ;;
+            pyreq="python3 python3-requests rsync"; ffm="ffmpeg" ;;
         dnf|yum)
-            pyreq="python3 python3-requests rsync curl"; ffm="ffmpeg" ;;
+            pyreq="python3 python3-requests rsync"; ffm="ffmpeg" ;;
         pacman)
             # No `pacman -Sy` here. Refreshing the database and then installing
             # without upgrading is the partial-upgrade pattern Arch does not
@@ -139,14 +139,24 @@ install_deps() {
             # one installed will not import. pkg_install() uses --needed, so an
             # already-current package costs nothing, and a stale database is a
             # missing package rather than a broken one.
-            pyreq="python python-requests rsync curl"; ffm="ffmpeg" ;;
+            pyreq="python python-requests rsync"; ffm="ffmpeg" ;;
         zypper)
-            pyreq="python3 python3-requests rsync curl"; ffm="ffmpeg" ;;
+            pyreq="python3 python3-requests rsync"; ffm="ffmpeg" ;;
         apk)
-            pyreq="python3 py3-requests rsync curl"; ffm="ffmpeg" ;;
+            pyreq="python3 py3-requests rsync"; ffm="ffmpeg" ;;
     esac
 
     pkg_install $pyreq || warn "Some base packages failed to install."
+
+    # curl on its own, and only when the command is missing. A package manager
+    # installs a list as one transaction, and Fedora ships curl-minimal, which
+    # provides `curl` and conflicts with the package of that name: naming it in
+    # the list above failed the whole install, python3-requests and rsync with
+    # it, and the pip fallback below then ran against the system Python. It is
+    # needed only to download the source, where obtain_source() says so.
+    if ! command -v curl >/dev/null 2>&1; then
+        pkg_install curl || warn "Could not install curl."
+    fi
 
     if command -v ffmpeg >/dev/null 2>&1; then
         ok "ffmpeg already present: $(command -v ffmpeg)"
@@ -172,16 +182,28 @@ install_deps() {
     fi
 }
 
+# Quiet when it works, and the package manager's own last lines when it does
+# not. Everything used to go to /dev/null, so a refused transaction reached the
+# operator as "Some base packages failed to install." with no package named and
+# no reason given, which is a question only the discarded output could answer.
 pkg_install() {
+    local log rc=0
+    log=$(mktemp 2>/dev/null) || log=""
     case "$PKG" in
-        apt-get) apt-get install -y -qq "$@" >/dev/null 2>&1 ;;
-        dnf)     dnf install -y -q "$@" >/dev/null 2>&1 ;;
-        yum)     yum install -y -q "$@" >/dev/null 2>&1 ;;
-        pacman)  pacman -S --noconfirm --needed "$@" >/dev/null 2>&1 ;;
-        zypper)  zypper --non-interactive install "$@" >/dev/null 2>&1 ;;
-        apk)     apk add --quiet "$@" >/dev/null 2>&1 ;;
-        *)       return 1 ;;
+        apt-get) apt-get install -y -qq "$@" >"${log:-/dev/null}" 2>&1 || rc=$? ;;
+        dnf)     dnf install -y -q "$@" >"${log:-/dev/null}" 2>&1 || rc=$? ;;
+        yum)     yum install -y -q "$@" >"${log:-/dev/null}" 2>&1 || rc=$? ;;
+        pacman)  pacman -S --noconfirm --needed "$@" >"${log:-/dev/null}" 2>&1 || rc=$? ;;
+        zypper)  zypper --non-interactive install "$@" >"${log:-/dev/null}" 2>&1 || rc=$? ;;
+        apk)     apk add --quiet "$@" >"${log:-/dev/null}" 2>&1 || rc=$? ;;
+        *)       rc=1 ;;
     esac
+    if [ "$rc" -ne 0 ] && [ -n "$log" ] && [ -s "$log" ]; then
+        note "$PKG install $* exited $rc; its last lines:"
+        tail -n 8 "$log" | sed 's/^/        /'
+    fi
+    if [ -n "$log" ]; then rm -f "$log"; fi
+    return "$rc"
 }
 
 # ---------------------------------------------------------------------------
@@ -509,9 +531,7 @@ EOF
 }
 
 install_units() {
-    for unit in timelapse-capture.service timelapse-encode.service \
-                timelapse-encode.timer timelapse-web.service \
-                timelapse-watch.service timelapse-watch.timer; do
+    for unit in "${ALL_UNITS[@]}"; do
         install -m 0644 "$SRC/service/$unit" "$UNITDIR/$unit"
     done
     sync_units
@@ -622,6 +642,17 @@ run_wizard() {
 
 MANAGED_UNITS=(timelapse-capture.service timelapse-encode.timer
                timelapse-watch.timer timelapse-web.service)
+
+# Every unit file this installer puts in $UNITDIR, for installing and for
+# removing. The removal list used to be its own copy, and when the watch units
+# arrived only the install list learned about them: uninstall left both
+# behind, and a later reinstall's snapshot then saw the timer as present
+# before and never adopted it. Each timer sits before its service, so
+# disabling in this order stops the trigger before the thing it triggers.
+ALL_UNITS=(timelapse-capture.service
+           timelapse-encode.timer timelapse-encode.service
+           timelapse-web.service
+           timelapse-watch.timer timelapse-watch.service)
 
 IS_UPGRADE=0
 UNITS_ENABLED_BEFORE=" "
@@ -883,17 +914,13 @@ as_service_user() {
 do_uninstall() {
     step "Uninstall"
     if [ -d /run/systemd/system ]; then
-        systemctl disable --now timelapse-capture.service 2>/dev/null || true
-        systemctl disable --now timelapse-encode.timer 2>/dev/null || true
-        systemctl disable --now timelapse-encode.service 2>/dev/null || true
-        systemctl disable --now timelapse-web.service 2>/dev/null || true
-        systemctl disable --now timelapse-watch.timer 2>/dev/null || true
-        systemctl disable --now timelapse-watch.service 2>/dev/null || true
+        for unit in "${ALL_UNITS[@]}"; do
+            systemctl disable --now "$unit" 2>/dev/null || true
+        done
     fi
-    rm -f "$UNITDIR"/timelapse-capture.service \
-          "$UNITDIR"/timelapse-encode.service \
-          "$UNITDIR"/timelapse-encode.timer \
-          "$UNITDIR"/timelapse-web.service
+    for unit in "${ALL_UNITS[@]}"; do
+        rm -f "${UNITDIR:?}/$unit"
+    done
     [ -d /run/systemd/system ] && systemctl daemon-reload || true
     rm -rf "$PREFIX"
     rm -f /usr/local/bin/timelapse

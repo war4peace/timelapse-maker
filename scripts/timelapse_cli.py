@@ -26,6 +26,7 @@ path to this file, and moving the install directory cannot leave a wrapper
 pointing at the old one.
 """
 
+import fnmatch
 import json
 import os
 import shutil
@@ -118,13 +119,39 @@ def newest_log(stem="capture", log_dir=None):
     Newest by name rather than by mtime, which is this project's standing rule
     and is right here too: the daily handler names files YYYYMMDD, so the names
     sort chronologically and a file touched by a reader cannot jump the queue.
+
+    **Raises PermissionError** for a directory this account may not read, which
+    is not the same answer as an empty one. It used Path.glob, and measured on
+    Linux, glob returns [] for a directory it cannot open rather than raising,
+    so a refused prompt was told "No capture log yet" with nothing to act on.
     """
     folder = Path(log_dir) if log_dir else Path(CONFIG_DIR) / "logs"
     try:
-        found = sorted(folder.glob("%s-*.log" % stem))
+        names = os.listdir(str(folder))
+    except PermissionError:
+        raise
     except OSError:
         return None
-    return found[-1] if found else None
+    found = sorted(n for n in names
+                   if fnmatch.fnmatch(n, "%s-*.log" % stem))
+    return folder / found[-1] if found else None
+
+
+def configured_log_dir():
+    """paths.log_dir from the config, or None when it names none or is unreadable.
+
+    The default sits under the configuration directory, and the storage scan
+    advises putting data on another drive, so a `logs` that looked only in the
+    default gave the same "no log yet" from an elevated prompt as well.
+    """
+    try:
+        with open(str(CONFIG_PATH), encoding="utf-8") as fh:
+            cfg = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    paths = cfg.get("paths") if isinstance(cfg, dict) else None
+    value = paths.get("log_dir") if isinstance(paths, dict) else None
+    return str(value) if value else None
 
 
 def follow(path, lines=40):
@@ -157,11 +184,21 @@ def do_logs(extra):
     stem = LOG_STEMS.get(CAPTURE_UNIT, "capture")
     if extra and extra[0] in ("encode", "web"):
         stem = extra[0]
-    path = newest_log(stem)
+    configured = configured_log_dir()
+    folder = Path(configured) if configured else Path(CONFIG_DIR) / "logs"
+    try:
+        path = newest_log(stem, folder)
+    except PermissionError:
+        print("  %s cannot be read from this prompt." % folder)
+        print("  " + elevation_hint())
+        return 1
     if path is None:
-        print("  No %s log yet under %s." % (stem, Path(CONFIG_DIR) / "logs"))
-        print("  The log directory is whatever paths.log_dir names in your")
-        print("  config; this looks in the default one.")
+        print("  No %s log yet under %s." % (stem, folder))
+        if configured:
+            print("  That is paths.log_dir from your config.")
+        else:
+            print("  Your config names no paths.log_dir, or could not be")
+            print("  read, so this is the default location.")
         return 1
     print("  %s  (Ctrl-C to stop)" % path)
     return follow(path)

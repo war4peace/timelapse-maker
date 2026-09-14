@@ -1303,13 +1303,24 @@ def remove_task(unit):
 
 
 def task_exists(unit):
-    """True, False, or None when schtasks could not be run at all."""
+    """True, False, or None when it cannot be told.
+
+    None for schtasks being absent, and for a failed query from a prompt that
+    is not elevated. schtasks exits 1 both for a task that is not there and
+    for one this account may not read, and the tasks here are registered to
+    SYSTEM, so unelevated that is every one of them; the text that would tell
+    the two apart is localised. Mapping both to False made `timelapse status`
+    print "not installed" for a registered task, one line below a service it
+    had just called RUNNING. A checker's own limits are not a finding.
+    """
     if not IS_WINDOWS:
         return None
     if not shutil.which("schtasks"):
         return None
     ok, _ = _schtasks(["/Query", "/TN", native_name(unit)])
-    return ok
+    if ok:
+        return True
+    return False if is_elevated() else None
 
 
 # What Task Scheduler's LastTaskResult means. It is either the last run's exit

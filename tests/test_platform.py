@@ -993,6 +993,48 @@ class TestTaskResult(unittest.TestCase):
             self.assertEqual(plat.task_result(given), "unknown", repr(given))
 
 
+class TestAnUnreadableTaskIsNotAnAbsentOne(unittest.TestCase):
+    """schtasks exits 1 for a missing task and for one it may not read.
+
+    The tasks are registered to SYSTEM, so from a prompt that is not elevated
+    that is every task, and `timelapse status` printed "not installed" one
+    line below a service it had just called RUNNING.
+    """
+
+    def query(self, ok, elevated, unit=plat.ENCODE_UNIT):
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+                mock.patch.object(plat.shutil, "which",
+                                  return_value="C:\\Windows\\schtasks.exe"), \
+                mock.patch.object(plat, "_schtasks",
+                                  return_value=(ok, "ERROR: Access is denied.")), \
+                mock.patch.object(plat, "is_elevated", return_value=elevated):
+            return plat.task_exists(unit)
+
+    def test_an_unelevated_refusal_is_unknown(self):
+        self.assertIsNone(self.query(False, elevated=False))
+
+    def test_an_elevated_miss_is_absent(self):
+        # The control: elevated, the only way to fail the query is not to exist.
+        self.assertIs(self.query(False, elevated=True), False)
+
+    def test_a_task_found_is_present_either_way(self):
+        self.assertIs(self.query(True, elevated=False), True)
+        self.assertIs(self.query(True, elevated=True), True)
+
+    def test_removing_what_it_cannot_see_is_not_reported_as_done(self):
+        # remove_task() treated False as "already gone". Unelevated it now goes
+        # on to the delete, which is refused, and says so.
+        with mock.patch.object(plat, "IS_WINDOWS", True), \
+                mock.patch.object(plat.shutil, "which",
+                                  return_value="C:\\Windows\\schtasks.exe"), \
+                mock.patch.object(plat, "_schtasks",
+                                  return_value=(False, "ERROR: Access is denied.")), \
+                mock.patch.object(plat, "is_elevated", return_value=False):
+            ok, detail = plat.remove_task(plat.ENCODE_UNIT)
+        self.assertFalse(ok)
+        self.assertIn("denied", detail)
+
+
 class TestWindowsCallsDeclineElsewhere(unittest.TestCase):
     """Every Windows-only call answers on Linux rather than raising.
 
@@ -2370,10 +2412,294 @@ class TestTheRestartActionsAreArmed(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("restart-on-reported-failure", detail)
 
-if __name__ == "__main__":
-    unittest.main()
+
+class LedgerAdvapi(FakeAdvapi):
+    """FakeAdvapi with distinct handles, a GetLastError, and a ledger (M32).
+
+    Every handle the product opens is a new integer and every close is struck
+    off against the handle it names, so a path that opens two and closes one
+    shows up as the one still in `open_handles`. A refused call leaves the
+    error named for it in `errors`, 5 (access denied) by default, which is
+    what `ctypes.get_last_error` answers under `ledger()`.
+    """
+
+    def __init__(self, refuse=(), errors=None, state=None):
+        FakeAdvapi.__init__(self, refuse)
+        self.errors = dict(errors or {})
+        self.state = plat.SERVICE_RUNNING if state is None else state
+        self.last_error = 0
+        self.next_handle = 100
+        self.open_handles = set()
+        self.closed = []
+        self.changed = None
+        self.created = None
+
+    def _refused(self, name):
+        if self._ok(name):
+            return False
+        self.last_error = self.errors.get(name, 5)
+        return True
+
+    def _handle(self, name):
+        if self._refused(name):
+            return 0
+        self.next_handle += 1
+        self.open_handles.add(self.next_handle)
+        return self.next_handle
+
+    def OpenSCManagerW(self, machine, database, access):
+        return self._handle("OpenSCManagerW")
+
+    def OpenServiceW(self, scm, name, access):
+        return self._handle("OpenServiceW")
+
+    def CreateServiceW(self, *args):
+        self.created = args
+        return self._handle("CreateServiceW")
+
+    def ChangeServiceConfigW(self, *args):
+        self.changed = args
+        return 0 if self._refused("ChangeServiceConfigW") else 1
+
+    def QueryServiceStatusEx(self, svc, level, buf, size, needed):
+        if self._refused("QueryServiceStatusEx"):
+            return 0
+        deref(buf).dwCurrentState = self.state
+        return 1
+
+    def DeleteService(self, svc):
+        return 0 if self._refused("DeleteService") else 1
+
+    def StartServiceW(self, svc, argc, argv):
+        return 0 if self._refused("StartServiceW") else 1
+
+    def CloseServiceHandle(self, handle):
+        self.closed.append(handle)
+        self.open_handles.discard(handle)
+        return self._ok("CloseServiceHandle")
+
+    def StartServiceCtrlDispatcherW(self, table):
+        if self._refused("StartServiceCtrlDispatcherW"):
+            return 0
+        return FakeAdvapi.StartServiceCtrlDispatcherW(self, table)
 
 
+@contextlib.contextmanager
+def ledger(advapi):
+    # create=True: ctypes.get_last_error exists on Windows only.
+    with fake_windows(advapi), \
+            mock.patch.object(plat.ctypes, "get_last_error", create=True,
+                              side_effect=lambda: advapi.last_error):
+        yield advapi
+
+
+class TestRegisteringAService(unittest.TestCase):
+    """install_service() on both legs, including the paths production found.
+
+    The 1073 fall-through was found by re-running a real installer, and the
+    display name in CreateServiceW's third argument by an operator who could
+    not find the service in services.msc. Neither had a test until now, and
+    nothing checked that a handle opened on a failure path is closed.
+    """
+
+    ARGV = ["C:\\Python\\python.exe", "C:\\tl\\timelapse_capture.py"]
+
+    def install(self, **kw):
+        advapi = LedgerAdvapi(**kw)
+        with ledger(advapi):
+            result = plat.install_service(plat.CAPTURE_UNIT,
+                                          "Camera snapshot capture", self.ARGV)
+        return result, advapi
+
+    def exists(self, **kw):
+        refuse = ("CreateServiceW",) + tuple(kw.pop("refuse", ()))
+        errors = dict(kw.pop("errors", {}), CreateServiceW=plat.ERROR_SERVICE_EXISTS)
+        return self.install(refuse=refuse, errors=errors, **kw)
+
+    def windows_name(self, fn):
+        # Asked with the platform declared, as the product was: native_name()
+        # is the systemd unit name on the Linux legs, which is how this test
+        # passed here and failed in WSL the first time it ran there.
+        with mock.patch.object(plat, "IS_WINDOWS", True):
+            return fn(plat.CAPTURE_UNIT)
+
+    def test_a_new_service_is_filed_under_its_display_name(self):
+        (ok, detail), advapi = self.install()
+        self.assertTrue(ok, detail)
+        self.assertEqual(advapi.created[1], self.windows_name(plat.native_name))
+        self.assertEqual(advapi.created[2], self.windows_name(plat.display_name))
+        self.assertEqual(advapi.created[7], plat.service_binpath(self.ARGV))
+        self.assertNotIn("ChangeServiceConfigW", advapi.calls)
+
+    def test_an_existing_service_is_reconfigured_rather_than_refused(self):
+        (ok, detail), advapi = self.exists()
+        self.assertTrue(ok, detail)
+        self.assertIn("ChangeServiceConfigW", advapi.calls)
+        self.assertEqual(advapi.changed[4], plat.service_binpath(self.ARGV))
+        # lpDisplayName is the last argument, which is the services.msc trap
+        # met a second time: the description is not the display name.
+        self.assertEqual(advapi.changed[-1],
+                         self.windows_name(plat.display_name))
+        self.assertIn(plat.SERVICE_CONFIG_FAILURE_ACTIONS_FLAG,
+                      [level for level, _ in advapi.config2])
+
+    def test_any_other_refusal_is_reported_by_call_and_code(self):
+        (ok, detail), advapi = self.install(refuse=("CreateServiceW",),
+                                            errors={"CreateServiceW": 1072})
+        self.assertFalse(ok)
+        self.assertIn("CreateServiceW", detail)
+        self.assertIn("1072", detail)
+        self.assertNotIn("ChangeServiceConfigW", advapi.calls)
+
+    def test_a_refused_reconfigure_says_which_call(self):
+        (ok, detail), _ = self.exists(refuse=("ChangeServiceConfigW",),
+                                      errors={"ChangeServiceConfigW": 1057})
+        self.assertFalse(ok)
+        self.assertIn("ChangeServiceConfigW", detail)
+        self.assertIn("1057", detail)
+
+    def test_every_handle_opened_is_closed_on_every_path(self):
+        paths = {
+            "fresh": lambda: self.install(),
+            "exists": lambda: self.exists(),
+            "create refused": lambda: self.install(
+                refuse=("CreateServiceW",), errors={"CreateServiceW": 5}),
+            "reconfigure refused": lambda: self.exists(
+                refuse=("ChangeServiceConfigW",)),
+            "reopen refused": lambda: self.exists(refuse=("OpenServiceW",)),
+            "settings refused": lambda: self.install(
+                refuse=("ChangeServiceConfig2W",)),
+        }
+        for label, run in paths.items():
+            (_ok, _detail), advapi = run()
+            self.assertTrue(advapi.closed, "%s opened nothing" % label)
+            self.assertEqual(advapi.open_handles, set(), label)
+
+    def test_no_service_manager_is_a_reason_not_a_traceback(self):
+        (ok, detail), advapi = self.install(refuse=("OpenSCManagerW",))
+        self.assertFalse(ok)
+        self.assertIn("OpenSCManagerW", detail)
+        self.assertEqual(advapi.open_handles, set())
+
+
+class TestAskingAndChangingAService(unittest.TestCase):
+    """service_state()'s three answers, and removing and starting, on both legs."""
+
+    def run_call(self, call, **kw):
+        advapi = LedgerAdvapi(**kw)
+        with ledger(advapi), \
+                mock.patch.object(plat, "_await_state",
+                                  lambda unit, wanted, timeout: advapi.state):
+            result = call(plat.CAPTURE_UNIT)
+        self.assertEqual(advapi.open_handles, set(), "a handle was left open")
+        return result
+
+    def test_a_service_it_can_read_answers_its_state(self):
+        self.assertEqual(self.run_call(plat.service_state,
+                                       state=plat.SERVICE_STOPPED),
+                         plat.SERVICE_STOPPED)
+
+    def test_1060_is_absent(self):
+        self.assertEqual(
+            self.run_call(plat.service_state, refuse=("OpenServiceW",),
+                          errors={"OpenServiceW":
+                                  plat.ERROR_SERVICE_DOES_NOT_EXIST}),
+            plat.SERVICE_ABSENT)
+
+    def test_access_denied_is_unasked_not_absent(self):
+        # The difference between "install it" and "say you could not look".
+        self.assertIsNone(self.run_call(plat.service_state,
+                                        refuse=("OpenServiceW",),
+                                        errors={"OpenServiceW": 5}))
+
+    def test_a_query_that_fails_is_unasked(self):
+        self.assertIsNone(self.run_call(plat.service_state,
+                                        refuse=("QueryServiceStatusEx",)))
+
+    def test_no_service_manager_is_unasked(self):
+        self.assertIsNone(self.run_call(plat.service_state,
+                                        refuse=("OpenSCManagerW",)))
+
+    def test_removing_what_is_not_there_is_done(self):
+        self.assertEqual(
+            self.run_call(plat.remove_service, refuse=("OpenServiceW",),
+                          errors={"OpenServiceW":
+                                  plat.ERROR_SERVICE_DOES_NOT_EXIST}),
+            (True, ""))
+
+    def test_removing_what_it_may_not_open_is_a_failure(self):
+        ok, detail = self.run_call(plat.remove_service,
+                                   refuse=("OpenServiceW",),
+                                   errors={"OpenServiceW": 5})
+        self.assertFalse(ok)
+        self.assertIn("OpenServiceW", detail)
+
+    def test_a_refused_delete_says_so(self):
+        ok, detail = self.run_call(plat.remove_service,
+                                   refuse=("DeleteService",),
+                                   errors={"DeleteService": 1072})
+        self.assertFalse(ok)
+        self.assertIn("DeleteService", detail)
+        self.assertIn("1072", detail)
+
+    def test_a_refused_start_says_so(self):
+        ok, detail = self.run_call(plat.start_service,
+                                   refuse=("StartServiceW",),
+                                   errors={"StartServiceW": 1058})
+        self.assertFalse(ok)
+        self.assertIn("StartServiceW", detail)
+        self.assertIn("1058", detail)
+
+    def test_a_start_that_did_not_reach_running_says_what_it_reached(self):
+        ok, detail = self.run_call(plat.start_service,
+                                   state=plat.SERVICE_STOPPED)
+        self.assertFalse(ok)
+        self.assertIn("reported", detail)
+
+    def test_a_start_that_reached_running_is_a_success(self):
+        self.assertEqual(self.run_call(plat.start_service), (True, ""))
+
+
+class TestHostingAService(unittest.TestCase):
+    """The order of run_as_service()'s reports, and its two refusals."""
+
+    def test_start_pending_comes_before_the_body_and_stopped_last(self):
+        advapi = FakeAdvapi()
+        before = []
+
+        def body(ready):
+            before.append([state for state, _, _ in advapi.reported])
+            ready()
+
+        with fake_windows(advapi):
+            rc = plat.run_as_service(plat.CAPTURE_UNIT, body, lambda: None)
+        self.assertEqual(rc, 0)
+        self.assertEqual(before, [[plat.SERVICE_START_PENDING]])
+        self.assertEqual([state for state, _, _ in advapi.reported],
+                         [plat.SERVICE_START_PENDING, plat.SERVICE_RUNNING,
+                          plat.SERVICE_STOPPED])
+
+    def test_a_refused_handler_runs_nothing_and_says_why(self):
+        advapi = LedgerAdvapi(refuse=("RegisterServiceCtrlHandlerExW",))
+        ran, said = [], []
+        with ledger(advapi):
+            plat.run_as_service(plat.CAPTURE_UNIT, ran.append, lambda: None,
+                                on_error=said.append)
+        self.assertEqual(ran, [])
+        self.assertEqual(advapi.reported, [])
+        self.assertIn("RegisterServiceCtrlHandlerExW", " ".join(said))
+
+    def test_run_from_a_console_says_how_it_is_meant_to_run(self):
+        advapi = LedgerAdvapi(
+            refuse=("StartServiceCtrlDispatcherW",),
+            errors={"StartServiceCtrlDispatcherW":
+                    plat.ERROR_FAILED_SERVICE_CONTROLLER_CONNECT})
+        said = []
+        with ledger(advapi):
+            rc = plat.run_as_service(plat.CAPTURE_UNIT, lambda ready: None,
+                                     lambda: None, on_error=said.append)
+        self.assertEqual(rc, 1)
+        self.assertIn("not launched by the service manager", " ".join(said))
 
 
 class TestTheOsProbesLiveHere(unittest.TestCase):
@@ -2754,3 +3080,7 @@ class TestSchtasksOutputIsDecodedAsTheConsoleWrote(unittest.TestCase):
         ok, text = self.run_it(b"SUCCESS: the task was created\n")
         self.assertTrue(ok)
         self.assertEqual(text, "SUCCESS: the task was created")
+
+
+if __name__ == "__main__":
+    unittest.main()

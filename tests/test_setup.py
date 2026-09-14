@@ -5520,6 +5520,28 @@ class TestUnitRegistrationCommands(unittest.TestCase):
             setup.print_unit_status()
         self.assertIn("failed", out.getvalue())
 
+    def status_with_unreadable_tasks(self, elevated):
+        out = io.StringIO()
+        with mock.patch.object(setup, "service_state",
+                               return_value=plat.SERVICE_RUNNING), \
+             mock.patch.object(setup, "task_info", return_value=None), \
+             mock.patch.object(setup, "task_exists", return_value=None), \
+             mock.patch.object(setup, "is_elevated", return_value=elevated), \
+             contextlib.redirect_stdout(out):
+            setup.print_unit_status()
+        return out.getvalue()
+
+    def test_an_unelevated_prompt_is_told_what_would_answer(self):
+        text = self.status_with_unreadable_tasks(elevated=False)
+        self.assertEqual(text.count("needs an elevated prompt"), 2)
+        self.assertNotIn("not installed", text)
+
+    def test_an_elevated_unknown_stays_a_plain_unknown(self):
+        # Elevation is not the missing piece there, so it is not named.
+        text = self.status_with_unreadable_tasks(elevated=True)
+        self.assertNotIn("elevated", text)
+        self.assertEqual(text.count("unknown"), 2)
+
 
 class TestDefaultMinFreeGb(unittest.TestCase):
     """A flat 60 is wrong on any disk with less than about 66 GB free.
@@ -6124,6 +6146,29 @@ class TestTheShellInstallerAgreesWithItself(unittest.TestCase):
         # and every default taken.
         self.assertIn("! { : < /dev/tty; } 2>/dev/null", self.source)
         self.assertNotIn("[ ! -r /dev/tty ]", self.code)
+
+    def pkg_lists(self):
+        return [line.split('pyreq="', 1)[1].split('"', 1)[0].split()
+                for line in self.code.splitlines() if 'pyreq="' in line]
+
+    def test_curl_is_not_in_any_base_transaction(self):
+        # Fedora's curl-minimal conflicts with the curl package, and a package
+        # manager installs a list as one transaction, so naming it took
+        # python3-requests and rsync down with it.
+        lists = self.pkg_lists()
+        self.assertEqual(len(lists), 5, lists)
+        for names in lists:
+            self.assertNotIn("curl", names)
+            self.assertIn("rsync", names)
+
+    def test_curl_is_installed_only_when_the_command_is_missing(self):
+        self.assertIn("if ! command -v curl >/dev/null 2>&1; then\n"
+                      "        pkg_install curl", self.code)
+
+    def test_a_refused_install_shows_what_the_package_manager_said(self):
+        body = self.source.split("\npkg_install() {", 1)[1].split("\n}\n", 1)[0]
+        self.assertNotIn(">/dev/null 2>&1 ;;", body)
+        self.assertIn('tail -n 8 "$log"', body)
 
     def test_pacman_does_not_refresh_without_upgrading(self):
         # -Sy then -S is the partial-upgrade pattern Arch does not support.
