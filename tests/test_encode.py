@@ -124,6 +124,46 @@ class TestValidFrames(unittest.TestCase):
         self.assertEqual((good, bad), ([], 0))
 
 
+class TestTheRepeatedHourPlaysInOrder(unittest.TestCase):
+    """DST fall-back repeats an hour, and the second pass is HHMMSS-1.jpg.
+
+    `-` sorts before `.`, so plain name order put 023000-1.jpg before
+    023000.jpg and the video jumped an hour back and forth for the whole hour
+    (M7). The test for the suffix only ever asserted that it existed.
+    """
+
+    def setUp(self):
+        self.day = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.day), True)
+
+    def names(self, *names):
+        for name in names:
+            make_frame(self.day / name)
+        good, _bad = enc.valid_frames(self.day, 100)
+        return [p.name for p in good]
+
+    def test_the_second_pass_follows_the_first(self):
+        self.assertEqual(
+            self.names("023000.jpg", "023000-1.jpg", "025959.jpg",
+                       "030000.jpg"),
+            ["023000.jpg", "025959.jpg", "023000-1.jpg", "030000.jpg"])
+
+    def test_plain_name_order_would_have_got_it_wrong(self):
+        # The control: sorted() alone puts the suffix first, which is why the
+        # key is needed at all.
+        self.assertEqual(sorted(["023000.jpg", "023000-1.jpg"]),
+                         ["023000-1.jpg", "023000.jpg"])
+
+    def test_an_ordinary_day_is_unchanged(self):
+        self.assertEqual(self.names("235959.jpg", "000000.jpg", "120000.jpg"),
+                         ["000000.jpg", "120000.jpg", "235959.jpg"])
+
+    def test_a_second_collision_follows_the_first(self):
+        self.assertEqual(
+            self.names("023000-2.jpg", "023000-1.jpg", "023000.jpg"),
+            ["023000.jpg", "023000-1.jpg", "023000-2.jpg"])
+
+
 class TestWriteConcatList(unittest.TestCase):
 
     def setUp(self):

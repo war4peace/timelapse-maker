@@ -147,6 +147,34 @@ While the version is `0.x`, the configuration format may change in any release.
   the destination with the same size, and not older than the local copy, is
   left alone, the way rsync already behaves on Linux.
 
+- **RTSP cameras no longer mix two days' frames on the days the clocks
+  change.** The grabber is told to stop at midnight, and that was worked out
+  as if every day had 24 hours. In spring it ran an hour into the next day
+  while still writing into the old day's folder, so the first hour of one
+  day's video was the next day's midnight; in autumn it stopped an hour early.
+  The time to midnight is now counted in real seconds.
+
+- **The hour that repeats when the clocks go back now plays in order.** Frames
+  from the second pass through that hour are saved as `HHMMSS-1.jpg`, and they
+  were sorted before the first pass, so for that hour the video jumped back and
+  forth between frames an hour apart. The encoder now puts the second pass
+  after the first.
+
+- **Capture recovers at once from the system clock being changed.** If the
+  clock was set back, capture could sleep through the whole difference before
+  taking another frame; if it was set forward, the next frame was filed under
+  a time long past, which on a device without a battery-backed clock can mean a
+  folder dated 1970 that the encoder then skips every night. Capture now
+  notices within one interval and carries on from the current time, and on
+  Linux it waits for the clock to be synchronised before starting where the
+  system supports that.
+
+- **A snapshot address that turns out to be a video stream can no longer hang
+  a camera.** Capture read the whole answer before looking at it, so an
+  address that streams video without end held that camera's capture for good
+  while its memory grew, and made stopping the service wait. It now gives up
+  after the fetch timeout, or once the answer passes 64 MB, and says why.
+
 - **Editing a camera no longer prints its password.** The address was offered
   as the default in brackets, and for an RTSP camera or a Reolink that address
   contains the login, so `timelapse cameras -e` put the password on the screen

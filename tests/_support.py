@@ -112,6 +112,78 @@ def wizard_tty(keystrokes, tty=False, auto=False, discovery=()):
         setup.offer_discovery = prev_discovery
 
 
+class FakeClock(object):
+    """Wall and monotonic time for driving a loop without waiting (M31).
+
+    `time()` is the wall clock and `step()` moves it alone, which is the point:
+    Event.wait is monotonic, and the capture loop's clock defects were all
+    about the two disagreeing. `advance()` moves both, as real waiting does.
+    """
+
+    def __init__(self, wall):
+        self.wall = float(wall)
+        self.mono = 1000.0
+        self.waits = []
+
+    def time(self):
+        return self.wall
+
+    def monotonic(self):
+        return self.mono
+
+    def sleep(self, seconds):
+        self.advance(seconds)
+
+    def advance(self, seconds):
+        self.wall += seconds
+        self.mono += seconds
+
+    def step(self, seconds):
+        """The wall clock alone, as NTP or an operator moves it."""
+        self.wall += seconds
+
+
+class FakeStop(object):
+    """A STOP event whose wait() passes time on a FakeClock instead of waiting.
+
+    It sets itself after `rounds` waits, so a loop that never ends is a failed
+    assertion rather than a suite that hangs. `during(n, clock)` runs inside
+    the n-th wait, after the time has passed, which is where a clock step has
+    to land to test that a loop notices one mid-wait.
+    """
+
+    def __init__(self, clock, rounds=100, during=None):
+        self.clock, self.rounds, self.during = clock, rounds, during
+        self._set = False
+
+    def is_set(self):
+        return self._set
+
+    def set(self):
+        self._set = True
+
+    def wait(self, seconds=None):
+        self.clock.waits.append(seconds)
+        self.clock.advance(seconds or 0)
+        if self.during:
+            self.during(len(self.clock.waits), self.clock)
+        if len(self.clock.waits) >= self.rounds:
+            self._set = True
+        return self._set
+
+
+@contextlib.contextmanager
+def fake_time(module, clock, stop):
+    """Point a module's `time` and `STOP` at the fakes, and put them back."""
+    import types
+    from unittest import mock
+    shim = types.SimpleNamespace(time=clock.time, monotonic=clock.monotonic,
+                                 sleep=clock.sleep)
+    with mock.patch.object(module, "time", shim), \
+            mock.patch.object(module, "STOP", stop):
+        yield clock
+
+
 class TempDirCase(unittest.TestCase):
     """A test case with its own temp directory, removed afterwards.
 

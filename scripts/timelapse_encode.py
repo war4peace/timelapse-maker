@@ -696,14 +696,36 @@ def select_encoder(ffmpeg, enc):
 # Frame handling
 # ----------------------------------------------------------------------------
 
+FRAME_NAME = re.compile(r"^(\d{2})(\d{4})(?:-(\d+))?$")
+
+
+def frame_order(path):
+    """Sort key for a day's frames: the hour, which pass through it, then MMSS.
+
+    Filenames are the sort key, and name order is chronological for every hour
+    of the year but one. When DST falls back local time repeats an hour, and
+    the capture daemon names the second pass HHMMSS-1.jpg; `-` sorts before
+    `.`, so 023000-1.jpg came before 023000.jpg and the video alternated
+    between frames an hour apart for the whole repeated hour. No six-digit
+    name can put the second pass after 025959 and before 030000, so the order
+    is decided here instead. A name that is not a frame name sorts after the
+    ones that are, by name.
+    """
+    m = FRAME_NAME.match(path.stem)
+    if not m:
+        return (1, path.name)
+    return (0, m.group(1), int(m.group(3) or 0), m.group(2))
+
+
 def valid_frames(day_dir, min_bytes):
     """Sorted list of frames that pass a cheap size + JPEG-header check.
 
-    Filenames are zero-padded HHMMSS, so lexical order is chronological and we
-    never depend on mtime.
+    Filenames are zero-padded HHMMSS, so their order is chronological and we
+    never depend on mtime; frame_order() handles the one hour a year where
+    plain name order is not.
     """
     good, bad = [], 0
-    for p in sorted(day_dir.glob("*.jpg")):
+    for p in sorted(day_dir.glob("*.jpg"), key=frame_order):
         try:
             if p.stat().st_size < min_bytes:
                 bad += 1

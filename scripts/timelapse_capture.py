@@ -588,12 +588,48 @@ def next_slot(after, interval):
     return (math.floor(after / interval) + 1) * interval
 
 
+def next_boundary(now, interval):
+    """The grid point at or after `now`: where the tick loop starts and resyncs."""
+    return math.ceil(now / interval) * interval
+
+
+def tick_plan(next_t, now, interval):
+    """("wait", seconds), ("fire", None) or ("resync", next_t) for the tick loop.
+
+    A tick more than one interval away in either direction is not one the loop
+    may honour, because the frame is named after the tick and not after the
+    clock. Ahead means the wall clock stepped back: Event.wait is monotonic, so
+    the loop used to sleep the whole step through. Behind means it stepped
+    forward, or the host was suspended, and the loop used to fire at once with
+    the stale tick, so a frame fetched on 1970-01-15 was filed under
+    1970-01-12. An RTC-less board that boots at the epoch and is stepped by
+    chrony a minute later does both in its first minute. Either way the answer
+    is the grid point after the clock, and no fetch on the tick that was due.
+    """
+    ahead = next_t - now
+    if ahead > interval or ahead < -interval:
+        return "resync", next_boundary(now, interval)
+    if ahead > 0:
+        return "wait", ahead
+    return "fire", None
+
+
 def seconds_to_midnight(now=None):
-    """Seconds until the next local midnight, floored at 1."""
+    """Seconds until the next local midnight, floored at 1.
+
+    By timestamps, not by subtracting datetimes. A naive datetime subtraction
+    counts wall-clock hours, and on the two DST days a day is not 24 of them:
+    measured in Europe/Bucharest, 00:00:10 on 2026-03-29 gave 86390 against a
+    real 82790. This is the RTSP grabber's `-t`, so in spring ffmpeg ran an
+    hour into the next day still writing into the old day's directory, and
+    `-strftime` then named those frames by the new day's clock over the first
+    hour of the old one. `.timestamp()` on a naive datetime goes through the
+    platform's local time rules; an aware one carries its own.
+    """
     now = datetime.now() if now is None else now
     midnight = (now + timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0)
-    return max(1.0, (midnight - now).total_seconds())
+    return max(1.0, midnight.timestamp() - now.timestamp())
 
 
 def read_cadence(day_dir):
@@ -731,6 +767,36 @@ class DayCadenceMixin:
             self.log.info("%s: now one frame every %ss at %sfps, from %s",
                           day, self.interval, self.framerate, source)
         return before != self.interval
+
+
+# Sixteen 4K JPEGs' worth. Not a limit on real snapshots, which are a few
+# megabytes; a limit on a URL that is not a snapshot at all.
+MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
+SNAPSHOT_CHUNK = 64 * 1024
+
+
+def read_snapshot(resp, deadline, limit, cap_bytes=None, clock=None):
+    """The body of a snapshot response, bounded in time and in size.
+
+    `deadline` is on time.monotonic(), or on `clock` when a test passes one.
+    Over the deadline is a Timeout, which classify() already calls
+    unreachable; over the cap is NotAJpeg carrying the first bytes, so the
+    classifier and the log see what it was.
+    """
+    cap_bytes = cap_bytes or MAX_SNAPSHOT_BYTES
+    clock = clock or time.monotonic
+    buf = bytearray()
+    for chunk in resp.iter_content(chunk_size=SNAPSHOT_CHUNK):
+        if chunk:
+            buf += chunk
+        if len(buf) > cap_bytes:
+            raise NotAJpeg("response passed %d MB and was still arriving; is "
+                           "the URL a video stream rather than a snapshot?"
+                           % (cap_bytes // (1024 * 1024)), bytes(buf[:256]))
+        if clock() > deadline:
+            raise requests.exceptions.Timeout(
+                "the snapshot was still arriving after %ss" % limit)
+    return bytes(buf)
 
 
 class HttpCamera(DayCadenceMixin, threading.Thread):
@@ -898,9 +964,19 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
                              "camera", self.err_ticks, AUTH_PAUSE // 60)
 
     def _grab(self, dt, timeout=None):
-        resp = self.session.get(self.url, timeout=timeout or self.timeout)
-        resp.raise_for_status()
-        data = resp.content
+        limit = timeout or self.timeout
+        deadline = time.monotonic() + limit
+        # Streamed, with a deadline and a cap. requests' timeout is per socket
+        # operation and `.content` reads to EOF, so a URL that is a stream
+        # rather than a snapshot (video.cgi, MJPEG), or a camera dribbling a
+        # byte at a time, held this thread for ever while its memory grew,
+        # logged nothing, and made a stop wait out the full join timeout.
+        resp = self.session.get(self.url, timeout=limit, stream=True)
+        try:
+            resp.raise_for_status()
+            data = read_snapshot(resp, deadline, limit)
+        finally:
+            resp.close()
 
         # Both carry the body, and the size check is the one that matters:
         # min_bytes is 4096 by default and a Reolink refusal is ~140 bytes of
@@ -932,7 +1008,7 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
     def run(self):
         self.root.mkdir(parents=True, exist_ok=True)
         self.begin_day(day_string(time.time()))
-        next_t = math.ceil(time.time() / self.interval) * self.interval
+        next_t = next_boundary(time.time(), self.interval)
         # The timeout is logged because it can differ from the configured one:
         # a camera on a shorter interval than the global has it clamped, and
         # the journal is where that becomes visible.
@@ -941,11 +1017,20 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
                       ", per-camera" if self.cam.get("interval_seconds") else "")
 
         while not STOP.is_set():
-            wait = next_t - time.time()
-            if wait > 0:
-                STOP.wait(wait)
-            if STOP.is_set():
-                break
+            action, value = tick_plan(next_t, time.time(), self.interval)
+            if action == "wait":
+                STOP.wait(value)
+                if STOP.is_set():
+                    break
+                # Asked again after the wait, because the clock can step while
+                # it waits, and the wait itself never notices.
+                action, value = tick_plan(next_t, time.time(), self.interval)
+            if action == "resync":
+                self.log.info("the clock and the schedule are %ds apart (a "
+                              "clock step or a suspended host); resuming on "
+                              "the grid", round(time.time() - next_t))
+                next_t = value
+                continue
 
             fire_t, next_t = next_t, next_t + self.interval
 
@@ -956,7 +1041,7 @@ class HttpCamera(DayCadenceMixin, threading.Thread):
             # If we fell behind (slow camera, suspended host), resync forward
             # rather than trying to catch up on a backlog of missed frames.
             if next_t <= time.time():
-                next_t = math.ceil(time.time() / self.interval) * self.interval
+                next_t = next_boundary(time.time(), self.interval)
 
             if PAUSED.is_set():
                 continue
@@ -1255,6 +1340,12 @@ class RtspCamera(DayCadenceMixin, threading.Thread):
 # Disk guard
 # ----------------------------------------------------------------------------
 
+# Capture resumes only once free space is back above the threshold by this
+# factor, so a disk hovering at the line does not pause and resume every check.
+RESUME_FACTOR = 1.1
+DISK_CHECK_EVERY = 300
+
+
 class DiskGuard(threading.Thread):
 
     def __init__(self, cfg):
@@ -1263,24 +1354,32 @@ class DiskGuard(threading.Thread):
         self.min_free = cfg["capture"].get("min_free_gb", 0) * (1024 ** 3)
         self.log = logging.getLogger("diskguard")
 
+    def check_once(self):
+        """One reading: pause below the threshold, resume above RESUME_FACTOR.
+
+        Its own method so the rule can be driven by a test. The loop around it
+        was executed by nothing, and the only test of the hysteresis asserted
+        that 1.1 times a number is bigger than the number.
+        """
+        free = shutil.disk_usage(self.path).free
+        if free < self.min_free and not PAUSED.is_set():
+            PAUSED.set()
+            self.log.error(
+                "PAUSING capture: only %.1f GB free on %s (threshold %.1f GB)",
+                free / 1024 ** 3, self.path, self.min_free / 1024 ** 3)
+        elif free >= self.min_free * RESUME_FACTOR and PAUSED.is_set():
+            PAUSED.clear()
+            self.log.warning("RESUMING capture: %.1f GB free", free / 1024 ** 3)
+
     def run(self):
         if self.min_free <= 0:
             return
         while not STOP.is_set():
             try:
-                free = shutil.disk_usage(self.path).free
-                if free < self.min_free and not PAUSED.is_set():
-                    PAUSED.set()
-                    self.log.error(
-                        "PAUSING capture: only %.1f GB free on %s (threshold %.1f GB)",
-                        free / 1024 ** 3, self.path, self.min_free / 1024 ** 3)
-                elif free >= self.min_free * 1.1 and PAUSED.is_set():
-                    PAUSED.clear()
-                    self.log.warning("RESUMING capture: %.1f GB free",
-                                     free / 1024 ** 3)
+                self.check_once()
             except Exception as exc:
                 self.log.warning("disk check failed: %s", exc)
-            STOP.wait(300)
+            STOP.wait(DISK_CHECK_EVERY)
 
 
 # ----------------------------------------------------------------------------

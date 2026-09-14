@@ -17,13 +17,35 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, tzinfo
 from pathlib import Path
 from unittest import mock
 
 import _support
 
 import timelapse_capture as cap
+
+
+class Bucharest2026(tzinfo):
+    """Europe/Bucharest's 2026 rules, written out.
+
+    Not zoneinfo: the Windows CI leg has no tz database, and a test that skips
+    where the bug is likeliest to be run is not one. EET is UTC+2, EEST +3,
+    changing at 01:00 UTC on the last Sundays of March and October.
+    """
+
+    SPRING = datetime(2026, 3, 29, 1, 0)
+    FALL = datetime(2026, 10, 25, 1, 0)
+
+    def utcoffset(self, dt):
+        utc = dt.replace(tzinfo=None) - timedelta(hours=2)
+        return timedelta(hours=3 if self.SPRING <= utc < self.FALL else 2)
+
+    def dst(self, dt):
+        return self.utcoffset(dt) - timedelta(hours=2)
+
+    def tzname(self, dt):
+        return "EEST" if self.dst(dt) else "EET"
 
 
 def make_config(frames_root, interval=5):
@@ -375,6 +397,24 @@ class TestOneDayOneCadence(unittest.TestCase):
             cap.seconds_to_midnight(datetime(2026, 8, 11, 23, 59, 59, 999999)),
             1.0)
 
+    # The two tests above pass with the old wall-clock subtraction too, which
+    # is how the DST error survived (M6). These three cannot: an aware
+    # datetime carries the offset change, and a subtraction of two datetimes
+    # sharing one tzinfo ignores it.
+
+    def test_the_spring_forward_day_is_an_hour_short(self):
+        self.assertEqual(cap.seconds_to_midnight(
+            datetime(2026, 3, 29, 0, 0, 10, tzinfo=Bucharest2026())), 82790)
+
+    def test_the_fall_back_day_is_an_hour_long(self):
+        self.assertEqual(cap.seconds_to_midnight(
+            datetime(2026, 10, 25, 0, 0, 10, tzinfo=Bucharest2026())), 89990)
+
+    def test_an_ordinary_day_in_the_same_zone_is_a_day(self):
+        # The control for the two above.
+        self.assertEqual(cap.seconds_to_midnight(
+            datetime(2026, 8, 11, 0, 0, 10, tzinfo=Bucharest2026())), 86390)
+
     def test_the_rtsp_command_stops_at_the_boundary(self):
         # ffmpeg carries fps=1/interval on its command line, so adopting a
         # new cadence means launching a new process, and midnight is the only
@@ -387,33 +427,185 @@ class TestOneDayOneCadence(unittest.TestCase):
 
 
 class TestScheduleMath(unittest.TestCase):
-    """The absolute-boundary arithmetic that keeps capture drift-free."""
+    """The absolute-boundary arithmetic that keeps capture drift-free.
 
-    def next_boundary(self, now, interval):
-        return math.ceil(now / interval) * interval
+    This class used to define its own next_boundary() and assert on that, so it
+    passed with the loop's arithmetic deleted (M31). These are the product's
+    functions, and TestTheTickLoop drives the loop that uses them.
+    """
 
     def test_lands_on_an_exact_multiple(self):
-        self.assertEqual(self.next_boundary(1000.0, 5), 1000)
-        self.assertEqual(self.next_boundary(1001.0, 5), 1005)
-        self.assertEqual(self.next_boundary(1004.9, 5), 1005)
+        self.assertEqual(cap.next_boundary(1000.0, 5), 1000)
+        self.assertEqual(cap.next_boundary(1001.0, 5), 1005)
+        self.assertEqual(cap.next_boundary(1004.9, 5), 1005)
 
-    def test_targets_do_not_drift_with_slow_fetches(self):
-        # Each target is computed from the clock, not by adding to the previous
-        # completion time, so latency cannot accumulate.
-        interval, t = 5, self.next_boundary(1000.0, 5)
-        targets = []
-        for _ in range(5):
-            targets.append(t)
-            t += interval
-        self.assertEqual(targets, [1000, 1005, 1010, 1015, 1020])
+    def test_a_tick_that_is_due_is_fired(self):
+        self.assertEqual(cap.tick_plan(1000, 1000.0, 5), ("fire", None))
+        self.assertEqual(cap.tick_plan(1000, 1003.0, 5), ("fire", None))
 
-    def test_resync_skips_a_missed_backlog(self):
-        # Fallen 30s behind: jump to the next boundary rather than replaying
-        # six missed frames back to back.
-        interval, next_t, now = 5, 1000, 1030.0
-        if next_t <= now:
-            next_t = self.next_boundary(now, interval)
-        self.assertEqual(next_t, 1030)
+    def test_a_tick_ahead_is_waited_for(self):
+        self.assertEqual(cap.tick_plan(1005, 1001.0, 5), ("wait", 4.0))
+
+    def test_no_wait_is_longer_than_an_interval(self):
+        # Event.wait is monotonic: a longer wait is one a clock step sleeps
+        # through whole (M8).
+        for now in (1000.0, 1000.001, 1002.5, 1004.999):
+            action, value = cap.tick_plan(1005, now, 5)
+            self.assertEqual(action, "wait")
+            self.assertLessEqual(value, 5)
+
+    def test_a_clock_stepped_back_resyncs_to_the_grid_after_it(self):
+        now = 1005 - 3600.0
+        self.assertEqual(cap.tick_plan(1005, now, 5),
+                         ("resync", cap.next_boundary(now, 5)))
+
+    def test_a_clock_stepped_forward_resyncs_rather_than_firing_stale(self):
+        now = 1005 + 3 * 86400 + 2.0
+        self.assertEqual(cap.tick_plan(1005, now, 5),
+                         ("resync", cap.next_boundary(now, 5)))
+
+    def test_the_line_is_one_interval_either_way(self):
+        self.assertEqual(cap.tick_plan(1005, 1000.0, 5)[0], "wait")
+        self.assertEqual(cap.tick_plan(1005, 1010.0, 5)[0], "fire")
+        self.assertEqual(cap.tick_plan(1005, 999.9, 5)[0], "resync")
+        self.assertEqual(cap.tick_plan(1005, 1010.1, 5)[0], "resync")
+
+
+class TestTheTickLoop(unittest.TestCase):
+    """HttpCamera.run(), executed (M31, and M8's clock steps).
+
+    Executed by no test before this: resync, rollover, PAUSED, the auth-quiet
+    skip and stop all sat in a loop that only ever ran in production, and
+    H10, M8, M30 and L1 were all found in that half. Run synchronously on a
+    fake clock, with _grab replaced by a recorder, so nothing waits.
+    """
+
+    INTERVAL = 5
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        cap.PAUSED.clear()
+        self.addCleanup(cap.PAUSED.clear)
+        self.grabs = []
+
+    def camera(self, interval=INTERVAL):
+        cfg = make_config(self.tmp, interval)
+        cfg["capture"]["retry_within_tick"] = False
+        return cap.HttpCamera({"name": "Roof", "url": "http://192.0.2.1/snap"},
+                              cfg)
+
+    def run_loop(self, cam, start, rounds=40, on_grab=None, during=None):
+        clock = _support.FakeClock(start)
+        stop = _support.FakeStop(clock, rounds, during)
+
+        def grab(dt, timeout=None):
+            self.grabs.append((dt, clock.time()))
+            if on_grab:
+                on_grab(len(self.grabs), clock, stop)
+
+        cam._grab = grab
+        with _support.fake_time(cap, clock, stop):
+            cam.run()
+        return clock
+
+    @staticmethod
+    def noon():
+        return datetime(2026, 8, 12, 12, 0, 0, 300000).timestamp()
+
+    def assert_named_after_the_clock(self):
+        # No frame may be named more than one interval away from the wall
+        # clock at the moment it was fetched.
+        for dt, fetched_at in self.grabs:
+            self.assertLessEqual(abs(fetched_at - dt.timestamp()),
+                                 self.INTERVAL, dt)
+
+    def test_frames_are_fetched_on_the_grid(self):
+        clock = self.run_loop(self.camera(), self.noon(), rounds=10)
+        stamps = [round(dt.timestamp()) for dt, _ in self.grabs]
+        self.assertGreater(len(stamps), 5)
+        for stamp in stamps:
+            self.assertEqual(stamp % self.INTERVAL, 0)
+        self.assertEqual({b - a for a, b in zip(stamps, stamps[1:])},
+                         {self.INTERVAL})
+        self.assertLessEqual(max(clock.waits), self.INTERVAL)
+
+    def test_a_slow_fetch_resyncs_rather_than_replaying(self):
+        def slow_once(n, clock, stop):
+            if n == 1:
+                clock.advance(17)
+
+        self.run_loop(self.camera(), self.noon(), rounds=10, on_grab=slow_once)
+        stamps = [round(dt.timestamp()) for dt, _ in self.grabs]
+        self.assertEqual(stamps, sorted(set(stamps)), "a tick was replayed")
+        self.assertGreaterEqual(stamps[1] - stamps[0], 15)
+        self.assert_named_after_the_clock()
+
+    def test_paused_fetches_nothing_and_keeps_ticking(self):
+        cap.PAUSED.set()
+        clock = self.run_loop(self.camera(), self.noon(), rounds=10)
+        self.assertEqual(self.grabs, [])
+        self.assertEqual(len(clock.waits), 10)
+        self.assertLessEqual(max(clock.waits), self.INTERVAL)
+
+    def test_the_auth_quiet_period_fetches_nothing(self):
+        cam = self.camera()
+        cam.auth_quiet_until = self.noon() + 10000
+        self.run_loop(cam, self.noon(), rounds=10)
+        self.assertEqual(self.grabs, [])
+
+    def test_a_clock_stepped_back_is_not_slept_through(self):
+        def back(n, clock, stop):
+            if n == 2:
+                clock.step(-3600)
+
+        clock = self.run_loop(self.camera(), self.noon(), rounds=15,
+                              on_grab=back)
+        self.assertLessEqual(max(clock.waits), self.INTERVAL,
+                             "waited out the step on the monotonic clock")
+        self.assertGreater(len(self.grabs), 3)
+        self.assert_named_after_the_clock()
+
+    def test_a_clock_stepped_forward_names_no_frame_from_the_past(self):
+        def forward(n, clock, stop):
+            if n == 2:
+                clock.step(3 * 86400)
+
+        self.run_loop(self.camera(), self.noon(), rounds=15, on_grab=forward)
+        self.assertGreater(len(self.grabs), 3)
+        self.assert_named_after_the_clock()
+
+    def test_a_step_during_a_wait_is_seen_before_the_next_fetch(self):
+        # Mid-wait rather than mid-fetch, which is the half the re-plan after
+        # the wait exists for.
+        def back(n, clock):
+            if n == 3:
+                clock.step(-3600)
+
+        self.run_loop(self.camera(), self.noon(), rounds=15, during=back)
+        self.assertGreater(len(self.grabs), 3)
+        self.assert_named_after_the_clock()
+
+    def test_stop_during_a_fetch_ends_the_loop(self):
+        def stop_now(n, clock, stop):
+            stop.set()
+
+        self.run_loop(self.camera(), self.noon(), rounds=50, on_grab=stop_now)
+        self.assertEqual(len(self.grabs), 1)
+
+    def test_crossing_midnight_adopts_the_next_days_cadence(self):
+        start = datetime(2026, 8, 12, 23, 59, 50).timestamp()
+        next_day = self.tmp / "Roof" / "2026-08-13"
+        next_day.mkdir(parents=True)
+        cap.write_cadence(next_day, 60, 30)
+        cam = self.camera()
+        self.run_loop(cam, start, rounds=12)
+        self.assertEqual(cam.day, "2026-08-13")
+        self.assertEqual(cam.interval, 60)
+        after = [dt for dt, _ in self.grabs if dt.day == 13]
+        self.assertGreater(len(after), 2)
+        self.assertEqual({dt.second for dt in after}, {0},
+                         "the new day kept the old grid")
 
 
 class TestIntraTickRetry(unittest.TestCase):
@@ -554,18 +746,76 @@ class TestDiskGuard(unittest.TestCase):
         cfg["capture"]["min_free_gb"] = 60
         self.assertEqual(cap.DiskGuard(cfg).min_free, 60 * 1024 ** 3)
 
-    def test_zero_disables_the_guard(self):
-        cfg = make_config(self.tmp)
-        cfg["capture"]["min_free_gb"] = 0
-        self.assertEqual(cap.DiskGuard(cfg).min_free, 0)
+    # The two tests that stood here checked an attribute and that 1.1 times a
+    # number is bigger than the number: a DiskGuard with no hysteresis at all
+    # passed both, and run() was entered by no test (M30).
 
-    def test_resume_threshold_has_hysteresis(self):
-        # Pause below the threshold, resume only at 110% of it, so a disk
-        # hovering at the limit cannot flap the guard on and off.
+    def guard(self, threshold_gb):
         cfg = make_config(self.tmp)
-        cfg["capture"]["min_free_gb"] = 10
-        guard = cap.DiskGuard(cfg)
-        self.assertGreater(guard.min_free * 1.1, guard.min_free)
+        cfg["capture"]["min_free_gb"] = threshold_gb
+        cap.PAUSED.clear()
+        self.addCleanup(cap.PAUSED.clear)
+        # The pause and resume lines are logged at ERROR and WARNING, which is
+        # correct and would reach stderr through logging's last resort.
+        logging.disable(logging.CRITICAL)
+        self.addCleanup(logging.disable, logging.NOTSET)
+        return cap.DiskGuard(cfg)
+
+    def read(self, guard, free_gb):
+        usage = mock.Mock(free=int(free_gb * 1024 ** 3))
+        with mock.patch.object(cap.shutil, "disk_usage", return_value=usage):
+            guard.check_once()
+
+    def test_below_the_threshold_pauses(self):
+        guard = self.guard(10)
+        self.read(guard, 9)
+        self.assertTrue(cap.PAUSED.is_set())
+
+    def test_just_above_the_threshold_stays_paused(self):
+        guard = self.guard(10)
+        self.read(guard, 9)
+        self.read(guard, 10.5)
+        self.assertTrue(cap.PAUSED.is_set(), "resumed inside the hysteresis band")
+
+    def test_a_disk_hovering_at_the_line_does_not_flap(self):
+        guard = self.guard(10)
+        self.read(guard, 9)
+        self.read(guard, 10)
+        self.assertTrue(cap.PAUSED.is_set())
+
+    def test_past_the_resume_line_resumes(self):
+        guard = self.guard(10)
+        self.read(guard, 9)
+        self.read(guard, 11)
+        self.assertFalse(cap.PAUSED.is_set())
+
+    def test_the_resume_line_is_what_ships(self):
+        self.assertEqual(cap.RESUME_FACTOR, 1.1)
+
+    def test_zero_disables_the_guard_without_reading_the_disk(self):
+        guard = self.guard(0)
+        with mock.patch.object(cap.shutil, "disk_usage",
+                               side_effect=AssertionError("read the disk")):
+            guard.run()                     # returns rather than looping
+
+    def test_run_takes_a_reading_every_round(self):
+        class OneRound(object):
+            def __init__(self):
+                self.rounds = 0
+
+            def is_set(self):
+                return self.rounds > 0
+
+            def wait(self, seconds):
+                self.rounds += 1
+                return True
+
+        guard = self.guard(10)
+        usage = mock.Mock(free=9 * 1024 ** 3)
+        with mock.patch.object(cap, "STOP", OneRound()), \
+                mock.patch.object(cap.shutil, "disk_usage", return_value=usage):
+            guard.run()
+        self.assertTrue(cap.PAUSED.is_set())
 
 
 class TestCredentialsNeverReachTheLog(unittest.TestCase):
@@ -1137,11 +1387,23 @@ class TestRtspStateIsHonest(unittest.TestCase):
 
 
 class FakeResponse:
-    """Enough of a requests.Response for _grab() and raise_for_status()."""
+    """Enough of a requests.Response for _grab() and raise_for_status().
+
+    Streamed since M9: _grab() reads the body through iter_content() and
+    closes the response, so both are here as well as `content`.
+    """
 
     def __init__(self, content=b"", status=200):
         self.content = content
         self.status_code = status
+        self.closed = False
+
+    def iter_content(self, chunk_size=1):
+        for i in range(0, len(self.content), chunk_size):
+            yield self.content[i:i + chunk_size]
+
+    def close(self):
+        self.closed = True
 
     def raise_for_status(self):
         if self.status_code >= 400:
@@ -1232,7 +1494,7 @@ class TestRefusalReachesTheClassifier(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def grab(self, response):
-        self.cam.session.get = lambda url, timeout=None: response
+        self.cam.session.get = lambda url, **kw: response
         try:
             self.cam._grab(datetime(2026, 8, 14, 9, 0, 0))
         except Exception as exc:            # noqa: BLE001
@@ -1263,6 +1525,87 @@ class TestRefusalReachesTheClassifier(unittest.TestCase):
     def test_a_real_jpeg_still_works(self):
         jpeg = b"\xff\xd8" + b"j" * 9000
         self.assertIsNone(self.grab(FakeResponse(jpeg)))
+
+
+class Endless(object):
+    """A 200 whose body never ends: an MJPEG URL where a snapshot belongs."""
+
+    status_code = 200
+
+    def __init__(self, delay=0.0, chunk=b"\xff\xd8" + b"x" * 1024, chunks=None):
+        # `chunks` bounds it, so that with the fix reverted a test fails in
+        # seconds rather than hanging, or reading gigabytes into memory.
+        self.delay, self.chunk, self.chunks = delay, chunk, chunks
+        self.closed = False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=1):
+        n = 0
+        while self.chunks is None or n < self.chunks:
+            n += 1
+            if self.delay:
+                time.sleep(self.delay)
+            yield self.chunk
+
+    def close(self):
+        self.closed = True
+
+
+class TestASnapshotThatNeverEnds(unittest.TestCase):
+    """requests' timeout is per socket read and `.content` reads to EOF, so a
+    stream held the camera's thread, and its memory, for ever (M9)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.cam = cap.HttpCamera(
+            {"name": "Gate", "url": "http://192.0.2.1/video.cgi"},
+            make_config(self.tmp))
+        self.asked = {}
+
+    def serve(self, response):
+        def get(url, **kw):
+            self.asked.update(kw)
+            return response
+        self.cam.session.get = get
+        return response
+
+    def test_a_stream_is_stopped_at_the_size_cap(self):
+        resp = self.serve(Endless(chunks=2000))
+        with mock.patch.object(cap, "MAX_SNAPSHOT_BYTES", 64 * 1024):
+            with self.assertRaises(cap.NotAJpeg) as caught:
+                self.cam._grab(datetime(2026, 8, 14, 9, 0, 0))
+        self.assertIn("video stream", str(caught.exception))
+        self.assertTrue(resp.closed)
+
+    def test_a_dribble_is_stopped_at_the_deadline(self):
+        resp = self.serve(Endless(delay=0.01, chunk=b"x", chunks=500))
+        self.cam.timeout = 0.05
+        started = time.monotonic()
+        with self.assertRaises(cap.requests.exceptions.Timeout):
+            self.cam._grab(datetime(2026, 8, 14, 9, 0, 0))
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertEqual(cap.classify(cap.requests.exceptions.Timeout("x")),
+                         "unreachable")
+        self.assertTrue(resp.closed)
+
+    def test_the_request_asks_for_a_stream(self):
+        self.serve(FakeResponse(b"\xff\xd8" + b"j" * 9000))
+        self.cam._grab(datetime(2026, 8, 14, 9, 0, 0))
+        self.assertIs(self.asked.get("stream"), True)
+
+    def test_the_deadline_is_read_from_the_clock_given(self):
+        clock = iter([0.0, 1.0, 2.0, 9.0]).__next__
+        with self.assertRaises(cap.requests.exceptions.Timeout):
+            cap.read_snapshot(Endless(), deadline=5.0, limit=5, clock=clock)
+
+    def test_an_ordinary_snapshot_is_read_whole(self):
+        body = b"\xff\xd8" + b"j" * 200000
+        self.assertEqual(
+            cap.read_snapshot(FakeResponse(body), time.monotonic() + 60, 60),
+            body)
 
 
 class TestAuthBackOff(unittest.TestCase):

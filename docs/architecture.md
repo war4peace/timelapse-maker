@@ -224,11 +224,29 @@ stopped taking pictures, and **once more on clean shutdown** with
 **`HttpCamera(threading.Thread)`**: one per `method: "http"` camera.
 
 - `run()`: the scheduling loop. Computes `next_t` as an absolute epoch multiple
-  of `interval`, sleeps until it, fires, then advances. Because targets are
-  absolute, the loop cannot accumulate drift from fetch latency. If it falls a
-  full interval behind (slow camera, host suspend) it resyncs forward to the
-  next boundary instead of replaying a backlog.
-- `_grab(dt, timeout=None)`: one fetch. Validates size ≥ `min_bytes` and JPEG
+  of `interval` (`next_boundary()`), sleeps until it, fires, then advances.
+  Because targets are absolute, the loop cannot accumulate drift from fetch
+  latency. If it falls a full interval behind (slow camera, host suspend) it
+  resyncs forward to the next boundary instead of replaying a backlog.
+  **`tick_plan()` decides each step** (0.2.1, M8): a tick more than one
+  interval away in *either* direction is a resync, not a wait and not a fire.
+  `Event.wait` is monotonic, so a wall clock stepped back used to be slept
+  through whole, and one stepped forward fired at once with a stale tick and
+  named the frame days in the past; an RTC-less board stepped by NTP after
+  boot does both and leaves a 1970 day directory the encoder skips for ever.
+  The loop re-plans after every wait, so a step during one is seen before the
+  next fetch, and no wait exceeds an interval. The capture unit also orders
+  itself `After=time-sync.target`. **The loop is executed by tests now**
+  (M31): `TestTheTickLoop` runs it synchronously on `_support.FakeClock` /
+  `FakeStop`, covering the grid, a slow fetch, PAUSED, the auth-quiet skip,
+  steps both ways and mid-wait, stop mid-fetch, and a midnight cadence change.
+- `_grab(dt, timeout=None)`: one fetch, **streamed** (0.2.1, M9):
+  `read_snapshot()` reads the body against a monotonic deadline of the fetch
+  timeout and a 64 MB cap, because requests' timeout is per socket read and
+  `.content` reads to EOF, so an MJPEG or `video.cgi` URL held the thread and
+  its memory for ever. Over the deadline is a `Timeout` (unreachable to the
+  classifier), over the cap a `NotAJpeg` carrying the first bytes. Then it
+  validates size ≥ `min_bytes` and JPEG
   SOI (`FF D8`), writes temp, `os.replace`s into place. Nothing is written until
   both checks pass, so a failed attempt leaves no partial file and no
   `_dest_path` collision for a retry to trip over. A `FileNotFoundError` from
@@ -444,9 +462,12 @@ for a machine with 0.2.1 installed.
 **`DiskGuard(threading.Thread)`**
 
 Polls `shutil.disk_usage(frames_root).free` every 300s. Below `min_free_gb`, sets
-`PAUSED` and logs at ERROR. Clears at 110% of threshold (hysteresis, so it can't
-flap). Capture threads keep their timing loops running while paused so they
-resume on-boundary. Disabled by setting `min_free_gb: 0`.
+`PAUSED` and logs at ERROR. Clears at `RESUME_FACTOR` (110%) of threshold
+(hysteresis, so it can't flap). Capture threads keep their timing loops running
+while paused so they resume on-boundary. Disabled by setting `min_free_gb: 0`.
+One reading is `check_once()` (0.2.1, M30), so the rule is driven by tests
+rather than asserted about: the previous hysteresis test checked that 1.1 times
+a number exceeds the number, and passed with no hysteresis at all.
 
 ### 4.2 `timelapse_encode.py`
 
@@ -3577,7 +3598,11 @@ the config.
   test executes, and the rule is worth executing.
 - **RTSP gets `-t seconds_to_midnight()`.** ffmpeg carries `fps=1/interval` on
   its command line, so a new cadence means a new process, and the boundary is
-  the only moment that may happen. Its `rc=0` is the planned handover and is
+  the only moment that may happen. **Counted by timestamps** since 0.2.1 (M6):
+  subtracting two datetimes counts wall-clock hours, so on the spring DST day
+  ffmpeg ran an hour past midnight into the old day's directory, `-strftime`
+  naming those frames by the new day's clock over the old day's first hour,
+  and on the autumn day it stopped an hour early. Its `rc=0` is the planned handover and is
   logged at info; logging it as a warning nightly would train people to ignore
   the line that matters. Since 0.1.7 the day is also baked into the output
   path, so **one ffmpeg process writes into exactly one day directory**. If it
@@ -3989,9 +4014,15 @@ help.
 ## 8. Known limitations
 
 - **DST fall-back**: local time repeats an hour, so `HHMMSS` names collide.
-  `HttpCamera._dest_path` appends `-1`, `-2` … and keeps everything, at the cost
-  of that hour sorting slightly oddly. The RTSP path (ffmpeg `-strftime`) has no
-  such guard and will overwrite. Video length varies on DST days (23h or 25h).
+  `HttpCamera._dest_path` appends `-1`, `-2` … and keeps everything. Plain name
+  order put `023000-1.jpg` before `023000.jpg` (`-` sorts before `.`), so the
+  video alternated between frames an hour apart; since 0.2.1 (M7) the encoder
+  sorts by `frame_order()`, hour then pass then MMSS, which is chronological.
+  **This is the one place name order and play order differ.** The RTSP path
+  (ffmpeg `-strftime` with `-y`) has no such guard and overwrites the first
+  pass with the second, keeping one hour of frames rather than two; accepted,
+  since a pattern that could not collide would give up `-strftime`. Video
+  length varies on DST days (23h or 25h).
 - **PTZ cameras** jump-cut between presets in the finished video.
 - **Cameras are polled independently**, so frames across cameras are not
   synchronised to the same instant.

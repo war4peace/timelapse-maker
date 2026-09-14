@@ -3,6 +3,13 @@ Description=Camera snapshot capture for timelapse
 Documentation=https://github.com/war4peace/timelapse-maker
 After=network-online.target
 Wants=network-online.target
+# A board with no real-time clock boots near the epoch and is stepped by NTP a
+# minute later; a frame captured before then lands in a 1970 day directory the
+# encoder skips for ever. This waits for the clock where the distribution
+# provides a service that holds time-sync.target back, and costs nothing where
+# it does not. The daemon also resyncs on a step it sees (tick_plan).
+After=time-sync.target
+Wants=time-sync.target
 
 [Service]
 Type=simple
