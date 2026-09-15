@@ -6,6 +6,7 @@ What was fixed in each version, one line per fix, in plain language. Newest vers
 
 - [0.2.2 (unreleased)](#022-unreleased)
 - [0.2.1 - 2026-09-14](#021---2026-09-14)
+- [0.2.0 - 2026-08-18](#020---2026-08-18)
 
 ## 0.2.2 (unreleased)
 
@@ -150,3 +151,26 @@ Of these, 2 High and 1 Medium were found on the author's own machine, outside th
 - Docs: File counts and changelog links corrected
 - Bug: Linux service files are now written in one place, and unusual characters in paths are handled everywhere
 - Tests: Shared test helpers moved into one file
+
+## 0.2.0 - 2026-08-18
+
+The Windows release: timelapse-maker runs natively on Windows as well as Linux, from the same program. The web UI stays Linux-only for now, because on Windows the videos can already be browsed and played from the share.
+
+### New features and improvements
+
+- Windows: timelapse-maker runs natively, with no WSL or Linux machine needed
+- Windows: a downloadable installer (`.exe`) that also fetches Python and ffmpeg, but only if the machine does not already have them
+- Windows: a graphical setup window, from the Start menu or `timelapse gui`, which asks the same questions as the console setup and can test each camera and show the picture it returned
+- Windows: capture runs as a real Windows service, listed as "Timelapse Capture" in Services, and starts with the machine
+- Windows: the nightly encode and the credential check run as scheduled tasks, on the same schedule as on Linux
+- Windows: finished videos are moved to a folder on the machine or to a network share, with an optional share username and password for the nightly job
+- Windows: a mapped drive letter is saved as the network address it points to, because the nightly job cannot see drive letters
+- Windows: the `timelapse` command, run from an Administrator window
+- Windows: logs are written as one file per day
+- Camera names that differ only in capital letters, and names Windows reserves such as `NUL`, are refused on both systems
+- The automated build now runs the tests on Windows as well as Linux
+
+### Fixes
+
+- Bug: Windows: saving a status file could fail if the web page happened to be reading it at the same moment
+- Bug: Windows: the setup called a network port free when another program was already using it

@@ -90,7 +90,7 @@ jobs:
         run: python tests/smoke_test.py
 
   # Added at the first commit of the Windows port rather than the last, per
-  # docs/future-features.md item 11e. The suite already passed on Windows
+  # docs/architecture.md §9b, 11e. The suite already passed on Windows
   # before any of this existed, so this leg starts green and its entire value
   # is catching timelapse_platform regressing: half of what that module
   # answers is unreachable from the Linux legs by construction, and this

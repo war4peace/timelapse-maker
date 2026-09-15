@@ -3,7 +3,7 @@
 timelapse_platform.py: the one place a platform difference may live.
 
 Every other script here is platform-neutral and must stay that way. The rule,
-from docs/future-features.md item 11e: **no `if os.name == "nt"` outside this
+from docs/architecture.md §9b, 11e: **no `if os.name == "nt"` outside this
 file.** The moment that test appears in timelapse_capture.py, the two-forks
 outcome has started arriving by increments, and this project has already
 written down what happens when one copy of a rule drifts from another.
