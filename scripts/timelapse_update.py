@@ -43,7 +43,7 @@ import urllib.request
 # otherwise.
 from timelapse_platform import use_colour
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 GITHUB_REPO = "war4peace/timelapse-maker"
 GITHUB_API = "https://api.github.com/repos/" + GITHUB_REPO

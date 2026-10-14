@@ -41,7 +41,7 @@ from timelapse_platform import (
     SERVICE_STATES, elevation_hint, is_elevated, service_state,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 HERE = Path(__file__).resolve().parent
 SCRIPTS = ("capture", "encode", "test", "setup", "update", "platform", "web",

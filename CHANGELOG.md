@@ -9,6 +9,7 @@ While the version is `0.x`, the configuration format may change in any release.
 ## Contents
 
 - [Unreleased](#unreleased)
+- [0.2.2 - 2026-10-14](#022---2026-10-14)
 - [0.2.1 - 2026-09-14](#021---2026-09-14)
 - [0.2.0 - 2026-08-18](#020---2026-08-18)
 - [0.1.9 - 2026-08-15](#019---2026-08-15)
@@ -32,6 +33,8 @@ While the version is `0.x`, the configuration format may change in any release.
 - [0.0.1 - 2026-08-05](#001---2026-08-05)
 
 ## [Unreleased]
+
+## [0.2.2] - 2026-10-14
 
 ### Added
 
@@ -820,7 +823,8 @@ Found while reviewing the private codebase for publication:
 - Replaced the deprecated `datetime.utcnow()` with a timezone-aware timestamp.
 - Replaced `os.uname()` with `platform.node()` in the failure reporter.
 
-[Unreleased]: https://github.com/war4peace/timelapse-maker/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/war4peace/timelapse-maker/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.2.2
 [0.2.1]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.2.1
 [0.2.0]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.2.0
 [0.1.9]: https://github.com/war4peace/timelapse-maker/releases/tag/v0.1.9

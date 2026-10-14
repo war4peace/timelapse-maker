@@ -39,7 +39,7 @@ from timelapse_platform import (CONFIG_PATH, IS_WINDOWS,  # noqa: E402
                                 admin_cmd, is_reserved_name, is_unc,
                                 no_console, use_colour)
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # Where camera samples go. A fixed /tmp/timelapse-test was shared by every
 # account that runs this, which is three of them (the service user from

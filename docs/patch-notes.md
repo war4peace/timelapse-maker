@@ -4,11 +4,13 @@ What was fixed in each version, one line per fix, in plain language. Newest vers
 
 ## Contents
 
-- [0.2.2 (unreleased)](#022-unreleased)
+- [0.2.2 - 2026-10-14](#022---2026-10-14)
 - [0.2.1 - 2026-09-14](#021---2026-09-14)
 - [0.2.0 - 2026-08-18](#020---2026-08-18)
 
-## 0.2.2 (unreleased)
+## 0.2.2 - 2026-10-14
+
+Knowing when a camera has stopped: a warning when one stops delivering frames, and a nightly summary that lists a camera with no frames and colours a short day. Plus a way back from split storage folders on Windows.
 
 ### New features and improvements
 

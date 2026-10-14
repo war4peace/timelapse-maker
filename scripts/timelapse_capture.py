@@ -42,7 +42,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install requests "
              "(or: sudo apt install python3-requests)")
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 
 # ----------------------------------------------------------------------------

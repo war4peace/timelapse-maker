@@ -38,7 +38,7 @@ from timelapse_platform import (CONFIG_PATH, FFMPEG_URL,   # noqa: E402
                                 IS_WINDOWS, elevation_hint, is_elevated,
                                 is_unc, no_console, share_root)
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 OK, WARN, FAIL = "ok", "warn", "fail"
 

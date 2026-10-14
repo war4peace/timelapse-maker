@@ -86,7 +86,7 @@ from timelapse_platform import (                           # noqa: E402
     CONFIG_PATH, WEB_STATE_DIR_DEFAULT,
 )
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 log = logging.getLogger("web")
 

@@ -64,7 +64,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from xml.sax import saxutils
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 # The one test, made once, so that nothing below has to repeat it and nothing
 # outside this file has to make it at all.
