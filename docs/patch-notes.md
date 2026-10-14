@@ -10,8 +10,16 @@ What was fixed in each version, one line per fix, in plain language. Newest vers
 
 ## 0.2.2 (unreleased)
 
+### New features and improvements
+
+- A notification when a camera stops delivering frames for ten minutes, saying how many cameras are still working and what went wrong with the last attempt (for a camera moved to a new address, the old address it is still trying); a second one when it comes back
+- The nightly summary now lists a camera that captured nothing all day, as a row marked NONE, instead of leaving it out
+- In the nightly Discord summary and on the web page, cameras under 95% coverage are shown in dark yellow
+
 ### Fixes
 
+- Bug: the web page's warning colour was never defined, so warnings looked like ordinary text
+- Bug: during the hour the clocks go back in autumn, the status page showed every camera's last frame as falling further and further behind
 - Bug: Windows: once the frames, videos and logs folders were in different places, the setup window had no way to put them back together; a **Consolidate paths** button now does
 
 ## 0.2.1 - 2026-09-14

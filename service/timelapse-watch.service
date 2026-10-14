@@ -1,5 +1,5 @@
 [Unit]
-Description=Report refused camera credentials and a stale NVIDIA driver
+Description=Report silent cameras, refused camera credentials and a stale NVIDIA driver
 Documentation=https://github.com/war4peace/timelapse-maker
 After=network-online.target
 Wants=network-online.target
@@ -7,7 +7,9 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 # Same account as capture and encode: it reads the state file the capture
-# daemon writes, and the config that holds the notification sinks.
+# daemon writes, the config that holds the notification sinks, and the names
+# of the newest frames under frames_root, which ProtectSystem=strict leaves
+# readable.
 User=timelapse
 Group=timelapse
 ExecStart=/usr/bin/python3 /opt/timelapse/timelapse_encode.py --watch /etc/timelapse/config.json

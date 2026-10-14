@@ -77,8 +77,8 @@ from timelapse_encode import (hostport, is_ipv6, redact,  # noqa: E402
 # is the only one this service may write to. Two meanings of one name in one
 # file is how the wrong directory ends up in a hardening claim.
 from timelapse_encode import (                            # noqa: E402
-    CAPTURE_STATE, ENCODE_STATE, STATE_VERSION,
-    coverage_of, day_cadence,
+    CAPTURE_STATE, ENCODE_STATE, LOW_COVERAGE, NO_FRAMES, STATE_VERSION,
+    coverage_of, day_cadence, frame_epoch, frame_key, newest_frame_epoch,
     state_dir as runtime_state_dir,
 )
 
@@ -1468,10 +1468,6 @@ COUNT_TTL = 20
 _counts = {}                    # (path, ttl bucket) -> (frames, newest name)
 _counts_lock = threading.Lock()
 
-# HHMMSS at the start of a frame name. The DST fall-back suffix (`-1`) may
-# follow, which is why this matches a prefix rather than the whole name.
-FRAME_NAME = re.compile(r"^(\d{2})(\d{2})(\d{2})")
-
 
 def scan_day(day_dir):
     """(frames, newest filename) for a day, in one pass over the directory.
@@ -1495,17 +1491,23 @@ def scan_day(day_dir):
         hit = _counts.get(key)
     if hit is not None:
         return hit
-    frames, newest = 0, ""
+    frames, newest, newest_order = 0, "", None
     try:
         with os.scandir(day_dir) as it:
             # scandir over listdir, and the name only: this never stats a
             # single file, which is what keeps a 17,000-frame day cheap. The
-            # newest name comes free from the same pass.
+            # newest name comes free from the same pass, by the encoder's
+            # frame order, which is what puts the second pass through the
+            # repeated DST hour after the first. Not called `key`: that name
+            # is the cache key above, and reusing it stored every result
+            # under the last frame's sort order, where nothing looks.
             for entry in it:
                 if entry.name.endswith(".jpg"):
                     frames += 1
-                    if entry.name > newest:
-                        newest = entry.name
+                    order = frame_key(entry.name)
+                    if order[0] == 0 and (newest_order is None
+                                          or order > newest_order):
+                        newest, newest_order = entry.name, order
     except FileNotFoundError:
         pass
     except OSError:
@@ -1525,32 +1527,6 @@ def count_frames(day_dir):
     return scan_day(day_dir)[0]
 
 
-def frame_epoch(day, name):
-    """When a frame was captured, from its name. Never from its mtime.
-
-    Order and time are properties of the *name* throughout this project:
-    filenames are zero-padded `HHMMSS`, so lexical order is chronological
-    order, and nothing reads mtime (architecture.md §2). A PowerShell
-    predecessor mixed `CreationTime` and `LastWriteTime` between its passes
-    and deleted the wrong files; that whole class of bug is gone as long as
-    the name stays the authority. Reading mtime here to answer "when was the
-    last frame" would put it back, and would also be wrong after any copy,
-    restore or rsync that did not preserve timestamps.
-    """
-    m = FRAME_NAME.match(name or "")
-    if not m:
-        return None
-    hour, minute, second = (int(g) for g in m.groups())
-    if hour > 23 or minute > 59 or second > 59:
-        return None
-    try:
-        midnight = datetime.datetime.strptime(day, "%Y-%m-%d")
-    except (TypeError, ValueError):
-        return None
-    return midnight.replace(hour=hour, minute=minute,
-                            second=second).timestamp()
-
-
 def last_frame_epoch(cfg, cam, now=None):
     """When this camera's newest frame was captured, or None.
 
@@ -1559,21 +1535,16 @@ def last_frame_epoch(cfg, cam, now=None):
     row said "12s ago", because the daemon has no last-frame time for a
     stream another process is writing. The directory has one.
 
-    Yesterday is consulted only when today is empty. That is the minute after
-    midnight, when the newest frame is still in the day that just ended, and
-    it costs one listing of a directory that is empty by definition.
+    The rule is the encoder's newest_frame_epoch(), which the silent-camera
+    watch also reads, so this column and that notification cannot disagree.
+    Only the listing is this module's, because it is cached. An unreadable
+    day reads as empty here, as it always has on this page.
     """
     root = cfg.get("paths", {}).get("frames_root")
     if not root or not cam.get("name"):
         return None
-    now = datetime.datetime.now() if now is None else now
-    base = Path(root) / str(cam["name"])
-    for back in (0, 1):
-        day = (now - datetime.timedelta(days=back)).strftime("%Y-%m-%d")
-        frames, newest = scan_day(base / day)
-        if frames:
-            return frame_epoch(day, newest)
-    return None
+    return newest_frame_epoch(root, cam["name"], now,
+                              scan=lambda d: scan_day(d)[1] or "")
 
 
 def seconds_elapsed_today(now=None):
@@ -2038,8 +2009,13 @@ LAYOUT = """<!doctype html>
   .note {{ margin: .8rem 0 0; padding: .6rem .75rem; border-radius: 6px;
            background: rgba(200,140,0,.14); font-size: .9rem; }}
   .ok {{ color: #1a7f37; }} .bad {{ color: #b3261e; }}
+  /* Dark yellow, for "worth a look" rather than "broken": a camera with no
+     frame yet, and coverage under the line. The class was applied to those
+     cells from 0.1.6 and never defined, so they rendered as ordinary text. */
+  .warn {{ color: #9a6700; }}
   @media (prefers-color-scheme: dark) {{
     .ok {{ color: #4ac26b; }} .bad {{ color: #ff7b72; }}
+    .warn {{ color: #d29922; }}
   }}
   ul.todo {{ margin: 0; padding-left: 1.1rem; opacity: .65; font-size: .9rem; }}
   nav {{ display: flex; gap: .5rem; flex-wrap: wrap; margin-bottom: 1.25rem;
@@ -3305,6 +3281,8 @@ class Handler(BaseHTTPRequestHandler):
                 made += f', {run["failed"]} failed'
             if run.get("skipped"):
                 made += f', {run["skipped"]} skipped'
+            if run.get("no_frames"):
+                made += f', {run["no_frames"]} with no frames'
             rows.append(("Produced", made))
 
         xfer = run.get("transfer")
@@ -3338,14 +3316,20 @@ class Handler(BaseHTTPRequestHandler):
                 # web service from starting at all. See the same note in
                 # timelapse_setup.py's summarise_web().
                 cov = d.get("coverage")
-                mark = ' class="bad"' if d.get("status") == "FAIL" else ""
+                status = d.get("status")
+                mark = (' class="bad"' if status == "FAIL"
+                        else ' class="warn"' if status == NO_FRAMES else "")
                 shown = "-" if cov is None else f"{cov:g}%"
+                # The nightly message's threshold, so the two agree on which
+                # cameras had a short day.
+                cov_cls = ("warn" if cov is not None and cov < LOW_COVERAGE
+                           else "dim")
                 parts.append(
                     f'<tr><td>{escape(str(d.get("camera", "?")))}</td>'
                     f'<td class="dim">{escape(str(d.get("date", "?")))}</td>'
-                    f'<td{mark}>{escape(str(d.get("status", "?")))}</td>'
+                    f'<td{mark}>{escape(str(status or "?"))}</td>'
                     f'<td class="dim">{d.get("frames", 0):,}</td>'
-                    f'<td class="dim">{escape(shown)}</td>'
+                    f'<td class="{cov_cls}">{escape(shown)}</td>'
                     f'<td class="dim">{escape(human_size(d.get("size") or 0))}'
                     f'</td></tr>')
             parts.append("</table>")

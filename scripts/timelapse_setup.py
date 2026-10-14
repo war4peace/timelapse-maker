@@ -2047,7 +2047,8 @@ def service_definitions(scripts_dir, config_path, python=None):
         # timelapse-watch.timer: every 5 minutes, TimeoutStartSec=60, and
         # deliberately NOT Persistent, because a missed check is not worth
         # catching up on.
-        (WATCH_UNIT, "Report refused camera credentials and a stale NVIDIA driver",
+        (WATCH_UNIT, "Report silent cameras, refused camera credentials and a "
+                     "stale NVIDIA driver",
          argv("timelapse_encode.py", "--watch"),
          {"triggers": repeating_trigger(5),
           "catch_up": False, "time_limit": "PT1M"}),
@@ -4173,7 +4174,8 @@ def default_config(template_path=None):
         "capture": {"interval_seconds": 5, "timeout_seconds": 4,
                     "min_bytes": 4096, "min_free_gb": 60,
                     "log_every_n_failures": 60, "retry_within_tick": True,
-                    "notify_auth_failures": True},
+                    "notify_auth_failures": True,
+                    "notify_silent_cameras": True},
         "encode": {"framerate": 60, "container": "mkv", "gop": 120,
                    "av1_preset": "p6", "av1_cq": 26, "hevc_cq": 24,
                    "x264_crf": 20, "min_frames": 100,

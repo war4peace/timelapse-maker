@@ -457,6 +457,11 @@ Those two videos are the ones that appear twice in the library screenshot in [se
 
 The table is sized from its contents rather than to fixed widths, because **a Discord embed is narrower than a Discord message**: about 50 columns of a monospace block survive before it wraps, and a wrapped row folds its last field onto a second line under the first, which reads as this program having printed garbage. The date is a heading rather than a column for the same reason, since it would otherwise repeat the same value on every row and cost ten of them.
 
+Since 0.2.2, two things about that table:
+
+- **A camera that captured nothing that day has a row**, marked `NONE` with 0 frames and 0%, and the message becomes a warning with a "No frames" line. Before, it simply had no row, because the table is built from the days that have frames. The row only appears for a day some other camera did capture, so a day the recorder was off does not list every camera.
+- **A camera under 95% coverage is dark yellow** in Discord, and in the web UI's Last encode panel. Discord colours text with `ansi` code blocks, which its desktop app renders; the phone apps have had trouble with them in the past, so the colour is only sent on a night that has a row to colour, and a good night looks exactly as it always has. If a short-day summary looks odd on your phone, say so. ntfy and Telegram get the same table without colour. The two screenshots above predate this, so the 42% and 17% rows in the Windows one would be yellow today.
+
 ```bash
 sudo timelapse notify
 ```
@@ -471,12 +476,13 @@ Each one is offered a test message as you configure it, and `timelapse test` sen
 
 A failing sink can never fail the run it is reporting on, and one sink being down does not stop the others. Failures are logged and the encode's exit status is unaffected.
 
-The same sinks carry two warnings from the watch timer, each sent once when the problem starts and once when it clears, never repeated while it lasts:
+The same sinks carry three warnings from the watch timer, which checks every five minutes. Each is sent once when the problem starts and once when it clears, never repeated while it lasts:
 
+- **A camera has stopped delivering frames** (`capture.notify_silent_cameras`, since 0.2.2). Sent when an enabled camera has had no new frame for ten minutes, or ten of its own intervals if that is longer, so a camera rebooting does not trigger it. The message names the camera, says how long since its last frame and how many of your enabled cameras are still delivering, and quotes what capture last got from it. That last part is usually the answer: a camera you gave a new address shows up as a connection failure to the **old** address, which is still the one in the config. Fix the address with `timelapse cameras -e:NAME`; the all-clear follows within five minutes of its first new frame. Several cameras going quiet together arrive as one message. It stays quiet while the disk guard has paused capture, and for the first ten minutes after capture starts.
 - **A camera is refusing our credentials** (`capture.notify_auth_failures`). Capture from that camera pauses apart from an occasional retry, so this program does not keep the camera's account locked.
 - **The NVIDIA driver was updated but the old one is still loaded** (`encode.notify_driver_mismatch`, Linux, checked hourly). Until a restart, the nightly encode falls back to libx264; see [Common snags](#common-snags).
 
-With no sink configured, the driver warning is still written to the log every hour. Neither is recorded as announced until a sink has actually accepted it, so the first sink you add announces whatever is still going on.
+With no sink configured, the driver warning is still written to the log every hour. None is recorded as announced until a sink has actually accepted it, so the first sink you add announces whatever is still going on.
 
 **If you configured Discord before 0.1.6**, nothing changes and there is nothing to do: the old `discord` block in `config.json` still works exactly as it did. The moment you run `timelapse notify`, the settings move into a `notify` list that can hold several sinks, and the old block is switched off so it cannot look configured while being ignored.
 
@@ -502,7 +508,7 @@ The installer puts a single wrapper on `PATH`. Everything below is a subcommand 
 
 | Command | What it does |
 |---|---|
-| `timelapse status` | `systemctl status` for every unit in one shot: capture, the encode timer **and the encode service**, the watch timer (refused camera credentials, and a stale NVIDIA driver), and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
+| `timelapse status` | `systemctl status` for every unit in one shot: capture, the encode timer **and the encode service**, the watch timer (silent cameras, refused camera credentials, and a stale NVIDIA driver), and the web UI. Running or not, how long, recent log lines, and when the next encode fires. The encode *service* is listed separately from its timer on purpose: it is oneshot, so a run that failed (a broken transfer, say) leaves the service failed while the timer still looks healthy. |
 | `timelapse logs` | Follows the capture journal live (`journalctl -u timelapse-capture -f`). Ctrl-C to stop. This is where camera failures and recoveries appear. |
 | `timelapse usage` | Disk report: frames, bytes and date range per camera, plus totals, videos and free space. See below. |
 | `timelapse test` | Pre-flight check. Fetches from every enabled camera and reports resolution and size, verifies the encoders, disk headroom, the transfer destination and every notification sink. Run it after any change. **Exits 1 if anything came back FAIL**, 0 otherwise, so a script can act on it; a WARN is not a failure. `--usage` and `--encoders` are reports and always exit 0. |

@@ -4164,6 +4164,23 @@ class TestTodaysCoverage(StateMixin, unittest.TestCase):
         self.assertEqual(web.frame_epoch("2026-08-14", "031500-1.jpg"),
                          web.frame_epoch("2026-08-14", "031500.jpg"))
 
+    def test_the_newest_frame_follows_the_dst_hour(self):
+        # The second pass through the repeated hour was written after the
+        # first, whatever plain name order says.
+        d = self.day_dir("Roof")
+        for name in ("025959.jpg", "024500-1.jpg"):
+            (d / name).write_bytes(b"\xff\xd8x")
+        self.assertEqual(web.scan_day(d), (2, "024500-1.jpg"))
+
+    def test_the_rule_is_the_encoders_not_a_copy(self):
+        # The silent-camera watch reads the same functions, so this column and
+        # that notification cannot disagree about when a camera last
+        # delivered. A copy here is how they would start to.
+        import timelapse_encode as enc
+        self.assertIs(web.frame_epoch, enc.frame_epoch)
+        self.assertIs(web.newest_frame_epoch, enc.newest_frame_epoch)
+        self.assertFalse(hasattr(web, "FRAME_NAME"))
+
     def test_a_name_that_is_not_a_frame_is_no_answer(self):
         for name in ("", "cadence.json", "9999.jpg", "abcdef.jpg",
                      "997000.jpg"):
@@ -4250,6 +4267,44 @@ class TestLastEncodePanel(StateMixin, unittest.TestCase):
         self.run_payload(transfer={"ok": False, "moved": 0,
                                    "detail": "exit 23: chgrp failed"})
         self.assertIn("exit 23", self.body())
+
+    def day(self, camera, coverage, status="OK", frames=17280):
+        return {"camera": camera, "date": "2026-08-11", "status": status,
+                "frames": frames, "bad": 0, "size": 0, "seconds": 1.0,
+                "interval": 5, "coverage": coverage, "note": ""}
+
+    def test_a_short_day_is_marked(self):
+        # The nightly message's threshold (LOW_COVERAGE), so the page and the
+        # message agree on which cameras had a short day.
+        self.run_payload(days=[self.day("Roof", 100.0),
+                               self.day("Gate", 94.9, frames=16400),
+                               self.day("Yard", 95.0, frames=16416)])
+        body = self.body()
+        self.assertIn('<td class="warn">94.9%</td>', body)
+        self.assertIn('<td class="dim">95%</td>', body)
+        self.assertIn('<td class="dim">100%</td>', body)
+
+    def test_a_camera_with_no_frames_has_a_row(self):
+        self.run_payload(no_frames=1,
+                         days=[self.day("Roof", 100.0),
+                               self.day("Gate", 0.0, status="NONE",
+                                        frames=0)])
+        body = self.body()
+        self.assertIn('<td class="warn">NONE</td>', body)
+        self.assertIn('<td class="warn">0%</td>', body)
+        self.assertIn("1 with no frames", body)
+
+    def test_warn_is_a_colour_now(self):
+        # Applied to cells since 0.1.6 and never defined, so a camera with no
+        # frame yet looked like any other row.
+        # Both themes, separately: one regex over the page is satisfied by the
+        # dark rule alone and would pass with the light one deleted.
+        self.run_payload()
+        _status, _, raw = request("/", self.config)
+        light, _, dark = raw.partition("@media (prefers-color-scheme: dark)")
+        rule = r"\.warn \{ color: #[0-9a-f]{6}; \}"
+        self.assertRegex(light, rule)
+        self.assertRegex(dark, rule)
 
     def test_a_run_with_no_transfer_does_not_look_like_a_failed_one(self):
         self.run_payload(transfer=None)

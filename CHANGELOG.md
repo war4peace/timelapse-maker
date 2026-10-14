@@ -33,7 +33,21 @@ While the version is `0.x`, the configuration format may change in any release.
 
 ## [Unreleased]
 
+### Added
+
+- **A warning when a camera stops delivering frames.** Asked for 2026-10-14, while moving the cameras to new addresses: when a camera's address changes, capture goes on asking the old one and the other cameras carry on, and nothing in this program said so. The nightly summary did not help either, because it was built from the days that have frames, so after the first day such a camera was not listed at 0%, it was simply missing from the table (fixed below).
+
+  The watch timer now compares the cameras enabled in the config with the ones that have delivered a frame in the last ten minutes (or ten of the camera's own intervals, if that is longer, so a camera at one frame every five minutes is not called silent for missing one). When one goes quiet it sends a single warning naming it, how long since its last frame, what capture last got from it, and how many of your enabled cameras are still delivering; when its frames resume, one all-clear. For a moved camera, "what capture last got" is a connection failure that names the old address, which is usually the whole answer. Cameras that go quiet together arrive as one message. It works the same for RTSP cameras, because it reads the frames on disk rather than anything only the HTTP path records.
+
+  It stays quiet while the disk guard has paused capture, for the first ten minutes after capture starts, and about a camera that is refusing our credentials, which already has its own warning.
+
+- **The nightly summary lists a camera that captured nothing.** It gets a row with status `NONE`, 0 frames and 0% coverage, a "No frames" line under the table, and the message turns into a warning. Before this such a camera had no row at all. The encode itself still counts as a success, so the exit code and the service state are unchanged. A row only appears for a day some other camera did capture, which proves capture was running, and never for a camera-day an earlier run has already reported, so a retry of one failed day does not list every other camera as empty.
+- **Short days stand out.** In the Discord summary, a row under 95% coverage is dark yellow, and the web UI's Last encode panel marks the same rows. The colour uses Discord's `ansi` code blocks, which colour on the desktop app; the block is only marked that way on a night that has such a row, so a good night reaches every client exactly as before. ntfy and Telegram get the same table without the colour codes. Like the other watch warnings it needs a notification sink, and a warning that no sink accepted is retried five minutes later rather than forgotten. Set `capture.notify_silent_cameras` to `false` to turn it off. It was refused in August as "item 7", and the refusal said what would reopen it; this is that case (see `docs/decided-against.md`).
+
 ### Fixed
+
+- **The web UI's warning colour exists.** Cells for a camera with no frame yet, and for coverage under 98% so far today, were marked as warnings since 0.1.6, but the colour was never defined, so they looked like every other row. They are dark yellow now, in both light and dark themes.
+- **The status page's "Last frame" no longer falls behind during the hour the clocks go back.** In that hour the camera names its frames `HHMMSS-1.jpg`, which sorts before the first pass's `HHMMSS.jpg`, so the page picked the first pass's last frame as the newest and every row drifted to nearly an hour stale until the hour ended. The page and the new silent-camera warning now share one definition of the newest frame, which knows about the repeated hour; without it the warning would have reported every camera silent once a year.
 
 - **Windows: the setup window can put the storage folders back together.** 0.2.1 made the setup window keep a videos folder you had placed somewhere else, instead of quietly moving it back under the data folder. But once the frames, videos and logs folders were split, nothing in the window could regroup them: retyping the original data folder looked exactly like not touching it. When they are split, the Global configuration page now says so and offers a **Consolidate paths** button, which puts all three back under the data folder shown. The lines under the field show the result before you save.
 

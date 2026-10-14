@@ -18,7 +18,9 @@
     "min_free_gb": 60,
     "log_every_n_failures": 60,
     "retry_within_tick": true,
-    "notify_auth_failures": true
+    "_comment_notify": "Both need a notification sink. notify_auth_failures: once when a camera is confirmed to be refusing our credentials, once when it accepts them again. notify_silent_cameras: once when an enabled camera has delivered no frame for ten minutes (or ten of its own intervals, if that is longer), naming how many cameras are still delivering, and once when its frames resume. Checked every five minutes. Set either false to turn it off.",
+    "notify_auth_failures": true,
+    "notify_silent_cameras": true
   },
   "encode": {
     "_comment": "av1_preset p1 fastest .. p7 slowest. Lower cq/crf = higher quality, bigger files.",

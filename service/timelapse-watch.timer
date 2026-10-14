@@ -1,5 +1,5 @@
 [Unit]
-Description=Periodic check for cameras refusing our credentials
+Description=Periodic check for silent cameras, refused credentials and a stale NVIDIA driver
 Documentation=https://github.com/war4peace/timelapse-maker
 
 [Timer]

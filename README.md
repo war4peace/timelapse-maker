@@ -45,7 +45,7 @@ Both platforms capture and encode. **Linux additionally has the web UI and in-pl
 
 ### Windows
 
-Download `timelapse-maker-setup-<version>.exe` from the [releases page](https://github.com/war4peace/timelapse-maker/releases) and run it. Allow the administrator prompt. It copies everything, registers the capture functionality as a real Windows service and the nightly encode and credential check as scheduled tasks, then opens a graphical wizard for general and camera configuration.
+Download `timelapse-maker-setup-<version>.exe` from the [releases page](https://github.com/war4peace/timelapse-maker/releases) and run it. Allow the administrator prompt. It copies everything, registers the capture functionality as a real Windows service and the nightly encode and the watch (silent cameras, refused credentials) as scheduled tasks, then opens a graphical wizard for general and camera configuration.
 
 **It can supply Python and/or ffmpeg if the machine doesn't have them.** Two checkboxes, both ticked, and both act only if that component is missing: an ffmpeg you installed yourself is the one that gets used, because a recorder usually already has one chosen deliberately, and the same goes for an existing Python 3.9 or newer. Anything it does fetch is pinned by version and checked against a SHA-256 before it runs.
 
@@ -239,9 +239,11 @@ One message per nightly run, to **Discord**, **ntfy**, **Telegram**, any combina
 
 A row per camera with frames, coverage, size and how long it took, then the totals, the encoder that was actually used, free disk and whether the transfer worked. It is what tells you the thing worked without you going to look, and on Windows it is the only one of the two, since the web UI is Linux-only.
 
-Roof reads 5,760 frames against the others' 17,280 and is still 100%, because coverage is measured against the cadence *that* camera is running at.
+Roof reads 5,760 frames against the others' 17,280 and is still 100%, because coverage is measured against the cadence *that* camera is running at. A camera under 95% is dark yellow, and one that captured nothing all day gets a row marked `NONE` rather than no row.
 
 A failing notification can never fail the run it is reporting on, and one sink being down does not stop the others.
+
+Between runs, the same sinks carry warnings, each sent once when the problem starts and once when it clears: a camera that has **stopped delivering frames**, with how many cameras are still working and what the last attempt got (for a camera given a new address, a failure to reach the old one); a camera **refusing the configured credentials**; and, on Linux, an **NVIDIA driver update** waiting for a restart. See [install.md §6a](docs/install.md#6a-notifications).
 
 <sub>[&uarr; Contents](#contents)</sub>
 

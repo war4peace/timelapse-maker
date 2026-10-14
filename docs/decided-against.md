@@ -11,7 +11,7 @@ Nothing here is forbidden forever. If the constraint changes, the entry says whi
 - [Frame retention beyond encode](#frame-retention-beyond-encode)
 - [Frozen-camera detection](#frozen-camera-detection)
 - [Restarting a camera automatically](#restarting-a-camera-automatically)
-- [Alerting when a camera stops answering](#alerting-when-a-camera-stops-answering)
+- [Alerting when a camera stops answering](#alerting-when-a-camera-stops-answering) (reopened, built in 0.2.2)
 - [An ONVIF client library](#an-onvif-client-library)
 - [In-browser `<video>` playback](#in-browser-video-playback)
 - [Thumbnails and poster frames](#thumbnails-and-poster-frames)
@@ -88,7 +88,7 @@ Three more, each sufficient on its own:
 - **"Disable it during maintenance" contradicts "set and forget".** The core promise here is running untouched for weeks or months. A guard you must remember to turn off before touching anything is a guard that fires exactly when you are busy.
 - **Anyone with several IP cameras already owns something that does this**, and better: an NVR, Agent DVR, Home Assistant, Uptime Kuma. This program is supplementary by design, and stepping onto ground another tool already holds is how it starts conflicting with setups it cannot see.
 
-**What was proposed instead** was an optional notification on repeated snapshot failures, default off: telling someone is not the same as acting, it cannot fight another controller, and it needs no new credential. That became item 7, and it was refused a day later on its own merits. See the next entry.
+**What was proposed instead** was an optional notification on repeated snapshot failures, default off: telling someone is not the same as acting, it cannot fight another controller, and it needs no new credential. That became item 7, and it was refused a day later on its own merits. See the next entry, which was reopened and built in 0.2.2 after a real incident; nothing about that changes this one.
 
 **Reopen if:** there is real demand *and* an answer to the arbitration question, which is not "add a config flag". Knowing that a reboot is safe means knowing what else touches that camera, and nothing in this program's design gives it that.
 
@@ -97,6 +97,10 @@ Three more, each sufficient on its own:
 <sub>[&uarr; Contents](#contents)</sub>
 
 ## Alerting when a camera stops answering
+
+**Reopened 2026-10-14 and built in 0.2.2, on exactly the condition this entry set.** The operator gave a camera a new address, knowingly, as part of moving the cameras to new addresses, and found that nothing in this program would have said so: capture went on asking the old address and every other camera carried on. That is "a camera that was up while its snapshots failed for a reason the camera did not declare", the reopen condition at the end of this entry, word for word; a monitor watching that camera would have stayed green, because the camera was fine. It was built the way the last paragraph prescribes: keyed on the age of the newest frame rather than on `consec_fail`, in the watch that reads `capture.json`, so the capture daemon still opens no socket. See [architecture.md §4.2](architecture.md#42-timelapse_encodepy).
+
+**One claim below was wrong, and it is the one that priced the refusal.** "The operator finds out at 00:05 from `Cov%` of 0" is false for the case that matters. Capture creates a day's directory on the first frame that day, and the nightly run builds its list from the directories, so a camera that delivered nothing all day is **absent from the summary**, not listed at 0%. Only the day it broke shows up, as a short day. The cost was therefore never "one camera for one day"; it was a camera dropping out of the table without a word for as long as the fault lasted. Also fixed in 0.2.2: such a camera now gets a `NONE` row, and any row under 95% coverage is coloured. Read the rest as the record of the original decision. Most of it still holds: this is not an uptime monitor, and a camera that is merely powered off is still better watched by something built for that.
 
 **Refused on scope and duplication, 2026-08-13: a monitoring tool running on the same box does this better, and the one failure mode it cannot see is the one this alert would have missed anyway.**
 

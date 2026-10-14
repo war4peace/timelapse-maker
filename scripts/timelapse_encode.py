@@ -30,7 +30,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib import request as urlrequest
 
@@ -864,10 +864,100 @@ def frame_order(path):
     is decided here instead. A name that is not a frame name sorts after the
     ones that are, by name.
     """
-    m = FRAME_NAME.match(path.stem)
+    return frame_key(path.name)
+
+
+def frame_key(name):
+    """frame_order() for a bare filename, for callers that never build a Path.
+
+    The web UI and the silent-camera watch both pick a day's newest frame from
+    a directory listing, and "newest" has to mean what it means here, or for
+    the repeated hour every autumn they would both name 02:59:59 from the
+    first pass as the newest frame while the second pass is being written.
+    """
+    m = FRAME_NAME.match(name.rsplit(".", 1)[0])
     if not m:
-        return (1, path.name)
+        return (1, name)
     return (0, m.group(1), int(m.group(3) or 0), m.group(2))
+
+
+def frame_epoch(day, name):
+    """When a frame was captured, from its name. Never from its mtime.
+
+    Order and time are properties of the *name* throughout this project:
+    filenames are zero-padded `HHMMSS`, so lexical order is chronological
+    order, and nothing reads mtime (architecture.md §2). A PowerShell
+    predecessor mixed `CreationTime` and `LastWriteTime` between its passes
+    and deleted the wrong files; that whole class of bug is gone as long as
+    the name stays the authority. Reading mtime here to answer "when was the
+    last frame" would put it back, and would also be wrong after any copy,
+    restore or rsync that did not preserve timestamps.
+
+    A `-N` suffix is the second pass through the hour DST repeats, so it is
+    the later of the two moments that wall-clock time names (`fold=1`). On
+    any other day the two are the same moment and the suffix changes nothing.
+    """
+    m = FRAME_NAME.match((name or "").rsplit(".", 1)[0])
+    if not m:
+        return None
+    hour, minute, second = int(m.group(1)), int(m.group(2)[:2]), \
+        int(m.group(2)[2:])
+    if hour > 23 or minute > 59 or second > 59:
+        return None
+    try:
+        midnight = datetime.strptime(day, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+    return midnight.replace(hour=hour, minute=minute, second=second,
+                            fold=1 if m.group(3) else 0).timestamp()
+
+
+def newest_frame(day_dir):
+    """The newest frame's filename in a day directory, or "" if it has none.
+
+    A missing directory is "": no directory and an empty one mean the same
+    thing to anybody asking when the last frame was. A directory that exists
+    and cannot be read RAISES, because "no frames" and "cannot tell" want
+    opposite answers from the silent-camera watch, and a falsy return that
+    meant both would have it announce every camera silent the day a
+    permission went wrong.
+    """
+    best, best_key = "", None
+    try:
+        with os.scandir(day_dir) as it:
+            for entry in it:
+                if not entry.name.endswith(".jpg"):
+                    continue
+                key = frame_key(entry.name)
+                if key[0] == 0 and (best_key is None or key > best_key):
+                    best, best_key = entry.name, key
+    except FileNotFoundError:
+        return ""
+    return best
+
+
+def newest_frame_epoch(frames_root, name, now=None, scan=newest_frame):
+    """When this camera's newest frame was captured, or None for no frame.
+
+    The one answer for every camera however its frames are written, and the
+    reason it is read from the directory at all: an RTSP camera's frames are
+    written by ffmpeg, so the daemon has no last-frame time for it. Shared by
+    the web UI's "Last frame" column and the silent-camera watch, so the page
+    and the notification cannot disagree about when a camera last delivered.
+
+    Yesterday is consulted only when today has nothing. That is the minute
+    after midnight, when the newest frame is still in the day that just
+    ended, and it costs one listing of a directory that is empty by
+    definition. `scan` is newest_frame() unless the caller has a cached one.
+    """
+    now = datetime.now() if now is None else now
+    base = Path(frames_root) / str(name)
+    for back in (0, 1):
+        day = (now - timedelta(days=back)).strftime("%Y-%m-%d")
+        newest = scan(base / day)
+        if newest:
+            return frame_epoch(day, newest)
+    return None
 
 
 def valid_frames(day_dir, min_bytes):
@@ -1102,7 +1192,13 @@ def coverage_pct(result, interval):
     Keeps its own "no frames means no answer" rule rather than inheriting the
     live panel's 0%: a nightly row exists because a day was processed, so zero
     frames there means the day is not measurable, not that it scored nothing.
+
+    The exception is a NO_FRAMES row, which exists precisely because a camera
+    that should have captured all day captured nothing, so its zero is the
+    measurement and the whole point of the row.
     """
+    if result.get("status") == NO_FRAMES:
+        return 0.0
     if not result.get("frames"):
         return None
     return coverage_of(result["frames"],
@@ -1127,6 +1223,7 @@ def run_record(started, encoder, results, xfer, interval, error=""):
         "ok": sum(1 for r in results if r["status"] == "OK"),
         "skipped": sum(1 for r in results if r["status"] == "SKIP"),
         "failed": sum(1 for r in results if r["status"] == "FAIL"),
+        "no_frames": sum(1 for r in results if r["status"] == NO_FRAMES),
         "bytes": sum(r["size"] for r in results),
         "transfer": None if xfer is None else {
             "ok": bool(xfer.get("ok")),
@@ -2165,10 +2262,15 @@ def discord_payload(sink, title, description, level, fields):
 
 
 def plain_text(title, description, fields):
-    """The summary as one block of text, for sinks with no embed concept."""
+    """The summary as one block of text, for sinks with no embed concept.
+
+    Without the Discord-only colour: ntfy and Telegram would print the escape
+    codes, and the `ansi` tag on the fence with them.
+    """
     parts = [title, ""]
     if description:
-        parts.append(description)
+        parts.append(ANSI_CODE.sub("", description.replace("```ansi\n",
+                                                           "```\n")))
     for name, value in fields:
         parts.append(f"\n{name}: {value or '-'}")
     return "\n".join(parts).strip()
@@ -2335,9 +2437,10 @@ def load_notified(cfg):
 def save_notified(cfg, incidents=None, **sections):
     """Update notified.json, keeping every section this call does not name.
 
-    Two watches share the file, the credentials one and the GPU driver one,
-    and each rewrites it. Writing only its own section would erase the other's
-    record, and an erased record is a repeated notification.
+    Three watches share the file, the credentials one, the silent camera one
+    and the GPU driver one, and each rewrites it. Writing only its own section
+    would erase the others' records, and an erased record is a repeated
+    notification.
     """
     path = state_dir(cfg) / WATCH_STATE
     record = load_watch_record(cfg)
@@ -2427,6 +2530,229 @@ def watch_credentials(cfg):
     if changed:
         save_notified(cfg, known)
     return changed
+
+
+# ----------------------------------------------------------------------------
+# Silent camera watch
+#
+# Refused on 2026-08-13 (decided-against.md kept the argument), and reopened
+# 2026-10-14 by exactly the case that entry said would reopen it: a camera was
+# given a new address, so it was up and answering everything that knew where
+# it was, while this program went on asking the old address. An uptime monitor
+# watching the camera stays green through that. Only this program knows
+# whether *it* is getting frames, and it said so only in its own log.
+#
+# Built the way that entry said to build it, if ever: keyed on how long since
+# the last frame rather than on a failure counter, which covers a camera that
+# times out, one that answers garbage and an RTSP grabber writing nothing, all
+# at once; and in this watch, which reads what capture publishes, so the
+# daemon stays exactly as connectionless as it has always been.
+# ----------------------------------------------------------------------------
+
+# Ten minutes or ten of the camera's own intervals, whichever is longer. The
+# minutes outlast a reboot, including the dawn reboot a Home Assistant
+# automation gives one camera on the deployment, so a restart somebody
+# scheduled is not reported as a fault. The intervals keep a camera at one
+# frame every five minutes from being called silent for missing one.
+SILENT_AFTER = 600
+SILENT_TICKS = 10
+
+
+def silence_limit(interval):
+    """Seconds without a frame before a camera counts as silent."""
+    try:
+        interval = max(0, int(interval or 0))
+    except (TypeError, ValueError):
+        interval = 0
+    return max(SILENT_AFTER, SILENT_TICKS * interval)
+
+
+def stamp_epoch(text):
+    """One of our own ISO stamps back to epoch seconds, or None."""
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def silence_reason(entry, defer_auth):
+    """What capture says about a silent camera, in a sentence. Never a guess.
+
+    The observation, never the diagnosis, which is the credential watch's
+    rule: "connection timed out" is a fact about the last attempt, while
+    "the camera is off" is one of several things that would produce it.
+    """
+    if not entry:
+        # Enabled in the config, absent from the heartbeat: the running daemon
+        # read its config before this camera was there, and is not asking it
+        # for anything at all.
+        return ("Not being captured: the capture service started before this "
+                "camera was enabled. Restart the capture service.")
+    if entry.get("supervised"):
+        if not entry.get("alive"):
+            return ("Its ffmpeg grabber is not running (restarted %d times)."
+                    % (entry.get("restarts") or 0))
+        return "Its ffmpeg grabber is running and writing nothing."
+    err = entry.get("error") or {}
+    detail = clip(redact(err.get("detail") or ""), 300)
+    if err.get("class") == "auth":
+        return ("Refusing our credentials%s."
+                % (" (reported separately)" if defer_auth else ""))
+    if err.get("class") == "unreachable":
+        return "Could not connect: %s" % (detail or "no detail")
+    if err.get("class"):
+        return "Last attempt failed: %s" % (detail or "no detail")
+    return "Capture reports no error for it."
+
+
+def watch_cameras(cfg, now=None):
+    """Notify when enabled cameras stop delivering frames. Returns a count.
+
+    Counts the cameras the config says should be capturing against the ones
+    whose newest frame on disk is recent, sends one warning naming every
+    camera that has newly gone silent, and one all-clear when frames resume.
+    The count is of cameras whose reported state changed.
+
+    The newest frame on disk is the measure, not the daemon's `last_success`,
+    because only an HTTP camera has one: ffmpeg writes an RTSP camera's frames
+    and the directory is the only record of them.
+
+    Follows the credential watch's rules throughout. A stale heartbeat or a
+    stopped daemon moves nothing in either direction. No sinks means no
+    record, so configuring one tomorrow still announces today. Nothing
+    delivered is not "already told them". And a camera the credential watch
+    is already reporting is left to it, since "refusing our credentials" is
+    the better sentence about the same silence.
+    """
+    if not cfg.get("capture", {}).get("notify_silent_cameras", True):
+        return 0
+    if not notify_sinks(cfg):
+        return 0
+    state = read_capture_state(cfg)
+    if state is None:
+        return 0
+    if state.get("paused"):
+        # The disk guard stopped capture on purpose, so every camera is silent
+        # for a reason that is not the camera's, and a pause is no evidence
+        # that one which was silent came back.
+        return 0
+    frames_root = cfg.get("paths", {}).get("frames_root")
+    if not frames_root:
+        return 0
+
+    now = time.time() if now is None else now
+    today = datetime.fromtimestamp(now)
+    started = stamp_epoch(state.get("started"))
+    defer_auth = cfg.get("capture", {}).get("notify_auth_failures", True)
+    default_interval = cfg.get("capture", {}).get("interval_seconds")
+    published = {c.get("name"): c for c in state.get("cameras", [])
+                 if isinstance(c, dict)}
+    expected = [c for c in cfg.get("cameras", [])
+                if isinstance(c, dict) and c.get("name")
+                and c.get("enabled", True)]
+
+    record = load_watch_record(cfg)
+    known = record.get("silent")
+    known = dict(known) if isinstance(known, dict) else {}
+    # A camera removed or disabled since it was reported is the operator's
+    # own doing; it leaves the record without an all-clear it has not earned.
+    names = {c["name"] for c in expected}
+    dropped = [n for n in known if n not in names]
+    for name in dropped:
+        known.pop(name)
+
+    delivering, silent, fresh = 0, [], {}
+    for cam in expected:
+        name = cam["name"]
+        entry = published.get(name)
+        try:
+            last = newest_frame_epoch(frames_root, name, today)
+        except OSError as exc:
+            # Cannot tell is not silent. Moves nothing either way.
+            log.debug("cannot read %s's frames (%s)", name, exc)
+            continue
+        interval = ((entry or {}).get("interval")
+                    or cam.get("interval_seconds") or default_interval)
+        limit = silence_limit(interval)
+        if last is not None and now - last <= limit:
+            delivering += 1
+            fresh[name] = last
+            continue
+        if started is not None and now - started <= limit:
+            # Capture started too recently to have earned a verdict. A new
+            # daemon gets the same grace a running one gives a reboot, so a
+            # restart is never what makes a camera look silent.
+            continue
+        silent.append((name, last, entry))
+
+    count = ("Delivering frames", "%d of %d" % (delivering, len(expected)))
+    sent_count, saved = 0, bool(dropped)
+
+    def ago(last):
+        if last is None:
+            return "No frame today or yesterday."
+        return "Last frame %s, %s ago." % (stamp(last),
+                                           human_duration(now - last))
+
+    # A camera the credential watch speaks for is still listed, so the count
+    # adds up, but is never what triggers this message.
+    new = [(n, last, e) for n, last, e in silent
+           if n not in known
+           and not (defer_auth and ((e or {}).get("error") or {})
+                    .get("class") == "auth")]
+    if new:
+        for name, last, _entry in new:
+            # The journal is the record read after the fact, sinks or not.
+            log.warning("%s has delivered no frame for over %s", name,
+                        human_duration(now - (last or started or now)))
+        who = new[0][0] if len(new) == 1 else "%d cameras" % len(new)
+        sent, _failed = notify(
+            cfg, "⚠️ Timelapse - %s stopped delivering frames" % who,
+            "%s %s stopped delivering frames; %s of %s enabled cameras are "
+            "delivering. Capture keeps trying, and frames resume by "
+            "themselves if the camera comes back. If it does not, check that "
+            "it is powered and reachable at the address in the config: a "
+            "camera given a new address keeps working for everything else "
+            "while this program goes on asking the old one. "
+            "'timelapse test' tries every camera from this machine."
+            % (", ".join(n for n, _l, _e in new),
+               "has" if len(new) == 1 else "have",
+               delivering, len(expected)),
+            "warn",
+            [(n, " ".join([ago(last), silence_reason(e, defer_auth)]
+                          + (["Reported earlier."] if n in known else [])))
+             for n, last, e in silent] + [count])
+        # Nothing delivered is not "already told them"; the next tick retries.
+        if sent:
+            for name, last, _entry in new:
+                known[name] = stamp(last if last is not None else started)
+            sent_count += len(new)
+            saved = True
+
+    back = [n for n in known if n in fresh]
+    if back:
+        who = back[0] if len(back) == 1 else "%d cameras" % len(back)
+        sent, _failed = notify(
+            cfg, "✅ Timelapse - %s delivering frames again" % who,
+            "%s %s delivering frames again; %d of %d enabled cameras are "
+            "delivering." % (", ".join(back),
+                             "is" if len(back) == 1 else "are",
+                             delivering, len(expected)),
+            "ok",
+            [(n, "Silent from %s. Newest frame %s."
+                 % (known[n] or "an unknown time", stamp(fresh[n])))
+             for n in back] + [count])
+        if sent:
+            for name in back:
+                known.pop(name, None)
+            sent_count += len(back)
+            saved = True
+
+    if saved:
+        save_notified(cfg, silent=known)
+    return sent_count
 
 
 # ----------------------------------------------------------------------------
@@ -2548,6 +2874,18 @@ NAME_COL = 12
 SUMMARY_HEADS = ("Camera", "St", "Frames", "Cov%", "Size", "Time")
 SUMMARY_ALIGN = ("<", "<", ">", ">", ">", ">")
 
+# A row under this much coverage is coloured, asked for by the operator
+# 2026-10-14 alongside the no-frames row. The web UI's Last encode panel uses
+# the same number, so the page and the message agree on what counts as low.
+LOW_COVERAGE = 95
+
+# Discord renders a ```ansi block on desktop, and 33 is the dark yellow in its
+# palette. Discord only: the plain-text sinks get the same table with the
+# codes stripped (plain_text()), because ntfy and Telegram would print them.
+ANSI_LOW = "\x1b[33m"
+ANSI_RESET = "\x1b[0m"
+ANSI_CODE = re.compile(r"\x1b\[[0-9;]*m")
+
 
 def pad_row(values, widths):
     """One line of the table. Trailing blanks trimmed; they only cost width."""
@@ -2565,34 +2903,50 @@ def build_summary(results, interval):
     it narrow: the widths come from the content, and the date is a heading
     rather than a column repeating one value on every row. A run normally
     encodes a single day; catch-up runs after an outage get a block each.
+
+    A row under LOW_COVERAGE is coloured, padded first and coloured second,
+    because a format width counts escape codes (the 0.1.9 `cameras -l` bug).
+    The block is marked `ansi` only on a night that has such a row, so a good
+    night reaches every client exactly as it always has.
     """
     if not results:
         return "Nothing to report."
-    blocks = []
+    blocks, coloured = [], False
     for date in sorted({r["date"] for r in results}):
-        rows = []
+        rows, low = [], []
         for r in results:
             if r["date"] != date:
                 continue
             # Against the cadence this camera ran at, via the same helper the
             # run record uses, so the table and the file cannot disagree.
             cov = coverage_pct(r, interval)
+            none = r["status"] == NO_FRAMES
+            shown = f"{cov:.0f}" if cov is not None else "-"
             rows.append((
                 str(r["camera"])[:NAME_COL],
                 r["status"],
-                str(r["frames"] or "-"),
-                f"{cov:.0f}" if cov is not None else "-",
+                "0" if none else str(r["frames"] or "-"),
+                shown,
                 human_size(r["size"]) if r["size"] else "-",
-                human_duration(r["seconds"])))
+                "-" if none else human_duration(r["seconds"])))
+            # Judged on the number printed, so 94.6 (shown as 95) is not
+            # coloured beside an uncoloured 95. The web panel prints one
+            # decimal and judges the raw value, for the same reason.
+            low.append(cov is not None and int(shown) < LOW_COVERAGE)
         widths = [max([len(h)] + [len(row[i]) for row in rows])
                   for i, h in enumerate(SUMMARY_HEADS)]
         # Not len(header): the row builder strips trailing blanks, so a short
         # value in the last column would shorten the rule under it.
         rule = "-" * (sum(widths) + len(widths) - 1)
+        lines = []
+        for row, is_low in zip(rows, low):
+            text = pad_row(row, widths)
+            lines.append(ANSI_LOW + text + ANSI_RESET if is_low else text)
+            coloured = coloured or is_low
         blocks.append("\n".join(
-            [date, pad_row(SUMMARY_HEADS, widths), rule]
-            + [pad_row(row, widths) for row in rows]))
-    return "```\n" + "\n\n".join(blocks) + "\n```"
+            [date, pad_row(SUMMARY_HEADS, widths), rule] + lines))
+    fence = "```ansi\n" if coloured else "```\n"
+    return fence + "\n\n".join(blocks) + "\n```"
 
 
 # ----------------------------------------------------------------------------
@@ -2681,6 +3035,71 @@ def find_pending(frames_root, cameras, only_date, max_backlog, force=False):
     return sorted(jobs, key=lambda j: (j[1].name, j[0])), done
 
 
+# The status of a row for a camera that captured nothing on a day the others
+# did. Four letters like the other three, so the St column does not widen.
+NO_FRAMES = "NONE"
+
+
+def reported_days(cfg):
+    """Every (camera, date) a recorded run has already reported on."""
+    try:
+        with open(state_dir(cfg) / ENCODE_STATE, encoding="utf-8") as fh:
+            runs = json.load(fh).get("runs") or []
+    except (OSError, ValueError, AttributeError):
+        return set()
+    seen = set()
+    for run in runs:
+        for d in (run.get("days") or []) if isinstance(run, dict) else []:
+            if isinstance(d, dict):
+                seen.add((d.get("camera"), d.get("date")))
+    return seen
+
+
+def missing_days(cfg, frames_root, cameras, jobs, reported=frozenset()):
+    """NO_FRAMES rows: enabled cameras with nothing at all for a day being
+    encoded. Sorted by date, then camera.
+
+    The nightly table is built from day directories, and capture creates one
+    on the first frame of the day, so a camera that delivered nothing used to
+    be absent from the summary rather than listed at 0%. Only the day it broke
+    showed, as a short day. Reported 2026-10-14, from a camera moved to a new
+    address.
+
+    Three rules keep a row from saying something untrue:
+
+    - Only a day some camera DID capture. That is the proof that capture was
+      running at all; a host that was off, or a day before the install,
+      would otherwise list every camera.
+    - Never a camera whose directory for that day exists. It is either a job
+      already, or encoded earlier and kept.
+    - Never a (camera, date) a recorded run has already reported. Frames are
+      deleted after a good encode, so a directory that is gone can mean
+      "encoded last night" as easily as "never captured", and this is the
+      case a retry run meets: one camera's day failed, the next run tries it
+      again, and every other camera's directory for that day has gone. The
+      run history is what tells the two apart.
+
+    The caller leaves this out for an explicit --date, which is a rescue of
+    one day's frames, not a nightly report.
+    """
+    dates = sorted({d.name for _cam, d in jobs})
+    have = {(cam, d.name) for cam, d in jobs}
+    rows = []
+    for day in dates:
+        for name in cameras:
+            if (name, day) in have or (name, day) in reported:
+                continue
+            if (Path(frames_root) / name / day).exists():
+                continue
+            cam = camera_entry(cfg, name)
+            rows.append({"camera": name, "date": day, "status": NO_FRAMES,
+                         "frames": 0, "bad": 0, "size": 0, "seconds": 0,
+                         "note": "no frames captured that day",
+                         "interval": camera_interval(cfg, cam),
+                         "fps": camera_framerate(cfg, cam)})
+    return rows
+
+
 def explain_idle(frames_root, cameras, today=None, only_date=None):
     """Lines saying WHY find_pending() came back empty.
 
@@ -2765,8 +3184,9 @@ def main():
     ap.add_argument("--force", action="store_true",
                     help="re-encode days that are already marked encoded")
     ap.add_argument("--watch", action="store_true",
-                    help="check capture state for cameras refusing our "
-                         "credentials, notify, and exit (run from a timer)")
+                    help="check for silent cameras, cameras refusing our "
+                         "credentials and a stale NVIDIA driver, notify, "
+                         "and exit (run from a timer)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -2785,6 +3205,7 @@ def main():
         # Each in its own guard: one watch going wrong must not cost the other
         # its check, which is the failure isolation the encoder has per camera.
         for label, watch in (("Credential watch", watch_credentials),
+                             ("Camera watch", watch_cameras),
                              ("Driver watch", watch_gpu_driver)):
             try:
                 changed = watch(cfg)
@@ -2898,6 +3319,13 @@ def main():
 
         log.info("Found %d job(s) across %d camera(s).", len(jobs), len(cameras))
 
+        # Before the loop, which deletes the directories it encodes; the rule
+        # itself does not depend on that, but reading the disk before this run
+        # changes it is the easier thing to reason about.
+        missing = ([] if args.date else
+                   missing_days(cfg, frames_root, cameras, jobs,
+                                reported_days(cfg)))
+
         results = []
         for cam, day_dir in jobs:
             if cam not in cameras:
@@ -2917,6 +3345,10 @@ def main():
 
         xfer = None if args.no_transfer else transfer(cfg, args.dry_run)
 
+        # Into the table in camera order, so it reads like the camera list.
+        results = sorted(results + missing,
+                         key=lambda r: (r["date"], r["camera"]))
+
         # -- report ---------------------------------------------------------
         ok = [r for r in results if r["status"] == "OK"]
         failed = [r for r in results if r["status"] == "FAIL"]
@@ -2928,8 +3360,9 @@ def main():
         for r in results:
             log.info(" %-4s %-12s %-10s frames=%-6s %s",
                      r["status"], r["camera"], r["date"], r["frames"], r["note"])
-        log.info("Done in %s | %d ok, %d skipped, %d failed",
-                 human_duration(elapsed), len(ok), len(skipped), len(failed))
+        log.info("Done in %s | %d ok, %d skipped, %d failed, %d with no frames",
+                 human_duration(elapsed), len(ok), len(skipped), len(failed),
+                 len(missing))
 
         try:
             free = shutil.disk_usage(frames_root).free
@@ -2953,8 +3386,15 @@ def main():
         if skipped:
             fields.append(("Skipped", "\n".join(
                 f"{r['camera']} {r['date']}: {r['note']}" for r in skipped)))
+        if missing:
+            fields.append(("No frames", "\n".join(
+                f"{r['camera']} {r['date']}" for r in missing)))
 
         all_good = not failed and (xfer is None or xfer["ok"])
+        # A camera with no frames turns the message into a warning and leaves
+        # the exit status alone: the encode did everything it was given, and a
+        # failed unit is a claim about this program, not about a camera.
+        clean = all_good and not missing
         # Before the notification, deliberately: Discord is the part that can
         # be disabled, unreachable or rate-limited, and the local record of
         # what happened should not depend on any of that.
@@ -2962,9 +3402,9 @@ def main():
                                         interval))
         notify(
             cfg,
-            ("\u2705 " if all_good else "\u26a0\ufe0f ") + "Timelapse Generation",
+            ("\u2705 " if clean else "\u26a0\ufe0f ") + "Timelapse Generation",
             build_summary(results, interval),
-            "ok" if all_good else "warn",
+            "ok" if clean else "warn",
             fields)
         return 0 if all_good else 1
 

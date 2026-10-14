@@ -1931,6 +1931,238 @@ class TestBuildSummary(unittest.TestCase):
     def test_no_results_is_not_an_empty_code_block(self):
         self.assertEqual(enc.build_summary([], 5), "Nothing to report.")
 
+    # -- colour (2026-10-14) ----------------------------------------------
+    # Rows under LOW_COVERAGE are dark yellow in Discord, asked for by the
+    # operator. Discord-only: a ```ansi block on desktop, stripped for the
+    # plain-text sinks, which would print the codes.
+
+    def body(self, out, camera):
+        return next(ln for ln in out.splitlines() if camera in ln)
+
+    def test_a_short_day_is_coloured(self):
+        out = enc.build_summary([self.row(camera="Roof"),
+                                 self.row(camera="Gate", frames=15000)], 5)
+        self.assertTrue(out.startswith("```ansi\n"))
+        gate = self.body(out, "Gate")
+        self.assertTrue(gate.startswith(enc.ANSI_LOW), repr(gate))
+        self.assertTrue(gate.endswith(enc.ANSI_RESET), repr(gate))
+        self.assertNotIn("\x1b", self.body(out, "Roof"))
+        self.assertNotIn("\x1b", self.body(out, "Camera"))
+
+    def test_a_good_night_is_exactly_what_it_always_was(self):
+        # No ansi tag, no escape codes: every client, phones included, gets
+        # the table it got before this existed.
+        out = enc.build_summary([self.row(camera="Roof"),
+                                 self.row(camera="Gate")], 5)
+        self.assertTrue(out.startswith("```\n"))
+        self.assertNotIn("\x1b", out)
+
+    def test_the_line_is_drawn_on_the_number_printed(self):
+        # 95% is not under 95. 94.6% prints as 95 and is not coloured either,
+        # or a yellow 95 would sit beside a white one. 94.4% prints as 94.
+        for frames, coloured in ((16416, False),      # 95.0
+                                 (16347, False),      # 94.6 -> "95"
+                                 (16312, True)):      # 94.4 -> "94"
+            out = enc.build_summary([self.row(frames=frames)], 5)
+            self.assertEqual("\x1b" in out, coloured, frames)
+
+    def test_colour_does_not_move_a_column(self):
+        # Pad first, colour second: a format width counts escape codes, which
+        # is the 0.1.9 `cameras -l` bug. Stripped, the coloured table is the
+        # uncoloured one, character for character.
+        rows = [self.row(camera="Roof"), self.row(camera="Gate", frames=900)]
+        out = enc.build_summary(rows, 5)
+        with mock.patch.object(enc, "LOW_COVERAGE", 0):
+            plain = enc.build_summary(rows, 5)
+        self.assertEqual(enc.ANSI_CODE.sub("", out).replace("```ansi", "```"),
+                         plain)
+
+    def test_the_colour_is_invisible_to_the_width_budget(self):
+        rows = [self.row(camera=n, frames=900) for n in
+                ("Court180", "Doorbell", "Garage", "Gate", "Roof")]
+        out = enc.ANSI_CODE.sub("", enc.build_summary(rows, 5))
+        self.assertLessEqual(self.widest(out), self.BUDGET)
+
+    def test_a_no_frames_row(self):
+        row = self.row(camera="Gate", status=enc.NO_FRAMES, frames=0, size=0,
+                       seconds=0)
+        out = enc.build_summary([self.row(camera="Roof"), row], 5)
+        gate = enc.ANSI_CODE.sub("", self.body(out, "Gate")).split()
+        self.assertEqual(gate, ["Gate", "NONE", "0", "0", "-", "-"])
+        self.assertTrue(self.body(out, "Gate").startswith(enc.ANSI_LOW))
+
+    def test_the_plain_text_sinks_get_no_escape_codes(self):
+        out = enc.build_summary([self.row(camera="Gate", frames=900)], 5)
+        text = enc.plain_text("t", out, [])
+        self.assertNotIn("\x1b", text)
+        self.assertNotIn("```ansi", text)
+        self.assertIn("Gate", text)
+
+    def test_discord_keeps_them(self):
+        out = enc.build_summary([self.row(camera="Gate", frames=900)], 5)
+        payload = enc.discord_payload({}, "t", out, "warn", [])
+        self.assertIn(enc.ANSI_LOW, payload["embeds"][0]["description"])
+
+
+class TestNoFramesRows(unittest.TestCase):
+    """A camera that captured nothing gets a row, instead of no row at all.
+
+    The nightly table is built from day directories, and capture creates one
+    on the first frame, so a camera that delivered nothing simply was not in
+    it. Asked for 2026-10-14, with a camera moved to a new address.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.frames = self.tmp / "frames"
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.cfg = {
+            "paths": {"frames_root": str(self.frames),
+                      "video_output": str(self.tmp / "videos"),
+                      "log_dir": str(self.tmp / "logs"),
+                      "state_dir": str(self.state),
+                      "ffmpeg": "ffmpeg", "ffprobe": "ffprobe"},
+            "capture": {"interval_seconds": 5, "min_bytes": 4096},
+            "encode": {"framerate": 60, "min_frames": 1, "container": "mkv",
+                       "delete_frames_on_success": True,
+                       "max_backlog_days": 7},
+            "transfer": {"enabled": False},
+            "cameras": [{"name": "Gate", "enabled": True},
+                        {"name": "Roof", "enabled": True,
+                         "interval_seconds": 60},
+                        {"name": "Yard", "enabled": False}],
+        }
+        self.config_path = self.tmp / "config.json"
+        self.config_path.write_text(json.dumps(self.cfg), encoding="utf-8")
+        make_frame(self.frames / "Gate" / "2026-09-12" / "000001.jpg")
+
+    def jobs(self):
+        return [("Gate", self.frames / "Gate" / "2026-09-12")]
+
+    def missing(self, reported=frozenset(), cameras=("Gate", "Roof")):
+        return enc.missing_days(self.cfg, self.frames, list(cameras),
+                                self.jobs(), reported)
+
+    def history(self, *pairs):
+        (self.state / enc.ENCODE_STATE).write_text(json.dumps({
+            "version": 1, "kind": "encode",
+            "runs": [{"days": [{"camera": c, "date": d, "status": "OK"}
+                               for c, d in pairs]}]}), encoding="utf-8")
+
+    # -- the rule ------------------------------------------------------------
+
+    def test_a_camera_with_nothing_that_day_gets_a_row(self):
+        rows = self.missing()
+        self.assertEqual([(r["camera"], r["date"], r["status"])
+                          for r in rows],
+                         [("Roof", "2026-09-12", "NONE")])
+        # Its own cadence, so the record says what it should have delivered.
+        self.assertEqual(rows[0]["interval"], 60)
+
+    def test_its_coverage_is_zero_not_unknown(self):
+        self.assertEqual(enc.coverage_pct(self.missing()[0], 5), 0.0)
+
+    def test_a_disabled_camera_gets_none(self):
+        # The caller passes enabled cameras only; Yard is not among them.
+        self.assertNotIn("Yard", [r["camera"] for r in self.missing()])
+
+    def test_only_days_some_camera_captured(self):
+        # A day nobody captured proves nothing about any one camera: the host
+        # was off, or the install had not happened yet.
+        self.assertEqual(enc.missing_days(self.cfg, self.frames,
+                                          ["Gate", "Roof"], []), [])
+
+    def test_a_directory_that_exists_is_not_missing(self):
+        # Encoded earlier and kept, which is not this row's business.
+        (self.frames / "Roof" / "2026-09-12").mkdir(parents=True)
+        self.assertEqual(self.missing(), [])
+
+    def test_a_day_already_reported_is_not_reported_again(self):
+        # The retry case: Gate's day failed last night and is tried again
+        # tonight, while Roof's directory for it was deleted after its own
+        # good encode. Without the history this calls Roof silent.
+        self.history(("Roof", "2026-09-12"))
+        self.assertEqual(self.missing(enc.reported_days(self.cfg)), [])
+
+    def test_reported_days_reads_the_run_history(self):
+        self.history(("Roof", "2026-09-12"), ("Gate", "2026-09-11"))
+        self.assertEqual(enc.reported_days(self.cfg),
+                         {("Roof", "2026-09-12"), ("Gate", "2026-09-11")})
+
+    def test_a_missing_or_damaged_history_is_empty(self):
+        self.assertEqual(enc.reported_days(self.cfg), set())
+        (self.state / enc.ENCODE_STATE).write_text("{nope", encoding="utf-8")
+        self.assertEqual(enc.reported_days(self.cfg), set())
+        (self.state / enc.ENCODE_STATE).write_text("[]", encoding="utf-8")
+        self.assertEqual(enc.reported_days(self.cfg), set())
+
+    def test_the_run_record_counts_them(self):
+        rec = enc.run_record(time.time(), None, self.missing(), None, 5)
+        self.assertEqual(rec["no_frames"], 1)
+        self.assertEqual(rec["days"][0]["coverage"], 0.0)
+
+    # -- through main() ------------------------------------------------------
+
+    def run_main(self, extra=()):
+        sent, records = [], []
+
+        def fake_encode_day(cfg, encoder, camera, day_dir, out_dir, dry_run):
+            return {"status": "OK", "camera": camera, "date": day_dir.name,
+                    "frames": 17280, "bad": 0, "size": 1, "seconds": 0.1,
+                    "note": "", "interval": 5}
+
+        argv = ["timelapse_encode.py", str(self.config_path)] + list(extra)
+        with mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(enc, "setup_logging", lambda *a, **k: None), \
+             mock.patch.object(enc, "select_encoder",
+                               lambda *a: {"name": "libx264", "args": []}), \
+             mock.patch.object(enc, "encode_day", fake_encode_day), \
+             mock.patch.object(enc.shutil, "rmtree", lambda p, **k: None), \
+             mock.patch.object(enc, "transfer",
+                               lambda *a, **k: {"ok": True, "moved": 0,
+                                                "detail": ""}), \
+             mock.patch.object(enc, "notify",
+                               lambda *a, **k: sent.append(a) or (1, 0)), \
+             mock.patch.object(enc, "write_run_state",
+                               lambda cfg, rec: records.append(rec)):
+            code = enc.main()
+        return code, sent, records
+
+    def test_the_nightly_message_carries_the_row(self):
+        code, sent, records = self.run_main()
+        _cfg, title, desc, level, fields = sent[0]
+        self.assertIn("NONE", desc)
+        self.assertIn("Roof", desc)
+        self.assertIn(("No frames", "Roof 2026-09-12"), fields)
+        # A warning about a camera, not a failure of this program.
+        self.assertTrue(title.startswith("⚠"), title)
+        self.assertEqual(level, "warn")
+        self.assertEqual(code, 0)
+        self.assertEqual(records[0]["no_frames"], 1)
+
+    def test_the_rows_read_in_camera_order(self):
+        # Attic has nothing and sorts before Gate, which was encoded. Rows
+        # merely appended would put it after; Roof alone could not tell.
+        self.cfg["cameras"].insert(0, {"name": "Attic", "enabled": True})
+        self.config_path.write_text(json.dumps(self.cfg), encoding="utf-8")
+        _code, sent, _records = self.run_main()
+        desc = sent[0][2]
+        self.assertLess(desc.index("Attic"), desc.index("Gate"))
+        self.assertLess(desc.index("Gate"), desc.index("Roof"))
+
+    def test_an_explicit_date_is_a_rescue_not_a_report(self):
+        _code, sent, _records = self.run_main(["--date", "2026-09-12"])
+        self.assertNotIn("NONE", sent[0][2])
+
+    def test_a_night_with_every_camera_is_still_a_good_night(self):
+        make_frame(self.frames / "Roof" / "2026-09-12" / "000001.jpg")
+        code, sent, _records = self.run_main()
+        self.assertTrue(sent[0][1].startswith("✅"), sent[0][1])
+        self.assertEqual(sent[0][3], "ok")
+        self.assertEqual(code, 0)
+
 
 class TestPerCameraEncodeSettings(unittest.TestCase):
 
@@ -3287,6 +3519,501 @@ class TestCredentialWatch(unittest.TestCase):
         self.assertNotIn("hunter2", json.dumps(fields))
 
 
+class TestCameraWatch(unittest.TestCase):
+    """Enabled cameras against cameras delivering frames, once per incident.
+
+    Reported 2026-10-14: a camera was given a new address, capture went on
+    asking the old one, the other cameras carried on, and nothing said so.
+    Driven through real capture.json files and real frame directories, since
+    the frames on disk are the measure and a mocked answer would not exercise
+    the one thing this depends on.
+
+    `now` is pinned to midday so no test straddles midnight, and every frame
+    is named for a time relative to it. The heartbeat is fresh against the
+    real clock, because read_capture_state() reads the real clock.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.frames = self.tmp / "frames"
+        self.state = self.tmp / "state"
+        self.state.mkdir()
+        self.now = enc.datetime.now().replace(
+            hour=12, minute=0, second=0, microsecond=0).timestamp()
+        self.cfg = {
+            "paths": {"state_dir": str(self.state),
+                      "frames_root": str(self.frames)},
+            "capture": {"interval_seconds": 5},
+            "cameras": [{"name": "Roof", "enabled": True},
+                        {"name": "Gate", "enabled": True}],
+            "notify": [{"type": "discord", "enabled": True,
+                        "webhook_url": "https://example.invalid/w"}]}
+        self.sent = []
+        patcher = mock.patch.object(
+            enc, "notify",
+            side_effect=lambda cfg, title, desc, level, fields:
+                self.sent.append((title, desc, level, fields)) or (1, 0))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    # -- fixtures ------------------------------------------------------------
+
+    def frame(self, name, ago):
+        """One frame for `name`, captured `ago` seconds before self.now."""
+        when = enc.datetime.fromtimestamp(self.now - ago)
+        day = self.frames / name / when.strftime("%Y-%m-%d")
+        day.mkdir(parents=True, exist_ok=True)
+        (day / when.strftime("%H%M%S.jpg")).write_bytes(b"\xff\xd8x")
+
+    def http(self, name, cls=None, detail="", interval=5):
+        err = None
+        if cls:
+            err = {"class": cls, "since": "2026-10-14T11:00:00", "ticks": 9,
+                   "detail": detail, "confirmed": cls == "auth",
+                   "quiet_until": None}
+        return {"name": name, "method": "http", "supervised": False,
+                "interval": interval, "error": err}
+
+    def rtsp(self, name, alive=True):
+        # No last_success, ever: ffmpeg writes these frames, not the daemon.
+        return {"name": name, "method": "rtsp", "supervised": True,
+                "interval": 5, "alive": alive, "restarts": 4,
+                "last_success": None}
+
+    def capture(self, cameras, started_ago=3600, running=True, paused=False,
+                age=0):
+        state = {"version": 1, "kind": "capture", "running": running,
+                 "paused": paused,
+                 "started": enc.stamp(self.now - started_ago),
+                 "updated_epoch": int(time.time()) - age,
+                 "cameras": cameras}
+        (self.state / enc.CAPTURE_STATE).write_text(json.dumps(state),
+                                                    encoding="utf-8")
+
+    def watch(self, offset=0):
+        return enc.watch_cameras(self.cfg, now=self.now + offset)
+
+    def later(self, offset):
+        """A check `offset` seconds on, with Roof still delivering."""
+        self.frame("Roof", 3 - offset)
+        return self.watch(offset)
+
+    def silent_record(self):
+        return enc.load_watch_record(self.cfg).get("silent")
+
+    def healthy(self):
+        """Roof delivering, Gate silent for an hour: the reported case."""
+        self.frame("Roof", 3)
+        self.frame("Gate", 3600)
+        self.capture([self.http("Roof"),
+                      self.http("Gate", "unreachable",
+                                "HTTPConnectionPool(host='192.0.2.50', "
+                                "port=80): Connect timeout")])
+
+    # -- the reported case ---------------------------------------------------
+
+    def test_a_camera_that_stopped_is_reported_with_the_count(self):
+        self.healthy()
+        self.assertEqual(self.watch(), 1)
+        self.assertEqual(len(self.sent), 1)
+        title, desc, level, fields = self.sent[0]
+        self.assertIn("Gate stopped delivering frames", title)
+        self.assertEqual(level, "warn")
+        self.assertIn("1 of 2", desc)
+        self.assertIn(("Delivering frames", "1 of 2"), fields)
+        gate = dict(fields)["Gate"]
+        # The address it is still asking is the clue to a moved camera, and
+        # it is capture's own words, not a diagnosis.
+        self.assertIn("192.0.2.50", gate)
+        self.assertIn("1h 00m 00s ago", gate)
+        self.assertNotIn("Roof", dict(fields))
+
+    def test_the_same_silence_is_not_reported_twice(self):
+        self.healthy()
+        self.watch()
+        for minutes in (5, 10, 60):
+            self.assertEqual(self.later(minutes * 60), 0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_frames_resuming_send_one_all_clear(self):
+        self.healthy()
+        self.watch()
+        self.frame("Gate", -300)        # five minutes after the alarm
+        self.assertEqual(self.watch(310), 1)
+        title, desc, level, fields = self.sent[1]
+        self.assertIn("Gate delivering frames again", title)
+        self.assertEqual(level, "ok")
+        self.assertIn("2 of 2", desc)
+        self.assertEqual(self.silent_record(), {})
+        self.assertEqual(self.watch(320), 0)
+
+    def test_a_second_silence_after_a_recovery_is_reported_again(self):
+        self.healthy()
+        self.watch()
+        self.frame("Gate", -300)
+        self.watch(310)
+        self.assertEqual(self.later(310 + 3600), 1)
+        self.assertEqual(len(self.sent), 3)
+        self.assertIn("Gate stopped", self.sent[2][0])
+
+    def test_the_record_is_on_disk_and_names_the_last_frame(self):
+        # Each check is a fresh process, so "already told them" must be here.
+        self.healthy()
+        self.watch()
+        self.assertEqual(self.silent_record(),
+                         {"Gate": enc.stamp(self.now - 3600)})
+
+    # -- the threshold -------------------------------------------------------
+
+    def test_a_short_gap_is_not_silence(self):
+        # A reboot: nine minutes at five seconds is under ten minutes.
+        self.frame("Roof", 3)
+        self.frame("Gate", 9 * 60)
+        self.capture([self.http("Roof"), self.http("Gate", "unreachable")])
+        self.assertEqual(self.watch(), 0)
+        self.assertEqual(self.sent, [])
+
+    def test_the_limit_follows_a_slow_cameras_own_interval(self):
+        # One frame every two minutes: ten intervals is twenty minutes, so a
+        # fifteen minute gap is two missed frames, not an outage.
+        self.cfg["cameras"][1]["interval_seconds"] = 120
+        self.frame("Roof", 3)
+        self.frame("Gate", 15 * 60)
+        self.capture([self.http("Roof"), self.http("Gate", interval=120)])
+        self.assertEqual(self.watch(), 0)
+        self.assertEqual(self.watch(6 * 60), 1)
+
+    def test_the_heartbeat_interval_beats_the_config(self):
+        # Today runs at the cadence it began with; an edit lands at midnight.
+        self.cfg["cameras"][1]["interval_seconds"] = 5
+        self.frame("Roof", 3)
+        self.frame("Gate", 15 * 60)
+        self.capture([self.http("Roof"), self.http("Gate", interval=120)])
+        self.assertEqual(self.watch(), 0)
+
+    def test_silence_limit(self):
+        self.assertEqual(enc.silence_limit(5), 600)
+        self.assertEqual(enc.silence_limit(60), 600)
+        self.assertEqual(enc.silence_limit(300), 3000)
+        for junk in (None, 0, "x", -5):
+            self.assertEqual(enc.silence_limit(junk), 600, junk)
+
+    # -- every camera, however its frames arrive -----------------------------
+
+    def test_an_rtsp_camera_is_measured_from_its_frames(self):
+        # The daemon has no last_success for it, so a watch keyed on that
+        # field would be blind to every RTSP camera there is.
+        self.frame("Roof", 3)
+        self.frame("Gate", 3600)
+        self.capture([self.http("Roof"), self.rtsp("Gate", alive=False)])
+        self.assertEqual(self.watch(), 1)
+        self.assertIn("grabber is not running", dict(self.sent[0][3])["Gate"])
+
+    def test_a_healthy_rtsp_camera_says_nothing(self):
+        self.frame("Roof", 3)
+        self.frame("Gate", 3)
+        self.capture([self.http("Roof"), self.rtsp("Gate")])
+        self.assertEqual(self.watch(), 0)
+
+    def test_a_grabber_that_runs_and_writes_nothing_is_reported(self):
+        self.frame("Roof", 3)
+        self.frame("Gate", 3600)
+        self.capture([self.http("Roof"), self.rtsp("Gate", alive=True)])
+        self.assertEqual(self.watch(), 1)
+        self.assertIn("writing nothing", dict(self.sent[0][3])["Gate"])
+
+    def test_a_camera_that_never_delivered_is_reported(self):
+        # A new camera added with the wrong address has no last frame at all.
+        self.frame("Roof", 3)
+        self.capture([self.http("Roof"), self.http("Gate", "unreachable")])
+        self.assertEqual(self.watch(), 1)
+        self.assertIn("No frame today or yesterday",
+                      dict(self.sent[0][3])["Gate"])
+
+    def test_an_enabled_camera_the_daemon_is_not_running(self):
+        # Enabled by hand and capture never restarted: nothing asks it.
+        self.frame("Roof", 3)
+        self.capture([self.http("Roof")])
+        self.assertEqual(self.watch(), 1)
+        self.assertIn("Restart the capture service",
+                      dict(self.sent[0][3])["Gate"])
+
+    def test_yesterdays_last_frame_counts_after_midnight(self):
+        self.now = enc.datetime.now().replace(
+            hour=0, minute=0, second=30, microsecond=0).timestamp()
+        self.frame("Roof", 35)          # 23:59:55 yesterday
+        self.frame("Gate", 35)
+        self.capture([self.http("Roof"), self.http("Gate")])
+        self.assertEqual(self.watch(), 0)
+
+    # -- what must not move anything -----------------------------------------
+
+    def test_a_daemon_that_just_started_gets_its_grace(self):
+        # No frame yet, but capture started two minutes ago: no verdict.
+        self.frame("Roof", 3)
+        self.capture([self.http("Roof"), self.http("Gate")], started_ago=120)
+        self.assertEqual(self.watch(), 0)
+
+    def test_a_restart_is_not_an_all_clear(self):
+        # The trap: measuring from the restart would call a camera that is
+        # still dead "recovered" for ten minutes after every restart.
+        self.healthy()
+        self.watch()
+        self.capture([self.http("Roof"), self.http("Gate", "unreachable")],
+                     started_ago=-500)
+        self.assertEqual(self.later(600), 0)
+        self.assertIn("Gate", self.silent_record())
+
+    def test_a_stale_heartbeat_moves_nothing(self):
+        self.frame("Roof", 3)
+        self.frame("Gate", 3600)
+        self.capture([self.http("Roof"), self.http("Gate")],
+                     age=enc.CAPTURE_STALE + 60)
+        self.assertEqual(self.watch(), 0)
+
+    def test_a_stopped_daemon_moves_nothing(self):
+        # Every camera goes quiet when capture stops, and that is not news
+        # about any camera. Nor is the stop an all-clear.
+        self.healthy()
+        self.watch()
+        self.frame("Gate", -300)
+        self.capture([], running=False)
+        self.assertEqual(self.watch(310), 0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_a_disk_guard_pause_moves_nothing(self):
+        self.frame("Roof", 3600)
+        self.frame("Gate", 3600)
+        self.capture([self.http("Roof"), self.http("Gate")], paused=True)
+        self.assertEqual(self.watch(), 0)
+        self.assertEqual(self.sent, [])
+
+    def test_frames_it_cannot_read_are_not_silence(self):
+        # "Cannot tell" and "nothing there" want opposite answers; the first
+        # must not announce every camera silent the day a permission breaks.
+        self.capture([self.http("Roof"), self.http("Gate")])
+        with mock.patch.object(enc.os, "scandir",
+                               side_effect=PermissionError("denied")):
+            self.assertEqual(self.watch(), 0)
+        self.assertEqual(self.sent, [])
+
+    def test_a_disabled_camera_is_not_expected(self):
+        self.cfg["cameras"][1]["enabled"] = False
+        self.frame("Roof", 3)
+        self.capture([self.http("Roof")])
+        self.assertEqual(self.watch(), 0)
+
+    def test_the_count_covers_enabled_cameras_only(self):
+        self.cfg["cameras"].append({"name": "Yard", "enabled": False})
+        self.healthy()
+        self.watch()
+        self.assertIn(("Delivering frames", "1 of 2"), self.sent[0][3])
+
+    def test_a_camera_removed_while_silent_leaves_without_an_all_clear(self):
+        self.healthy()
+        self.watch()
+        self.cfg["cameras"] = self.cfg["cameras"][:1]
+        self.assertEqual(self.watch(300), 0)
+        self.assertEqual(len(self.sent), 1)
+        self.assertEqual(self.silent_record(), {})
+
+    # -- the credential watch speaks first ----------------------------------
+
+    def test_a_refusal_is_left_to_the_credential_watch(self):
+        # Same silence, better sentence; two messages about it is noise.
+        self.frame("Roof", 3)
+        self.frame("Gate", 3600)
+        self.capture([self.http("Roof"), self.http("Gate", "auth")])
+        self.assertEqual(self.watch(), 0)
+
+    def test_unless_that_watch_is_switched_off(self):
+        self.cfg["capture"]["notify_auth_failures"] = False
+        self.frame("Roof", 3)
+        self.frame("Gate", 3600)
+        self.capture([self.http("Roof"), self.http("Gate", "auth")])
+        self.assertEqual(self.watch(), 1)
+        self.assertIn("Refusing our credentials",
+                      dict(self.sent[0][3])["Gate"])
+
+    def test_a_refusing_camera_is_still_counted_and_listed(self):
+        # The count has to add up even when one of the missing is reported
+        # by the other watch.
+        self.cfg["cameras"].append({"name": "Yard", "enabled": True})
+        self.healthy()
+        self.frame("Yard", 3600)
+        self.capture([self.http("Roof"),
+                      self.http("Gate", "unreachable"),
+                      self.http("Yard", "auth")])
+        self.assertEqual(self.watch(), 1)
+        _title, _desc, _level, fields = self.sent[0]
+        self.assertIn(("Delivering frames", "1 of 3"), fields)
+        self.assertIn("reported separately", dict(fields)["Yard"])
+
+    # -- several cameras -----------------------------------------------------
+
+    def test_cameras_going_silent_together_are_one_message(self):
+        self.frame("Roof", 3600)
+        self.frame("Gate", 3600)
+        self.capture([self.http("Roof"), self.http("Gate")])
+        self.assertEqual(self.watch(), 2)
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("2 cameras stopped", self.sent[0][0])
+        self.assertIn(("Delivering frames", "0 of 2"), self.sent[0][3])
+
+    def test_a_later_silence_lists_the_earlier_one_as_reported(self):
+        self.cfg["cameras"].append({"name": "Yard", "enabled": True})
+        self.healthy()
+        self.frame("Yard", 3)
+        self.capture([self.http("Roof"), self.http("Gate"),
+                      self.http("Yard")])
+        self.watch()
+        self.assertEqual(self.watch(3600), 2)   # Roof and Yard now
+        title, _desc, _level, fields = self.sent[1]
+        self.assertIn("2 cameras stopped", title)
+        self.assertIn("Reported earlier", dict(fields)["Gate"])
+        self.assertNotIn("Reported earlier", dict(fields)["Roof"])
+
+    # -- delivery and the record --------------------------------------------
+
+    def test_no_sinks_means_no_record_either(self):
+        self.cfg["notify"] = []
+        self.healthy()
+        self.assertEqual(self.watch(), 0)
+        self.assertFalse((self.state / enc.WATCH_STATE).exists())
+        self.cfg["notify"] = [{"type": "discord", "enabled": True,
+                               "webhook_url": "https://example.invalid/w"}]
+        self.assertEqual(self.watch(), 1)
+
+    def test_it_can_be_switched_off(self):
+        self.cfg["capture"]["notify_silent_cameras"] = False
+        self.healthy()
+        self.assertEqual(self.watch(), 0)
+
+    def test_it_is_on_when_the_key_is_absent(self):
+        # Upgrades keep the existing config, which does not have it.
+        self.assertNotIn("notify_silent_cameras", self.cfg["capture"])
+        self.healthy()
+        self.assertEqual(self.watch(), 1)
+
+    def test_a_failed_delivery_is_retried_next_tick(self):
+        self.healthy()
+        with mock.patch.object(enc, "notify", return_value=(0, 1)), \
+             self.assertLogs(enc.log, "WARNING"):
+            self.assertEqual(self.watch(), 0)
+        self.assertIsNone(self.silent_record())
+        self.assertEqual(self.watch(300), 1)
+
+    def test_a_failed_all_clear_is_retried_too(self):
+        self.healthy()
+        self.watch()
+        self.frame("Gate", -300)
+        with mock.patch.object(enc, "notify", return_value=(0, 1)):
+            self.assertEqual(self.watch(310), 0)
+        self.assertIn("Gate", self.silent_record())
+        self.assertEqual(self.watch(320), 1)
+
+    def test_the_other_watches_records_survive(self):
+        # Three watches share notified.json; each must keep the others'.
+        enc.save_notified(self.cfg, {"Yard": "2026-10-14T09:00:00"},
+                          gpu={"checked_epoch": 1, "mismatch": None})
+        self.healthy()
+        self.watch()
+        record = enc.load_watch_record(self.cfg)
+        self.assertEqual(record["incidents"], {"Yard": "2026-10-14T09:00:00"})
+        self.assertEqual(record["gpu"], {"checked_epoch": 1, "mismatch": None})
+        self.assertIn("Gate", record["silent"])
+
+    def test_the_journal_says_so_too(self):
+        self.healthy()
+        with self.assertLogs(enc.log, "WARNING") as logs:
+            self.watch()
+        self.assertIn("Gate has delivered no frame", "\n".join(logs.output))
+
+    def test_the_message_carries_no_credential(self):
+        # Capture redacts what it publishes; this redacts again, because the
+        # file may have been written by an older daemon than this reader.
+        self.frame("Roof", 3)
+        self.capture([self.http("Roof"),
+                      self.http("Gate", "other",
+                                "500 for url: http://c/s?password=hunter2")])
+        self.watch()
+        self.assertNotIn("hunter2", json.dumps(self.sent))
+
+
+class TestNewestFrame(unittest.TestCase):
+    """Which frame is newest, and when it was taken: shared with the web UI.
+
+    The page's "Last frame" column and the silent-camera watch read these, so
+    they cannot disagree about when a camera last delivered.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_the_second_pass_through_the_dst_hour_is_newer(self):
+        # Plain name order puts 025959 (first pass) after 024500-1 (second
+        # pass, written later). That would make every camera look an hour
+        # silent once a year, and the watch would say so at 02:10.
+        for name in ("025959.jpg", "024500-1.jpg", "013000.jpg"):
+            (self.tmp / name).write_bytes(b"\xff\xd8x")
+        self.assertEqual(enc.newest_frame(self.tmp), "024500-1.jpg")
+
+    def test_the_suffix_names_the_later_of_the_two_moments(self):
+        # The repeated hour depends on the zone (02:xx in London, 03:xx in
+        # Bucharest, none in UTC), and a test that named one hour could not
+        # fail anywhere else. So it finds the one this machine repeats. Where
+        # there is none, as on a UTC CI runner, the suffix must change nothing.
+        # Repeated, not merely ambiguous: the spring gap also makes fold
+        # matter, the other way round, and the first version of this test
+        # found that hour in March and failed on it.
+        first = enc.datetime(2026, 1, 1)
+        repeated = None
+        for hours in range(365 * 24):
+            t = first + timedelta(hours=hours, minutes=30)
+            if (t.replace(fold=1).timestamp()
+                    > t.replace(fold=0).timestamp()):
+                repeated = t
+                break
+        if repeated is None:
+            self.assertEqual(enc.frame_epoch("2026-10-25", "023000-1.jpg"),
+                             enc.frame_epoch("2026-10-25", "023000.jpg"))
+            return
+        day = repeated.strftime("%Y-%m-%d")
+        hhmmss = repeated.strftime("%H%M%S")
+        self.assertEqual(enc.frame_epoch(day, hhmmss + ".jpg"),
+                         repeated.replace(fold=0).timestamp())
+        self.assertEqual(enc.frame_epoch(day, hhmmss + "-1.jpg"),
+                         repeated.replace(fold=1).timestamp())
+        self.assertGreater(enc.frame_epoch(day, hhmmss + "-1.jpg"),
+                           enc.frame_epoch(day, hhmmss + ".jpg"))
+
+    def test_a_jpg_that_is_not_a_frame_is_never_the_newest(self):
+        for name in ("120000.jpg", "snapshot.jpg", "zzz.jpg"):
+            (self.tmp / name).write_bytes(b"\xff\xd8x")
+        self.assertEqual(enc.newest_frame(self.tmp), "120000.jpg")
+
+    def test_a_missing_directory_has_no_frame(self):
+        self.assertEqual(enc.newest_frame(self.tmp / "nope"), "")
+
+    def test_an_unreadable_directory_raises(self):
+        with mock.patch.object(enc.os, "scandir",
+                               side_effect=PermissionError("denied")):
+            with self.assertRaises(OSError):
+                enc.newest_frame(self.tmp)
+
+    def test_frame_order_is_unchanged(self):
+        # frame_order() now delegates to frame_key(); the encoder's concat
+        # order must be exactly what it was.
+        names = ["030000.jpg", "023000-1.jpg", "023000.jpg", "025959.jpg",
+                 "notes.jpg", "010000.jpg"]
+        ordered = [p.name for p in sorted((Path(n) for n in names),
+                                          key=enc.frame_order)]
+        self.assertEqual(ordered, ["010000.jpg", "023000.jpg", "025959.jpg",
+                                   "023000-1.jpg", "030000.jpg", "notes.jpg"])
+
+
 class TestVerifyShareCredentials(unittest.TestCase):
     """Proving a password, as opposed to proving a folder is writable.
 
@@ -3587,10 +4314,11 @@ class TestOnlyOneRunAtATime(unittest.TestCase):
         with mock.patch.object(sys, "argv", argv), \
              mock.patch.object(enc, "setup_logging", lambda *a, **k: None), \
              mock.patch.object(enc, "watch_credentials", lambda cfg: 0), \
+             mock.patch.object(enc, "watch_cameras", lambda cfg: 0), \
              mock.patch.object(enc, "watch_gpu_driver", lambda cfg: 0):
             self.assertEqual(enc.main(), 0)
 
-    def test_one_watch_failing_does_not_stop_the_other(self):
+    def test_one_watch_failing_does_not_stop_the_others(self):
         ran = []
 
         def broken(cfg):
@@ -3600,11 +4328,13 @@ class TestOnlyOneRunAtATime(unittest.TestCase):
         with mock.patch.object(sys, "argv", argv), \
              mock.patch.object(enc, "setup_logging", lambda *a, **k: None), \
              mock.patch.object(enc, "watch_credentials", broken), \
+             mock.patch.object(enc, "watch_cameras",
+                               lambda cfg: ran.append("cameras") or 0), \
              mock.patch.object(enc, "watch_gpu_driver",
-                               lambda cfg: ran.append(1) or 0), \
+                               lambda cfg: ran.append("driver") or 0), \
              self.assertLogs(enc.log, "ERROR"):
             self.assertEqual(enc.main(), 0)
-        self.assertEqual(ran, [1])
+        self.assertEqual(ran, ["cameras", "driver"])
 
     def test_a_lock_that_cannot_be_taken_at_all_does_not_stop_the_run(self):
         """Three answers and not two. A lock file that cannot be created is an
